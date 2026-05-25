@@ -35,6 +35,31 @@ if (-not $LogPath) {
     $LogPath = Join-Path $resolvedOpsRoot "runner.log"
 }
 
+# Preflight: validate the ops config before handing control to the runner. Without
+# this, a corrupt JSON file or a config with zero jobs would still launch python,
+# silently no-op (or crash with a stack trace), and Task Scheduler would never
+# surface the actual reason.
+try {
+    $configPayload = Get-Content -LiteralPath $resolvedConfig -Raw -Encoding utf8 | ConvertFrom-Json
+}
+catch {
+    "[$(Get-Date -Format o)] ops config invalid JSON ($resolvedConfig): $_" | Out-File -FilePath $LogPath -Append -Encoding utf8
+    throw "ops config is not valid JSON: $resolvedConfig"
+}
+
+if ($null -eq $configPayload.jobs -or @($configPayload.jobs).Count -eq 0) {
+    "[$(Get-Date -Format o)] ops config has no jobs ($resolvedConfig)" | Out-File -FilePath $LogPath -Append -Encoding utf8
+    throw "ops config has no jobs: $resolvedConfig"
+}
+
+$invalidJobs = @($configPayload.jobs) | Where-Object {
+    [string]::IsNullOrWhiteSpace($_.name) -or [string]::IsNullOrWhiteSpace($_.job_type)
+}
+if ($invalidJobs.Count -gt 0) {
+    "[$(Get-Date -Format o)] ops config contains jobs missing name or job_type ($resolvedConfig)" | Out-File -FilePath $LogPath -Append -Encoding utf8
+    throw "ops config jobs missing name or job_type: $resolvedConfig"
+}
+
 $mutex = New-Object System.Threading.Mutex($false, "Global\CryptoMarketDataPlantOpsRunner")
 $hasHandle = $false
 
