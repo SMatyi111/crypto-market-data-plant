@@ -25,6 +25,7 @@ class CollectorConfig:
     connect_retries: int = 8
     retry_backoff_seconds: float = 1.0
     max_backoff_seconds: float = 60.0
+    subscription_ack_timeout_seconds: float = 5.0
 
 
 @dataclass(slots=True)

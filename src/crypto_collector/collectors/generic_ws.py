@@ -31,10 +31,16 @@ class GenericWebsocketCollector(BaseCollector):
         while True:
             try:
                 async with websockets.connect(self.config.websocket_url) as websocket:
-                    subscription = self._subscription_message()
-                    if subscription:
-                        await websocket.send(json.dumps(subscription))
+                    pending = await self._subscribe(websocket)
                     attempt = 0
+                    for raw in pending:
+                        payload = raw.payload
+                        if not self._should_emit(payload):
+                            continue
+                        yield raw
+                        message_count += 1
+                        if limit is not None and message_count >= limit:
+                            return
                     async for message in websocket:
                         payload = json.loads(message)
                         if not self._should_emit(payload):
@@ -67,6 +73,65 @@ class GenericWebsocketCollector(BaseCollector):
                 )
                 await asyncio.sleep(delay)
 
+    async def _subscribe(self, websocket: object) -> list[RawMessage]:
+        """Send subscription and wait for an ack. Returns any data frames received during the wait
+        so the caller can forward them instead of dropping recorded traffic on the floor."""
+        subscription = self._subscription_message()
+        if not subscription:
+            return []
+        await websocket.send(json.dumps(subscription))
+        timeout = float(self.config.subscription_ack_timeout_seconds)
+        if timeout <= 0:
+            return []
+        buffered: list[RawMessage] = []
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"subscription ack timed out for {self.config.source}:{self.config.channel}"
+                )
+            raw = await asyncio.wait_for(websocket.recv(), timeout=remaining)
+            try:
+                payload = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            if self._is_subscription_error(payload):
+                raise RuntimeError(f"subscription rejected: {payload}")
+            if self._is_subscription_ack(payload):
+                return buffered
+            if isinstance(payload, dict) and self._should_emit(payload):
+                buffered.append(
+                    RawMessage(
+                        source=self.config.source,
+                        received_at=utc_now(),
+                        payload=payload,
+                    )
+                )
+
+    def _is_subscription_ack(self, payload: object) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        if self.config.subscription_style == "coinbase":
+            return payload.get("type") == "subscriptions"
+        if self.config.subscription_style == "binance":
+            return payload.get("result") is None and "id" in payload
+        return False
+
+    def _is_subscription_error(self, payload: object) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        if self.config.subscription_style == "coinbase":
+            return payload.get("type") == "error"
+        if self.config.subscription_style == "binance":
+            error = payload.get("error")
+            if isinstance(error, dict) and error:
+                return True
+            code = payload.get("code")
+            return code not in (None, 0)
+        return False
+
     def _subscription_message(self) -> dict[str, object]:
         if self.config.subscription_style == "none":
             return {}
@@ -91,6 +156,9 @@ class GenericWebsocketCollector(BaseCollector):
             if payload.get("result") is None and "id" in payload:
                 return False
             if payload.get("e") is None and "data" not in payload:
+                return False
+        if self.config.subscription_style == "coinbase":
+            if payload.get("type") in {"subscriptions", "error"}:
                 return False
         return True
 

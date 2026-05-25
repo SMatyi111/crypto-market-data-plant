@@ -86,6 +86,45 @@ def test_generic_collector_backoff_grows_exponentially_with_cap() -> None:
     assert _backoff_delay(attempt=10, base=1.0, cap=8.0) == 8.0
 
 
+class _FakeWebsocket:
+    def __init__(self, incoming: list[str]) -> None:
+        self._incoming = list(incoming)
+        self.sent: list[str] = []
+
+    async def send(self, message: str) -> None:
+        self.sent.append(message)
+
+    async def recv(self) -> str:
+        if not self._incoming:
+            raise AssertionError("no more frames queued")
+        return self._incoming.pop(0)
+
+
+def test_generic_collector_subscribe_waits_for_coinbase_ack_and_buffers_early_frames() -> None:
+    import asyncio
+    collector = make_collector("coinbase")
+    fake = _FakeWebsocket(
+        incoming=[
+            '{"type": "open", "product_id": "BTC-USD"}',
+            '{"type": "subscriptions", "channels": []}',
+        ]
+    )
+    buffered = asyncio.run(collector._subscribe(fake))
+    assert fake.sent and "subscribe" in fake.sent[0]
+    assert len(buffered) == 1
+    assert buffered[0].payload["type"] == "open"
+
+
+def test_generic_collector_subscribe_raises_on_explicit_error_frame() -> None:
+    import asyncio
+    import pytest
+
+    collector = make_collector("coinbase")
+    fake = _FakeWebsocket(incoming=['{"type": "error", "message": "bad sub"}'])
+    with pytest.raises(RuntimeError, match="subscription rejected"):
+        asyncio.run(collector._subscribe(fake))
+
+
 def test_generic_collector_retryable_errors_include_connection_closed() -> None:
     assert _generic_is_retryable_connect_error(TimeoutError("nope")) is True
     assert _generic_is_retryable_connect_error(OSError("connection reset by peer")) is True
