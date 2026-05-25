@@ -34,7 +34,9 @@ class CollectorPipeline:
         run_paths: RunPaths,
         normalized_root: Path | None = None,
         raw_rotate_bytes: int = 512 * 1024 * 1024,
+        metrics_flush_every: int = 1000,
     ) -> None:
+        self.metrics_flush_every = max(0, int(metrics_flush_every))
         self.collector = collector
         self.normalizer = normalizer
         self.quality_gate = quality_gate
@@ -66,6 +68,21 @@ class CollectorPipeline:
                     quarantined_row = normalized.to_dict()
                     quarantined_row["reasons"] = verdict.reasons
                     self.quarantine_sink.write(quarantined_row)
+
+                if (
+                    self.metrics_flush_every
+                    and summary.raw_messages % self.metrics_flush_every == 0
+                ):
+                    # Stream partial metrics so external monitors see in-flight state
+                    # instead of having to wait for shutdown to learn the gate is
+                    # quarantining 30% of events.
+                    self.metrics_sink.write(
+                        {
+                            **summary.to_dict(),
+                            "reject_counts": self.quality_gate.metrics(),
+                            "partial": True,
+                        }
+                    )
         finally:
             # Always flush, even on cancellation / exception, so buffered Parquet rows
             # and the summary metrics are persisted instead of lost on shutdown.
@@ -73,6 +90,7 @@ class CollectorPipeline:
                 {
                     **summary.to_dict(),
                     "reject_counts": self.quality_gate.metrics(),
+                    "partial": False,
                 }
             )
             if self.parquet_sink is not None:
