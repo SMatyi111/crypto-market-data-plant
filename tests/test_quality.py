@@ -77,6 +77,15 @@ def test_quality_gate_is_safe_under_concurrent_validate_calls() -> None:
     assert isinstance(gate.metrics(), dict)
 
 
+def test_quality_gate_session_id_isolates_per_run_sequence_state() -> None:
+    older_run = QualityGate(session_id="20260101_000000")
+    older_run.validate(make_event(sequence=999_999))
+    newer_run = QualityGate(session_id="20260102_000000")
+    # A fresh session starting from a smaller sequence (e.g. exchange-side reset)
+    # must not see the prior run's high-water mark.
+    assert newer_run.validate(make_event(sequence=1)).accepted is True
+
+
 def test_quality_gate_accepts_duplicate_sequence_as_idempotent_replay() -> None:
     gate = QualityGate()
     assert gate.validate(make_event(sequence=10)).accepted is True

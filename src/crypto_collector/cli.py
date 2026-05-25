@@ -162,7 +162,7 @@ async def run_mock(args: argparse.Namespace) -> None:
     pipeline = CollectorPipeline(
         collector=collector,
         normalizer=GenericL3Normalizer(),
-        quality_gate=QualityGate(),
+        quality_gate=QualityGate(session_id=run_paths.base.name),
         run_paths=run_paths,
         normalized_root=default_normalized_root("market"),
     )
@@ -295,7 +295,7 @@ async def collect_binance_trades_segment(args: argparse.Namespace) -> dict[str, 
     pipeline = CollectorPipeline(
         collector=collector,
         normalizer=BinanceTradeNormalizer(),
-        quality_gate=QualityGate(max_delay_ms=config.max_delay_ms),
+        quality_gate=QualityGate(max_delay_ms=config.max_delay_ms, session_id=run_paths.base.name),
         run_paths=run_paths,
         normalized_root=default_normalized_root("trades"),
     )

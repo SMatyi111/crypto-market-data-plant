@@ -14,11 +14,16 @@ class QualityGate:
         max_delay_ms: int = 5_000,
         max_future_skew_ms: int = 60_000,
         require_monotonic_sequence: bool = True,
+        session_id: str | None = None,
     ) -> None:
         self.max_delay_ms = max_delay_ms
         self.max_future_skew_ms = max_future_skew_ms
         self.require_monotonic_sequence = require_monotonic_sequence
-        self._last_sequence_by_stream: dict[tuple[str, str, str], int] = {}
+        # session_id keeps the per-stream sequence cursor scoped to a single collection
+        # run. Otherwise an exchange-side sequence reset or a collector restart in the
+        # same process would look like a backwards jump and falsely flag every event.
+        self.session_id = session_id
+        self._last_sequence_by_stream: dict[tuple[str, str, str, str | None], int] = {}
         self._sequence_lock = threading.Lock()
         self.reject_counts: Counter[str] = Counter()
         self._reject_lock = threading.Lock()
@@ -45,7 +50,7 @@ class QualityGate:
                 reasons.append("stale_or_clock_skew")
 
         if self.require_monotonic_sequence and event.sequence is not None:
-            stream_key = (event.source, event.product, event.channel)
+            stream_key = (event.source, event.product, event.channel, self.session_id)
             with self._sequence_lock:
                 last_sequence = self._last_sequence_by_stream.get(stream_key)
                 # Some venues legitimately re-send the same sequence as an idempotency marker.
