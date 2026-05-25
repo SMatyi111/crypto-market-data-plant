@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from collections import Counter
 from datetime import UTC, datetime
 
@@ -18,7 +19,9 @@ class QualityGate:
         self.max_future_skew_ms = max_future_skew_ms
         self.require_monotonic_sequence = require_monotonic_sequence
         self._last_sequence_by_stream: dict[tuple[str, str, str], int] = {}
+        self._sequence_lock = threading.Lock()
         self.reject_counts: Counter[str] = Counter()
+        self._reject_lock = threading.Lock()
 
     def validate(self, event: NormalizedL3Event) -> ValidationResult:
         reasons: list[str] = []
@@ -43,24 +46,28 @@ class QualityGate:
 
         if self.require_monotonic_sequence and event.sequence is not None:
             stream_key = (event.source, event.product, event.channel)
-            last_sequence = self._last_sequence_by_stream.get(stream_key)
-            # Some venues legitimately re-send the same sequence as an idempotency marker.
-            # Treat only strictly-decreasing sequences as a violation.
-            if last_sequence is not None and event.sequence < last_sequence:
-                reasons.append("non_monotonic_sequence")
-            elif last_sequence is None or event.sequence > last_sequence:
-                self._last_sequence_by_stream[stream_key] = event.sequence
+            with self._sequence_lock:
+                last_sequence = self._last_sequence_by_stream.get(stream_key)
+                # Some venues legitimately re-send the same sequence as an idempotency marker.
+                # Treat only strictly-decreasing sequences as a violation.
+                if last_sequence is not None and event.sequence < last_sequence:
+                    reasons.append("non_monotonic_sequence")
+                elif last_sequence is None or event.sequence > last_sequence:
+                    self._last_sequence_by_stream[stream_key] = event.sequence
 
         if event.event_type == "unknown":
             reasons.append("unknown_event_type")
 
-        for reason in reasons:
-            self.reject_counts[reason] += 1
+        if reasons:
+            with self._reject_lock:
+                for reason in reasons:
+                    self.reject_counts[reason] += 1
 
         return ValidationResult(accepted=not reasons, reasons=reasons)
 
     def metrics(self) -> dict[str, int]:
-        return dict(self.reject_counts)
+        with self._reject_lock:
+            return dict(self.reject_counts)
 
 
 def utc_now() -> datetime:
@@ -70,6 +77,7 @@ def utc_now() -> datetime:
 class MetadataQualityGate:
     def __init__(self) -> None:
         self.reject_counts: Counter[str] = Counter()
+        self._reject_lock = threading.Lock()
 
     def validate(self, record: object) -> ValidationResult:
         metadata = getattr(record, "metadata", {})
@@ -85,10 +93,13 @@ class MetadataQualityGate:
         ):
             reasons.append("invalid_update_range")
 
-        for reason in reasons:
-            self.reject_counts[reason] += 1
+        if reasons:
+            with self._reject_lock:
+                for reason in reasons:
+                    self.reject_counts[reason] += 1
 
         return ValidationResult(accepted=not reasons, reasons=reasons)
 
     def metrics(self) -> dict[str, int]:
-        return dict(self.reject_counts)
+        with self._reject_lock:
+            return dict(self.reject_counts)

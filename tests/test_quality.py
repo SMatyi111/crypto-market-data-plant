@@ -52,6 +52,31 @@ def test_quality_gate_keeps_highest_sequence_after_rejection() -> None:
     assert gate.validate(make_event(sequence=11)).accepted is True
 
 
+def test_quality_gate_is_safe_under_concurrent_validate_calls() -> None:
+    import threading
+
+    gate = QualityGate()
+    barrier = threading.Barrier(8)
+    sequences_seen: list[bool] = []
+
+    def worker(start: int) -> None:
+        barrier.wait()
+        for offset in range(50):
+            result = gate.validate(make_event(sequence=start + offset))
+            sequences_seen.append(result.accepted)
+
+    threads = [threading.Thread(target=worker, args=(i * 1000,)) for i in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    # The accepted count is non-deterministic across threads but the gate must
+    # not have raised and metrics() must remain readable.
+    assert len(sequences_seen) == 8 * 50
+    assert isinstance(gate.metrics(), dict)
+
+
 def test_quality_gate_accepts_duplicate_sequence_as_idempotent_replay() -> None:
     gate = QualityGate()
     assert gate.validate(make_event(sequence=10)).accepted is True
