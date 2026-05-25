@@ -81,7 +81,8 @@ def build_parser() -> argparse.ArgumentParser:
     trades_parser.add_argument("--ops-root", type=Path, default=default_ops_root())
     trades_parser.add_argument("--worker-name", default="binance-trades-worker")
     trades_parser.add_argument("--heartbeat-interval-seconds", type=float, default=30.0)
-    trades_parser.add_argument("--max-delay-ms", type=int, default=5_000)
+    trades_parser.add_argument("--max-delay-ms", type=int, default=60_000)
+    trades_parser.add_argument("--max-future-skew-ms", type=int, default=5_000)
 
     ops_parser = subparsers.add_parser("ops-runner", help="Run collection and curation jobs from a manifest")
     ops_parser.add_argument("--config", type=Path, required=True)
@@ -289,13 +290,18 @@ async def collect_binance_trades_segment(args: argparse.Namespace) -> dict[str, 
         websocket_url="wss://stream.binance.com:9443/ws",
         subscription_style="binance",
         max_delay_ms=args.max_delay_ms,
+        max_future_skew_ms=getattr(args, "max_future_skew_ms", 5_000),
     )
     collector = GenericWebsocketCollector(config=config)
     run_paths = prepare_run_paths(output_root=config.output_root, source="binance_trades")
     pipeline = CollectorPipeline(
         collector=collector,
         normalizer=BinanceTradeNormalizer(),
-        quality_gate=QualityGate(max_delay_ms=config.max_delay_ms, session_id=run_paths.base.name),
+        quality_gate=QualityGate(
+            max_delay_ms=config.max_delay_ms,
+            max_future_skew_ms=config.max_future_skew_ms,
+            session_id=run_paths.base.name,
+        ),
         run_paths=run_paths,
         normalized_root=default_normalized_root("trades"),
     )
@@ -343,6 +349,7 @@ def run_binance_trades_worker(args: argparse.Namespace) -> None:
             count=source_args.segment_count,
             output_root=source_args.output_root,
             max_delay_ms=source_args.max_delay_ms,
+            max_future_skew_ms=getattr(source_args, "max_future_skew_ms", 5_000),
         ),
         collect_segment=collect_binance_trades_segment,
         progress_message=lambda segment_index, summary: (
@@ -496,7 +503,8 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             ops_root=Path(raw_args.get("ops_root", default_ops_root())),
             worker_name=raw_args.get("worker_name", "binance-trades-worker"),
             heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
-            max_delay_ms=raw_args.get("max_delay_ms", 5_000),
+            max_delay_ms=raw_args.get("max_delay_ms", 60_000),
+            max_future_skew_ms=raw_args.get("max_future_skew_ms", 5_000),
         )
     if job.job_type in {"book-sync-health", "backfill-replay"}:
         return SimpleNamespace(

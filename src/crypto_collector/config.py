@@ -20,7 +20,8 @@ class CollectorConfig:
     channel: str = "full"
     websocket_url: str | None = None
     subscription_style: str = "coinbase"
-    max_delay_ms: int = 5_000
+    max_delay_ms: int = 60_000
+    max_future_skew_ms: int = 5_000
     require_monotonic_sequence: bool = True
     connect_retries: int = 8
     retry_backoff_seconds: float = 1.0

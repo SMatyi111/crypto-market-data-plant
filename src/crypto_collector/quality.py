@@ -11,8 +11,8 @@ class QualityGate:
     def __init__(
         self,
         *,
-        max_delay_ms: int = 5_000,
-        max_future_skew_ms: int = 60_000,
+        max_delay_ms: int = 60_000,
+        max_future_skew_ms: int = 5_000,
         require_monotonic_sequence: bool = True,
         session_id: str | None = None,
     ) -> None:
