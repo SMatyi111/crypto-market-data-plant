@@ -44,9 +44,11 @@ class QualityGate:
         if self.require_monotonic_sequence and event.sequence is not None:
             stream_key = (event.source, event.product, event.channel)
             last_sequence = self._last_sequence_by_stream.get(stream_key)
-            if last_sequence is not None and event.sequence <= last_sequence:
+            # Some venues legitimately re-send the same sequence as an idempotency marker.
+            # Treat only strictly-decreasing sequences as a violation.
+            if last_sequence is not None and event.sequence < last_sequence:
                 reasons.append("non_monotonic_sequence")
-            else:
+            elif last_sequence is None or event.sequence > last_sequence:
                 self._last_sequence_by_stream[stream_key] = event.sequence
 
         if event.event_type == "unknown":

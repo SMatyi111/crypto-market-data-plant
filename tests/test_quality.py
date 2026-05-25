@@ -52,6 +52,14 @@ def test_quality_gate_keeps_highest_sequence_after_rejection() -> None:
     assert gate.validate(make_event(sequence=11)).accepted is True
 
 
+def test_quality_gate_accepts_duplicate_sequence_as_idempotent_replay() -> None:
+    gate = QualityGate()
+    assert gate.validate(make_event(sequence=10)).accepted is True
+    duplicate = gate.validate(make_event(sequence=10))
+    assert duplicate.accepted is True
+    assert "non_monotonic_sequence" not in duplicate.reasons
+
+
 def test_quality_gate_rejects_clock_skew() -> None:
     gate = QualityGate(max_delay_ms=100)
     event = make_event(exchange_time=datetime.now(tz=UTC) - timedelta(seconds=1))
