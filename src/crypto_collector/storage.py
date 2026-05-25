@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -33,13 +34,18 @@ def prepare_run_paths(output_root: Path, source: str, started_at: datetime | Non
 
 
 class JsonlSink:
-    def __init__(self, root: Path, filename: str) -> None:
+    def __init__(self, root: Path, filename: str, *, fsync: bool = True) -> None:
         self.path = root / filename
+        self._fsync = fsync
 
     def write(self, row: dict[str, Any]) -> None:
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, sort_keys=True))
             handle.write("\n")
+            handle.flush()
+            if self._fsync:
+                # fsync prevents a torn last line if the process dies before the OS flushes.
+                os.fsync(handle.fileno())
 
 
 class ParquetDatasetSink:

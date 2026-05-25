@@ -4,7 +4,16 @@ from pathlib import Path
 
 import pyarrow.dataset as ds
 
-from crypto_collector.storage import ParquetDatasetSink
+from crypto_collector.storage import JsonlSink, ParquetDatasetSink
+
+
+def test_jsonl_sink_flushes_each_write_so_partial_lines_dont_accumulate(tmp_path: Path) -> None:
+    sink = JsonlSink(tmp_path, "events.jsonl")
+    sink.write({"a": 1})
+    sink.write({"a": 2})
+    # Read without closing any other handle — every write must be durably on disk already.
+    lines = (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    assert lines == ['{"a": 1}', '{"a": 2}']
 
 
 def test_parquet_dataset_sink_writes_partitioned_dataset(tmp_path: Path) -> None:

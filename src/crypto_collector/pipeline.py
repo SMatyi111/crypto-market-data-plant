@@ -45,31 +45,34 @@ class CollectorPipeline:
 
     async def run(self, limit: int | None = None) -> RunSummary:
         summary = RunSummary()
-        async for raw in self.collector.stream(limit=limit):
-            summary.raw_messages += 1
-            self.raw_sink.write(raw.to_dict())
+        try:
+            async for raw in self.collector.stream(limit=limit):
+                summary.raw_messages += 1
+                self.raw_sink.write(raw.to_dict())
 
-            normalized = self.normalizer.normalize(raw)
-            verdict = self.quality_gate.validate(normalized)
-            if verdict.accepted:
-                summary.clean_events += 1
-                normalized_row = normalized.to_dict()
-                self.clean_sink.write(normalized_row)
-                if self.parquet_sink is not None:
-                    self.parquet_sink.write(normalized_row)
-            else:
-                summary.quarantined_events += 1
-                quarantined_row = normalized.to_dict()
-                quarantined_row["reasons"] = verdict.reasons
-                self.quarantine_sink.write(quarantined_row)
-
-        self.metrics_sink.write(
-            {
-                **summary.to_dict(),
-                "reject_counts": self.quality_gate.metrics(),
-            }
-        )
-        if self.parquet_sink is not None:
-            self.parquet_sink.flush()
+                normalized = self.normalizer.normalize(raw)
+                verdict = self.quality_gate.validate(normalized)
+                if verdict.accepted:
+                    summary.clean_events += 1
+                    normalized_row = normalized.to_dict()
+                    self.clean_sink.write(normalized_row)
+                    if self.parquet_sink is not None:
+                        self.parquet_sink.write(normalized_row)
+                else:
+                    summary.quarantined_events += 1
+                    quarantined_row = normalized.to_dict()
+                    quarantined_row["reasons"] = verdict.reasons
+                    self.quarantine_sink.write(quarantined_row)
+        finally:
+            # Always flush, even on cancellation / exception, so buffered Parquet rows
+            # and the summary metrics are persisted instead of lost on shutdown.
+            self.metrics_sink.write(
+                {
+                    **summary.to_dict(),
+                    "reject_counts": self.quality_gate.metrics(),
+                }
+            )
+            if self.parquet_sink is not None:
+                self.parquet_sink.flush()
         return summary
 
