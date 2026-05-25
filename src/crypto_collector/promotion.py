@@ -161,6 +161,11 @@ def promote_replayable_runs(
                 curated_row["promotion_tag"] = "replayable"
                 parquet_sink.write(curated_row)
                 promoted_rows += 1
+            # Flush per-run BEFORE appending to the index. An index entry must imply
+            # the Parquet rows for that run are durably on disk: otherwise a flush
+            # failure after the index write would leave the index claiming a run was
+            # promoted while the rows were silently dropped on retry.
+            parquet_sink.flush()
             index_sink.write(
                 {
                     "run_path": run_key,
@@ -182,6 +187,12 @@ def promote_replayable_runs(
                 )
             )
         except Exception as exc:  # noqa: BLE001
+            # Best-effort flush of any partial rows already written for this run so we
+            # don't lose them silently on subsequent failures.
+            try:
+                parquet_sink.flush()
+            except Exception:  # noqa: BLE001
+                pass
             failed_count += 1
             runs.append(
                 PromotionRunStatus(
