@@ -33,6 +33,23 @@ def test_default_normalized_root_prefers_archive_root_when_available(tmp_path: P
     assert config.default_normalized_root("market") == archive_root / "normalized" / "market"
 
 
+def test_default_output_root_emits_warning_when_no_env_override_is_set(monkeypatch, recwarn) -> None:
+    monkeypatch.delenv("MARKET_DATA_OUTPUT_ROOT", raising=False)
+    monkeypatch.delenv("CRYPTO_COLLECTOR_OUTPUT_ROOT", raising=False)
+    config._FALLBACK_WARNED.clear()
+    config.default_output_root()
+    fallback_warnings = [w for w in recwarn.list if "MARKET_DATA_OUTPUT_ROOT" in str(w.message)]
+    assert fallback_warnings
+
+
+def test_default_output_root_does_not_warn_when_env_override_is_set(monkeypatch, recwarn) -> None:
+    monkeypatch.setenv("CRYPTO_COLLECTOR_OUTPUT_ROOT", r"D:\custom_output")
+    config._FALLBACK_WARNED.clear()
+    config.default_output_root()
+    fallback_warnings = [w for w in recwarn.list if "MARKET_DATA_OUTPUT_ROOT" in str(w.message)]
+    assert fallback_warnings == []
+
+
 def test_default_ops_root_prefers_archive_root_when_available(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv("CRYPTO_COLLECTOR_OPS_ROOT", raising=False)
     archive_root = tmp_path / "archive-root"

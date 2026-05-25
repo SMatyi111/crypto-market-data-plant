@@ -2,10 +2,31 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+import warnings
 from pathlib import Path
 
 
 DEFAULT_ARCHIVE_ROOT = Path(r"D:\market_archive")
+
+_FALLBACK_WARNED: set[str] = set()
+
+
+def _warn_implicit_fallback(env_vars: tuple[str, ...], chosen: Path) -> None:
+    """Warn once per process when no env override is set and we resort to a default path.
+
+    A misconfigured operator writing to the wrong disk is hard to notice — this turns
+    a silent fallback into a UserWarning that ops scripts can surface in logs.
+    """
+    key = "|".join(env_vars) + "->" + str(chosen)
+    if key in _FALLBACK_WARNED:
+        return
+    _FALLBACK_WARNED.add(key)
+    warnings.warn(
+        f"market-data-plant: no value set for {' or '.join(env_vars)}; "
+        f"falling back to {chosen}",
+        UserWarning,
+        stacklevel=3,
+    )
 DEFAULT_MARKET_OUTPUT_ROOT = DEFAULT_ARCHIVE_ROOT / "raw" / "market"
 DEFAULT_NORMALIZED_ROOT = DEFAULT_ARCHIVE_ROOT / "normalized"
 DEFAULT_CURATED_ROOT = DEFAULT_ARCHIVE_ROOT / "curated" / "research"
@@ -35,52 +56,70 @@ class RunConfig:
     count: int | None = None
 
 
+_OUTPUT_ENV = ("MARKET_DATA_OUTPUT_ROOT", "CRYPTO_COLLECTOR_OUTPUT_ROOT")
+_NORMALIZED_ENV = ("MARKET_DATA_NORMALIZED_ROOT", "CRYPTO_COLLECTOR_NORMALIZED_ROOT")
+_CURATED_ENV = ("MARKET_DATA_CURATED_ROOT", "CRYPTO_COLLECTOR_CURATED_ROOT")
+_OPS_ENV = ("MARKET_DATA_OPS_ROOT", "CRYPTO_COLLECTOR_OPS_ROOT")
+
+
 def default_output_root() -> Path:
-    configured = os.environ.get("MARKET_DATA_OUTPUT_ROOT") or os.environ.get("CRYPTO_COLLECTOR_OUTPUT_ROOT")
+    configured = os.environ.get(_OUTPUT_ENV[0]) or os.environ.get(_OUTPUT_ENV[1])
     if configured:
         return Path(configured)
     archive_root = default_archive_root()
     if archive_root.exists():
-        return archive_root / "raw" / "market"
-    if DEFAULT_ARCHIVE_ROOT.exists():
-        return DEFAULT_MARKET_OUTPUT_ROOT
-    return Path("data")
+        chosen = archive_root / "raw" / "market"
+    elif DEFAULT_ARCHIVE_ROOT.exists():
+        chosen = DEFAULT_MARKET_OUTPUT_ROOT
+    else:
+        chosen = Path("data")
+    _warn_implicit_fallback(_OUTPUT_ENV, chosen)
+    return chosen
 
 
 def default_normalized_root(dataset: str) -> Path:
-    configured = os.environ.get("MARKET_DATA_NORMALIZED_ROOT") or os.environ.get("CRYPTO_COLLECTOR_NORMALIZED_ROOT")
+    configured = os.environ.get(_NORMALIZED_ENV[0]) or os.environ.get(_NORMALIZED_ENV[1])
     if configured:
         return Path(configured) / dataset
     archive_root = default_archive_root()
     if archive_root.exists():
-        return archive_root / "normalized" / dataset
-    if DEFAULT_ARCHIVE_ROOT.exists():
-        return DEFAULT_NORMALIZED_ROOT / dataset
-    return Path("normalized") / dataset
+        chosen = archive_root / "normalized" / dataset
+    elif DEFAULT_ARCHIVE_ROOT.exists():
+        chosen = DEFAULT_NORMALIZED_ROOT / dataset
+    else:
+        chosen = Path("normalized") / dataset
+    _warn_implicit_fallback(_NORMALIZED_ENV, chosen)
+    return chosen
 
 
 def default_curated_root(dataset: str) -> Path:
-    configured = os.environ.get("MARKET_DATA_CURATED_ROOT") or os.environ.get("CRYPTO_COLLECTOR_CURATED_ROOT")
+    configured = os.environ.get(_CURATED_ENV[0]) or os.environ.get(_CURATED_ENV[1])
     if configured:
         return Path(configured) / dataset
     archive_root = default_archive_root()
     if archive_root.exists():
-        return archive_root / "curated" / "research" / dataset
-    if DEFAULT_ARCHIVE_ROOT.exists():
-        return DEFAULT_CURATED_ROOT / dataset
-    return Path("curated") / dataset
+        chosen = archive_root / "curated" / "research" / dataset
+    elif DEFAULT_ARCHIVE_ROOT.exists():
+        chosen = DEFAULT_CURATED_ROOT / dataset
+    else:
+        chosen = Path("curated") / dataset
+    _warn_implicit_fallback(_CURATED_ENV, chosen)
+    return chosen
 
 
 def default_ops_root() -> Path:
-    configured = os.environ.get("MARKET_DATA_OPS_ROOT") or os.environ.get("CRYPTO_COLLECTOR_OPS_ROOT")
+    configured = os.environ.get(_OPS_ENV[0]) or os.environ.get(_OPS_ENV[1])
     if configured:
         return Path(configured)
     archive_root = default_archive_root()
     if archive_root.exists():
-        return archive_root / "ops"
-    if DEFAULT_ARCHIVE_ROOT.exists():
-        return DEFAULT_OPS_ROOT
-    return Path("ops")
+        chosen = archive_root / "ops"
+    elif DEFAULT_ARCHIVE_ROOT.exists():
+        chosen = DEFAULT_OPS_ROOT
+    else:
+        chosen = Path("ops")
+    _warn_implicit_fallback(_OPS_ENV, chosen)
+    return chosen
 
 
 def default_archive_root() -> Path:
