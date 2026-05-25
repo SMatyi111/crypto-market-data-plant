@@ -1,0 +1,31 @@
+[project]
+name = "crypto-market-data-plant"
+version = "0.1.0"
+description = "Research-grade public crypto market data collection, replay, quality, and curation plant."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pyarrow>=14.0",
+    "websockets>=12.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+market-data-plant = "crypto_collector.cli:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

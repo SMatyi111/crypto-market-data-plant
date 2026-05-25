@@ -1,0 +1,89 @@
+{
+  "jobs": [
+    {
+      "name": "binance-btc-depth",
+      "job_type": "binance-depth-worker",
+      "interval_seconds": 3600,
+      "args": {
+        "symbol": "btcusdt",
+        "speed": "100ms",
+        "segment_count": 5000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "connect_retries": 3,
+        "retry_backoff_seconds": 2.0,
+        "output_root": "D:\\market_archive\\raw\\market",
+        "ops_root": "D:\\market_archive\\ops"
+      }
+    },
+    {
+      "name": "binance-btc-trades",
+      "job_type": "binance-trades-worker",
+      "interval_seconds": 3600,
+      "args": {
+        "symbol": "btcusdt",
+        "channel": "trade",
+        "segment_count": 5000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "output_root": "D:\\market_archive\\raw\\market",
+        "ops_root": "D:\\market_archive\\ops"
+      }
+    },
+    {
+      "name": "book-sync-health",
+      "job_type": "book-sync-health",
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "D:\\market_archive\\raw\\market\\binance_depth",
+        "limit": 20,
+        "max_age_hours": 6
+      }
+    },
+    {
+      "name": "quarantine-market",
+      "job_type": "quarantine-runs",
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "D:\\market_archive\\raw\\market\\binance_depth",
+        "quarantine_root": "D:\\market_archive\\quarantine\\market\\binance_depth",
+        "limit": 20,
+        "max_age_hours": 6
+      }
+    },
+    {
+      "name": "promote-market",
+      "job_type": "promote-replayable",
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "D:\\market_archive\\raw\\market\\binance_depth",
+        "target_root": "D:\\market_archive\\curated\\research\\market_replayable",
+        "limit": 20,
+        "max_age_hours": 6
+      }
+    },
+    {
+      "name": "research-manifest",
+      "job_type": "research-manifest",
+      "interval_seconds": 900,
+      "args": {
+        "archive_root": "D:\\market_archive",
+        "output_root": "D:\\market_archive\\curated\\research\\manifests"
+      }
+    },
+    {
+      "name": "cleanup-dry-run",
+      "job_type": "cleanup",
+      "interval_seconds": 3600,
+      "args": {
+        "archive_root": "D:\\market_archive",
+        "raw_days": 14,
+        "raw_policy": [
+          "market/binance_depth=14",
+          "market/binance_trades=14"
+        ],
+        "apply": false
+      }
+    }
+  ]
+}
