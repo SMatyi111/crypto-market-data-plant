@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
+
+_EPOCH_UTC = datetime(1970, 1, 1, tzinfo=UTC)
 
 from .asset_registry import resolve_spot_instrument
 from .context_models import NormalizedDepthUpdate
@@ -74,8 +76,12 @@ def _parse_timestamp_ms(value: Any, errors: list[str]) -> datetime | None:
     if value in (None, ""):
         return None
     try:
-        return datetime.fromtimestamp(int(value) / 1000, tz=UTC)
-    except (TypeError, ValueError, OSError):
+        # Use integer microsecond arithmetic instead of float seconds. For L3 trade
+        # ordering we want lossless conversion — `int(value) / 1000` introduces
+        # representation error that breaks tie-breakers between events sharing a
+        # millisecond boundary.
+        return _EPOCH_UTC + timedelta(microseconds=int(value) * 1000)
+    except (TypeError, ValueError, OverflowError):
         errors.append("invalid_event_time")
         return None
 

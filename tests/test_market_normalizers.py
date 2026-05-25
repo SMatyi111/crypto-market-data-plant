@@ -88,6 +88,32 @@ def test_binance_trade_normalizer_maps_trade_payload_to_l3_event() -> None:
     assert verdict.accepted is True
 
 
+def test_binance_trade_normalizer_preserves_exact_millisecond_in_exchange_time() -> None:
+    normalizer = BinanceTradeNormalizer()
+    # Pick a millisecond near the current epoch that would round-trip badly via
+    # float seconds. With float division we'd get a microsecond offset; with
+    # integer microsecond arithmetic the conversion is lossless.
+    trade_time_ms = 1_700_000_000_001
+    raw = RawMessage(
+        source="binance",
+        received_at=datetime(2026, 1, 1, tzinfo=UTC),
+        payload={
+            "e": "trade",
+            "E": trade_time_ms,
+            "T": trade_time_ms,
+            "s": "BTCUSDT",
+            "t": 1,
+            "p": "1",
+            "q": "1",
+            "m": False,
+        },
+    )
+    event = normalizer.normalize(raw)
+    assert event.exchange_time is not None
+    # Microsecond field must be exactly 1ms = 1000us, with zero float noise.
+    assert event.exchange_time.microsecond == 1000
+
+
 def test_binance_trade_normalizer_maps_agg_trade_side_from_buyer_maker_flag() -> None:
     normalizer = BinanceTradeNormalizer()
     now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
