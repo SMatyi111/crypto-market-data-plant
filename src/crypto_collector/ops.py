@@ -120,6 +120,43 @@ class CleanupReport:
         }
 
 
+@dataclass(slots=True)
+class StaleWorkerPruneCandidate:
+    worker_name: str
+    heartbeat_path: str
+    age_seconds: float | None
+    status: str
+    reason: str
+    related_paths: list[str]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class StaleWorkerPruneReport:
+    mode: str
+    checked_at: datetime
+    ops_root: str
+    archive_root: str
+    candidate_count: int
+    moved_count: int
+    findings: list[str]
+    candidates: list[StaleWorkerPruneCandidate]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "checked_at": self.checked_at.isoformat(),
+            "ops_root": self.ops_root,
+            "archive_root": self.archive_root,
+            "candidate_count": self.candidate_count,
+            "moved_count": self.moved_count,
+            "findings": self.findings,
+            "candidates": [candidate.to_dict() for candidate in self.candidates],
+        }
+
+
 class OpsRunnerLock:
     def __init__(self, ops_root: Path, *, runner_name: str) -> None:
         self.ops_root = ops_root
@@ -694,10 +731,12 @@ def build_health_report(
                 }
             )
 
+    managed_worker_names = _managed_worker_names(jobs) if jobs is not None else None
     standalone_workers, standalone_findings = _standalone_worker_rows(
         ops_root=ops_root,
         checked_at=checked_at,
         stale_after_seconds=stale_after_seconds,
+        managed_worker_names=managed_worker_names,
     )
     findings.extend(standalone_findings)
 
@@ -713,8 +752,9 @@ def build_health_report(
     except FileNotFoundError:
         findings.append("ops_root_missing")
 
+    status_findings = [item for item in findings if not item.startswith("unmanaged_")]
     status = "ok"
-    if findings:
+    if status_findings:
         status = "warn"
     if any(
         item in findings
@@ -776,6 +816,76 @@ def run_cleanup(
         total_bytes=total_bytes,
         removed_count=removed_count,
         removed_bytes=removed_bytes,
+        candidates=candidates,
+    )
+
+
+def prune_stale_worker_artifacts(
+    *,
+    ops_root: Path,
+    stale_after_days: float = 2.0,
+    apply: bool = False,
+    managed_worker_names: set[str] | None = None,
+) -> StaleWorkerPruneReport:
+    checked_at = datetime.now(tz=UTC)
+    workers_root = ops_root / "standalone_workers"
+    archive_root = ops_root / "archived_standalone_workers" / checked_at.strftime("%Y%m%d_%H%M%S")
+    protected = set(managed_worker_names or set()) | {"binance-depth-worker", "binance-trades-worker"}
+    stale_after_seconds = stale_after_days * 24 * 60 * 60
+    candidates: list[StaleWorkerPruneCandidate] = []
+
+    if workers_root.exists():
+        for heartbeat_path in sorted(workers_root.glob("*.json")):
+            payload = _read_json_file(heartbeat_path)
+            if not isinstance(payload, dict):
+                continue
+            name = str(payload.get("worker_name") or heartbeat_path.stem)
+            if name in protected:
+                continue
+            last_seen = _parse_dt(payload.get("last_seen"))
+            age_seconds = (checked_at - last_seen).total_seconds() if last_seen is not None else None
+            stale = age_seconds is None or age_seconds > stale_after_seconds
+            if not stale:
+                continue
+            related_paths = _worker_artifact_paths(workers_root, name)
+            candidates.append(
+                StaleWorkerPruneCandidate(
+                    worker_name=name,
+                    heartbeat_path=str(heartbeat_path),
+                    age_seconds=age_seconds,
+                    status=str(payload.get("status") or "unknown"),
+                    reason="stale_unmanaged_worker",
+                    related_paths=[str(path) for path in related_paths],
+                )
+            )
+
+    moved_count = 0
+    findings: list[str] = []
+    if apply and candidates:
+        archive_root.mkdir(parents=True, exist_ok=True)
+        for candidate in candidates:
+            for raw_path in candidate.related_paths:
+                source = Path(raw_path)
+                if not source.exists():
+                    continue
+                relative = source.relative_to(workers_root)
+                target = archive_root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if target.exists():
+                    target = target.with_name(f"{target.stem}.{int(time.time() * 1000)}{target.suffix}")
+                shutil.move(str(source), str(target))
+                moved_count += 1
+    elif candidates:
+        findings.append("dry_run_candidates")
+
+    return StaleWorkerPruneReport(
+        mode="apply" if apply else "dry-run",
+        checked_at=checked_at,
+        ops_root=str(ops_root),
+        archive_root=str(archive_root),
+        candidate_count=len(candidates),
+        moved_count=moved_count,
+        findings=findings,
         candidates=candidates,
     )
 
@@ -862,6 +972,7 @@ def _standalone_worker_rows(
     ops_root: Path,
     checked_at: datetime,
     stale_after_seconds: int,
+    managed_worker_names: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     findings: list[str] = []
     rows: list[dict[str, Any]] = []
@@ -874,6 +985,7 @@ def _standalone_worker_rows(
         if not isinstance(payload, dict):
             continue
         name = str(payload.get("worker_name") or heartbeat_path.stem)
+        managed = managed_worker_names is None or name in managed_worker_names
         status = str(payload.get("status") or "unknown")
         last_seen = _parse_dt(payload.get("last_seen"))
         age_seconds = max(0.0, (checked_at - last_seen).total_seconds()) if last_seen is not None else None
@@ -888,15 +1000,20 @@ def _standalone_worker_rows(
             if current_started_at is not None
             else None
         )
+        row_findings: list[str] = []
         if stale:
-            findings.append(f"stale_worker:{name}")
+            row_findings.append("stale_worker")
+            findings.append(f"{'stale_worker' if managed else 'unmanaged_stale_worker'}:{name}")
         if pid_missing:
-            findings.append(f"missing_worker_pid:{name}")
+            row_findings.append("missing_worker_pid")
+            findings.append(f"{'missing_worker_pid' if managed else 'unmanaged_missing_worker_pid'}:{name}")
         if status == "error":
-            findings.append(f"worker_error:{name}")
+            row_findings.append("worker_error")
+            findings.append(f"{'worker_error' if managed else 'unmanaged_worker_error'}:{name}")
         rows.append(
             {
                 "name": name,
+                "managed": managed,
                 "worker_type": payload.get("worker_type"),
                 "venue": payload.get("venue"),
                 "symbol": payload.get("symbol"),
@@ -906,6 +1023,8 @@ def _standalone_worker_rows(
                 "age_seconds": age_seconds,
                 "stale": stale,
                 "pid_missing": pid_missing,
+                "blocking": managed and bool(row_findings),
+                "findings": row_findings,
                 "message": payload.get("message"),
                 "last_segment_index": payload.get("last_segment_index"),
                 "last_run_path": payload.get("last_run_path"),
@@ -918,6 +1037,30 @@ def _standalone_worker_rows(
             }
         )
     return rows, findings
+
+
+def _managed_worker_names(jobs: list[JobSpec] | None) -> set[str]:
+    names: set[str] = set()
+    for job in jobs or []:
+        if job.job_type == "binance-depth-worker":
+            names.add(str(job.args.get("worker_name") or "binance-depth-worker"))
+        elif job.job_type == "binance-trades-worker":
+            names.add(str(job.args.get("worker_name") or "binance-trades-worker"))
+    return names
+
+
+def _worker_artifact_paths(workers_root: Path, worker_name: str) -> list[Path]:
+    paths: list[Path] = []
+    heartbeat = workers_root / f"{worker_name}.json"
+    lock = workers_root / f"{worker_name}.lock"
+    if heartbeat.exists():
+        paths.append(heartbeat)
+    if lock.exists():
+        paths.append(lock)
+    logs_root = workers_root / "logs"
+    if logs_root.exists():
+        paths.extend(sorted(path for path in logs_root.glob(f"{worker_name}.*") if path.is_file()))
+    return paths
 
 
 def _parse_dt(value: Any) -> datetime | None:

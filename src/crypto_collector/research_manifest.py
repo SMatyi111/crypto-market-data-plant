@@ -48,7 +48,7 @@ def build_manifest(*, archive_root: Path, current_date: date | None = None) -> d
         "market": archive_root / "normalized" / "market",
         "trades": archive_root / "normalized" / "trades",
     }
-    promoted = read_promotion_index(curated_root / "_promotion_index.jsonl")
+    promoted, promotion_stats = read_promotion_index_with_stats(curated_root / "_promotion_index.jsonl")
     replay = read_replay_summaries(raw_depth_root)
     curated_files = collect_partition_files(curated_root)
     normalized = {
@@ -72,12 +72,18 @@ def build_manifest(*, archive_root: Path, current_date: date | None = None) -> d
             name: rows.get(day_value, {"parquet_files": 0, "parquet_bytes": 0})
             for name, rows in normalized.items()
         }
-        status = "ready" if promoted_day["runs"] > 0 and replay_day["unreplayable_runs"] == 0 else "missing"
+        has_promoted_rows = promoted_day["rows"] > 0 or promoted_day["runs"] > 0
+        has_bad_raw_runs = replay_day["unreplayable_runs"] > 0 or replay_day["missing_summaries"] > 0
+        status = "missing"
+        if has_promoted_rows:
+            status = "ready_with_quarantine" if has_bad_raw_runs else "ready"
         if date.fromisoformat(day_value) == current:
             status = "building"
         notes: list[str] = []
         if replay_day["unreplayable_runs"]:
             notes.append("raw_depth_has_unreplayable_runs")
+        if replay_day["missing_summaries"]:
+            notes.append("missing_replay_summaries")
         if promoted_day["runs"] == 0:
             notes.append("no_promoted_market_runs")
         days.append(
@@ -95,10 +101,16 @@ def build_manifest(*, archive_root: Path, current_date: date | None = None) -> d
         )
     summary = {
         "ready_day_count": sum(1 for item in days if item["readiness"] == "ready"),
+        "ready_with_quarantine_day_count": sum(1 for item in days if item["readiness"] == "ready_with_quarantine"),
         "building_day_count": sum(1 for item in days if item["readiness"] == "building"),
         "missing_day_count": sum(1 for item in days if item["readiness"] == "missing"),
         "total_curated_market_rows": sum(item["curated_market_replayable"]["rows"] for item in days),
         "total_promoted_runs": sum(item["curated_market_replayable"]["runs"] for item in days),
+        "deduped_promoted_run_count": promotion_stats["deduped_promoted_run_count"],
+        "duplicate_promotion_entry_count": promotion_stats["duplicate_promotion_entry_count"],
+        "duplicate_promoted_run_count": promotion_stats["duplicate_promoted_run_count"],
+        "raw_promotion_index_entry_count": promotion_stats["raw_promotion_index_entry_count"],
+        "missing_replay_summary_count": sum(item["raw_depth_quality"]["missing_summaries"] for item in days),
         "total_raw_depth_unreplayable_runs": sum(item["raw_depth_quality"]["unreplayable_runs"] for item in days),
     }
     return {
@@ -110,22 +122,51 @@ def build_manifest(*, archive_root: Path, current_date: date | None = None) -> d
 
 
 def read_promotion_index(path: Path) -> dict[str, dict[str, Any]]:
+    promoted, _stats = read_promotion_index_with_stats(path)
+    return promoted
+
+
+def read_promotion_index_with_stats(path: Path) -> tuple[dict[str, dict[str, Any]], dict[str, int]]:
     by_day: dict[str, dict[str, Any]] = defaultdict(empty_promoted_day)
     if not path.exists():
-        return {}
+        return {}, {
+            "raw_promotion_index_entry_count": 0,
+            "deduped_promoted_run_count": 0,
+            "duplicate_promotion_entry_count": 0,
+            "duplicate_promoted_run_count": 0,
+        }
+    latest_by_run: dict[str, dict[str, Any]] = {}
+    seen_counts: Counter[str] = Counter()
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
         row = json.loads(line)
-        day_value = run_name_to_day(Path(str(row.get("run_path", ""))).name)
+        run_path = str(row.get("run_path") or "")
+        if not run_path:
+            continue
+        seen_counts[run_path] += 1
+        previous = latest_by_run.get(run_path)
+        if previous is None or str(row.get("promoted_at") or "") >= str(previous.get("promoted_at") or ""):
+            latest_by_run[run_path] = row
+
+    for row in latest_by_run.values():
+        run_path = str(row.get("run_path") or "")
+        day_value = run_name_to_day(Path(run_path).name)
         if day_value is None:
             continue
         item = by_day[day_value]
         item["runs"] += 1
         item["rows"] += int(row.get("promoted_rows") or 0)
-        item["latest_run"] = max_optional(item["latest_run"], Path(str(row.get("run_path", ""))).name)
+        item["latest_run"] = max_optional(item["latest_run"], Path(run_path).name)
         item["latest_promoted_at"] = max_optional(item["latest_promoted_at"], str(row.get("promoted_at") or ""))
-    return dict(by_day)
+    duplicate_run_count = sum(1 for count in seen_counts.values() if count > 1)
+    duplicate_entry_count = sum(count - 1 for count in seen_counts.values() if count > 1)
+    return dict(by_day), {
+        "raw_promotion_index_entry_count": sum(seen_counts.values()),
+        "deduped_promoted_run_count": len(latest_by_run),
+        "duplicate_promotion_entry_count": duplicate_entry_count,
+        "duplicate_promoted_run_count": duplicate_run_count,
+    }
 
 
 def read_replay_summaries(root: Path) -> dict[str, dict[str, Any]]:
@@ -172,6 +213,7 @@ def render_manifest_markdown(manifest: dict[str, Any]) -> str:
         f"- Built at: `{manifest['built_at']}`",
         f"- Archive root: `{manifest['archive_root']}`",
         f"- Ready days: `{manifest['summary']['ready_day_count']}`",
+        f"- Ready with quarantine days: `{manifest['summary']['ready_with_quarantine_day_count']}`",
         f"- Building days: `{manifest['summary']['building_day_count']}`",
         f"- Curated market rows: `{manifest['summary']['total_curated_market_rows']:,}`",
         "",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import threading
 import time
@@ -14,7 +15,15 @@ from crypto_collector.cli import (
     run_ops_runner,
 )
 from crypto_collector.models import utc_now
-from crypto_collector.ops import JobExecutionResult, JobSpec, OpsRunner, StandaloneWorkerRuntime, load_ops_config
+from crypto_collector.ops import (
+    JobExecutionResult,
+    JobSpec,
+    OpsRunner,
+    StandaloneWorkerRuntime,
+    build_health_report,
+    load_ops_config,
+    prune_stale_worker_artifacts,
+)
 
 
 def test_load_ops_config_filters_disabled_jobs(tmp_path: Path) -> None:
@@ -400,3 +409,149 @@ def test_standalone_segment_heartbeat_preserves_last_run_path(tmp_path: Path) ->
     assert heartbeat["status"] == "running"
     assert heartbeat["last_segment_index"] == 1
     assert heartbeat["last_run_path"].endswith("previous")
+
+
+def test_health_with_config_does_not_error_on_unmanaged_stale_workers(tmp_path: Path) -> None:
+    ops_root = tmp_path / "ops"
+    workers_root = ops_root / "standalone_workers"
+    workers_root.mkdir(parents=True)
+    now = datetime.now(tz=UTC)
+    (ops_root / "heartbeat.json").write_text(
+        json.dumps(
+            {
+                "status": "running",
+                "last_seen": now.isoformat(),
+                "job_counters": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (ops_root / "job_runs.jsonl").write_text(
+        json.dumps(
+            {
+                "job_name": "binance-btc-depth",
+                "job_type": "binance-depth-worker",
+                "status": "success",
+                "started_at": (now - timedelta(seconds=10)).isoformat(),
+                "finished_at": now.isoformat(),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (workers_root / "binance-depth-worker.json").write_text(
+        json.dumps(
+            {
+                "worker_name": "binance-depth-worker",
+                "worker_type": "binance-depth-worker",
+                "status": "stopped",
+                "pid": os.getpid(),
+                "last_seen": now.isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    (workers_root / "binance-depth-worker-btcfdusd.json").write_text(
+        json.dumps(
+            {
+                "worker_name": "binance-depth-worker-btcfdusd",
+                "worker_type": "binance-depth-worker",
+                "status": "running",
+                "pid": 999999,
+                "last_seen": (now - timedelta(days=7)).isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    jobs = [
+        JobSpec(
+            name="binance-btc-depth",
+            job_type="binance-depth-worker",
+            interval_seconds=3600,
+            args={"worker_name": "binance-depth-worker"},
+        )
+    ]
+    report = build_health_report(
+        ops_root=ops_root,
+        jobs=jobs,
+        stale_after_seconds=120,
+        job_stale_multiplier=3.0,
+    )
+
+    assert report.status == "ok"
+    assert "unmanaged_stale_worker:binance-depth-worker-btcfdusd" in report.findings
+    assert not any(item == "stale_worker:binance-depth-worker-btcfdusd" for item in report.findings)
+    worker = next(row for row in report.standalone_workers if row["name"] == "binance-depth-worker-btcfdusd")
+    assert worker["managed"] is False
+    assert worker["blocking"] is False
+
+
+def test_health_without_config_keeps_legacy_all_worker_blocking_behavior(tmp_path: Path) -> None:
+    ops_root = tmp_path / "ops"
+    workers_root = ops_root / "standalone_workers"
+    workers_root.mkdir(parents=True)
+    now = datetime.now(tz=UTC)
+    (ops_root / "heartbeat.json").write_text(
+        json.dumps({"status": "running", "last_seen": now.isoformat(), "job_counters": {}}),
+        encoding="utf-8",
+    )
+    (workers_root / "old-worker.json").write_text(
+        json.dumps(
+            {
+                "worker_name": "old-worker",
+                "worker_type": "old",
+                "status": "running",
+                "pid": 999999,
+                "last_seen": (now - timedelta(days=7)).isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = build_health_report(ops_root=ops_root, jobs=None, stale_after_seconds=120)
+
+    assert report.status == "error"
+    assert "stale_worker:old-worker" in report.findings
+
+
+def test_prune_stale_worker_artifacts_dry_run_and_apply(tmp_path: Path) -> None:
+    ops_root = tmp_path / "ops"
+    workers_root = ops_root / "standalone_workers"
+    logs_root = workers_root / "logs"
+    logs_root.mkdir(parents=True)
+    old_seen = (datetime.now(tz=UTC) - timedelta(days=7)).isoformat()
+    (workers_root / "old-fdusd.json").write_text(
+        json.dumps({"worker_name": "old-fdusd", "status": "running", "last_seen": old_seen, "pid": 999999}),
+        encoding="utf-8",
+    )
+    (workers_root / "old-fdusd.lock").write_text("stale", encoding="utf-8")
+    (logs_root / "old-fdusd.out.log").write_text("out", encoding="utf-8")
+    (workers_root / "binance-depth-worker.json").write_text(
+        json.dumps({"worker_name": "binance-depth-worker", "status": "running", "last_seen": old_seen, "pid": 999999}),
+        encoding="utf-8",
+    )
+
+    dry_run = prune_stale_worker_artifacts(
+        ops_root=ops_root,
+        stale_after_days=2,
+        apply=False,
+        managed_worker_names={"binance-depth-worker"},
+    )
+    assert dry_run.mode == "dry-run"
+    assert dry_run.candidate_count == 1
+    assert dry_run.candidates[0].worker_name == "old-fdusd"
+    assert (workers_root / "old-fdusd.json").exists()
+
+    applied = prune_stale_worker_artifacts(
+        ops_root=ops_root,
+        stale_after_days=2,
+        apply=True,
+        managed_worker_names={"binance-depth-worker"},
+    )
+    assert applied.mode == "apply"
+    assert applied.candidate_count == 1
+    assert applied.moved_count == 3
+    assert not (workers_root / "old-fdusd.json").exists()
+    assert (workers_root / "binance-depth-worker.json").exists()
+    assert list((ops_root / "archived_standalone_workers").rglob("old-fdusd.json"))

@@ -35,6 +35,7 @@ from .ops import (
     StandaloneWorkerRuntime,
     build_health_report,
     load_ops_config,
+    prune_stale_worker_artifacts,
     run_cleanup,
 )
 from .pipeline import CollectorPipeline
@@ -104,6 +105,13 @@ def build_parser() -> argparse.ArgumentParser:
     cleanup_parser.add_argument("--raw-policy", action="append", default=[], metavar="DATASET/SOURCE=DAYS")
     cleanup_parser.add_argument("--apply", action="store_true")
     cleanup_parser.add_argument("--format", choices=["json", "text"], default="text")
+
+    prune_parser = subparsers.add_parser("ops-prune-stale-workers", help="Archive stale unmanaged worker metadata")
+    prune_parser.add_argument("--ops-root", type=Path, default=default_ops_root())
+    prune_parser.add_argument("--config", type=Path)
+    prune_parser.add_argument("--stale-after-days", type=float, default=2.0)
+    prune_parser.add_argument("--apply", action="store_true")
+    prune_parser.add_argument("--format", choices=["json", "text"], default="text")
 
     replay_parser = subparsers.add_parser("replay", help="Replay one archived Binance depth run")
     replay_parser.add_argument("--run-path", type=Path, required=True)
@@ -569,6 +577,32 @@ def run_cleanup_command(args: argparse.Namespace) -> None:
     print(f"removed_bytes={report.removed_bytes}")
 
 
+def run_ops_prune_stale_workers(args: argparse.Namespace) -> None:
+    jobs = load_ops_config(args.config) if args.config and args.config.exists() else None
+    managed_names: set[str] = set()
+    for job in jobs or []:
+        if job.job_type == "binance-depth-worker":
+            managed_names.add(str(job.args.get("worker_name") or "binance-depth-worker"))
+        elif job.job_type == "binance-trades-worker":
+            managed_names.add(str(job.args.get("worker_name") or "binance-trades-worker"))
+    report = prune_stale_worker_artifacts(
+        ops_root=args.ops_root,
+        stale_after_days=args.stale_after_days,
+        apply=args.apply,
+        managed_worker_names=managed_names,
+    )
+    if args.format == "json":
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+        return
+    print(f"mode={report.mode}")
+    print(f"candidate_count={report.candidate_count}")
+    print(f"moved_count={report.moved_count}")
+    print(f"archive_root={report.archive_root}")
+    print(f"findings={','.join(report.findings) if report.findings else 'none'}")
+    for candidate in report.candidates:
+        print(f"candidate={candidate.worker_name} status={candidate.status} paths={len(candidate.related_paths)}")
+
+
 def run_replay(args: argparse.Namespace) -> None:
     summary = replay_depth_run(run_path=args.run_path, max_levels=args.max_levels, write_summary=True)
     if args.format == "json":
@@ -829,6 +863,8 @@ def main() -> None:
         run_health(args)
     elif args.command == "cleanup":
         run_cleanup_command(args)
+    elif args.command == "ops-prune-stale-workers":
+        run_ops_prune_stale_workers(args)
     elif args.command == "replay":
         run_replay(args)
     elif args.command == "book-sync-health":
