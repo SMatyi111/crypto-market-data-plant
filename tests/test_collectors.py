@@ -8,7 +8,11 @@ from crypto_collector.cli import (
     build_parser,
     _is_retryable_connect_error,
 )
-from crypto_collector.collectors.generic_ws import GenericWebsocketCollector
+from crypto_collector.collectors.generic_ws import (
+    GenericWebsocketCollector,
+    _backoff_delay,
+    _is_retryable_connect_error as _generic_is_retryable_connect_error,
+)
 from crypto_collector.config import CollectorConfig
 from crypto_collector.models import RawMessage, utc_now
 
@@ -73,3 +77,21 @@ def test_cli_binance_trades_worker_defaults_to_trade_channel() -> None:
     parser = build_parser()
     args = parser.parse_args(["binance-trades-worker"])
     assert args.channel == "trade"
+
+
+def test_generic_collector_backoff_grows_exponentially_with_cap() -> None:
+    assert _backoff_delay(attempt=1, base=1.0, cap=60.0) == 1.0
+    assert _backoff_delay(attempt=2, base=1.0, cap=60.0) == 2.0
+    assert _backoff_delay(attempt=3, base=1.0, cap=60.0) == 4.0
+    assert _backoff_delay(attempt=10, base=1.0, cap=8.0) == 8.0
+
+
+def test_generic_collector_retryable_errors_include_connection_closed() -> None:
+    assert _generic_is_retryable_connect_error(TimeoutError("nope")) is True
+    assert _generic_is_retryable_connect_error(OSError("connection reset by peer")) is True
+
+    class ConnectionClosed(Exception):
+        pass
+
+    assert _generic_is_retryable_connect_error(ConnectionClosed("bye")) is True
+    assert _generic_is_retryable_connect_error(ValueError("config bug")) is False

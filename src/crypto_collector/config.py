@@ -22,6 +22,9 @@ class CollectorConfig:
     subscription_style: str = "coinbase"
     max_delay_ms: int = 5_000
     require_monotonic_sequence: bool = True
+    connect_retries: int = 8
+    retry_backoff_seconds: float = 1.0
+    max_backoff_seconds: float = 60.0
 
 
 @dataclass(slots=True)
