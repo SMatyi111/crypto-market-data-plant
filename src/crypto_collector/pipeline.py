@@ -7,7 +7,7 @@ from .collectors.base import BaseCollector
 from .models import RawMessage
 from .normalizer import GenericL3Normalizer
 from .quality import QualityGate
-from .storage import JsonlSink, ParquetDatasetSink, RunPaths
+from .storage import JsonlSink, ParquetDatasetSink, RotatingJsonlSink, RunPaths
 
 
 @dataclass(slots=True)
@@ -33,11 +33,14 @@ class CollectorPipeline:
         quality_gate: QualityGate,
         run_paths: RunPaths,
         normalized_root: Path | None = None,
+        raw_rotate_bytes: int = 512 * 1024 * 1024,
     ) -> None:
         self.collector = collector
         self.normalizer = normalizer
         self.quality_gate = quality_gate
-        self.raw_sink = JsonlSink(run_paths.raw, "messages.jsonl")
+        # Raw traffic is the fastest-growing file; rotate it so a long-running
+        # collector doesn't produce a single multi-GB messages.jsonl.
+        self.raw_sink = RotatingJsonlSink(run_paths.raw, "messages.jsonl", max_bytes=raw_rotate_bytes)
         self.clean_sink = JsonlSink(run_paths.clean, "events.jsonl")
         self.quarantine_sink = JsonlSink(run_paths.quarantine, "events.jsonl")
         self.metrics_sink = JsonlSink(run_paths.metrics, "summary.jsonl")

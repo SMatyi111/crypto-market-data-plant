@@ -48,6 +48,78 @@ class JsonlSink:
                 os.fsync(handle.fileno())
 
 
+class RotatingJsonlSink:
+    """JSONL sink that rolls the active file when it exceeds max_bytes.
+
+    Long-running collectors otherwise produce single multi-GB files that are
+    expensive to grep, replay, or copy. The on-disk layout is:
+        messages.jsonl       (active)
+        messages.1.jsonl     (rolled)
+        messages.2.jsonl     (rolled)
+    """
+
+    def __init__(
+        self,
+        root: Path,
+        filename: str,
+        *,
+        max_bytes: int = 512 * 1024 * 1024,
+        fsync: bool = True,
+    ) -> None:
+        self.root = root
+        self.filename = filename
+        self.max_bytes = max(1, int(max_bytes))
+        self._fsync = fsync
+        self._active_path = root / filename
+        self._part_index = self._discover_next_part_index()
+        self._current_bytes = (
+            self._active_path.stat().st_size if self._active_path.exists() else 0
+        )
+
+    @property
+    def path(self) -> Path:
+        return self._active_path
+
+    def write(self, row: dict[str, Any]) -> None:
+        encoded = (json.dumps(row, sort_keys=True) + "\n").encode("utf-8")
+        if self._current_bytes > 0 and self._current_bytes + len(encoded) > self.max_bytes:
+            self._rotate()
+        with self._active_path.open("ab") as handle:
+            handle.write(encoded)
+            handle.flush()
+            if self._fsync:
+                os.fsync(handle.fileno())
+        self._current_bytes += len(encoded)
+
+    def _rotate(self) -> None:
+        stem, dot, ext = self.filename.rpartition(".")
+        if dot:
+            new_name = f"{stem}.{self._part_index}.{ext}"
+        else:
+            new_name = f"{self.filename}.{self._part_index}"
+        rotated_path = self.root / new_name
+        os.replace(self._active_path, rotated_path)
+        self._part_index += 1
+        self._current_bytes = 0
+
+    def _discover_next_part_index(self) -> int:
+        stem, dot, ext = self.filename.rpartition(".")
+        if not dot:
+            prefix, suffix = self.filename + ".", ""
+        else:
+            prefix, suffix = stem + ".", "." + ext
+        highest = 0
+        if self.root.exists():
+            for entry in self.root.iterdir():
+                name = entry.name
+                if not (name.startswith(prefix) and name.endswith(suffix)):
+                    continue
+                middle = name[len(prefix) : len(name) - len(suffix)] if suffix else name[len(prefix) :]
+                if middle.isdigit():
+                    highest = max(highest, int(middle))
+        return highest + 1
+
+
 class ParquetDatasetSink:
     def __init__(
         self,
