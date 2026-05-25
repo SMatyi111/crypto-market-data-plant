@@ -139,6 +139,66 @@ def test_replay_depth_run_flags_empty_runs(tmp_path: Path) -> None:
     assert "no_events" in summary.findings
 
 
+def test_replay_depth_run_does_not_double_count_snapshot_gap_as_sequence_gap(tmp_path: Path) -> None:
+    """A snapshot anchor gap must increment snapshot_gap_count only, not also gap_count."""
+    run_path = tmp_path / "binance_depth" / "20260406_000099"
+    clean_path = run_path / "clean"
+    snapshot_path = run_path / "snapshots"
+    clean_path.mkdir(parents=True)
+    snapshot_path.mkdir(parents=True)
+    (snapshot_path / "book_snapshot.json").write_text(
+        json.dumps(
+            {
+                "source": "binance",
+                "product": "BTCUSDT",
+                "received_at": "2026-04-06T00:00:00+00:00",
+                "snapshot": {
+                    "lastUpdateId": 100,
+                    "bids": [["100.0", "1.0"]],
+                    "asks": [["101.0", "1.0"]],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    events = [
+        # First post-snapshot event jumps past snapshot_last+1 -> snapshot anchor gap.
+        {
+            "source": "binance",
+            "product": "BTCUSDT",
+            "event_time": "2026-04-06T00:00:01+00:00",
+            "received_at": "2026-04-06T00:00:01+00:00",
+            "first_update_id": 110,
+            "final_update_id": 115,
+            "instrument": {"instrument_id": "spot:binance:BTCUSDT"},
+            "bids": [],
+            "asks": [],
+        },
+        # Next event is contiguous with the anchor -> must not count as a normal gap.
+        {
+            "source": "binance",
+            "product": "BTCUSDT",
+            "event_time": "2026-04-06T00:00:02+00:00",
+            "received_at": "2026-04-06T00:00:02+00:00",
+            "first_update_id": 116,
+            "final_update_id": 120,
+            "instrument": {"instrument_id": "spot:binance:BTCUSDT"},
+            "bids": [],
+            "asks": [],
+        },
+    ]
+    (clean_path / "events.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in events),
+        encoding="utf-8",
+    )
+
+    summary = replay_depth_run(run_path, write_summary=False)
+
+    assert summary.snapshot_gap_count == 1
+    assert summary.gap_count == 0
+    assert summary.reordered_count == 0
+
+
 def test_replay_depth_run_flags_snapshot_anchor_gap(tmp_path: Path) -> None:
     run_path = tmp_path / "binance_depth" / "20260406_000003"
     clean_path = run_path / "clean"

@@ -185,23 +185,29 @@ def replay_depth_run(
         else:
             if snapshot_last_update_id is not None and not snapshot_anchor_applied:
                 if final_id <= snapshot_last_update_id:
+                    # Update predates the snapshot; ignore it without touching the cursor.
                     continue
                 if first_id > snapshot_last_update_id + 1:
                     snapshot_gap_count += 1
-                    snapshot_anchor_applied = True
-                elif first_id <= snapshot_last_update_id + 1 <= final_id:
-                    snapshot_anchor_applied = True
-                previous_final_update_id = snapshot_last_update_id
-            if first_update_id is None:
-                first_update_id = first_id
-            last_update_id = final_id
-            if previous_final_update_id is not None:
-                if final_id <= previous_final_update_id:
-                    reordered_count += 1
-                elif first_id > previous_final_update_id + 1:
-                    gap_count += 1
-            if previous_final_update_id is None or final_id > previous_final_update_id:
+                snapshot_anchor_applied = True
+                if first_update_id is None:
+                    first_update_id = first_id
+                last_update_id = final_id
+                # Anchor the post-snapshot cursor on this event's final_id so subsequent
+                # events are compared against the actual stream, not against the stale
+                # snapshot id (which would double-count a snapshot gap as a sequence gap).
                 previous_final_update_id = final_id
+            else:
+                if first_update_id is None:
+                    first_update_id = first_id
+                last_update_id = final_id
+                if previous_final_update_id is not None:
+                    if final_id <= previous_final_update_id:
+                        reordered_count += 1
+                    elif first_id > previous_final_update_id + 1:
+                        gap_count += 1
+                if previous_final_update_id is None or final_id > previous_final_update_id:
+                    previous_final_update_id = final_id
 
         bid_updates = _levels_from_row(row.get("bids"))
         ask_updates = _levels_from_row(row.get("asks"))
