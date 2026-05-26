@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from .context_models import AssetRef, InstrumentRef
 from .instrument_master import ASSET_ALIAS_RECORDS, list_instrument_aliases, list_asset_aliases
 
@@ -9,6 +11,35 @@ ALIAS_INDEX = {
     record.alias.upper(): record
     for record in ASSET_ALIAS_RECORDS
 }
+
+LEGACY_ASSET_ID_MAP = {
+    "asset:btc": "crypto:BTC",
+    "asset:eth": "crypto:ETH",
+    "asset:sol": "crypto:SOL",
+    "asset:xrp": "crypto:XRP",
+    "asset:doge": "crypto:DOGE",
+    "asset:bnb": "crypto:BNB",
+    "asset:ada": "crypto:ADA",
+    "asset:usdt": "stablecoin:USDT",
+    "asset:usdc": "stablecoin:USDC",
+    "asset:usd": "fiat:USD",
+}
+
+
+def normalize_legacy_asset_id(asset_id: str | None) -> str | None:
+    if asset_id is None:
+        return None
+    return LEGACY_ASSET_ID_MAP.get(asset_id, asset_id)
+
+
+def normalize_legacy_instrument(instrument: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(instrument, dict):
+        return instrument
+    for asset_key in ("base_asset", "quote_asset"):
+        asset = instrument.get(asset_key)
+        if isinstance(asset, dict):
+            asset["asset_id"] = normalize_legacy_asset_id(asset.get("asset_id"))
+    return instrument
 
 
 def resolve_asset(symbol_or_alias: str) -> AssetRef | None:

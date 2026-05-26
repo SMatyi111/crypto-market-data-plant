@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from crypto_collector.asset_registry import (
+    normalize_legacy_asset_id,
+    normalize_legacy_instrument,
     resolve_asset,
     resolve_perp_instrument,
     resolve_spot_instrument,
@@ -61,3 +63,35 @@ def test_resolve_asset_handles_extended_alias_table() -> None:
     assert resolve_asset("SOL").asset_id == "crypto:SOL"
     assert resolve_asset("DOGE").asset_id == "crypto:DOGE"
     assert resolve_asset("RIPPLE").asset_id == "crypto:XRP"
+
+
+def test_normalize_legacy_asset_id_maps_known_ids() -> None:
+    assert normalize_legacy_asset_id("asset:btc") == "crypto:BTC"
+    assert normalize_legacy_asset_id("asset:usdt") == "stablecoin:USDT"
+    assert normalize_legacy_asset_id("asset:usd") == "fiat:USD"
+
+
+def test_normalize_legacy_asset_id_passes_through_new_and_unknown() -> None:
+    assert normalize_legacy_asset_id("crypto:BTC") == "crypto:BTC"
+    assert normalize_legacy_asset_id("asset:unknown") == "asset:unknown"
+    assert normalize_legacy_asset_id(None) is None
+
+
+def test_normalize_legacy_instrument_rewrites_nested_asset_ids() -> None:
+    instrument = {
+        "instrument_id": "spot:binance:BTCUSDT",
+        "base_asset": {"asset_id": "asset:btc", "symbol": "BTC"},
+        "quote_asset": {"asset_id": "asset:usdt", "symbol": "USDT"},
+    }
+    normalized = normalize_legacy_instrument(instrument)
+    assert normalized["base_asset"]["asset_id"] == "crypto:BTC"
+    assert normalized["quote_asset"]["asset_id"] == "stablecoin:USDT"
+    assert normalized["instrument_id"] == "spot:binance:BTCUSDT"
+
+
+def test_normalize_legacy_instrument_handles_none_and_missing_quote() -> None:
+    assert normalize_legacy_instrument(None) is None
+    instrument = {"base_asset": {"asset_id": "asset:btc"}, "quote_asset": None}
+    normalized = normalize_legacy_instrument(instrument)
+    assert normalized["base_asset"]["asset_id"] == "crypto:BTC"
+    assert normalized["quote_asset"] is None
