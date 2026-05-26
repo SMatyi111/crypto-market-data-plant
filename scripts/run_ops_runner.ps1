@@ -79,8 +79,19 @@ try {
     Push-Location $workspaceRoot
     try {
         "[$(Get-Date -Format o)] starting ops runner with $resolvedConfig" | Out-File -FilePath $LogPath -Append -Encoding utf8
-        & $pythonPath -m crypto_collector.cli ops-runner --config $resolvedConfig --ops-root $resolvedOpsRoot *>> $LogPath
-        $exitCode = $LASTEXITCODE
+        # PowerShell 5.1 quirk: with ErrorActionPreference=Stop, any line python writes to
+        # stderr (e.g. UserWarning from default_*_root fallbacks) gets wrapped as a
+        # NativeCommandError and terminates the script before python finishes. Temporarily
+        # downgrade so stderr lines are non-fatal; we still gate success on $LASTEXITCODE.
+        $savedErrorActionPreference = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try {
+            & $pythonPath -m crypto_collector.cli ops-runner --config $resolvedConfig --ops-root $resolvedOpsRoot *>> $LogPath
+            $exitCode = $LASTEXITCODE
+        }
+        finally {
+            $ErrorActionPreference = $savedErrorActionPreference
+        }
         if ($exitCode -ne 0) {
             throw "ops runner exited with code $exitCode"
         }
