@@ -7,6 +7,65 @@ fully trusting this for unsupervised long-running research.
 
 Ordered roughly by risk × ease.
 
+---
+
+## North-star goal — multi-pair, multi-venue, day-bounded, pull-ready
+
+What "done" looks like, eventually:
+
+- **Continuous collection**, not the current hour-bounded segment model. A run
+  rotates at the day boundary, not at an arbitrary message count.
+- **Daily curated files** that an analyst can pull by date alone (e.g.
+  `curated/research/market_replayable/source=binance/instrument=BTC-USDT/event_date=2026-05-26/*.parquet`)
+  with no per-run timestamp directories to think about.
+- **Multiple instruments** per venue: BTCUSDT, ETHUSDT, SOLUSDT, … each in its
+  own collection lane. Today the config has one symbol hard-coded per worker.
+- **Multiple venues**: Binance + Coinbase + Bybit + Kraken (depth + trades each),
+  plus the options stack already running (Binance options, Deribit). Each venue
+  gets its own normalizer and replay validator.
+- **Published "ready day" manifest** that downstream tools consume: for each
+  (venue, instrument, event_date) tuple, is the day complete and replay-clean?
+  The existing `research-manifest` job is the scaffolding; it needs to become
+  the contract.
+- **Standards documented** in the repo so future-me (and anyone else) knows
+  what the guarantees are: schema per dataset, gap policy, what "replayable"
+  actually means, retention SLA, how to consume.
+
+### Gap from today
+
+- One pair (BTCUSDT), one venue (Binance) for depth/trades.
+- Hour-bounded run directories — analyst has to glob across them to assemble
+  a day.
+- Manifest exists at `D:\market_archive\curated\research\manifests\` but isn't
+  the canonical "what's ready" artifact downstream tools key off of.
+- No published standards doc.
+
+### Rough order if/when this becomes the focus
+
+1. **Per-instrument lanes** — turn `symbol` from a fixed CLI flag into a list
+   of jobs in `ops.live.local.json`. One job per (venue, instrument). Each
+   job gets its own worker, own ops-state, own quarantine. (Re-uses existing
+   code; mostly a config exercise.)
+2. **Day-bounded run rotation** — change `_run_segmented_worker` from
+   "segment_count messages per segment" to "rotate at midnight UTC". Replay
+   then runs over whole days, not arbitrary 5000-event slices.
+3. **Add Coinbase + Bybit + Kraken adapters** — each needs a normalizer
+   (like `BinanceDepthNormalizer`) and venue-specific subscription / snapshot
+   handling. Generic collector already handles `subscription_style` so most
+   of the framework is there.
+4. **Curated layout by event_date** — already partitioned that way at the
+   Parquet layer; just need the manifest to surface it as the contract.
+5. **`STANDARDS.md`** at repo root: schema, gap policy, replayable definition,
+   retention, consumer API. Tag manifest output with the standards version.
+
+### Risk
+
+This is the actual product. Until it exists, "research-ready data" means
+"depth from Binance BTCUSDT, hour by hour, manually assembled." Worth
+investing in once the immediate hardening list above is closed out.
+
+---
+
 ## 1. Reconnect depth-worker in place instead of ending the segment
 
 **Where:** `src/crypto_collector/cli.py` — `_open_binance_depth_connection` /
