@@ -66,24 +66,15 @@ investing in once the immediate hardening list above is closed out.
 
 ---
 
-## 1. Reconnect depth-worker in place instead of ending the segment
+## 1. Reconnect depth-worker in place instead of ending the segment — DONE
 
-**Where:** `src/crypto_collector/cli.py` — `_open_binance_depth_connection` /
-`collect_binance_depth_segment` (around lines 173-280, 740-772).
-
-**What:** Today the depth path only retries the *opening* handshake. Any
-mid-stream WebSocket disconnect (Binance keepalive ping timeout, NAT drop,
-etc.) ends the segment, fetches a fresh REST snapshot, and starts a new run
-directory. Wasteful, fragments the archive, and creates extra "anchor gap"
-risk at every blip.
-
-**Fix:** Wrap the depth read loop with the same reconnect-in-place logic as
-the generic collector (commit `6754887`). Re-use `_align_binance_buffered_events`
-to detect if the post-disconnect window still aligns with the prior snapshot —
-only fetch a new snapshot if it doesn't.
-
-**Risk:** Medium. Real outages happen, and right now they cost extra REST
-calls plus messier replay output.
+**Status:** Resolved. `collect_binance_depth_segment` now reconnects-in-place
+on retryable WS errors / clean close, reusing the original snapshot anchor
+and applying `_align_binance_buffered_events` against a rolling
+`last_seen_final_update_id`. If the post-reconnect window has a gap, the
+segment ends cleanly (preserving replay's single-snapshot-per-run invariant)
+and the worker loop opens a fresh run+snapshot. Metrics now expose
+`reconnect_count` and `alignment_break_count` per segment.
 
 ---
 

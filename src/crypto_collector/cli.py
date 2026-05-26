@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import shutil
 import sys
 import threading
@@ -11,7 +12,11 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
-from .collectors.generic_ws import GenericWebsocketCollector
+from .collectors.generic_ws import (
+    GenericWebsocketCollector,
+    _backoff_delay,
+    _is_retryable_connect_error,
+)
 from .collectors.mock_l3 import MockL3Collector
 from .config import (
     DEFAULT_ARCHIVE_ROOT,
@@ -46,6 +51,8 @@ from .replay import backfill_replay_summaries, build_book_sync_health_report, re
 from .research_manifest import DEFAULT_MANIFEST_ROOT, generate_research_manifest
 from .storage import JsonlSink, ParquetDatasetSink, prepare_run_paths
 
+logger = logging.getLogger(__name__)
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="market-data-plant")
@@ -69,6 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
     depth_parser.add_argument("--snapshot-limit", type=int, default=1000)
     depth_parser.add_argument("--connect-retries", type=int, default=3)
     depth_parser.add_argument("--retry-backoff-seconds", type=float, default=2.0)
+    depth_parser.add_argument("--max-backoff-seconds", type=float, default=60.0)
     depth_parser.add_argument("--snapshot-base-url", default="https://api.binance.com/api/v3/depth")
 
     trades_parser = subparsers.add_parser("binance-trades-worker", help="Run segmented Binance trade collection")
@@ -195,6 +203,11 @@ async def collect_binance_depth_segment(args: argparse.Namespace) -> dict[str, o
     normalizer = BinanceDepthNormalizer()
     quality_gate = MetadataQualityGate()
 
+    max_attempts = max(1, int(args.connect_retries))
+    retry_backoff_seconds = float(args.retry_backoff_seconds)
+    max_backoff_seconds = float(getattr(args, "max_backoff_seconds", 60.0))
+    resubscribe_buffer_seconds = float(getattr(args, "resubscribe_buffer_seconds", 1.0))
+
     connection, websocket, snapshot, pending_raws, connect_attempts = await _open_binance_depth_connection(
         websockets=websockets,
         websocket_url=str(config.websocket_url),
@@ -202,21 +215,33 @@ async def collect_binance_depth_segment(args: argparse.Namespace) -> dict[str, o
         channel=str(config.channel),
         snapshot_limit=args.snapshot_limit,
         snapshot_base_url=args.snapshot_base_url,
-        connect_retries=max(1, int(args.connect_retries)),
-        retry_backoff_seconds=float(args.retry_backoff_seconds),
+        connect_retries=max_attempts,
+        retry_backoff_seconds=retry_backoff_seconds,
     )
+    snapshot_last_update_id = int(snapshot.get("lastUpdateId", 0))
+    write_snapshot_file(
+        run_paths.base / "snapshots" / "book_snapshot.json",
+        source="binance",
+        product=str(config.product).upper(),
+        snapshot=snapshot,
+        received_at=utc_now(),
+    )
+
     message_count = 0
     clean_count = 0
     quarantined_count = 0
-    try:
-        write_snapshot_file(
-            run_paths.base / "snapshots" / "book_snapshot.json",
-            source="binance",
-            product=str(config.product).upper(),
-            snapshot=snapshot,
-            received_at=utc_now(),
-        )
-        for raw in pending_raws:
+    reconnect_count = 0
+    alignment_break_count = 0
+    alignment_broken = False
+    reconnect_attempts = 0  # consecutive retryable failures since last successful frame
+    # Tracks the latest event id we've consumed so reconnect-in-place can check
+    # whether the next event bridges where we left off (not where the snapshot started).
+    last_seen_final_update_id = snapshot_last_update_id
+
+    def _process_batch(raws: list[RawMessage]) -> bool:
+        """Process buffered raws. Returns True if count reached."""
+        nonlocal message_count, clean_count, quarantined_count, last_seen_final_update_id
+        for raw in raws:
             message_count, clean_count, quarantined_count = _process_binance_depth_raw(
                 raw=raw,
                 raw_sink=raw_sink,
@@ -229,33 +254,185 @@ async def collect_binance_depth_segment(args: argparse.Namespace) -> dict[str, o
                 clean_count=clean_count,
                 quarantined_count=quarantined_count,
             )
+            window = _binance_update_window(raw.payload)
+            if window is not None and window[1] > last_seen_final_update_id:
+                last_seen_final_update_id = window[1]
             if message_count >= args.count:
-                break
-        if message_count < args.count:
-            async for message in websocket:
-                payload = json.loads(message)
-                if not _is_binance_depth_payload(payload):
-                    continue
-                raw = RawMessage(source=config.source, received_at=utc_now(), payload=payload)
-                message_count, clean_count, quarantined_count = _process_binance_depth_raw(
-                    raw=raw,
-                    raw_sink=raw_sink,
-                    clean_sink=clean_sink,
-                    quarantine_sink=quarantine_sink,
-                    parquet_sink=parquet_sink,
-                    normalizer=normalizer,
-                    quality_gate=quality_gate,
-                    message_count=message_count,
-                    clean_count=clean_count,
-                    quarantined_count=quarantined_count,
-                )
+                return True
+        return False
+
+    try:
+        if _process_batch(pending_raws):
+            return _finalize_depth_segment(
+                run_paths=run_paths,
+                snapshot=snapshot,
+                connect_attempts=connect_attempts,
+                reconnect_count=reconnect_count,
+                alignment_break_count=alignment_break_count,
+                message_count=message_count,
+                clean_count=clean_count,
+                quarantined_count=quarantined_count,
+                quality_gate=quality_gate,
+                parquet_sink=parquet_sink,
+                metrics_sink=metrics_sink,
+            )
+
+        while message_count < args.count and not alignment_broken:
+            try:
+                async for message in websocket:
+                    payload = json.loads(message)
+                    if not _is_binance_depth_payload(payload):
+                        continue
+                    raw = RawMessage(source=config.source, received_at=utc_now(), payload=payload)
+                    if _process_batch([raw]):
+                        break
+                    reconnect_attempts = 0  # any successful frame resets the retry budget
+                # Stream returned (or break above). If count reached, exit outer loop.
                 if message_count >= args.count:
                     break
-    finally:
-        await connection.__aexit__(None, None, None)
+                # Clean close — try to reconnect-in-place reusing the existing snapshot anchor.
+                await connection.__aexit__(None, None, None)
+                connection = None
+                websocket = None
+                logger.warning(
+                    "binance depth websocket closed cleanly; reconnecting-in-place source=binance_depth run=%s",
+                    run_paths.base.name,
+                )
+            except Exception as exc:  # noqa: BLE001
+                try:
+                    if connection is not None:
+                        await connection.__aexit__(type(exc), exc, exc.__traceback__)
+                except Exception:
+                    pass
+                connection = None
+                websocket = None
+                if not _is_retryable_connect_error(exc):
+                    raise
+                reconnect_attempts += 1
+                if reconnect_attempts >= max_attempts:
+                    raise
+                delay = _backoff_delay(
+                    attempt=reconnect_attempts,
+                    base=retry_backoff_seconds,
+                    cap=max_backoff_seconds,
+                )
+                logger.warning(
+                    "binance depth websocket reconnect run=%s attempt=%d delay=%.2fs error=%s",
+                    run_paths.base.name,
+                    reconnect_attempts,
+                    delay,
+                    exc,
+                )
+                await asyncio.sleep(delay)
 
+            # Reopen WS + resubscribe, NO new REST snapshot. We try alignment against the
+            # existing snapshot anchor — if the post-disconnect window still aligns, we stay
+            # in the same run. If alignment is broken, we end the segment cleanly so the
+            # next segment opens a fresh run with a fresh snapshot (replay invariants
+            # require one snapshot anchor per run dir).
+            try:
+                connection, websocket, buffered_raws = await _reopen_binance_depth_connection(
+                    websockets=websockets,
+                    websocket_url=str(config.websocket_url),
+                    product=str(config.product),
+                    channel=str(config.channel),
+                    resubscribe_buffer_seconds=resubscribe_buffer_seconds,
+                )
+            except Exception as exc:  # noqa: BLE001
+                if not _is_retryable_connect_error(exc):
+                    raise
+                reconnect_attempts += 1
+                if reconnect_attempts >= max_attempts:
+                    raise
+                delay = _backoff_delay(
+                    attempt=reconnect_attempts,
+                    base=retry_backoff_seconds,
+                    cap=max_backoff_seconds,
+                )
+                logger.warning(
+                    "binance depth resubscribe retry run=%s attempt=%d delay=%.2fs error=%s",
+                    run_paths.base.name,
+                    reconnect_attempts,
+                    delay,
+                    exc,
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            reconnect_count += 1
+            reconnect_attempts = 0
+
+            # Filter out events we already saw (u <= last seen). For the unprocessed-events
+            # case (last_seen_final_update_id == snapshot_last_update_id) this is identical
+            # to the snapshot-anchor alignment; after we've processed events it advances.
+            aligned = _align_binance_buffered_events(buffered_raws, last_seen_final_update_id)
+            if not _post_reconnect_alignment_holds(aligned, last_seen_final_update_id):
+                alignment_break_count += 1
+                alignment_broken = True
+                logger.warning(
+                    "binance depth post-reconnect alignment broken run=%s "
+                    "last_seen_final_update_id=%d first_window=%s; ending segment for fresh snapshot",
+                    run_paths.base.name,
+                    last_seen_final_update_id,
+                    _binance_update_window(aligned[0].payload) if aligned else None,
+                )
+                await connection.__aexit__(None, None, None)
+                connection = None
+                websocket = None
+                break
+
+            if _process_batch(aligned):
+                break
+    finally:
+        if connection is not None:
+            try:
+                await connection.__aexit__(None, None, None)
+            except Exception:  # noqa: BLE001
+                pass
+
+    return _finalize_depth_segment(
+        run_paths=run_paths,
+        snapshot=snapshot,
+        connect_attempts=connect_attempts,
+        reconnect_count=reconnect_count,
+        alignment_break_count=alignment_break_count,
+        message_count=message_count,
+        clean_count=clean_count,
+        quarantined_count=quarantined_count,
+        quality_gate=quality_gate,
+        parquet_sink=parquet_sink,
+        metrics_sink=metrics_sink,
+    )
+
+
+def _finalize_depth_segment(
+    *,
+    run_paths,
+    snapshot: dict[str, object],
+    connect_attempts: int,
+    reconnect_count: int,
+    alignment_break_count: int,
+    message_count: int,
+    clean_count: int,
+    quarantined_count: int,
+    quality_gate: MetadataQualityGate,
+    parquet_sink: ParquetDatasetSink,
+    metrics_sink: JsonlSink,
+) -> dict[str, object]:
     parquet_sink.flush()
-    replay_summary = replay_depth_run(run_paths.base, write_summary=True)
+    events_path = run_paths.base / "clean" / "events.jsonl"
+    if events_path.exists():
+        replay_summary = replay_depth_run(run_paths.base, write_summary=True)
+        replayable = replay_summary.replayable
+        findings = list(replay_summary.findings)
+        summary_path = replay_summary.summary_path
+    else:
+        # Segment ended with zero clean events (e.g., immediate alignment break on
+        # reconnect). No data to replay — flag the run as unreplayable so downstream
+        # quarantine + promotion treat it as a no-op rather than crashing.
+        replayable = False
+        findings = ["no_clean_events"]
+        summary_path = None
     metrics_sink.write(
         {
             "raw_messages": message_count,
@@ -265,9 +442,11 @@ async def collect_binance_depth_segment(args: argparse.Namespace) -> dict[str, o
             "snapshot_last_update_id": snapshot.get("lastUpdateId"),
             "snapshot_path": str(run_paths.base / "snapshots" / "book_snapshot.json"),
             "connect_attempts": connect_attempts,
-            "replayable": replay_summary.replayable,
-            "replay_findings": replay_summary.findings,
-            "replay_summary_path": replay_summary.summary_path,
+            "reconnect_count": reconnect_count,
+            "alignment_break_count": alignment_break_count,
+            "replayable": replayable,
+            "replay_findings": findings,
+            "replay_summary_path": summary_path,
         }
     )
     return {
@@ -276,8 +455,10 @@ async def collect_binance_depth_segment(args: argparse.Namespace) -> dict[str, o
         "quarantined_events": quarantined_count,
         "run_path": str(run_paths.base),
         "connect_attempts": connect_attempts,
-        "replayable": replay_summary.replayable,
-        "replay_findings": replay_summary.findings,
+        "reconnect_count": reconnect_count,
+        "alignment_break_count": alignment_break_count,
+        "replayable": replayable,
+        "replay_findings": findings,
     }
 
 
@@ -328,12 +509,15 @@ def run_binance_depth_worker(args: argparse.Namespace) -> None:
             snapshot_base_url=source_args.snapshot_base_url,
             connect_retries=source_args.connect_retries,
             retry_backoff_seconds=source_args.retry_backoff_seconds,
+            max_backoff_seconds=getattr(source_args, "max_backoff_seconds", 60.0),
         ),
         collect_segment=collect_binance_depth_segment,
         progress_message=lambda segment_index, summary: (
             "binance depth segment finished: "
             f"segment={segment_index} replayable={summary['replayable']} "
-            f"connect_attempts={summary['connect_attempts']} run_path={summary['run_path']}"
+            f"connect_attempts={summary['connect_attempts']} "
+            f"reconnects={summary.get('reconnect_count', 0)} "
+            f"run_path={summary['run_path']}"
         ),
     )
 
@@ -780,10 +964,70 @@ async def _open_binance_depth_connection(
     raise RuntimeError(f"binance depth connect/open failed after {connect_retries} attempt(s): {last_error}") from last_error
 
 
-def _is_retryable_connect_error(exc: Exception) -> bool:
-    if isinstance(exc, (TimeoutError, OSError, asyncio.TimeoutError)):
+async def _reopen_binance_depth_connection(
+    *,
+    websockets: object,
+    websocket_url: str,
+    product: str,
+    channel: str,
+    resubscribe_buffer_seconds: float = 1.0,
+) -> tuple[object, object, list[RawMessage]]:
+    """Open a new WS + resubscribe to depth, WITHOUT fetching a fresh REST snapshot.
+
+    The caller re-uses its existing snapshot anchor and decides via
+    `_post_reconnect_alignment_holds` whether the post-reconnect window still bridges that
+    snapshot. A single attempt; the caller handles retry/backoff.
+    """
+    connection = websockets.connect(websocket_url)
+    websocket = None
+    try:
+        websocket = await connection.__aenter__()
+        await websocket.send(
+            json.dumps({"method": "SUBSCRIBE", "params": [f"{product.lower()}@{channel}"], "id": 1})
+        )
+        buffered: list[RawMessage] = []
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + max(0.0, resubscribe_buffer_seconds)
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                message = await asyncio.wait_for(websocket.recv(), timeout=remaining)
+            except asyncio.TimeoutError:
+                break
+            try:
+                payload = json.loads(message)
+            except (TypeError, ValueError):
+                continue
+            if _is_binance_depth_payload(payload):
+                buffered.append(RawMessage(source="binance", received_at=utc_now(), payload=payload))
+        return connection, websocket, buffered
+    except Exception as exc:
+        if websocket is not None:
+            try:
+                await connection.__aexit__(type(exc), exc, exc.__traceback__)
+            except Exception:
+                pass
+        raise
+
+
+def _post_reconnect_alignment_holds(
+    aligned: list[RawMessage], snapshot_last_update_id: int
+) -> bool:
+    """Return True if the first aligned event after reconnect bridges the existing snapshot
+    (no gap), False if there's a sequence gap that would corrupt the run.
+
+    Empty `aligned` returns True — no events seen in the resubscribe window means we
+    couldn't observe a gap yet, so we keep streaming and let the normal flow handle the
+    next event. If the next event is itself a gap, replay will catch it downstream.
+    """
+    if not aligned:
         return True
-    return any(token in str(exc).lower() for token in ["opening handshake", "timed out", "connection reset", "network is unreachable"])
+    first_window = _binance_update_window(aligned[0].payload)
+    if first_window is None:
+        return True
+    return first_window[0] <= snapshot_last_update_id + 1
 
 
 def _is_binance_depth_payload(payload: object) -> bool:
