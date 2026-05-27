@@ -126,8 +126,14 @@ class ParquetDatasetSink:
         root: Path,
         *,
         schema_version: str = "v1",
-        batch_size: int = 1000,
+        batch_size: int = 100,
     ) -> None:
+        # batch_size caps how many normalized rows live in memory before a flush.
+        # On a hard kill / power cut, anything buffered here is lost — raw JSONL
+        # is still durable (per-row fsync) so you can rebuild from there, but the
+        # normalized layer briefly disagrees with raw. 100 keeps the lost-on-kill
+        # window to ~100 events of disagreement at the cost of more, smaller
+        # part-files in the Parquet dataset.
         self.root = root
         self.schema_version = schema_version
         self.batch_size = batch_size

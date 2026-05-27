@@ -126,36 +126,24 @@ trigger the finding (historical high-reject runs aren't an in-flight issue).
 
 ---
 
-## 5. Wake-from-sleep for the scheduled task
+## 5. Wake-from-sleep for the scheduled task — DONE
 
-**Where:** `scripts/install_startup_task.ps1` or a one-off task edit.
-
-**What:** `CryptoMarketDataPlant` doesn't have `-WakeToRun`. If the PC
-sleeps, collection pauses until manual wake. For "I'm not at home for a
-week" use, you either set power options to never sleep or add this flag.
-
-**Fix:** Add `-WakeToRun` to `New-ScheduledTaskSettingsSet` in the install
-script and re-register the task. Note: `-WakeToRun` requires the time
-trigger has a `StartBoundary`; for the Startup trigger this means the
-task wakes only when its repetition fires, not the boot itself.
-
-**Risk:** Depends on usage pattern. None if PC never sleeps.
+**Status:** Resolved. `-WakeToRun` added to `New-ScheduledTaskSettingsSet`
+in `scripts/install_startup_task.ps1`. With only the current
+`-AtStartup` / `-AtLogOn` trigger this flag is a no-op (those triggers
+fire when the OS comes up, not on a sleeping system) — but it costs
+nothing and is ready for the day a time-based or repetition trigger is
+added via `Set-ScheduledTask`. Re-register the task by re-running the
+installer as Administrator.
 
 ---
 
-## 6. Tighten ParquetDatasetSink batch_size from 1000 → 100
+## 6. Tighten ParquetDatasetSink batch_size from 1000 → 100 — DONE
 
-**Where:** `src/crypto_collector/storage.py:129`.
-
-**What:** On a hard kill / power cut, up to 1000 buffered normalized rows
-are lost for the in-flight run. Raw JSONL is still durable — you can
-rebuild from there — but the normalized layer briefly disagrees with raw.
-
-**Fix:** Drop the default to 100. Cost: more, smaller part-files in the
-Parquet dataset (slightly slower scans, more inode usage).
-
-**Risk:** Low. Only matters if you care about the normalized layer's
-consistency with raw at second-level granularity.
+**Status:** Resolved. Default lowered to 100 in
+`src/crypto_collector/storage.py`. Lost-on-kill window for the normalized
+layer is now ~100 events of disagreement with raw JSONL (which is still
+durable via per-write fsync) at the cost of more, smaller part-files.
 
 ---
 

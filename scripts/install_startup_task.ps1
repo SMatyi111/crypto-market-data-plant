@@ -39,7 +39,12 @@ $settings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `
     -MultipleInstances IgnoreNew `
     -AllowStartIfOnBatteries `
-    -DontStopIfGoingOnBatteries
+    -DontStopIfGoingOnBatteries `
+    -WakeToRun
+# -WakeToRun lets a time-based or repetition trigger pull the PC out of S3/S4
+# sleep so collection resumes without a manual lid-open. With only an
+# -AtStartup / -AtLogOn trigger (the default below) this flag is a no-op —
+# add a time-based trigger via Set-ScheduledTask if you need autonomous wake.
 
 if ($TriggerMode -eq "Startup") {
     $trigger = New-ScheduledTaskTrigger -AtStartup
