@@ -555,3 +555,191 @@ def test_prune_stale_worker_artifacts_dry_run_and_apply(tmp_path: Path) -> None:
     assert not (workers_root / "old-fdusd.json").exists()
     assert (workers_root / "binance-depth-worker.json").exists()
     assert list((ops_root / "archived_standalone_workers").rglob("old-fdusd.json"))
+
+
+def _write_summary_jsonl(run_path: Path, rows: list[dict]) -> None:
+    (run_path / "metrics").mkdir(parents=True)
+    (run_path / "metrics" / "summary.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+
+def test_health_surfaces_partial_metrics_from_active_run(tmp_path: Path) -> None:
+    """Per FOLLOW_UPS #4: an operator should see the in-flight reject ratio without
+    waiting for the run to finish. build_health_report should read the latest
+    summary.jsonl row of the active worker's current_run_path."""
+    ops_root = tmp_path / "ops"
+    workers_root = ops_root / "standalone_workers"
+    workers_root.mkdir(parents=True)
+    now = datetime.now(tz=UTC)
+    (ops_root / "heartbeat.json").write_text(
+        json.dumps({"status": "running", "last_seen": now.isoformat(), "job_counters": {}}),
+        encoding="utf-8",
+    )
+
+    run_path = tmp_path / "raw" / "market" / "binance_depth" / "20260527_120000"
+    run_path.mkdir(parents=True)
+    _write_summary_jsonl(
+        run_path,
+        [
+            {"raw_messages": 100, "clean_events": 90, "quarantined_events": 10, "partial": True},
+            # Latest row — in-flight metrics
+            {
+                "raw_messages": 500,
+                "clean_events": 350,
+                "quarantined_events": 150,  # 30% — above default threshold
+                "reject_counts": {"clock_skew": 150},
+                "partial": True,
+            },
+        ],
+    )
+    (workers_root / "binance-depth-worker.json").write_text(
+        json.dumps(
+            {
+                "worker_name": "binance-depth-worker",
+                "worker_type": "binance-depth-worker",
+                "status": "running",
+                "pid": os.getpid(),
+                "last_seen": now.isoformat(),
+                "current_segment": {
+                    "index": 1,
+                    "started_at": now.isoformat(),
+                    "run_path": str(run_path),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = build_health_report(
+        ops_root=ops_root,
+        jobs=None,
+        stale_after_seconds=300,
+        quarantine_ratio_threshold=0.20,
+    )
+
+    worker = next(
+        row for row in report.standalone_workers if row["name"] == "binance-depth-worker"
+    )
+    # The in-flight partial metrics are now visible
+    assert worker["partial_metrics"] is not None
+    assert worker["partial_metrics"]["raw_messages"] == 500
+    assert worker["partial_metrics"]["quarantined_events"] == 150
+    # Ratio is computed and reported
+    assert worker["quarantine_ratio"] is not None
+    assert abs(worker["quarantine_ratio"] - 0.30) < 1e-9
+    # High-quarantine finding is added since 0.30 > 0.20 threshold
+    assert "high_quarantine_ratio" in worker["findings"]
+    assert any(
+        item.startswith("high_quarantine_ratio:") or item.startswith("unmanaged_high_quarantine_ratio:")
+        for item in report.findings
+    )
+
+
+def test_health_does_not_flag_high_quarantine_for_stopped_workers(tmp_path: Path) -> None:
+    """A historical run with high reject rate is not an in-flight problem.
+    Stopped workers shouldn't add high_quarantine_ratio findings."""
+    ops_root = tmp_path / "ops"
+    workers_root = ops_root / "standalone_workers"
+    workers_root.mkdir(parents=True)
+    now = datetime.now(tz=UTC)
+    (ops_root / "heartbeat.json").write_text(
+        json.dumps({"status": "running", "last_seen": now.isoformat(), "job_counters": {}}),
+        encoding="utf-8",
+    )
+
+    run_path = tmp_path / "raw" / "market" / "binance_depth" / "20260527_110000"
+    run_path.mkdir(parents=True)
+    _write_summary_jsonl(
+        run_path,
+        [
+            {
+                "raw_messages": 100,
+                "clean_events": 40,
+                "quarantined_events": 60,  # 60% — would trip threshold if active
+                "partial": False,
+            }
+        ],
+    )
+    (workers_root / "binance-depth-worker.json").write_text(
+        json.dumps(
+            {
+                "worker_name": "binance-depth-worker",
+                "worker_type": "binance-depth-worker",
+                "status": "stopped",  # not active
+                "pid": os.getpid(),
+                "last_seen": now.isoformat(),
+                "last_run_path": str(run_path),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = build_health_report(
+        ops_root=ops_root,
+        jobs=None,
+        stale_after_seconds=300,
+        quarantine_ratio_threshold=0.20,
+    )
+
+    worker = next(
+        row for row in report.standalone_workers if row["name"] == "binance-depth-worker"
+    )
+    # The historical metrics are still surfaced (useful for context)
+    assert worker["quarantine_ratio"] is not None
+    assert worker["quarantine_ratio"] > 0.50
+    # But no finding fires — the worker isn't active
+    assert "high_quarantine_ratio" not in worker["findings"]
+    assert not any(
+        "high_quarantine_ratio:binance-depth-worker" in item for item in report.findings
+    )
+
+
+def test_health_partial_metrics_handles_missing_summary_jsonl(tmp_path: Path) -> None:
+    """If the worker just started and hasn't written summary.jsonl yet, the report
+    should not crash — partial_metrics is just None."""
+    ops_root = tmp_path / "ops"
+    workers_root = ops_root / "standalone_workers"
+    workers_root.mkdir(parents=True)
+    now = datetime.now(tz=UTC)
+    (ops_root / "heartbeat.json").write_text(
+        json.dumps({"status": "running", "last_seen": now.isoformat(), "job_counters": {}}),
+        encoding="utf-8",
+    )
+
+    run_path = tmp_path / "raw" / "market" / "binance_depth" / "20260527_130000"
+    run_path.mkdir(parents=True)
+    # NO metrics/summary.jsonl
+
+    (workers_root / "binance-depth-worker.json").write_text(
+        json.dumps(
+            {
+                "worker_name": "binance-depth-worker",
+                "worker_type": "binance-depth-worker",
+                "status": "running",
+                "pid": os.getpid(),
+                "last_seen": now.isoformat(),
+                "current_segment": {
+                    "index": 1,
+                    "started_at": now.isoformat(),
+                    "run_path": str(run_path),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = build_health_report(
+        ops_root=ops_root,
+        jobs=None,
+        stale_after_seconds=300,
+    )
+
+    worker = next(
+        row for row in report.standalone_workers if row["name"] == "binance-depth-worker"
+    )
+    assert worker["partial_metrics"] is None
+    assert worker["quarantine_ratio"] is None
+    # No high_quarantine finding
+    assert "high_quarantine_ratio" not in worker["findings"]

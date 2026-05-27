@@ -113,21 +113,16 @@ kill before index write, which the existing tests already cover.)
 
 ---
 
-## 4. Make `health` consume partial metrics
+## 4. Make `health` consume partial metrics — DONE
 
-**Where:** `src/crypto_collector/ops.py` — `build_health_report` and the
-`metrics` directory of each run.
-
-**What:** Commit #14 emits `partial: true` summary rows during a run. Nothing
-reads them. The `health` command only sees heartbeat + job_runs, not the
-in-flight reject-rate. An operator can't tell mid-run that the gate is
-quarantining 30% of events until the run ends.
-
-**Fix:** In `build_health_report`, find the latest `summary.jsonl` per
-active run, take the last line, expose `reject_counts` and the
-clean/quarantined ratio. Add a finding when the ratio exceeds a threshold.
-
-**Risk:** Low. Observability gap.
+**Status:** Resolved. `build_health_report` now reads the last row of
+`<current_run_path>/metrics/summary.jsonl` for each standalone worker and
+surfaces it on the worker row as `partial_metrics` + `quarantine_ratio`.
+When the ratio exceeds `--quarantine-ratio-threshold` (default 0.20) AND
+the worker is still active, the report adds a
+`high_quarantine_ratio:<worker>` finding so operators see in-flight gate
+problems instead of having to wait for shutdown. Stopped workers don't
+trigger the finding (historical high-reject runs aren't an in-flight issue).
 
 ---
 

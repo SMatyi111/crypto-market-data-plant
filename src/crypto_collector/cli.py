@@ -119,6 +119,14 @@ def build_parser() -> argparse.ArgumentParser:
     health_parser.add_argument("--job-stale-multiplier", type=float, default=3.0)
     health_parser.add_argument("--recent-failure-window-seconds", type=float, default=3600.0)
     health_parser.add_argument("--min-disk-free-gb", type=float, default=50.0)
+    health_parser.add_argument(
+        "--quarantine-ratio-threshold",
+        type=float,
+        default=0.20,
+        help="Flag a worker as high_quarantine_ratio when "
+        "quarantined_events / raw_messages exceeds this fraction in the latest "
+        "summary.jsonl row of the active run.",
+    )
     health_parser.add_argument("--format", choices=["json", "text"], default="text")
 
     cleanup_parser = subparsers.add_parser("cleanup", help="Report or apply archive cleanup")
@@ -783,6 +791,7 @@ def run_health(args: argparse.Namespace) -> None:
         job_stale_multiplier=args.job_stale_multiplier,
         recent_failure_window_seconds=args.recent_failure_window_seconds,
         min_disk_free_gb=args.min_disk_free_gb,
+        quarantine_ratio_threshold=float(getattr(args, "quarantine_ratio_threshold", 0.20)),
     )
     if args.format == "json":
         print(json.dumps(report.to_dict(), indent=2, sort_keys=True))

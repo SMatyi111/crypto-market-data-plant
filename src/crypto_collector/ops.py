@@ -599,6 +599,7 @@ def build_health_report(
     job_stale_multiplier: float = 2.5,
     recent_failure_window_seconds: int = 900,
     min_disk_free_gb: float = 100.0,
+    quarantine_ratio_threshold: float = 0.20,
 ) -> HealthReport:
     checked_at = datetime.now(tz=UTC)
     heartbeat_path = ops_root / "heartbeat.json"
@@ -737,6 +738,7 @@ def build_health_report(
         checked_at=checked_at,
         stale_after_seconds=stale_after_seconds,
         managed_worker_names=managed_worker_names,
+        quarantine_ratio_threshold=quarantine_ratio_threshold,
     )
     findings.extend(standalone_findings)
 
@@ -973,6 +975,7 @@ def _standalone_worker_rows(
     checked_at: datetime,
     stale_after_seconds: int,
     managed_worker_names: set[str] | None = None,
+    quarantine_ratio_threshold: float = 0.20,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     findings: list[str] = []
     rows: list[dict[str, Any]] = []
@@ -1010,6 +1013,48 @@ def _standalone_worker_rows(
         if status == "error":
             row_findings.append("worker_error")
             findings.append(f"{'worker_error' if managed else 'unmanaged_worker_error'}:{name}")
+
+        # Pull the in-flight metrics from the latest summary.jsonl row for the active
+        # (or most recent) run. Without this, an operator can't see mid-run that the
+        # quality gate is quarantining 30% of events until the run ends.
+        current_run_path = current_segment.get("run_path") if current_segment else None
+        last_run_path = payload.get("last_run_path")
+        partial_metrics: dict[str, Any] | None = None
+        quarantine_ratio: float | None = None
+        partial_run_path = current_run_path or last_run_path
+        if partial_run_path:
+            partial_metrics = _read_latest_summary_row(Path(partial_run_path))
+            if partial_metrics is not None:
+                raw_messages = partial_metrics.get("raw_messages")
+                clean_events = partial_metrics.get("clean_events")
+                quarantined_events = partial_metrics.get("quarantined_events")
+                if (
+                    isinstance(raw_messages, (int, float))
+                    and raw_messages > 0
+                    and isinstance(quarantined_events, (int, float))
+                ):
+                    quarantine_ratio = float(quarantined_events) / float(raw_messages)
+                elif (
+                    isinstance(clean_events, (int, float))
+                    and isinstance(quarantined_events, (int, float))
+                    and (clean_events + quarantined_events) > 0
+                ):
+                    quarantine_ratio = (
+                        float(quarantined_events)
+                        / float(clean_events + quarantined_events)
+                    )
+                if (
+                    quarantine_ratio is not None
+                    and quarantine_ratio > quarantine_ratio_threshold
+                    and active
+                ):
+                    # Only flag for active runs — historical high-quarantine runs are
+                    # an artifact of past stream loss, not an in-flight problem.
+                    row_findings.append("high_quarantine_ratio")
+                    findings.append(
+                        f"{'high_quarantine_ratio' if managed else 'unmanaged_high_quarantine_ratio'}:{name}"
+                    )
+
         rows.append(
             {
                 "name": name,
@@ -1027,16 +1072,47 @@ def _standalone_worker_rows(
                 "findings": row_findings,
                 "message": payload.get("message"),
                 "last_segment_index": payload.get("last_segment_index"),
-                "last_run_path": payload.get("last_run_path"),
+                "last_run_path": last_run_path,
                 "current_segment_index": current_segment.get("index") if current_segment else None,
                 "current_segment_started_at": (
                     current_started_at.isoformat() if current_started_at is not None else None
                 ),
                 "current_segment_age_seconds": current_segment_age_seconds,
-                "current_run_path": current_segment.get("run_path") if current_segment else None,
+                "current_run_path": current_run_path,
+                "partial_metrics": partial_metrics,
+                "quarantine_ratio": quarantine_ratio,
             }
         )
     return rows, findings
+
+
+def _read_latest_summary_row(run_path: Path) -> dict[str, Any] | None:
+    """Return the last JSON row in <run_path>/metrics/summary.jsonl, or None.
+
+    The pipeline emits a row every `metrics_flush_every` events with
+    `partial: True`, plus a final `partial: False` row on shutdown. Reading the
+    last line gives us the freshest in-flight snapshot of raw/clean/quarantined
+    counts + reject_counts.
+    """
+    summary_path = run_path / "metrics" / "summary.jsonl"
+    if not summary_path.exists():
+        return None
+    try:
+        raw = summary_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    last_row: dict[str, Any] | None = None
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            last_row = parsed
+    return last_row
 
 
 def _managed_worker_names(jobs: list[JobSpec] | None) -> set[str]:
