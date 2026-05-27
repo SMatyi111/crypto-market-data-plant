@@ -67,6 +67,13 @@ def build_parser() -> argparse.ArgumentParser:
     mock_parser.add_argument("--count", type=int, default=25)
     mock_parser.add_argument("--output-root", type=Path, default=default_output_root())
     mock_parser.add_argument("--product", default="BTC-USD")
+    mock_parser.add_argument(
+        "--delay-ms",
+        type=float,
+        default=0.0,
+        help="Per-event delay (ms). Used by durability tests to slow the stream "
+        "enough that SIGKILL can land mid-write.",
+    )
 
     depth_parser = subparsers.add_parser("binance-depth-worker", help="Run segmented Binance depth collection")
     depth_parser.add_argument("--symbol", default="btcusdt")
@@ -172,7 +179,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 async def run_mock(args: argparse.Namespace) -> None:
-    collector = MockL3Collector(source="mock", product=args.product)
+    collector = MockL3Collector(
+        source="mock",
+        product=args.product,
+        delay_ms=float(getattr(args, "delay_ms", 0.0)),
+    )
     run_paths = prepare_run_paths(output_root=args.output_root, source="mock")
     pipeline = CollectorPipeline(
         collector=collector,

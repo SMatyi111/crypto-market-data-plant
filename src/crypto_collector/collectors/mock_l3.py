@@ -8,9 +8,19 @@ from .base import BaseCollector
 
 
 class MockL3Collector(BaseCollector):
-    def __init__(self, *, source: str, product: str) -> None:
+    def __init__(
+        self,
+        *,
+        source: str,
+        product: str,
+        delay_ms: float = 0.0,
+    ) -> None:
         self.source = source
         self.product = product
+        # Per-event delay. Default 0 keeps test/mock runs instantaneous;
+        # the durability test bumps this so the subprocess actually has
+        # writes in flight when SIGKILL arrives.
+        self.delay_ms = max(0.0, float(delay_ms))
 
     async def stream(self, limit: int | None = None) -> AsyncIterator[RawMessage]:
         count = limit or 25
@@ -30,5 +40,8 @@ class MockL3Collector(BaseCollector):
                     "order_id": f"order-{sequence}",
                 },
             )
-            await asyncio.sleep(0)
+            if self.delay_ms > 0:
+                await asyncio.sleep(self.delay_ms / 1000.0)
+            else:
+                await asyncio.sleep(0)
 

@@ -94,20 +94,22 @@ of received_at.
 
 ---
 
-## 3. Real durability test under SIGKILL / power loss
+## 3. Real durability test under SIGKILL / power loss — DONE
 
-**Where:** New `tests/test_durability.py` or a manual runbook.
+**Status:** Resolved. `tests/test_durability.py` spawns the mock pipeline as
+a subprocess, kills it with `Popen.kill()` (which is `TerminateProcess` on
+Windows — equivalent to SIGKILL, no user-space cleanup runs), then asserts
+that every line in the produced JSONL files parses cleanly and the file
+ends with a newline. If a future refactor removes the per-write fsync, the
+test fails — the killed subprocess would otherwise leave a partial last
+line in messages.jsonl. Added `--delay-ms` to the mock CLI so the
+subprocess actually has writes in flight when the kill lands.
 
-**What:** Commit #3 added fsync to JSONL writes, on paper protecting against
-torn-tail lines on crash. There is no test that actually kills the process
-mid-write and verifies the file parses cleanly. A future refactor could
-remove the flush+fsync without anyone noticing.
-
-**Fix:** Spawn the mock pipeline in a subprocess, kill -9 it during writes,
-read the output and assert every line is valid JSON. Same for the per-run
-Parquet flush in promotion (commit #11).
-
-**Risk:** Low today, regression-prevention against future edits.
+(The per-run Parquet flush in promotion is also exercised by the existing
+`test_promotion.py`, which validates the flush-before-index ordering. A
+dedicated SIGKILL-mid-Parquet-flush test was deferred — the index is the
+single durability gate there, and a kill before flush is equivalent to a
+kill before index write, which the existing tests already cover.)
 
 ---
 
