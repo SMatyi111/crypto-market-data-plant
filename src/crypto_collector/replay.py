@@ -492,6 +492,214 @@ def backfill_replay_summaries(
     )
 
 
+@dataclass(slots=True)
+class TradesReplaySummary:
+    replay_type: str
+    mode: str
+    run_path: str
+    events_path: str
+    source: str | None
+    product: str | None
+    instrument_id: str | None
+    event_count: int
+    first_trade_id: int | None
+    last_trade_id: int | None
+    first_event_time: str | None
+    last_event_time: str | None
+    non_monotonic_count: int
+    trade_id_gap_count: int
+    trade_id_gap_total_missing: int
+    invalid_price_count: int
+    invalid_size_count: int
+    excessive_clock_skew_count: int
+    max_clock_skew_ms: float | None
+    duplicate_trade_id_count: int
+    replayable: bool
+    findings: list[str]
+    summary_path: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def replay_trades_run(
+    run_path: Path,
+    *,
+    max_clock_skew_ms: float = 60_000.0,
+    write_summary: bool = True,
+) -> TradesReplaySummary:
+    """Replay-validate a trades run. The contract mirrors `replay_depth_run`: the function
+    writes `metrics/replay_summary.json` with `replayable: bool` + `findings: list[str]`,
+    so the existing `quarantine_bad_runs` and `promote_replayable_runs` work unchanged.
+
+    Quality bar (per `FOLLOW_UPS.md` #2):
+    - trade_id monotonicity (non-decreasing — duplicates are flagged but tolerated)
+    - no trade_id gaps (Binance trade_id is a dense global counter per symbol)
+    - price and size both positive and finite
+    - exchange_time within `max_clock_skew_ms` of received_at
+    """
+    resolved_run_path, events_path, summary_path = _resolve_run_paths(run_path)
+    event_count = 0
+    first_trade_id: int | None = None
+    last_trade_id: int | None = None
+    first_event_time: str | None = None
+    last_event_time: str | None = None
+    non_monotonic_count = 0
+    trade_id_gap_count = 0
+    trade_id_gap_total_missing = 0
+    invalid_price_count = 0
+    invalid_size_count = 0
+    excessive_clock_skew_count = 0
+    max_clock_skew_ms_seen: float | None = None
+    duplicate_trade_id_count = 0
+    source: str | None = None
+    product: str | None = None
+    instrument_id: str | None = None
+    previous_trade_id: int | None = None
+
+    for row in _read_jsonl(events_path):
+        event_count += 1
+        source = source or _optional_str(row.get("source"))
+        product = product or _optional_str(row.get("product"))
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        if instrument_id is None:
+            instrument_id = _optional_str(metadata.get("instrument_id"))
+
+        exchange_time_str = _optional_str(row.get("exchange_time"))
+        if first_event_time is None:
+            first_event_time = exchange_time_str
+        last_event_time = exchange_time_str
+
+        # trade_id monotonicity + gap
+        trade_id = _optional_int(row.get("sequence"))
+        if trade_id is None:
+            trade_id = _optional_int(row.get("trade_id"))
+        if trade_id is not None:
+            if first_trade_id is None:
+                first_trade_id = trade_id
+            last_trade_id = trade_id
+            if previous_trade_id is not None:
+                if trade_id < previous_trade_id:
+                    non_monotonic_count += 1
+                elif trade_id == previous_trade_id:
+                    duplicate_trade_id_count += 1
+                else:
+                    delta = trade_id - previous_trade_id
+                    if delta > 1:
+                        trade_id_gap_count += 1
+                        trade_id_gap_total_missing += delta - 1
+            previous_trade_id = trade_id
+
+        # price/size positivity
+        price = _optional_float(row.get("price"))
+        if price is None or not _is_finite_positive(price):
+            invalid_price_count += 1
+        size = _optional_float(row.get("size"))
+        if size is None or not _is_finite_positive(size):
+            invalid_size_count += 1
+
+        # clock-skew
+        received_at_str = _optional_str(row.get("received_at"))
+        skew_ms = _abs_skew_ms(exchange_time_str, received_at_str)
+        if skew_ms is not None:
+            if max_clock_skew_ms_seen is None or skew_ms > max_clock_skew_ms_seen:
+                max_clock_skew_ms_seen = skew_ms
+            if skew_ms > max_clock_skew_ms:
+                excessive_clock_skew_count += 1
+
+    findings: list[str] = []
+    if event_count == 0:
+        findings.append("no_events")
+    if non_monotonic_count:
+        findings.append("non_monotonic_trade_ids")
+    if trade_id_gap_count:
+        findings.append("trade_id_gaps")
+    if invalid_price_count:
+        findings.append("invalid_prices")
+    if invalid_size_count:
+        findings.append("invalid_sizes")
+    if excessive_clock_skew_count:
+        findings.append("excessive_clock_skew")
+
+    replayable = (
+        event_count > 0
+        and non_monotonic_count == 0
+        and trade_id_gap_count == 0
+        and invalid_price_count == 0
+        and invalid_size_count == 0
+        and excessive_clock_skew_count == 0
+    )
+
+    summary = TradesReplaySummary(
+        replay_type="trades",
+        mode="trade_stream",
+        run_path=str(resolved_run_path),
+        events_path=str(events_path),
+        source=source,
+        product=product,
+        instrument_id=instrument_id,
+        event_count=event_count,
+        first_trade_id=first_trade_id,
+        last_trade_id=last_trade_id,
+        first_event_time=first_event_time,
+        last_event_time=last_event_time,
+        non_monotonic_count=non_monotonic_count,
+        trade_id_gap_count=trade_id_gap_count,
+        trade_id_gap_total_missing=trade_id_gap_total_missing,
+        invalid_price_count=invalid_price_count,
+        invalid_size_count=invalid_size_count,
+        excessive_clock_skew_count=excessive_clock_skew_count,
+        max_clock_skew_ms=max_clock_skew_ms_seen,
+        duplicate_trade_id_count=duplicate_trade_id_count,
+        replayable=replayable,
+        findings=findings,
+        summary_path=str(summary_path) if summary_path is not None else None,
+    )
+
+    if write_summary and summary_path is not None:
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text(
+            json.dumps(summary.to_dict(), indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+    return summary
+
+
+def _is_finite_positive(value: float) -> bool:
+    try:
+        if value <= 0:
+            return False
+        if value != value:  # NaN
+            return False
+        if value in (float("inf"), float("-inf")):
+            return False
+    except TypeError:
+        return False
+    return True
+
+
+def _abs_skew_ms(exchange_time_iso: str | None, received_at_iso: str | None) -> float | None:
+    if not exchange_time_iso or not received_at_iso:
+        return None
+    try:
+        exchange_dt = datetime.fromisoformat(exchange_time_iso)
+        received_dt = datetime.fromisoformat(received_at_iso)
+    except (TypeError, ValueError):
+        return None
+    delta = received_dt - exchange_dt
+    return abs(delta.total_seconds() * 1000.0)
+
+
+def _optional_float(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _resolve_run_paths(run_path: Path) -> tuple[Path, Path, Path | None]:
     if run_path.is_file():
         events_path = run_path

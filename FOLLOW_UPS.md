@@ -78,23 +78,19 @@ and the worker loop opens a fresh run+snapshot. Metrics now expose
 
 ---
 
-## 2. Add a quality-gated curation chain for trades
+## 2. Add a quality-gated curation chain for trades — DONE
 
-**Where:** `src/crypto_collector/promotion.py`, `replay.py`, plus a new
-trades-side replay module.
+**Status:** Resolved. Added `replay_trades_run` to `replay.py` and wired it
+into `collect_binance_trades_segment`, so every trades run now writes a
+`metrics/replay_summary.json` with the same `{replayable, findings}` shape
+the depth chain uses. `quarantine_bad_runs` and `promote_replayable_runs`
+work unchanged — `ops.live.example.json` shows the matching trades-side
+quarantine + promote jobs.
 
-**What:** Depth has `replay_depth_run` → `quarantine_bad_runs` →
-`promote_replayable_runs` → curated Parquet. Trades have nothing — they
-land in `normalized/trades/` Parquet directly. "Curated = clean" only
-applies to depth today.
-
-**Fix:** Trades don't have first/final update IDs, so the gap-check has to
-be different. A reasonable trades quality bar: trade_id monotonicity,
-positive price/size, exchange_time within clock-skew tolerance,
-trade_id density vs. wall-clock (catastrophic drop = dropped stream).
-
-**Risk:** Low for today, important if you start running quant research on
-the trades data and need the same "I trust this" guarantee.
+Quality bar: trade_id monotonicity (non-decreasing), no trade_id gaps
+(Binance trade_id is a dense per-symbol counter), price and size finite
+and positive, exchange_time within `--max-clock-skew-ms` (default 60s)
+of received_at.
 
 ---
 

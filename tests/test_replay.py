@@ -3,7 +3,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from crypto_collector.replay import backfill_replay_summaries, replay_depth_run
+from crypto_collector.replay import (
+    backfill_replay_summaries,
+    replay_depth_run,
+    replay_trades_run,
+)
 
 
 def test_replay_depth_run_reconstructs_book_and_writes_summary(tmp_path: Path) -> None:
@@ -304,3 +308,182 @@ def test_backfill_replay_summaries_skips_existing_without_overwrite(tmp_path: Pa
     assert report.updated_count == 0
     assert report.skipped_count == 1
     assert report.runs[0].action == "skipped_existing"
+
+
+def _write_trades_run(
+    run_path: Path,
+    rows: list[dict],
+) -> None:
+    clean_path = run_path / "clean"
+    clean_path.mkdir(parents=True)
+    (clean_path / "events.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+
+def _trade_row(
+    *,
+    trade_id: int,
+    price: float = 100.0,
+    size: float = 0.5,
+    exchange_time: str = "2026-04-06T00:00:00+00:00",
+    received_at: str = "2026-04-06T00:00:00.100000+00:00",
+) -> dict:
+    return {
+        "source": "binance",
+        "product": "BTCUSDT",
+        "channel": "trades",
+        "event_type": "trade",
+        "exchange_time": exchange_time,
+        "received_at": received_at,
+        "side": "buy",
+        "price": price,
+        "size": size,
+        "trade_id": str(trade_id),
+        "sequence": trade_id,
+        "raw_type": "trade",
+        "metadata": {"instrument_id": "spot:binance:BTCUSDT"},
+    }
+
+
+def test_replay_trades_run_marks_clean_stream_replayable(tmp_path: Path) -> None:
+    run_path = tmp_path / "binance_trades" / "20260406_000000"
+    _write_trades_run(
+        run_path,
+        [_trade_row(trade_id=i, price=100.0 + i * 0.01) for i in range(1, 6)],
+    )
+
+    summary = replay_trades_run(run_path)
+
+    assert summary.replayable is True, summary
+    assert summary.findings == []
+    assert summary.event_count == 5
+    assert summary.first_trade_id == 1
+    assert summary.last_trade_id == 5
+    assert summary.trade_id_gap_count == 0
+    assert summary.non_monotonic_count == 0
+    # summary file written to disk
+    summary_path = run_path / "metrics" / "replay_summary.json"
+    assert summary_path.exists()
+    on_disk = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert on_disk["replay_type"] == "trades"
+    assert on_disk["replayable"] is True
+
+
+def test_replay_trades_run_flags_trade_id_gap(tmp_path: Path) -> None:
+    run_path = tmp_path / "binance_trades" / "20260406_000001"
+    _write_trades_run(
+        run_path,
+        [
+            _trade_row(trade_id=1),
+            _trade_row(trade_id=2),
+            _trade_row(trade_id=10),  # gap: missing 3..9
+        ],
+    )
+
+    summary = replay_trades_run(run_path)
+
+    assert summary.replayable is False
+    assert "trade_id_gaps" in summary.findings
+    assert summary.trade_id_gap_count == 1
+    assert summary.trade_id_gap_total_missing == 7
+
+
+def test_replay_trades_run_flags_non_monotonic_trade_id(tmp_path: Path) -> None:
+    run_path = tmp_path / "binance_trades" / "20260406_000002"
+    _write_trades_run(
+        run_path,
+        [
+            _trade_row(trade_id=5),
+            _trade_row(trade_id=3),  # backwards from 5
+            _trade_row(trade_id=2),  # backwards from 3
+            _trade_row(trade_id=10),  # forwards (gap) but monotonic
+        ],
+    )
+
+    summary = replay_trades_run(run_path)
+
+    assert summary.replayable is False
+    assert "non_monotonic_trade_ids" in summary.findings
+    # 5→3 backwards, 3→2 backwards → 2 non-monotonic transitions
+    assert summary.non_monotonic_count == 2
+
+
+def test_replay_trades_run_flags_invalid_price_and_size(tmp_path: Path) -> None:
+    run_path = tmp_path / "binance_trades" / "20260406_000003"
+    _write_trades_run(
+        run_path,
+        [
+            _trade_row(trade_id=1, price=100.0, size=1.0),
+            _trade_row(trade_id=2, price=0.0, size=1.0),  # zero price
+            _trade_row(trade_id=3, price=100.0, size=-0.5),  # negative size
+        ],
+    )
+
+    summary = replay_trades_run(run_path)
+
+    assert summary.replayable is False
+    assert "invalid_prices" in summary.findings
+    assert "invalid_sizes" in summary.findings
+    assert summary.invalid_price_count == 1
+    assert summary.invalid_size_count == 1
+
+
+def test_replay_trades_run_flags_excessive_clock_skew(tmp_path: Path) -> None:
+    run_path = tmp_path / "binance_trades" / "20260406_000004"
+    # received_at is 2 minutes after exchange_time → 120_000ms skew, exceeds 60_000 default
+    _write_trades_run(
+        run_path,
+        [
+            _trade_row(
+                trade_id=1,
+                exchange_time="2026-04-06T00:00:00+00:00",
+                received_at="2026-04-06T00:02:00+00:00",
+            ),
+        ],
+    )
+
+    summary = replay_trades_run(run_path, max_clock_skew_ms=60_000.0)
+
+    assert summary.replayable is False
+    assert "excessive_clock_skew" in summary.findings
+    assert summary.excessive_clock_skew_count == 1
+    assert summary.max_clock_skew_ms is not None
+    assert summary.max_clock_skew_ms >= 119_000  # ~120s skew
+
+
+def test_replay_trades_run_with_no_events_is_unreplayable(tmp_path: Path) -> None:
+    run_path = tmp_path / "binance_trades" / "20260406_000005"
+    _write_trades_run(run_path, [])
+
+    summary = replay_trades_run(run_path)
+
+    assert summary.replayable is False
+    assert summary.event_count == 0
+    assert "no_events" in summary.findings
+
+
+def test_replay_trades_run_writes_summary_compatible_with_quarantine_chain(tmp_path: Path) -> None:
+    """The trades replay summary must use the same {replayable, findings} shape as
+    `replay_depth_run` so quarantine_bad_runs and promote_replayable_runs can act on
+    it unchanged."""
+    run_path = tmp_path / "binance_trades" / "20260406_000006"
+    _write_trades_run(
+        run_path,
+        [
+            _trade_row(trade_id=1),
+            _trade_row(trade_id=100),  # huge gap → unreplayable
+        ],
+    )
+
+    replay_trades_run(run_path)
+
+    summary_json = json.loads(
+        (run_path / "metrics" / "replay_summary.json").read_text(encoding="utf-8")
+    )
+    # The two keys the curation chain reads
+    assert isinstance(summary_json["replayable"], bool)
+    assert isinstance(summary_json["findings"], list)
+    assert summary_json["replayable"] is False
+    assert "trade_id_gaps" in summary_json["findings"]

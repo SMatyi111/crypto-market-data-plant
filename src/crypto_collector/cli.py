@@ -47,7 +47,12 @@ from .pipeline import CollectorPipeline
 from .promotion import promote_replayable_runs
 from .quality import MetadataQualityGate, QualityGate
 from .quarantine import quarantine_bad_runs
-from .replay import backfill_replay_summaries, build_book_sync_health_report, replay_depth_run
+from .replay import (
+    backfill_replay_summaries,
+    build_book_sync_health_report,
+    replay_depth_run,
+    replay_trades_run,
+)
 from .research_manifest import DEFAULT_MANIFEST_ROOT, generate_research_manifest
 from .storage import JsonlSink, ParquetDatasetSink, prepare_run_paths
 
@@ -91,6 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
     trades_parser.add_argument("--heartbeat-interval-seconds", type=float, default=30.0)
     trades_parser.add_argument("--max-delay-ms", type=int, default=60_000)
     trades_parser.add_argument("--max-future-skew-ms", type=int, default=5_000)
+    trades_parser.add_argument("--max-clock-skew-ms", type=float, default=60_000.0)
 
     ops_parser = subparsers.add_parser("ops-runner", help="Run collection and curation jobs from a manifest")
     ops_parser.add_argument("--config", type=Path, required=True)
@@ -486,12 +492,34 @@ async def collect_binance_trades_segment(args: argparse.Namespace) -> dict[str, 
         run_paths=run_paths,
         normalized_root=default_normalized_root("trades"),
     )
-    summary = await pipeline.run(limit=args.count)
+    pipeline_summary = await pipeline.run(limit=args.count)
+
+    # Write the trades replay summary so the existing quarantine + promote chain
+    # (which keys off `metrics/replay_summary.json`) can curate trades runs the
+    # same way it curates depth runs.
+    events_path = run_paths.base / "clean" / "events.jsonl"
+    if events_path.exists():
+        replay_summary = replay_trades_run(
+            run_paths.base,
+            max_clock_skew_ms=float(getattr(args, "max_clock_skew_ms", 60_000.0)),
+            write_summary=True,
+        )
+        replayable = replay_summary.replayable
+        replay_findings = list(replay_summary.findings)
+        replay_summary_path = replay_summary.summary_path
+    else:
+        replayable = False
+        replay_findings = ["no_clean_events"]
+        replay_summary_path = None
+
     return {
-        "raw_messages": summary.raw_messages,
-        "clean_events": summary.clean_events,
-        "quarantined_events": summary.quarantined_events,
+        "raw_messages": pipeline_summary.raw_messages,
+        "clean_events": pipeline_summary.clean_events,
+        "quarantined_events": pipeline_summary.quarantined_events,
         "run_path": str(run_paths.base),
+        "replayable": replayable,
+        "replay_findings": replay_findings,
+        "replay_summary_path": replay_summary_path,
     }
 
 
@@ -534,11 +562,13 @@ def run_binance_trades_worker(args: argparse.Namespace) -> None:
             output_root=source_args.output_root,
             max_delay_ms=source_args.max_delay_ms,
             max_future_skew_ms=getattr(source_args, "max_future_skew_ms", 5_000),
+            max_clock_skew_ms=getattr(source_args, "max_clock_skew_ms", 60_000.0),
         ),
         collect_segment=collect_binance_trades_segment,
         progress_message=lambda segment_index, summary: (
             "binance trades segment finished: "
-            f"segment={segment_index} clean_events={summary['clean_events']} run_path={summary['run_path']}"
+            f"segment={segment_index} clean_events={summary['clean_events']} "
+            f"replayable={summary.get('replayable')} run_path={summary['run_path']}"
         ),
     )
 

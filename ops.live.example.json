@@ -63,6 +63,29 @@
       }
     },
     {
+      "name": "quarantine-trades",
+      "job_type": "quarantine-runs",
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "D:\\market_archive\\raw\\market\\binance_trades",
+        "quarantine_root": "D:\\market_archive\\quarantine\\market\\binance_trades",
+        "limit": 20,
+        "max_age_hours": 6
+      }
+    },
+    {
+      "name": "promote-trades",
+      "job_type": "promote-replayable",
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "D:\\market_archive\\raw\\market\\binance_trades",
+        "target_root": "D:\\market_archive\\curated\\research\\trades_replayable",
+        "quarantine_index": "D:\\market_archive\\quarantine\\market\\binance_trades\\_quarantine_index.jsonl",
+        "limit": 20,
+        "max_age_hours": 6
+      }
+    },
+    {
       "name": "research-manifest",
       "job_type": "research-manifest",
       "interval_seconds": 900,
