@@ -90,6 +90,13 @@ def build_parser() -> argparse.ArgumentParser:
     depth_parser.add_argument("--retry-backoff-seconds", type=float, default=2.0)
     depth_parser.add_argument("--max-backoff-seconds", type=float, default=60.0)
     depth_parser.add_argument("--snapshot-base-url", default="https://api.binance.com/api/v3/depth")
+    depth_parser.add_argument(
+        "--source-suffix",
+        default="",
+        help="Optional per-instrument lane suffix. When non-empty, runs go to "
+        "<output_root>/binance_depth_<suffix>/<timestamp>/ instead of "
+        "binance_depth/. Leave empty to preserve the legacy single-symbol BTC layout.",
+    )
 
     trades_parser = subparsers.add_parser("binance-trades-worker", help="Run segmented Binance trade collection")
     trades_parser.add_argument("--symbol", default="btcusdt")
@@ -104,6 +111,13 @@ def build_parser() -> argparse.ArgumentParser:
     trades_parser.add_argument("--max-delay-ms", type=int, default=60_000)
     trades_parser.add_argument("--max-future-skew-ms", type=int, default=5_000)
     trades_parser.add_argument("--max-clock-skew-ms", type=float, default=60_000.0)
+    trades_parser.add_argument(
+        "--source-suffix",
+        default="",
+        help="Optional per-instrument lane suffix. When non-empty, runs go to "
+        "<output_root>/binance_trades_<suffix>/<timestamp>/ instead of "
+        "binance_trades/. Leave empty to preserve the legacy single-symbol BTC layout.",
+    )
 
     ops_parser = subparsers.add_parser("ops-runner", help="Run collection and curation jobs from a manifest")
     ops_parser.add_argument("--config", type=Path, required=True)
@@ -219,7 +233,8 @@ async def collect_binance_depth_segment(args: argparse.Namespace) -> dict[str, o
         websocket_url="wss://stream.binance.com:9443/ws",
         subscription_style="binance",
     )
-    run_paths = prepare_run_paths(output_root=config.output_root, source="binance_depth")
+    source_name = _build_source_name("binance_depth", getattr(args, "source_suffix", ""))
+    run_paths = prepare_run_paths(output_root=config.output_root, source=source_name)
     raw_sink = JsonlSink(run_paths.raw, "messages.jsonl")
     clean_sink = JsonlSink(run_paths.clean, "events.jsonl")
     quarantine_sink = JsonlSink(run_paths.quarantine, "events.jsonl")
@@ -499,7 +514,8 @@ async def collect_binance_trades_segment(args: argparse.Namespace) -> dict[str, 
         max_future_skew_ms=getattr(args, "max_future_skew_ms", 5_000),
     )
     collector = GenericWebsocketCollector(config=config)
-    run_paths = prepare_run_paths(output_root=config.output_root, source="binance_trades")
+    source_name = _build_source_name("binance_trades", getattr(args, "source_suffix", ""))
+    run_paths = prepare_run_paths(output_root=config.output_root, source=source_name)
     pipeline = CollectorPipeline(
         collector=collector,
         normalizer=BinanceTradeNormalizer(),
@@ -557,6 +573,7 @@ def run_binance_depth_worker(args: argparse.Namespace) -> None:
             connect_retries=source_args.connect_retries,
             retry_backoff_seconds=source_args.retry_backoff_seconds,
             max_backoff_seconds=getattr(source_args, "max_backoff_seconds", 60.0),
+            source_suffix=getattr(source_args, "source_suffix", ""),
         ),
         collect_segment=collect_binance_depth_segment,
         progress_message=lambda segment_index, summary: (
@@ -582,6 +599,7 @@ def run_binance_trades_worker(args: argparse.Namespace) -> None:
             max_delay_ms=source_args.max_delay_ms,
             max_future_skew_ms=getattr(source_args, "max_future_skew_ms", 5_000),
             max_clock_skew_ms=getattr(source_args, "max_clock_skew_ms", 60_000.0),
+            source_suffix=getattr(source_args, "source_suffix", ""),
         ),
         collect_segment=collect_binance_trades_segment,
         progress_message=lambda segment_index, summary: (
@@ -1078,6 +1096,20 @@ def _post_reconnect_alignment_holds(
     if first_window is None:
         return True
     return first_window[0] <= snapshot_last_update_id + 1
+
+
+def _build_source_name(base: str, suffix: str | None) -> str:
+    """Compose the on-disk source-directory name. When `suffix` is empty we keep the
+    legacy single-symbol layout (`binance_depth/`) — important because the live BTC
+    collector writes there and migrations during active collection are risky. When
+    `suffix` is set, the run lands in `binance_depth_<sanitized>/` so independent
+    per-instrument lanes don't interleave timestamps."""
+    cleaned = "" if suffix is None else str(suffix).strip().lower()
+    if not cleaned:
+        return base
+    # Normalize: only allow lowercase letters, digits, and hyphen/underscore.
+    safe = "".join(ch if (ch.isalnum() or ch in {"-", "_"}) else "_" for ch in cleaned)
+    return f"{base}_{safe}"
 
 
 def _is_binance_depth_payload(payload: object) -> bool:

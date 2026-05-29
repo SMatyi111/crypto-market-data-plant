@@ -42,10 +42,11 @@ What "done" looks like, eventually:
 
 ### Rough order if/when this becomes the focus
 
-1. **Per-instrument lanes** — turn `symbol` from a fixed CLI flag into a list
-   of jobs in `ops.live.local.json`. One job per (venue, instrument). Each
-   job gets its own worker, own ops-state, own quarantine. (Re-uses existing
-   code; mostly a config exercise.)
+1. **Per-instrument lanes** — DONE. Added `--source-suffix` flag (depth +
+   trades) so additional symbols land in their own
+   `binance_depth_<suffix>/` / `binance_trades_<suffix>/` directory tree
+   without touching the legacy single-symbol BTC layout. `ops.live.example.json`
+   shows an ETH lane (`enabled: false`) as the recipe.
 2. **Day-bounded run rotation** — change `_run_segmented_worker` from
    "segment_count messages per segment" to "rotate at midnight UTC". Replay
    then runs over whole days, not arbitrary 5000-event slices.

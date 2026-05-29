@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from crypto_collector.cli import (
     _align_binance_buffered_events,
     _binance_update_window,
+    _build_source_name,
     _post_reconnect_alignment_holds,
     _reopen_binance_depth_connection,
     build_parser,
@@ -422,3 +423,49 @@ def test_collect_depth_segment_ends_segment_when_alignment_broken(tmp_path, monk
     # the worker loop's next segment is what fetches a fresh snapshot.
     assert len(snapshot_calls) == 1, result
     assert result["raw_messages"] == 0, result  # nothing processed pre-disconnect
+
+
+# --- Phase 2 #1: per-instrument lane source-name composition --------------
+
+
+def test_build_source_name_preserves_legacy_layout_when_suffix_empty() -> None:
+    """No suffix → no change. Critical: the live BTC collector writes to
+    `binance_depth/<timestamp>/` today and we don't want to break that."""
+    assert _build_source_name("binance_depth", "") == "binance_depth"
+    assert _build_source_name("binance_depth", None) == "binance_depth"
+    assert _build_source_name("binance_trades", "  ") == "binance_trades"
+
+
+def test_build_source_name_adds_lane_suffix_when_set() -> None:
+    """New ETH / SOL / etc. lanes opt into per-instrument subdirs by setting
+    --source-suffix. Output layout: <output_root>/binance_depth_ethusdt/<ts>/."""
+    assert _build_source_name("binance_depth", "ethusdt") == "binance_depth_ethusdt"
+    assert _build_source_name("binance_trades", "SOLUSDT") == "binance_trades_solusdt"
+    # whitespace stripped
+    assert _build_source_name("binance_depth", "  ethusdt  ") == "binance_depth_ethusdt"
+
+
+def test_build_source_name_sanitizes_unsafe_characters() -> None:
+    """A typo in the config shouldn't be able to write to ../../etc. Anything
+    outside [a-z0-9_-] is replaced with `_`."""
+    assert _build_source_name("binance_depth", "../bad") == "binance_depth____bad"
+    assert _build_source_name("binance_depth", "btc/usdt") == "binance_depth_btc_usdt"
+    assert _build_source_name("binance_depth", "btc.usdt") == "binance_depth_btc_usdt"
+
+
+def test_cli_parser_accepts_source_suffix_on_depth_and_trades() -> None:
+    parser = build_parser()
+    depth_args = parser.parse_args(
+        ["binance-depth-worker", "--symbol", "ethusdt", "--source-suffix", "ethusdt"]
+    )
+    assert depth_args.source_suffix == "ethusdt"
+    trades_args = parser.parse_args(
+        ["binance-trades-worker", "--symbol", "ethusdt", "--source-suffix", "ethusdt"]
+    )
+    assert trades_args.source_suffix == "ethusdt"
+
+    # Default is empty — backwards compatibility
+    default_depth = parser.parse_args(["binance-depth-worker"])
+    assert default_depth.source_suffix == ""
+    default_trades = parser.parse_args(["binance-trades-worker"])
+    assert default_trades.source_suffix == ""

@@ -31,6 +31,43 @@
       }
     },
     {
+      "// per-instrument lanes": "Set source_suffix + a unique worker_name to run a second symbol in its own lane. The legacy single-symbol job above keeps writing to binance_depth/; the new lanes write to binance_depth_ethusdt/, etc., so quarantine/promote can scope per-symbol without interleaving timestamps.",
+      "name": "binance-eth-depth",
+      "job_type": "binance-depth-worker",
+      "enabled": false,
+      "interval_seconds": 3600,
+      "args": {
+        "symbol": "ethusdt",
+        "speed": "100ms",
+        "segment_count": 5000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "connect_retries": 3,
+        "retry_backoff_seconds": 2.0,
+        "source_suffix": "ethusdt",
+        "worker_name": "binance-depth-worker-ethusdt",
+        "output_root": "D:\\market_archive\\raw\\market",
+        "ops_root": "D:\\market_archive\\ops"
+      }
+    },
+    {
+      "name": "binance-eth-trades",
+      "job_type": "binance-trades-worker",
+      "enabled": false,
+      "interval_seconds": 3600,
+      "args": {
+        "symbol": "ethusdt",
+        "channel": "trade",
+        "segment_count": 5000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "source_suffix": "ethusdt",
+        "worker_name": "binance-trades-worker-ethusdt",
+        "output_root": "D:\\market_archive\\raw\\market",
+        "ops_root": "D:\\market_archive\\ops"
+      }
+    },
+    {
       "name": "book-sync-health",
       "job_type": "book-sync-health",
       "interval_seconds": 300,
