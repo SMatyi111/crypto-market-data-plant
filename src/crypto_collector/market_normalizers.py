@@ -72,6 +72,69 @@ class BinanceTradeNormalizer:
         )
 
 
+class CoinbaseTradeNormalizer:
+    """Normalize Coinbase Exchange `matches` channel frames (type=match / last_match).
+
+    Two venue quirks the Binance normalizer doesn't have to deal with:
+
+    * Coinbase timestamps are ISO-8601 strings (`time`), not epoch milliseconds.
+    * Coinbase `side` is the *maker* order side. To keep `NormalizedL3Event.side`
+      meaning the same thing across venues as it does for Binance (the aggressor /
+      taker side), we flip it: a resting sell that gets hit means the taker bought.
+      `buyer_is_maker` and the raw maker side are preserved in metadata.
+
+    trade_id is a dense, per-product, monotonically increasing counter, so the same
+    monotonicity + gap checks the trades replay uses for Binance apply unchanged — a
+    gap means we actually dropped trades (e.g. an unclean reconnect), which the
+    curation gate should catch.
+    """
+
+    def normalize(self, raw: RawMessage) -> NormalizedL3Event:
+        payload = raw.payload.get("data", raw.payload)
+        parse_errors: list[str] = []
+        product = str(payload.get("product_id") or "UNKNOWN")
+        event_type = str(payload.get("type") or "match")
+        trade_time = _parse_iso_timestamp(payload.get("time"), parse_errors)
+        trade_id = _optional_int(payload.get("trade_id"), "trade_id", parse_errors)
+        price = _optional_float(payload.get("price"), "price", parse_errors)
+        size = _optional_float(payload.get("size"), "size", parse_errors)
+        maker_side = payload.get("side")
+        taker_side = _coinbase_taker_side(maker_side)
+        instrument = resolve_spot_instrument(
+            _strip_symbol_separators(product), venue=raw.source
+        )
+
+        metadata: dict[str, Any] = {
+            "instrument_id": instrument.instrument_id if instrument is not None else None,
+            "canonical_symbol": instrument.canonical_symbol if instrument is not None else None,
+            "maker_side": maker_side if maker_side in ("buy", "sell") else None,
+            "buyer_is_maker": _coinbase_buyer_is_maker(maker_side),
+            "coinbase_sequence": _optional_int(payload.get("sequence"), "sequence", parse_errors),
+        }
+        if parse_errors:
+            metadata["parse_errors"] = parse_errors
+
+        return NormalizedL3Event(
+            source=raw.source,
+            product=product,
+            channel="trades",
+            event_type=event_type,
+            exchange_time=trade_time,
+            received_at=raw.received_at,
+            side=taker_side,
+            price=price,
+            size=size,
+            trade_id=str(trade_id) if trade_id is not None else None,
+            # Sequence the dense per-product trade_id, not Coinbase's global `sequence`
+            # cursor: the trades replay + quality gate both expect a per-stream dense
+            # counter, and `sequence` is shared across products / message types so it
+            # would show false gaps on a single-product trades lane.
+            sequence=trade_id,
+            raw_type=event_type,
+            metadata={key: value for key, value in metadata.items() if value is not None},
+        )
+
+
 def _parse_timestamp_ms(value: Any, errors: list[str]) -> datetime | None:
     if value in (None, ""):
         return None
@@ -119,6 +182,47 @@ def _trade_side(buyer_is_maker: bool | None) -> str | None:
     if buyer_is_maker is None:
         return None
     return "sell" if buyer_is_maker else "buy"
+
+
+def _parse_iso_timestamp(value: Any, errors: list[str]) -> datetime | None:
+    if value in (None, ""):
+        return None
+    try:
+        text = str(value)
+        # datetime.fromisoformat only learned to accept a trailing 'Z' in 3.11; the
+        # archive runs on 3.11+ but normalize it anyway so the parser is self-contained.
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+    except (TypeError, ValueError):
+        errors.append("invalid_event_time")
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _coinbase_taker_side(maker_side: Any) -> str | None:
+    # Coinbase `side` is the maker (resting) order side; the aggressor is the opposite.
+    if maker_side == "buy":
+        return "sell"
+    if maker_side == "sell":
+        return "buy"
+    return None
+
+
+def _coinbase_buyer_is_maker(maker_side: Any) -> bool | None:
+    if maker_side == "buy":
+        return True
+    if maker_side == "sell":
+        return False
+    return None
+
+
+def _strip_symbol_separators(symbol: str) -> str:
+    # Venue symbols carry separators the spot resolver doesn't strip (Coinbase "BTC-USD",
+    # Kraken "XBT/USD"). Collapse them so resolve_spot_instrument can split base/quote.
+    return symbol.replace("-", "").replace("_", "").replace("/", "")
 
 
 def _parse_levels(

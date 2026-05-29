@@ -27,7 +27,11 @@ from .config import (
     default_ops_root,
     default_output_root,
 )
-from .market_normalizers import BinanceDepthNormalizer, BinanceTradeNormalizer
+from .market_normalizers import (
+    BinanceDepthNormalizer,
+    BinanceTradeNormalizer,
+    CoinbaseTradeNormalizer,
+)
 from .market_snapshots import fetch_binance_order_book_snapshot, write_snapshot_file
 from .models import RawMessage, utc_now
 from .normalizer import GenericL3Normalizer
@@ -127,6 +131,43 @@ def build_parser() -> argparse.ArgumentParser:
         "binance_trades/. Leave empty to preserve the legacy single-symbol BTC layout.",
     )
     trades_parser.add_argument(
+        "--rotate-at-midnight",
+        action="store_true",
+        help="Rotate the run directory at midnight UTC instead of at --segment-count "
+        "messages. See the depth worker's help text for the same flag.",
+    )
+
+    cb_trades_parser = subparsers.add_parser(
+        "coinbase-trades-worker", help="Run segmented Coinbase trade collection"
+    )
+    cb_trades_parser.add_argument(
+        "--symbol",
+        default="BTC-USD",
+        help="Coinbase product id, e.g. BTC-USD / ETH-USD (dash-separated).",
+    )
+    cb_trades_parser.add_argument(
+        "--channel",
+        default="matches",
+        help="Coinbase channel to subscribe to. 'matches' is the public trade feed.",
+    )
+    cb_trades_parser.add_argument("--segment-count", type=int, default=5000)
+    cb_trades_parser.add_argument("--max-segments", type=int)
+    cb_trades_parser.add_argument("--cooldown-seconds", type=float, default=1.0)
+    cb_trades_parser.add_argument("--output-root", type=Path, default=default_output_root())
+    cb_trades_parser.add_argument("--ops-root", type=Path, default=default_ops_root())
+    cb_trades_parser.add_argument("--worker-name", default="coinbase-trades-worker")
+    cb_trades_parser.add_argument("--heartbeat-interval-seconds", type=float, default=30.0)
+    cb_trades_parser.add_argument("--max-delay-ms", type=int, default=60_000)
+    cb_trades_parser.add_argument("--max-future-skew-ms", type=int, default=5_000)
+    cb_trades_parser.add_argument("--max-clock-skew-ms", type=float, default=60_000.0)
+    cb_trades_parser.add_argument(
+        "--source-suffix",
+        default="",
+        help="Optional per-instrument lane suffix. When non-empty, runs go to "
+        "<output_root>/coinbase_trades_<suffix>/<timestamp>/ instead of "
+        "coinbase_trades/.",
+    )
+    cb_trades_parser.add_argument(
         "--rotate-at-midnight",
         action="store_true",
         help="Rotate the run directory at midnight UTC instead of at --segment-count "
@@ -541,22 +582,57 @@ def _finalize_depth_segment(
 
 
 async def collect_binance_trades_segment(args: argparse.Namespace) -> dict[str, object]:
-    config = CollectorConfig(
+    return await _collect_trades_segment(
+        args,
         source="binance",
+        websocket_url="wss://stream.binance.com:9443/ws",
+        subscription_style="binance",
+        normalizer=BinanceTradeNormalizer(),
+        source_base="binance_trades",
+    )
+
+
+async def collect_coinbase_trades_segment(args: argparse.Namespace) -> dict[str, object]:
+    return await _collect_trades_segment(
+        args,
+        source="coinbase",
+        websocket_url="wss://ws-feed.exchange.coinbase.com",
+        subscription_style="coinbase",
+        normalizer=CoinbaseTradeNormalizer(),
+        source_base="coinbase_trades",
+    )
+
+
+async def _collect_trades_segment(
+    args: argparse.Namespace,
+    *,
+    source: str,
+    websocket_url: str,
+    subscription_style: str,
+    normalizer: object,
+    source_base: str,
+) -> dict[str, object]:
+    """Venue-agnostic trades segment. The trades pipeline (generic WS collector +
+    normalizer + quality gate + trades replay) is identical across venues; only the
+    endpoint, subscription style, normalizer and source-directory base differ, so each
+    venue is a thin wrapper that supplies those four. Keeping one body means the
+    curation contract (`metrics/replay_summary.json`) stays consistent venue-to-venue."""
+    config = CollectorConfig(
+        source=source,
         output_root=args.output_root,
         product=args.symbol,
         channel=args.channel,
-        websocket_url="wss://stream.binance.com:9443/ws",
-        subscription_style="binance",
+        websocket_url=websocket_url,
+        subscription_style=subscription_style,
         max_delay_ms=args.max_delay_ms,
         max_future_skew_ms=getattr(args, "max_future_skew_ms", 5_000),
     )
     collector = GenericWebsocketCollector(config=config)
-    source_name = _build_source_name("binance_trades", getattr(args, "source_suffix", ""))
+    source_name = _build_source_name(source_base, getattr(args, "source_suffix", ""))
     run_paths = prepare_run_paths(output_root=config.output_root, source=source_name)
     pipeline = CollectorPipeline(
         collector=collector,
-        normalizer=BinanceTradeNormalizer(),
+        normalizer=normalizer,
         quality_gate=QualityGate(
             max_delay_ms=config.max_delay_ms,
             max_future_skew_ms=config.max_future_skew_ms,
@@ -654,6 +730,32 @@ def run_binance_trades_worker(args: argparse.Namespace) -> None:
     )
 
 
+def run_coinbase_trades_worker(args: argparse.Namespace) -> None:
+    _run_segmented_worker(
+        args=args,
+        default_worker_name="coinbase-trades-worker",
+        worker_type="coinbase-trades-worker",
+        venue="coinbase",
+        build_segment_args=lambda source_args: SimpleNamespace(
+            symbol=source_args.symbol,
+            channel=source_args.channel,
+            count=source_args.segment_count,
+            output_root=source_args.output_root,
+            max_delay_ms=source_args.max_delay_ms,
+            max_future_skew_ms=getattr(source_args, "max_future_skew_ms", 5_000),
+            max_clock_skew_ms=getattr(source_args, "max_clock_skew_ms", 60_000.0),
+            source_suffix=getattr(source_args, "source_suffix", ""),
+            deadline_utc=None,  # _run_segmented_worker overrides this when rotate_at_midnight is set
+        ),
+        collect_segment=collect_coinbase_trades_segment,
+        progress_message=lambda segment_index, summary: (
+            "coinbase trades segment finished: "
+            f"segment={segment_index} clean_events={summary['clean_events']} "
+            f"replayable={summary.get('replayable')} run_path={summary['run_path']}"
+        ),
+    )
+
+
 def _run_segmented_worker(
     *,
     args: argparse.Namespace,
@@ -662,13 +764,14 @@ def _run_segmented_worker(
     build_segment_args,
     collect_segment,
     progress_message,
+    venue: str = "binance",
 ) -> None:
     worker_name = str(getattr(args, "worker_name", default_worker_name) or default_worker_name)
     runtime = StandaloneWorkerRuntime(
         args.ops_root,
         worker_name=worker_name,
         worker_type=worker_type,
-        venue="binance",
+        venue=venue,
         symbol=str(args.symbol).upper(),
         heartbeat_interval_seconds=float(getattr(args, "heartbeat_interval_seconds", 30.0)),
     )
@@ -761,6 +864,9 @@ def _execute_ops_job(job: JobSpec) -> JobExecutionResult | str | None:
     if job.job_type == "binance-trades-worker":
         run_binance_trades_worker(args)
         return "binance trades worker completed"
+    if job.job_type == "coinbase-trades-worker":
+        run_coinbase_trades_worker(args)
+        return "coinbase trades worker completed"
     if job.job_type == "book-sync-health":
         run_book_sync_health(args)
         return "book sync health completed"
@@ -820,6 +926,23 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             output_root=raw_args.get("output_root", default_output_root()),
             ops_root=Path(raw_args.get("ops_root", default_ops_root())),
             worker_name=raw_args.get("worker_name", "binance-trades-worker"),
+            heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
+            max_delay_ms=raw_args.get("max_delay_ms", 60_000),
+            max_future_skew_ms=raw_args.get("max_future_skew_ms", 5_000),
+            max_clock_skew_ms=raw_args.get("max_clock_skew_ms", 60_000.0),
+            source_suffix=raw_args.get("source_suffix", ""),
+            rotate_at_midnight=raw_args.get("rotate_at_midnight", False),
+        )
+    if job.job_type == "coinbase-trades-worker":
+        return SimpleNamespace(
+            symbol=raw_args.get("symbol", "BTC-USD"),
+            channel=raw_args.get("channel", "matches"),
+            segment_count=raw_args.get("segment_count", 5000),
+            max_segments=raw_args.get("max_segments"),
+            cooldown_seconds=raw_args.get("cooldown_seconds", 1.0),
+            output_root=raw_args.get("output_root", default_output_root()),
+            ops_root=Path(raw_args.get("ops_root", default_ops_root())),
+            worker_name=raw_args.get("worker_name", "coinbase-trades-worker"),
             heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
             max_delay_ms=raw_args.get("max_delay_ms", 60_000),
             max_future_skew_ms=raw_args.get("max_future_skew_ms", 5_000),
@@ -1270,6 +1393,8 @@ def main() -> None:
         run_binance_depth_worker(args)
     elif args.command == "binance-trades-worker":
         run_binance_trades_worker(args)
+    elif args.command == "coinbase-trades-worker":
+        run_coinbase_trades_worker(args)
     elif args.command == "ops-runner":
         run_ops_runner(args)
     elif args.command == "health":

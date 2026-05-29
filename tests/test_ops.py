@@ -804,6 +804,27 @@ def test_job_args_threads_lane_and_rotation_flags_for_trades() -> None:
     assert args.worker_name == "binance-trades-worker-ethusdt"
 
 
+def test_job_args_coinbase_trades_worker_defaults() -> None:
+    # The coinbase-trades-worker job_type must build a usable namespace with
+    # Coinbase-shaped defaults (dashed product, matches channel) so the ops-runner
+    # can drive it the same way it drives the Binance workers.
+    args = _job_args(
+        JobSpec(
+            name="coinbase-btc-trades",
+            job_type="coinbase-trades-worker",
+            interval_seconds=3600,
+            args={},
+        )
+    )
+
+    assert args.symbol == "BTC-USD"
+    assert args.channel == "matches"
+    assert args.worker_name == "coinbase-trades-worker"
+    assert args.source_suffix == ""
+    assert args.rotate_at_midnight is False
+    assert args.max_clock_skew_ms == 60_000.0
+
+
 def test_job_args_lane_flags_default_to_legacy_behavior() -> None:
     # Omitting the flags must preserve the legacy single-symbol layout: empty suffix,
     # rotation off. This is what keeps the live BTC collector unaffected.

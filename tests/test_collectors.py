@@ -15,8 +15,10 @@ from crypto_collector.cli import (
     _reopen_binance_depth_connection,
     build_parser,
     collect_binance_depth_segment,
+    collect_coinbase_trades_segment,
     _is_retryable_connect_error,
 )
+from crypto_collector.market_normalizers import CoinbaseTradeNormalizer
 from crypto_collector.collectors.generic_ws import (
     GenericWebsocketCollector,
     _backoff_delay,
@@ -561,3 +563,207 @@ def test_collect_depth_segment_stops_at_deadline_with_clean_finalize(tmp_path, m
     # And critically the replay summary was still written (clean shutdown)
     assert "replayable" in result
     assert result["replay_findings"] is not None
+
+
+# --- Phase 2 #3a: Coinbase trades adapter ---------------------------------
+
+
+def _coinbase_match(
+    *,
+    trade_id: int,
+    price: str,
+    size: str,
+    maker_side: str,
+    time_iso: str,
+    product_id: str = "BTC-USD",
+    sequence: int | None = None,
+    event_type: str = "match",
+) -> dict:
+    payload = {
+        "type": event_type,
+        "trade_id": trade_id,
+        "product_id": product_id,
+        "price": price,
+        "size": size,
+        "side": maker_side,
+        "time": time_iso,
+    }
+    if sequence is not None:
+        payload["sequence"] = sequence
+    return payload
+
+
+def test_coinbase_trade_normalizer_flips_maker_side_to_taker_side() -> None:
+    """Coinbase `side` is the maker order side; the normalized `side` must be the
+    aggressor (taker) side so it means the same thing as the Binance normalizer's
+    side. maker sell -> taker buy, and buyer_is_maker reflects the maker side."""
+    raw = RawMessage(
+        source="coinbase",
+        received_at=datetime(2026, 5, 28, 12, 0, 0, tzinfo=UTC),
+        payload=_coinbase_match(
+            trade_id=100,
+            price="50000.5",
+            size="0.25",
+            maker_side="sell",
+            time_iso="2026-05-28T12:00:00.000000Z",
+        ),
+    )
+
+    event = CoinbaseTradeNormalizer().normalize(raw)
+
+    assert event.side == "buy"  # maker sold -> taker bought
+    assert event.metadata["maker_side"] == "sell"
+    assert event.metadata["buyer_is_maker"] is False
+    assert event.price == 50000.5
+    assert event.size == 0.25
+    assert event.channel == "trades"
+    # Dense per-product trade_id is what the replay/quality gate sequence on.
+    assert event.trade_id == "100"
+    assert event.sequence == 100
+    assert event.exchange_time == datetime(2026, 5, 28, 12, 0, 0, tzinfo=UTC)
+
+
+def test_coinbase_trade_normalizer_maker_buy_is_taker_sell() -> None:
+    raw = RawMessage(
+        source="coinbase",
+        received_at=utc_now(),
+        payload=_coinbase_match(
+            trade_id=7,
+            price="100.0",
+            size="1.0",
+            maker_side="buy",
+            time_iso="2026-05-28T12:00:00Z",
+        ),
+    )
+
+    event = CoinbaseTradeNormalizer().normalize(raw)
+
+    assert event.side == "sell"  # maker bought -> taker sold
+    assert event.metadata["buyer_is_maker"] is True
+
+
+def test_coinbase_trade_normalizer_resolves_dashed_product_to_instrument() -> None:
+    """`resolve_spot_instrument` doesn't strip the Coinbase dash, so the normalizer
+    must collapse separators before resolving or the instrument comes back None."""
+    raw = RawMessage(
+        source="coinbase",
+        received_at=utc_now(),
+        payload=_coinbase_match(
+            trade_id=1,
+            price="50000",
+            size="0.1",
+            maker_side="sell",
+            time_iso="2026-05-28T12:00:00Z",
+            product_id="BTC-USD",
+        ),
+    )
+
+    event = CoinbaseTradeNormalizer().normalize(raw)
+
+    assert event.product == "BTC-USD"  # raw venue symbol preserved
+    assert event.metadata["instrument_id"] == "spot:coinbase:BTCUSD"
+    assert event.metadata["canonical_symbol"] == "BTC/USD"
+    assert "parse_errors" not in event.metadata
+
+
+def test_coinbase_trade_normalizer_flags_invalid_fields() -> None:
+    raw = RawMessage(
+        source="coinbase",
+        received_at=utc_now(),
+        payload=_coinbase_match(
+            trade_id=5,
+            price="not-a-number",
+            size="0.1",
+            maker_side="sell",
+            time_iso="garbage-timestamp",
+        ),
+    )
+
+    event = CoinbaseTradeNormalizer().normalize(raw)
+
+    assert event.price is None
+    assert event.exchange_time is None
+    assert "invalid_price" in event.metadata["parse_errors"]
+    assert "invalid_event_time" in event.metadata["parse_errors"]
+
+
+def test_cli_parser_coinbase_trades_worker_defaults() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["coinbase-trades-worker"])
+    assert args.symbol == "BTC-USD"
+    assert args.channel == "matches"
+    assert args.source_suffix == ""
+    assert args.rotate_at_midnight is False
+
+    suffixed = parser.parse_args(
+        ["coinbase-trades-worker", "--symbol", "ETH-USD", "--source-suffix", "ethusd"]
+    )
+    assert suffixed.symbol == "ETH-USD"
+    assert suffixed.source_suffix == "ethusd"
+
+
+def _install_fake_trades_runtime(monkeypatch, ws) -> "_FakeWebsocketsModule":
+    """Wire the generic WS collector to a scripted websockets module and stub out the
+    Parquet sink so the trades pipeline doesn't touch the real archive."""
+    import sys
+
+    import crypto_collector.pipeline as pipeline_mod
+
+    fake_ws_mod = _FakeWebsocketsModule([ws])
+
+    class _NoopParquet:
+        def __init__(self, *a, **k) -> None: ...
+        def write(self, row) -> None: ...
+        def flush(self) -> None: ...
+
+    monkeypatch.setattr(pipeline_mod, "ParquetDatasetSink", _NoopParquet)
+    monkeypatch.setitem(
+        sys.modules, "websockets", SimpleNamespace(connect=fake_ws_mod.connect)
+    )
+    return fake_ws_mod
+
+
+def test_collect_coinbase_trades_segment_writes_clean_events_and_replay_summary(
+    tmp_path, monkeypatch
+) -> None:
+    """End-to-end: a Coinbase matches stream lands in coinbase_trades/<ts>/ as clean
+    events and gets a trades replay summary, so the existing quarantine/promote chain
+    can curate it exactly like Binance trades."""
+    now = utc_now()
+    time_iso = now.isoformat().replace("+00:00", "Z")
+    ws = _ScriptedDepthWebsocket(
+        frames=[
+            {"type": "subscriptions", "channels": [{"name": "matches"}]},  # ack
+            _coinbase_match(trade_id=500, price="50000.0", size="0.1", maker_side="sell", time_iso=time_iso),
+            _coinbase_match(trade_id=501, price="50001.0", size="0.2", maker_side="buy", time_iso=time_iso),
+            _coinbase_match(trade_id=502, price="50002.0", size="0.3", maker_side="sell", time_iso=time_iso),
+        ]
+    )
+    _install_fake_trades_runtime(monkeypatch, ws)
+
+    args = SimpleNamespace(
+        symbol="BTC-USD",
+        channel="matches",
+        count=3,
+        output_root=tmp_path,
+        max_delay_ms=60_000,
+        max_future_skew_ms=5_000,
+        max_clock_skew_ms=60_000.0,
+        source_suffix="",
+        deadline_utc=None,
+    )
+
+    result = asyncio.run(collect_coinbase_trades_segment(args))
+
+    assert result["clean_events"] == 3, result
+    assert result["quarantined_events"] == 0
+    assert result["replayable"] is True, result["replay_findings"]
+
+    run_path = Path(result["run_path"])
+    assert run_path.parent.name == "coinbase_trades"
+    events = (run_path / "clean" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(events) == 3
+    first = json.loads(events[0])
+    assert first["source"] == "coinbase"
+    assert first["side"] == "buy"  # maker sell -> taker buy
+    assert (run_path / "metrics" / "replay_summary.json").exists()

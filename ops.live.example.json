@@ -68,6 +68,48 @@
       }
     },
     {
+      "// multi-venue lane": "Coinbase trades use the same generic WS collector + trades curation chain as Binance; only the endpoint, subscription style and normalizer differ. Runs land in coinbase_trades/ so the quarantine/promote-coinbase-trades jobs below can curate them independently. Set source_suffix for a second Coinbase product (e.g. ETH-USD).",
+      "name": "coinbase-btc-trades",
+      "job_type": "coinbase-trades-worker",
+      "enabled": false,
+      "interval_seconds": 3600,
+      "args": {
+        "symbol": "BTC-USD",
+        "channel": "matches",
+        "segment_count": 5000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "worker_name": "coinbase-trades-worker",
+        "output_root": "D:\\market_archive\\raw\\market",
+        "ops_root": "D:\\market_archive\\ops"
+      }
+    },
+    {
+      "name": "quarantine-coinbase-trades",
+      "job_type": "quarantine-runs",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "D:\\market_archive\\raw\\market\\coinbase_trades",
+        "quarantine_root": "D:\\market_archive\\quarantine\\market\\coinbase_trades",
+        "limit": 20,
+        "max_age_hours": 6
+      }
+    },
+    {
+      "name": "promote-coinbase-trades",
+      "job_type": "promote-replayable",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "D:\\market_archive\\raw\\market\\coinbase_trades",
+        "target_root": "D:\\market_archive\\curated\\research\\trades_replayable",
+        "quarantine_index": "D:\\market_archive\\quarantine\\market\\coinbase_trades\\_quarantine_index.jsonl",
+        "limit": 20,
+        "max_age_hours": 6
+      }
+    },
+    {
       "name": "book-sync-health",
       "job_type": "book-sync-health",
       "interval_seconds": 300,
