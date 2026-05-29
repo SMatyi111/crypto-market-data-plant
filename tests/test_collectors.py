@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,6 +10,7 @@ from crypto_collector.cli import (
     _align_binance_buffered_events,
     _binance_update_window,
     _build_source_name,
+    _next_utc_midnight,
     _post_reconnect_alignment_holds,
     _reopen_binance_depth_connection,
     build_parser,
@@ -469,3 +471,93 @@ def test_cli_parser_accepts_source_suffix_on_depth_and_trades() -> None:
     assert default_depth.source_suffix == ""
     default_trades = parser.parse_args(["binance-trades-worker"])
     assert default_trades.source_suffix == ""
+
+
+# --- Phase 2 #2: day-bounded rotation -------------------------------------
+
+
+def test_next_utc_midnight_returns_first_midnight_strictly_after() -> None:
+    """Day-bounded rotation needs the *next* UTC midnight strictly after the segment
+    start. A segment started at 23:59:59 UTC must rotate at the very next 00:00,
+    one second later, not 24 hours later."""
+    assert _next_utc_midnight(datetime(2026, 5, 28, 14, 30, tzinfo=UTC)) == datetime(
+        2026, 5, 29, 0, 0, tzinfo=UTC
+    )
+    # Boundary: 23:59:59 → next is the very next minute
+    assert _next_utc_midnight(datetime(2026, 5, 28, 23, 59, 59, tzinfo=UTC)) == datetime(
+        2026, 5, 29, 0, 0, tzinfo=UTC
+    )
+    # Naive datetime is treated as UTC
+    assert _next_utc_midnight(datetime(2026, 5, 28, 14, 30)) == datetime(
+        2026, 5, 29, 0, 0, tzinfo=UTC
+    )
+
+
+def test_next_utc_midnight_normalizes_non_utc_tz() -> None:
+    """Local-time inputs get converted to UTC before computing the next midnight,
+    so a New York start at 23:59 (= 04:59 UTC next day) rotates at *that* next
+    UTC midnight, not at New York midnight."""
+    from datetime import timezone
+
+    nyc = timezone(timedelta(hours=-5))
+    # 2026-05-28 23:59 NYC == 2026-05-29 04:59 UTC → next UTC midnight is 2026-05-30
+    assert _next_utc_midnight(datetime(2026, 5, 28, 23, 59, tzinfo=nyc)) == datetime(
+        2026, 5, 30, 0, 0, tzinfo=UTC
+    )
+
+
+def test_cli_parser_accepts_rotate_at_midnight() -> None:
+    parser = build_parser()
+    depth_args = parser.parse_args(["binance-depth-worker", "--rotate-at-midnight"])
+    assert depth_args.rotate_at_midnight is True
+    # Default is False — back-compat preserved for the live BTC collector
+    assert parser.parse_args(["binance-depth-worker"]).rotate_at_midnight is False
+    trades_args = parser.parse_args(["binance-trades-worker", "--rotate-at-midnight"])
+    assert trades_args.rotate_at_midnight is True
+    assert parser.parse_args(["binance-trades-worker"]).rotate_at_midnight is False
+
+
+def test_collect_depth_segment_stops_at_deadline_with_clean_finalize(tmp_path, monkeypatch) -> None:
+    """When the wall clock crosses `deadline_utc`, the depth segment stops cleanly
+    BEFORE the message count is reached, and the metrics/replay/parquet finalize
+    paths all still run (so the run dir is replayable + curatable)."""
+    # Pre-populate frames with bridging data so each one increments message_count
+    ws_initial = _ScriptedDepthWebsocket(
+        frames=[
+            {"result": None, "id": 1},  # ack
+            _depth_payload(first=99, final=101),  # bridges snapshot lastUpdateId=100
+            _depth_payload(first=102, final=103),
+            _depth_payload(first=104, final=105),
+        ],
+        close_with=None,
+    )
+    _install_fake_depth_runtime(monkeypatch, [ws_initial], snapshot_last_update_id=100)
+
+    # Deadline is ALREADY past — the very first processed event in
+    # _process_batch checks _deadline_crossed() and returns True, triggering
+    # clean finalize. This avoids racing the asyncio event loop.
+    deadline = datetime.now(tz=UTC) - timedelta(seconds=1)
+
+    args = SimpleNamespace(
+        symbol="btcusdt",
+        speed="100ms",
+        count=1000,
+        output_root=tmp_path,
+        snapshot_limit=10,
+        snapshot_base_url="https://example.test/depth",
+        connect_retries=3,
+        retry_backoff_seconds=0.0,
+        max_backoff_seconds=0.0,
+        resubscribe_buffer_seconds=0.05,
+        deadline_utc=deadline,
+    )
+
+    result = asyncio.run(collect_binance_depth_segment(args))
+
+    # The deadline_reached flag is surfaced in the summary
+    assert result["deadline_reached"] is True, result
+    # We didn't reach the message count — we stopped early on the deadline
+    assert result["raw_messages"] < 1000
+    # And critically the replay summary was still written (clean shutdown)
+    assert "replayable" in result
+    assert result["replay_findings"] is not None

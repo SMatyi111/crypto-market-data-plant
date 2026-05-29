@@ -8,7 +8,7 @@ import shutil
 import sys
 import threading
 import time
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -97,6 +97,14 @@ def build_parser() -> argparse.ArgumentParser:
         "<output_root>/binance_depth_<suffix>/<timestamp>/ instead of "
         "binance_depth/. Leave empty to preserve the legacy single-symbol BTC layout.",
     )
+    depth_parser.add_argument(
+        "--rotate-at-midnight",
+        action="store_true",
+        help="Rotate the run directory at midnight UTC instead of at --segment-count "
+        "messages. With this set, --segment-count becomes a soft cap (memory bound) "
+        "rather than the primary rotation trigger. Day-bounded run dirs line up with "
+        "the curated event_date partitioning downstream.",
+    )
 
     trades_parser = subparsers.add_parser("binance-trades-worker", help="Run segmented Binance trade collection")
     trades_parser.add_argument("--symbol", default="btcusdt")
@@ -117,6 +125,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional per-instrument lane suffix. When non-empty, runs go to "
         "<output_root>/binance_trades_<suffix>/<timestamp>/ instead of "
         "binance_trades/. Leave empty to preserve the legacy single-symbol BTC layout.",
+    )
+    trades_parser.add_argument(
+        "--rotate-at-midnight",
+        action="store_true",
+        help="Rotate the run directory at midnight UTC instead of at --segment-count "
+        "messages. See the depth worker's help text for the same flag.",
     )
 
     ops_parser = subparsers.add_parser("ops-runner", help="Run collection and curation jobs from a manifest")
@@ -273,14 +287,21 @@ async def collect_binance_depth_segment(args: argparse.Namespace) -> dict[str, o
     reconnect_count = 0
     alignment_break_count = 0
     alignment_broken = False
+    deadline_reached = False
     reconnect_attempts = 0  # consecutive retryable failures since last successful frame
     # Tracks the latest event id we've consumed so reconnect-in-place can check
     # whether the next event bridges where we left off (not where the snapshot started).
     last_seen_final_update_id = snapshot_last_update_id
+    deadline_utc: datetime | None = getattr(args, "deadline_utc", None)
+
+    def _deadline_crossed() -> bool:
+        return deadline_utc is not None and utc_now() >= deadline_utc
 
     def _process_batch(raws: list[RawMessage]) -> bool:
-        """Process buffered raws. Returns True if count reached."""
+        """Process buffered raws. Returns True if the segment should stop (count
+        reached OR day-bounded deadline crossed)."""
         nonlocal message_count, clean_count, quarantined_count, last_seen_final_update_id
+        nonlocal deadline_reached
         for raw in raws:
             message_count, clean_count, quarantined_count = _process_binance_depth_raw(
                 raw=raw,
@@ -299,10 +320,22 @@ async def collect_binance_depth_segment(args: argparse.Namespace) -> dict[str, o
                 last_seen_final_update_id = window[1]
             if message_count >= args.count:
                 return True
+            if _deadline_crossed():
+                deadline_reached = True
+                return True
         return False
 
     try:
         if _process_batch(pending_raws):
+            # Close the WS before finalizing — _process_batch returns True when count
+            # is reached OR the day-bounded deadline crossed, and either way we want
+            # the socket cleanup to happen before the parquet flush / replay summary.
+            try:
+                await connection.__aexit__(None, None, None)
+            except Exception:  # noqa: BLE001
+                pass
+            connection = None
+            websocket = None
             return _finalize_depth_segment(
                 run_paths=run_paths,
                 snapshot=snapshot,
@@ -315,9 +348,10 @@ async def collect_binance_depth_segment(args: argparse.Namespace) -> dict[str, o
                 quality_gate=quality_gate,
                 parquet_sink=parquet_sink,
                 metrics_sink=metrics_sink,
+                deadline_reached=deadline_reached,
             )
 
-        while message_count < args.count and not alignment_broken:
+        while message_count < args.count and not alignment_broken and not deadline_reached:
             try:
                 async for message in websocket:
                     payload = json.loads(message)
@@ -442,6 +476,7 @@ async def collect_binance_depth_segment(args: argparse.Namespace) -> dict[str, o
         quality_gate=quality_gate,
         parquet_sink=parquet_sink,
         metrics_sink=metrics_sink,
+        deadline_reached=deadline_reached,
     )
 
 
@@ -458,6 +493,7 @@ def _finalize_depth_segment(
     quality_gate: MetadataQualityGate,
     parquet_sink: ParquetDatasetSink,
     metrics_sink: JsonlSink,
+    deadline_reached: bool = False,
 ) -> dict[str, object]:
     parquet_sink.flush()
     events_path = run_paths.base / "clean" / "events.jsonl"
@@ -484,6 +520,7 @@ def _finalize_depth_segment(
             "connect_attempts": connect_attempts,
             "reconnect_count": reconnect_count,
             "alignment_break_count": alignment_break_count,
+            "deadline_reached": deadline_reached,
             "replayable": replayable,
             "replay_findings": findings,
             "replay_summary_path": summary_path,
@@ -497,6 +534,7 @@ def _finalize_depth_segment(
         "connect_attempts": connect_attempts,
         "reconnect_count": reconnect_count,
         "alignment_break_count": alignment_break_count,
+        "deadline_reached": deadline_reached,
         "replayable": replayable,
         "replay_findings": findings,
     }
@@ -527,7 +565,10 @@ async def collect_binance_trades_segment(args: argparse.Namespace) -> dict[str, 
         run_paths=run_paths,
         normalized_root=default_normalized_root("trades"),
     )
-    pipeline_summary = await pipeline.run(limit=args.count)
+    pipeline_summary = await pipeline.run(
+        limit=args.count,
+        deadline_utc=getattr(args, "deadline_utc", None),
+    )
 
     # Write the trades replay summary so the existing quarantine + promote chain
     # (which keys off `metrics/replay_summary.json`) can curate trades runs the
@@ -555,6 +596,7 @@ async def collect_binance_trades_segment(args: argparse.Namespace) -> dict[str, 
         "replayable": replayable,
         "replay_findings": replay_findings,
         "replay_summary_path": replay_summary_path,
+        "deadline_reached": bool(pipeline_summary.deadline_reached),
     }
 
 
@@ -574,6 +616,7 @@ def run_binance_depth_worker(args: argparse.Namespace) -> None:
             retry_backoff_seconds=source_args.retry_backoff_seconds,
             max_backoff_seconds=getattr(source_args, "max_backoff_seconds", 60.0),
             source_suffix=getattr(source_args, "source_suffix", ""),
+            deadline_utc=None,  # _run_segmented_worker overrides this when rotate_at_midnight is set
         ),
         collect_segment=collect_binance_depth_segment,
         progress_message=lambda segment_index, summary: (
@@ -600,6 +643,7 @@ def run_binance_trades_worker(args: argparse.Namespace) -> None:
             max_future_skew_ms=getattr(source_args, "max_future_skew_ms", 5_000),
             max_clock_skew_ms=getattr(source_args, "max_clock_skew_ms", 60_000.0),
             source_suffix=getattr(source_args, "source_suffix", ""),
+            deadline_utc=None,  # _run_segmented_worker overrides this when rotate_at_midnight is set
         ),
         collect_segment=collect_binance_trades_segment,
         progress_message=lambda segment_index, summary: (
@@ -630,13 +674,27 @@ def _run_segmented_worker(
     )
     completed_segments = 0
     last_run_path: str | None = None
+    rotate_at_midnight = bool(getattr(args, "rotate_at_midnight", False))
     with StandaloneWorkerLock(args.ops_root, worker_name=worker_name):
-        runtime.record_event("worker_started", details={"max_segments": args.max_segments, "output_root": str(args.output_root)})
+        runtime.record_event(
+            "worker_started",
+            details={
+                "max_segments": args.max_segments,
+                "output_root": str(args.output_root),
+                "rotate_at_midnight": rotate_at_midnight,
+            },
+        )
         runtime.write_heartbeat(status="idle", last_segment_index=0)
         try:
             while args.max_segments is None or completed_segments < args.max_segments:
                 segment_index = completed_segments + 1
                 segment_started_at = utc_now()
+                # When the worker is in day-bounded mode, each segment runs until
+                # midnight UTC instead of until --segment-count. The segment
+                # function checks the deadline in its inner stream loop and exits
+                # cleanly when it's crossed, so the parquet flush / replay summary
+                # / metrics write all still run.
+                segment_deadline_utc = _next_utc_midnight(segment_started_at) if rotate_at_midnight else None
                 stop_event, heartbeat_thread = runtime.start_segment_heartbeat(
                     segment_index=segment_index,
                     started_at=segment_started_at,
@@ -644,7 +702,10 @@ def _run_segmented_worker(
                     last_run_path=last_run_path,
                 )
                 try:
-                    summary = asyncio.run(collect_segment(build_segment_args(args)))
+                    segment_args = build_segment_args(args)
+                    if segment_deadline_utc is not None:
+                        segment_args.deadline_utc = segment_deadline_utc
+                    summary = asyncio.run(collect_segment(segment_args))
                 except Exception as exc:
                     runtime.record_event("segment_error", details={"segment_index": segment_index, "error": str(exc)})
                     runtime.write_heartbeat(
@@ -1096,6 +1157,15 @@ def _post_reconnect_alignment_holds(
     if first_window is None:
         return True
     return first_window[0] <= snapshot_last_update_id + 1
+
+
+def _next_utc_midnight(now: datetime) -> datetime:
+    """Return the next UTC midnight strictly after `now`. Used by day-bounded run
+    rotation: a segment that starts at 14:00 UTC ends at the upcoming 00:00 UTC
+    so the run directory aligns with the curated event_date partition contract."""
+    base = now.astimezone(UTC) if now.tzinfo is not None else now.replace(tzinfo=UTC)
+    next_day = base.date() + timedelta(days=1)
+    return datetime.combine(next_day, datetime.min.time(), tzinfo=UTC)
 
 
 def _build_source_name(base: str, suffix: str | None) -> str:

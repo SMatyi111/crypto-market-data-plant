@@ -47,9 +47,14 @@ What "done" looks like, eventually:
    `binance_depth_<suffix>/` / `binance_trades_<suffix>/` directory tree
    without touching the legacy single-symbol BTC layout. `ops.live.example.json`
    shows an ETH lane (`enabled: false`) as the recipe.
-2. **Day-bounded run rotation** — change `_run_segmented_worker` from
-   "segment_count messages per segment" to "rotate at midnight UTC". Replay
-   then runs over whole days, not arbitrary 5000-event slices.
+2. **Day-bounded run rotation** — DONE. Added `--rotate-at-midnight` flag
+   (depth + trades). When set, `_run_segmented_worker` computes a UTC-midnight
+   deadline for each segment and threads it through `args.deadline_utc`. The
+   depth segment checks `_deadline_crossed()` after each processed event;
+   `CollectorPipeline.run` does the same for trades. Segments stop cleanly
+   on the deadline (the existing parquet flush + replay summary + metrics
+   write all run), exposed via `deadline_reached` in the segment summary.
+   Default off preserves the count-based behavior the live BTC collector uses.
 3. **Add Coinbase + Bybit + Kraken adapters** — each needs a normalizer
    (like `BinanceDepthNormalizer`) and venue-specific subscription / snapshot
    handling. Generic collector already handles `subscription_style` so most

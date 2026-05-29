@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from .collectors.base import BaseCollector
-from .models import RawMessage
+from .models import RawMessage, utc_now
 from .normalizer import GenericL3Normalizer
 from .quality import QualityGate
 from .storage import JsonlSink, ParquetDatasetSink, RotatingJsonlSink, RunPaths
@@ -15,12 +16,14 @@ class RunSummary:
     raw_messages: int = 0
     clean_events: int = 0
     quarantined_events: int = 0
+    deadline_reached: bool = False
 
-    def to_dict(self) -> dict[str, int]:
+    def to_dict(self) -> dict[str, int | bool]:
         return {
             "raw_messages": self.raw_messages,
             "clean_events": self.clean_events,
             "quarantined_events": self.quarantined_events,
+            "deadline_reached": self.deadline_reached,
         }
 
 
@@ -48,7 +51,16 @@ class CollectorPipeline:
         self.metrics_sink = JsonlSink(run_paths.metrics, "summary.jsonl")
         self.parquet_sink = ParquetDatasetSink(normalized_root) if normalized_root else None
 
-    async def run(self, limit: int | None = None) -> RunSummary:
+    async def run(
+        self,
+        limit: int | None = None,
+        *,
+        deadline_utc: datetime | None = None,
+    ) -> RunSummary:
+        """Run the pipeline until the collector stream ends, `limit` is reached, or
+        the wall clock crosses `deadline_utc` (for day-bounded rotation). The deadline
+        check happens after each accepted/rejected event so partial work is flushed
+        in the existing finally block."""
         summary = RunSummary()
         try:
             async for raw in self.collector.stream(limit=limit):
@@ -68,6 +80,10 @@ class CollectorPipeline:
                     quarantined_row = normalized.to_dict()
                     quarantined_row["reasons"] = verdict.reasons
                     self.quarantine_sink.write(quarantined_row)
+
+                if deadline_utc is not None and utc_now() >= deadline_utc:
+                    summary.deadline_reached = True
+                    break
 
                 if (
                     self.metrics_flush_every
