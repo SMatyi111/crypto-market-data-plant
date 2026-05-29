@@ -227,20 +227,34 @@ verdict that gates promotion.
 1. **Read curated, not raw.** Pull from
    `curated/research/{market_replayable,trades_replayable}/schema_version=v1/source=<src>/event_date=<date>/`.
    Everything there passed §4.
-2. **Check the manifest first.** `research_manifest_latest.json` lists each day
-   with a `readiness`:
+2. **Check the manifest first.** `research_manifest_latest.json` is tagged with
+   `standards_version` (matches `STANDARDS_VERSION` above) and carries two views:
+   - `lanes` — the canonical per-`(venue, instrument, dataset)` readiness. Each
+     lane is discovered from its raw lane directory
+     (`<venue>_<dataset>[_<instrument>]`), carries a `gap_detection` tag
+     (`sequence` = §4.1/§4.2 strong gaplessness; `none_native` = §4.3 best-effort),
+     and lists per-`event_date` `readiness`. Readiness is driven by the curated
+     promotion index (`run_path` → lane, accurate per instrument) and the lane's
+     raw replay summaries — **not** the Parquet partitions, which are only
+     venue-partitioned today (see the partition note in §2).
+   - `days` — the legacy single global day timeline (Binance depth) kept for
+     back-compat; prefer `lanes`.
+
+   `readiness` values (same rule in both views):
    - `ready` — promoted rows present, no bad raw runs that day
    - `ready_with_quarantine` — promoted rows present, but some raw runs were
      unreplayable / missing summaries
    - `building` — the current UTC day, still collecting
    - `missing` — nothing promoted
 3. **Pin `schema_version`** in your reader so a future bump doesn't silently
-   change columns under you.
+   change columns under you. Pin `standards_version` from the manifest too if you
+   key off its shape.
 
-> **Current limitation:** the manifest is Binance-depth-centric (single global
-> day timeline keyed off `raw/market/binance_depth` + `market_replayable`
-> promotion). Trades and non-Binance venues are partially counted but not yet
-> first-class. Per-(venue, instrument, dataset) readiness is Roadmap (Phase 2 #4).
+> **Current limitation:** curated/normalized Parquet is partitioned by
+> `source=<venue>` only, so per-instrument lanes of the same venue+dataset share
+> Parquet partitions. The manifest's per-instrument readiness comes from the
+> promotion index (which records the originating lane), not the Parquet layout.
+> An `instrument=` partition column is still Roadmap (§8).
 
 ---
 
@@ -260,9 +274,9 @@ verdict that gates promotion.
 These are aspirations in `FOLLOW_UPS.md`, listed so nobody mistakes them for the
 current contract:
 
-- `instrument=` partition column in the curated/normalized datasets.
-- Manifest keyed by `(venue, instrument, dataset, event_date)` covering trades +
-  all venues, tagged with `standards_version`.
+- `instrument=` partition column in the curated/normalized datasets (so
+  per-instrument lanes of the same venue+dataset stop sharing Parquet
+  partitions; the manifest already separates them via the promotion index).
 - Non-sequence depth adapters (Coinbase `level2`, Kraken `book`) under the §4.3
   policy; sequence-bearing depth for Coinbase Advanced Trade / Bybit / Kraken v2.
 - Continuous day-bounded rotation as the default run model (vs. count-bounded).

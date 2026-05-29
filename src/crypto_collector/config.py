@@ -8,6 +8,12 @@ from pathlib import Path
 
 DEFAULT_ARCHIVE_ROOT = Path(r"D:\market_archive")
 
+# Contract version for the data the plant produces. Mirrors `STANDARDS_VERSION`
+# in STANDARDS.md (repo root); bump both together when the schema, partition
+# layout, or the definition of "replayable" changes. The research manifest tags
+# its output with this so downstream readers can pin to a known contract.
+STANDARDS_VERSION = 1
+
 _FALLBACK_WARNED: set[str] = set()
 
 
