@@ -10,6 +10,7 @@ import time
 import pytest
 
 from crypto_collector.cli import (
+    _job_args,
     build_parser,
     run_binance_depth_worker,
     run_ops_runner,
@@ -411,7 +412,17 @@ def test_standalone_segment_heartbeat_preserves_last_run_path(tmp_path: Path) ->
     assert heartbeat["last_run_path"].endswith("previous")
 
 
-def test_health_with_config_does_not_error_on_unmanaged_stale_workers(tmp_path: Path) -> None:
+def test_health_with_config_does_not_error_on_unmanaged_stale_workers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Point the normalized-partition check at a sandboxed root with a fresh write so
+    # the report does not depend on whether the live D:\market_archive has recent data.
+    normalized_root = tmp_path / "normalized"
+    monkeypatch.setenv("MARKET_DATA_NORMALIZED_ROOT", str(normalized_root))
+    partition = normalized_root / "market" / "schema_version=1" / "source=binance"
+    partition.mkdir(parents=True)
+    (partition / "part-0.parquet").write_bytes(b"")
+
     ops_root = tmp_path / "ops"
     workers_root = ops_root / "standalone_workers"
     workers_root.mkdir(parents=True)
@@ -743,3 +754,67 @@ def test_health_partial_metrics_handles_missing_summary_jsonl(tmp_path: Path) ->
     assert worker["quarantine_ratio"] is None
     # No high_quarantine finding
     assert "high_quarantine_ratio" not in worker["findings"]
+
+
+def test_job_args_threads_lane_and_rotation_flags_for_depth() -> None:
+    # Regression: the ops-runner is the production execution path, and the Phase 2
+    # lane/rotation flags must survive the JobSpec -> SimpleNamespace translation.
+    # Without this, the ETH lane in ops.live.example.json would collide with the BTC
+    # lane in binance_depth/ because source_suffix never reaches the segment builder.
+    job = JobSpec(
+        name="binance-eth-depth",
+        job_type="binance-depth-worker",
+        interval_seconds=3600,
+        args={
+            "symbol": "ethusdt",
+            "source_suffix": "ethusdt",
+            "rotate_at_midnight": True,
+            "max_backoff_seconds": 90.0,
+            "worker_name": "binance-depth-worker-ethusdt",
+        },
+    )
+
+    args = _job_args(job)
+
+    assert args.source_suffix == "ethusdt"
+    assert args.rotate_at_midnight is True
+    assert args.max_backoff_seconds == 90.0
+    assert args.worker_name == "binance-depth-worker-ethusdt"
+
+
+def test_job_args_threads_lane_and_rotation_flags_for_trades() -> None:
+    job = JobSpec(
+        name="binance-eth-trades",
+        job_type="binance-trades-worker",
+        interval_seconds=3600,
+        args={
+            "symbol": "ethusdt",
+            "source_suffix": "ethusdt",
+            "rotate_at_midnight": True,
+            "max_clock_skew_ms": 30_000.0,
+            "worker_name": "binance-trades-worker-ethusdt",
+        },
+    )
+
+    args = _job_args(job)
+
+    assert args.source_suffix == "ethusdt"
+    assert args.rotate_at_midnight is True
+    assert args.max_clock_skew_ms == 30_000.0
+    assert args.worker_name == "binance-trades-worker-ethusdt"
+
+
+def test_job_args_lane_flags_default_to_legacy_behavior() -> None:
+    # Omitting the flags must preserve the legacy single-symbol layout: empty suffix,
+    # rotation off. This is what keeps the live BTC collector unaffected.
+    depth = _job_args(
+        JobSpec(name="d", job_type="binance-depth-worker", interval_seconds=3600, args={})
+    )
+    trades = _job_args(
+        JobSpec(name="t", job_type="binance-trades-worker", interval_seconds=3600, args={})
+    )
+
+    assert depth.source_suffix == ""
+    assert depth.rotate_at_midnight is False
+    assert trades.source_suffix == ""
+    assert trades.rotate_at_midnight is False

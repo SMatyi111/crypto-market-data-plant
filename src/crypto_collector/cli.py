@@ -802,7 +802,13 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             snapshot_limit=raw_args.get("snapshot_limit", 1000),
             connect_retries=raw_args.get("connect_retries", 3),
             retry_backoff_seconds=raw_args.get("retry_backoff_seconds", 2.0),
+            max_backoff_seconds=raw_args.get("max_backoff_seconds", 60.0),
             snapshot_base_url=raw_args.get("snapshot_base_url", "https://api.binance.com/api/v3/depth"),
+            # Phase 2 lane/rotation flags must flow through the ops-runner too — without
+            # these the ETH lane example would silently collide with the BTC lane in
+            # binance_depth/ because the segment builder reads them via getattr.
+            source_suffix=raw_args.get("source_suffix", ""),
+            rotate_at_midnight=raw_args.get("rotate_at_midnight", False),
         )
     if job.job_type == "binance-trades-worker":
         return SimpleNamespace(
@@ -817,6 +823,9 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
             max_delay_ms=raw_args.get("max_delay_ms", 60_000),
             max_future_skew_ms=raw_args.get("max_future_skew_ms", 5_000),
+            max_clock_skew_ms=raw_args.get("max_clock_skew_ms", 60_000.0),
+            source_suffix=raw_args.get("source_suffix", ""),
+            rotate_at_midnight=raw_args.get("rotate_at_midnight", False),
         )
     if job.job_type in {"book-sync-health", "backfill-replay"}:
         return SimpleNamespace(
