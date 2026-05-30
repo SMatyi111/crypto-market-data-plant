@@ -117,6 +117,13 @@ class GenericWebsocketCollector(BaseCollector):
             return payload.get("type") == "subscriptions"
         if self.config.subscription_style == "binance":
             return payload.get("result") is None and "id" in payload
+        if self.config.subscription_style == "bybit":
+            # {"success":true,"ret_msg":"subscribe","op":"subscribe",...}; the pong
+            # reply uses op:"ping", so key off op:"subscribe" to avoid matching it.
+            return payload.get("op") == "subscribe" and payload.get("success") is True
+        if self.config.subscription_style == "kraken_v2":
+            # {"method":"subscribe","success":true,...}; one ack per symbol.
+            return payload.get("method") == "subscribe" and payload.get("success") is True
         return False
 
     def _is_subscription_error(self, payload: object) -> bool:
@@ -130,6 +137,10 @@ class GenericWebsocketCollector(BaseCollector):
                 return True
             code = payload.get("code")
             return code not in (None, 0)
+        if self.config.subscription_style == "bybit":
+            return payload.get("op") == "subscribe" and payload.get("success") is False
+        if self.config.subscription_style == "kraken_v2":
+            return payload.get("method") == "subscribe" and payload.get("success") is False
         return False
 
     def _subscription_message(self) -> dict[str, object]:
@@ -147,6 +158,21 @@ class GenericWebsocketCollector(BaseCollector):
                 "params": [f"{self.config.product.lower()}@{self.config.channel}"],
                 "id": 1,
             }
+        if self.config.subscription_style == "bybit":
+            # Topic is "<channel>.<symbol>", e.g. "publicTrade.BTCUSDT" or
+            # "orderbook.50.BTCUSDT" (the depth level is part of the channel).
+            return {
+                "op": "subscribe",
+                "args": [f"{self.config.channel}.{self.config.product}"],
+            }
+        if self.config.subscription_style == "kraken_v2":
+            return {
+                "method": "subscribe",
+                "params": {
+                    "channel": self.config.channel,
+                    "symbol": [self.config.product],
+                },
+            }
         raise ValueError(f"Unsupported subscription_style: {self.config.subscription_style}")
 
     def _should_emit(self, payload: object) -> bool:
@@ -160,6 +186,12 @@ class GenericWebsocketCollector(BaseCollector):
         if self.config.subscription_style == "coinbase":
             if payload.get("type") in {"subscriptions", "error"}:
                 return False
+        if self.config.subscription_style == "bybit":
+            # Data frames carry a "topic"; acks/pongs carry "op" and no topic.
+            return "topic" in payload
+        if self.config.subscription_style == "kraken_v2":
+            # Data frames are channel trade/book; drop heartbeat/status/pong + acks.
+            return payload.get("channel") in {"trade", "book"} and "data" in payload
         return True
 
 

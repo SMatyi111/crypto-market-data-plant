@@ -187,6 +187,142 @@ class CoinbaseDepthNormalizer:
         )
 
 
+class BybitTradeNormalizer:
+    """Normalize Bybit v5 spot `publicTrade.{symbol}` frames.
+
+    Two structural differences from the single-event venues:
+
+    * A single frame batches **many** trades in `data: [...]` (up to 1024), so this
+      normalizer exposes `normalize_many` and the pipeline fans them out.
+    * Bybit's spot trade id (`i`) is a **UUID string**, not a dense per-product
+      counter, and `seq` (cross sequence) is shared across batched messages — neither
+      supports `delta == 1` gap detection. So `sequence` is left `None` and the run is
+      curated by `replay_trades_stream_run` as a non-sequence (`none_native`) feed:
+      structurally clean, **not** gap-proof (STANDARDS §4.3).
+
+    `S` is the **taker (aggressor) side** directly (`"Buy"`/`"Sell"`), so unlike
+    Coinbase no flip is needed; `buyer_is_maker` is derived for the cross-venue
+    convention (taker sold ⇒ the buyer was the maker).
+    """
+
+    def normalize_many(self, raw: RawMessage) -> list[NormalizedL3Event]:
+        data = raw.payload.get("data")
+        if not isinstance(data, list):
+            return []
+        return [self._normalize_one(item, raw) for item in data]
+
+    def _normalize_one(self, item: Any, raw: RawMessage) -> NormalizedL3Event:
+        item = item if isinstance(item, dict) else {}
+        parse_errors: list[str] = []
+        product = str(item.get("s") or "UNKNOWN")
+        trade_time = _parse_timestamp_ms(item.get("T"), parse_errors)
+        taker_side = _bybit_taker_side(item.get("S"), parse_errors)
+        price = _optional_float(item.get("p"), "price", parse_errors)
+        size = _optional_float(item.get("v"), "size", parse_errors)
+        trade_id = item.get("i")
+        instrument = resolve_spot_instrument(
+            _strip_symbol_separators(product), venue=raw.source
+        )
+
+        metadata: dict[str, Any] = {
+            "instrument_id": instrument.instrument_id if instrument is not None else None,
+            "canonical_symbol": instrument.canonical_symbol if instrument is not None else None,
+            "buyer_is_maker": (taker_side == "sell") if taker_side is not None else None,
+            # Kept for forensics only — NOT used as a dense gap-detection sequence.
+            "bybit_cross_sequence": _optional_int(item.get("seq"), "cross_sequence", parse_errors),
+        }
+        if parse_errors:
+            metadata["parse_errors"] = parse_errors
+
+        return NormalizedL3Event(
+            source=raw.source,
+            product=product,
+            channel="trades",
+            event_type="trade",
+            exchange_time=trade_time,
+            received_at=raw.received_at,
+            side=taker_side,
+            price=price,
+            size=size,
+            trade_id=str(trade_id) if trade_id not in (None, "") else None,
+            # UUID trade id is not a dense counter, so no sequence-gap detection.
+            sequence=None,
+            raw_type="trade",
+            metadata={key: value for key, value in metadata.items() if value is not None},
+        )
+
+
+class KrakenTradeNormalizer:
+    """Normalize Kraken v2 `trade` channel frames.
+
+    Like Bybit, one frame batches several trades in `data: [...]`, so this exposes
+    `normalize_many`. Unlike Bybit, Kraken v2 `trade_id` is documented as "a sequence
+    number, unique per book" — a **dense per-pair counter** — so the standard
+    sequence-bearing `replay_trades_run` (STANDARDS §4.2) applies and gaps are
+    provable. `side` is the **taker (aggressor) side** directly (`"buy"`/`"sell"`).
+    """
+
+    def normalize_many(self, raw: RawMessage) -> list[NormalizedL3Event]:
+        data = raw.payload.get("data")
+        if not isinstance(data, list):
+            return []
+        return [self._normalize_one(item, raw) for item in data]
+
+    def _normalize_one(self, item: Any, raw: RawMessage) -> NormalizedL3Event:
+        item = item if isinstance(item, dict) else {}
+        parse_errors: list[str] = []
+        product = str(item.get("symbol") or "UNKNOWN")
+        raw_side = item.get("side")
+        taker_side = raw_side if raw_side in ("buy", "sell") else None
+        if raw_side is not None and taker_side is None:
+            parse_errors.append("invalid_side")
+        price = _optional_float(item.get("price"), "price", parse_errors)
+        size = _optional_float(item.get("qty"), "size", parse_errors)
+        trade_id = _optional_int(item.get("trade_id"), "trade_id", parse_errors)
+        trade_time = _parse_iso_timestamp(item.get("timestamp"), parse_errors)
+        instrument = resolve_spot_instrument(
+            _strip_symbol_separators(product), venue=raw.source
+        )
+
+        metadata: dict[str, Any] = {
+            "instrument_id": instrument.instrument_id if instrument is not None else None,
+            "canonical_symbol": instrument.canonical_symbol if instrument is not None else None,
+            "buyer_is_maker": (taker_side == "sell") if taker_side is not None else None,
+            "ord_type": item.get("ord_type") if item.get("ord_type") in ("limit", "market") else None,
+        }
+        if parse_errors:
+            metadata["parse_errors"] = parse_errors
+
+        return NormalizedL3Event(
+            source=raw.source,
+            product=product,
+            channel="trades",
+            event_type="trade",
+            exchange_time=trade_time,
+            received_at=raw.received_at,
+            side=taker_side,
+            price=price,
+            size=size,
+            trade_id=str(trade_id) if trade_id is not None else None,
+            # Dense per-pair counter → sequence-gap detection works (STANDARDS §4.2).
+            sequence=trade_id,
+            raw_type="trade",
+            metadata={key: value for key, value in metadata.items() if value is not None},
+        )
+
+
+def _bybit_taker_side(value: Any, errors: list[str]) -> str | None:
+    # Bybit `S` is the taker (aggressor) side, capitalized.
+    if value == "Buy":
+        return "buy"
+    if value == "Sell":
+        return "sell"
+    if value in (None, ""):
+        return None
+    errors.append("invalid_side")
+    return None
+
+
 def _split_l2_changes(
     values: Any,
     errors: list[str],

@@ -19,17 +19,20 @@ Two normalized datasets, each collected per (venue, instrument) lane:
 | Dataset  | Channel  | Normalizer(s)                                  | Curated target            |
 | -------- | -------- | ---------------------------------------------- | ------------------------- |
 | `depth`  | order book diffs | `BinanceDepthNormalizer`, `CoinbaseDepthNormalizer` | `market_replayable`  |
-| `trades` | trade prints     | `BinanceTradeNormalizer`, `CoinbaseTradeNormalizer` | `trades_replayable` |
+| `trades` | trade prints     | `BinanceTradeNormalizer`, `CoinbaseTradeNormalizer`, `KrakenTradeNormalizer`, `BybitTradeNormalizer` | `trades_replayable` |
 
-Venues live today: **Binance** (depth + trades), **Coinbase** (trades + depth).
-See Roadmap for the rest.
+Venues live today: **Binance** (depth + trades), **Coinbase** (trades + depth),
+**Kraken** (trades), **Bybit** (trades). See Roadmap for the rest.
 
-> **Gap-detection class differs by feed, not just by venue.** Binance depth/trades
-> and Coinbase trades are **sequence-bearing** (§4.1/§4.2 strong gaplessness).
-> Coinbase depth (`level2` / `level2_batch`) is **non-sequence** (`none_native`,
-> §4.3): the snapshot arrives in-stream and diffs carry no `U`/`u`, so `replayable`
-> there means *structurally clean*, **not** gap-proof. The per-lane `gap_detection`
-> tag in the manifest (§6) is how a consumer tells these apart.
+> **Gap-detection class differs by feed, not just by venue.** Binance depth/trades,
+> Coinbase trades, and **Kraken trades** are **sequence-bearing** (§4.1/§4.2 strong
+> gaplessness — Kraken v2 `trade_id` is a dense per-pair counter). Coinbase depth
+> (`level2` / `level2_batch`) and **Bybit spot trades** (`publicTrade`, whose trade
+> id is a UUID, not a dense counter) are **non-sequence** (`none_native`, §4.3):
+> `replayable` there means *structurally clean*, **not** gap-proof. The per-lane
+> `gap_detection` tag in the manifest (§6) is how a consumer tells these apart —
+> note that two `trades` lanes can have **different** classes (Kraken `sequence`
+> vs. Bybit `none_native`), so key off the tag, not the dataset name.
 
 ---
 
@@ -50,7 +53,8 @@ A collector "run" is one segment directory:
 
 `<source>` is the lane directory:
 
-- `binance_depth`, `binance_trades`, `coinbase_trades`, `coinbase_depth`
+- `binance_depth`, `binance_trades`, `coinbase_trades`, `coinbase_depth`,
+  `kraken_trades`, `bybit_trades`
 - Per-instrument lanes append a sanitized suffix: `binance_trades_ethusdt`, etc.
   (`--source-suffix`; empty preserves the legacy single-symbol layout).
 
@@ -156,8 +160,11 @@ Parquet rows.
 
 **Cross-venue `side` convention:** `side` is always the *aggressor* side. Binance
 gives `buyer_is_maker` (maker buy → taker sell). Coinbase gives the *maker* order
-side, so the normalizer flips it (maker sell → taker buy). The raw venue value is
-kept in `metadata` (`buyer_is_maker` / `maker_side`).
+side, so the normalizer flips it (maker sell → taker buy). Kraken (`side`) and
+Bybit (`S`, capitalized) already give the *taker* side, so no flip — just
+case-normalized. `buyer_is_maker` is derived for every venue (taker sold ⇒ buyer
+was maker) and the raw venue value is kept in `metadata`
+(`buyer_is_maker` / `maker_side`).
 
 ---
 
@@ -187,7 +194,7 @@ can be a legitimate venue artifact, and the gaplessness proof above is what the
 guarantee rests on. Consumers who require an uncrossed book at every tick should
 check `crossed_book_count` in `replay_summary.json` themselves.
 
-### 4.2 `trades` (sequence-bearing — Binance, Coinbase)
+### 4.2 `trades` (sequence-bearing — Binance, Coinbase, Kraken)
 
 `replayable` iff **all** hold:
 
@@ -198,13 +205,21 @@ check `crossed_book_count` in `replay_summary.json` themselves.
 - exchange→receipt clock skew within `--max-clock-skew-ms` (default 60 s)
 
 Findings: `non_monotonic_trade_ids`, `trade_id_gaps`, `invalid_prices`,
-`invalid_sizes`, `excessive_clock_skew`, `no_events`.
+`invalid_sizes`, `excessive_clock_skew`, `no_events`. Summary
+`gap_detection: "sequence"`, written by `replay_trades_run`.
 
-### 4.3 Gap policy for non-sequence depth feeds (`none_native`)
+Kraken v2 `trade` joins this class: its `trade_id` is documented as "a sequence
+number, unique per book" — a dense per-pair counter — so the same gap proof
+applies. (Kraken batches several trades per WS frame; the pipeline fans them out
+via `normalize_many`, but each event still carries its own dense `sequence`.)
 
-Some feeds carry **no per-message sequence number** (Coinbase `level2` /
-`level2_batch`; Kraken `book` v1). Gaplessness is **not provable** from these
-streams alone.
+### 4.3 Gap policy for non-sequence feeds (`none_native`)
+
+Some feeds carry **no usable dense sequence number** — either no per-message
+sequence at all (Coinbase `level2` / `level2_batch` depth; Kraken `book` v1) or
+only an opaque/UUID id that can't prove `delta == 1` (Bybit spot `publicTrade`,
+whose `i` is a UUID and `seq` is shared across batched messages). Gaplessness is
+**not provable** from these streams alone.
 
 Policy for any such adapter:
 
@@ -236,6 +251,34 @@ non-gating, as in §4.1) `crossed_book_states`. A reconnect mid-run yields a
 *second* in-stream snapshot, which trips `multiple_snapshot_anchors` and ends the
 run unreplayable — mirroring Binance depth's single-anchor invariant, so the
 worker's next segment simply starts a fresh book.
+
+**Live adapter — Bybit spot `trades` (`publicTrade`).** Bybit batches many trades
+per WS frame (`data: [...]`), fanned out via `normalize_many`. The per-trade id
+(`i`) is a **UUID**, and the only other ordering field (`seq`, the cross sequence)
+is shared across batched messages — neither supports `delta == 1` gap detection,
+so `sequence` is left `None` and the whole-run verdict (`replay_trades_stream_run`)
+sets `gap_detection: "none_native"` and `mode: "trade_stream_none_native"`.
+
+`replayable` iff **all** hold:
+
+- `event_count > 0`
+- exchange timestamps are monotonic non-decreasing (the only ordering signal)
+- `price` and `size` are finite and positive
+- exchange→receipt clock skew within `--max-clock-skew-ms` (default 60 s)
+
+There is **no** `trade_id` gap / monotonicity check. Findings: `no_events`,
+`non_monotonic_event_time`, `invalid_prices`, `invalid_sizes`,
+`excessive_clock_skew`. Promoted rows still land in `trades_replayable`, so a
+consumer that needs provable completeness MUST gate on the lane's
+`gap_detection == "sequence"` (Kraken/Binance/Coinbase trades), not just on the
+`trades` dataset.
+
+> **Bybit keepalive limitation.** Bybit drops idle public connections after
+> ~10 min and expects a `{"op":"ping"}` roughly every 20 s. The collector does not
+> send app-level pings today; an active trade stream stays alive on its own traffic
+> so bounded segments complete fine, but a **low-volume** symbol can have its
+> segment end early on a clean server close (the collector then reconnects / the
+> worker starts a fresh segment — no data loss, just shorter runs).
 
 ---
 
@@ -308,7 +351,10 @@ current contract:
 - `instrument=` partition column in the curated/normalized datasets (so
   per-instrument lanes of the same venue+dataset stop sharing Parquet
   partitions; the manifest already separates them via the promotion index).
-- More non-sequence depth adapters (Kraken `book` v1) under the §4.3 policy
-  (Coinbase `level2` is already live); sequence-bearing depth for Coinbase
-  Advanced Trade / Bybit / Kraken v2.
+- **Depth** for Kraken and Bybit (their trades lanes are already live): Bybit
+  `orderbook.{depth}` (snapshot/delta keyed on `u`, snapshot-anchored — a
+  middle-ground sequence) and Kraken v2 `book` (CRC32 checksum, no sequence — a
+  §4.3 `none_native` feed integrity-checked by the checksum).
+- App-level keepalive ping for Bybit (`{"op":"ping"}` ~20 s) so low-volume Bybit
+  lanes don't end segments early on the ~10 min idle drop (see §4.3).
 - Continuous day-bounded rotation as the default run model (vs. count-bounded).

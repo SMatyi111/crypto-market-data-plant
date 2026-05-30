@@ -866,6 +866,90 @@ def test_job_args_coinbase_depth_worker_threads_lane_flags() -> None:
     assert args.worker_name == "coinbase-depth-worker-ethusd"
 
 
+def test_job_args_kraken_trades_worker_defaults() -> None:
+    # The kraken-trades-worker job_type must build a usable namespace with Kraken v2
+    # defaults (slash pair, trade channel) so the ops-runner drives the dense
+    # sequence-bearing Kraken lane like the other workers.
+    args = _job_args(
+        JobSpec(
+            name="kraken-btc-trades",
+            job_type="kraken-trades-worker",
+            interval_seconds=3600,
+            args={},
+        )
+    )
+
+    assert args.symbol == "BTC/USD"
+    assert args.channel == "trade"
+    assert args.worker_name == "kraken-trades-worker"
+    assert args.source_suffix == ""
+    assert args.rotate_at_midnight is False
+    assert args.max_clock_skew_ms == 60_000.0
+
+
+def test_job_args_kraken_trades_worker_threads_lane_flags() -> None:
+    args = _job_args(
+        JobSpec(
+            name="kraken-eth-trades",
+            job_type="kraken-trades-worker",
+            interval_seconds=3600,
+            args={
+                "symbol": "ETH/USD",
+                "source_suffix": "ethusd",
+                "rotate_at_midnight": True,
+                "worker_name": "kraken-trades-worker-ethusd",
+            },
+        )
+    )
+
+    assert args.symbol == "ETH/USD"
+    assert args.source_suffix == "ethusd"
+    assert args.rotate_at_midnight is True
+    assert args.worker_name == "kraken-trades-worker-ethusd"
+
+
+def test_job_args_bybit_trades_worker_defaults() -> None:
+    # The bybit-trades-worker job_type must build a usable namespace with Bybit v5 spot
+    # defaults (no-separator symbol, publicTrade channel) so the ops-runner drives the
+    # none_native Bybit lane like the other workers.
+    args = _job_args(
+        JobSpec(
+            name="bybit-btc-trades",
+            job_type="bybit-trades-worker",
+            interval_seconds=3600,
+            args={},
+        )
+    )
+
+    assert args.symbol == "BTCUSDT"
+    assert args.channel == "publicTrade"
+    assert args.worker_name == "bybit-trades-worker"
+    assert args.source_suffix == ""
+    assert args.rotate_at_midnight is False
+    assert args.max_clock_skew_ms == 60_000.0
+
+
+def test_job_args_bybit_trades_worker_threads_lane_flags() -> None:
+    args = _job_args(
+        JobSpec(
+            name="bybit-eth-trades",
+            job_type="bybit-trades-worker",
+            interval_seconds=3600,
+            args={
+                "symbol": "ETHUSDT",
+                "source_suffix": "ethusdt",
+                "rotate_at_midnight": True,
+                "worker_name": "bybit-trades-worker-ethusdt",
+            },
+        )
+    )
+
+    assert args.symbol == "ETHUSDT"
+    assert args.source_suffix == "ethusdt"
+    assert args.rotate_at_midnight is True
+    assert args.worker_name == "bybit-trades-worker-ethusdt"
+
+
 def test_job_args_lane_flags_default_to_legacy_behavior() -> None:
     # Omitting the flags must preserve the legacy single-symbol layout: empty suffix,
     # rotation off. This is what keeps the live BTC collector unaffected.

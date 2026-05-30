@@ -8,6 +8,7 @@ from crypto_collector.replay import (
     replay_depth_run,
     replay_depth_stream_run,
     replay_trades_run,
+    replay_trades_stream_run,
 )
 
 
@@ -681,3 +682,172 @@ def test_replay_depth_stream_run_reports_crossed_book_without_blocking(tmp_path:
     assert summary.crossed_book_count >= 1
     assert "crossed_book_states" in summary.findings
     assert summary.replayable is True  # reported, not gating
+
+
+# --- Phase 2 #3c: non-sequence trades replay (Bybit spot, STANDARDS 4.3) ---
+
+
+def _stream_trade_row(
+    *,
+    price: float = 100.0,
+    size: float = 0.5,
+    side: str = "buy",
+    exchange_time: str = "2026-04-06T00:00:00+00:00",
+    received_at: str = "2026-04-06T00:00:00.100000+00:00",
+    trade_id: str = "uuid-aaaa",
+) -> dict:
+    """A Bybit-shaped none_native trade row: a UUID trade_id and NO dense `sequence`,
+    so the only ordering signal is the exchange timestamp."""
+    return {
+        "source": "bybit",
+        "product": "BTCUSDT",
+        "channel": "trades",
+        "event_type": "trade",
+        "exchange_time": exchange_time,
+        "received_at": received_at,
+        "side": side,
+        "price": price,
+        "size": size,
+        "trade_id": trade_id,
+        "sequence": None,
+        "raw_type": "trade",
+        "metadata": {"instrument_id": "spot:bybit:BTCUSDT"},
+    }
+
+
+def test_replay_trades_stream_run_marks_clean_stream_replayable_none_native(tmp_path: Path) -> None:
+    """A structurally clean none_native trade run is replayable, but the summary makes
+    clear gaplessness is NOT proven: gap_detection='none_native', no trade_id checks."""
+    run_path = tmp_path / "bybit_trades" / "20260406_000000"
+    _write_trades_run(
+        run_path,
+        [
+            _stream_trade_row(
+                trade_id=f"uuid-{i}",
+                price=100.0 + i * 0.01,
+                exchange_time=f"2026-04-06T00:00:0{i}+00:00",
+                received_at=f"2026-04-06T00:00:0{i}.100000+00:00",
+            )
+            for i in range(1, 6)
+        ],
+    )
+
+    summary = replay_trades_stream_run(run_path)
+
+    assert summary.replayable is True, summary
+    assert summary.findings == []
+    assert summary.event_count == 5
+    assert summary.gap_detection == "none_native"
+    assert summary.mode == "trade_stream_none_native"
+    # No dense counter, so trade-id fields are neutral.
+    assert summary.first_trade_id is None
+    assert summary.last_trade_id is None
+    assert summary.trade_id_gap_count == 0
+    # Summary file written + curation-chain compatible.
+    on_disk = json.loads(
+        (run_path / "metrics" / "replay_summary.json").read_text(encoding="utf-8")
+    )
+    assert on_disk["replay_type"] == "trades"
+    assert on_disk["gap_detection"] == "none_native"
+    assert on_disk["replayable"] is True
+
+
+def test_replay_trades_stream_run_does_not_flag_unordered_trade_ids(tmp_path: Path) -> None:
+    """The defining difference from replay_trades_run: out-of-order / duplicate UUID
+    trade ids are NOT a finding here, because there is no dense counter to gap-check.
+    Only the timestamp ordering matters."""
+    run_path = tmp_path / "bybit_trades" / "20260406_000001"
+    _write_trades_run(
+        run_path,
+        [
+            _stream_trade_row(trade_id="uuid-zzz", exchange_time="2026-04-06T00:00:01+00:00",
+                              received_at="2026-04-06T00:00:01.050000+00:00"),
+            _stream_trade_row(trade_id="uuid-aaa", exchange_time="2026-04-06T00:00:02+00:00",
+                              received_at="2026-04-06T00:00:02.050000+00:00"),
+        ],
+    )
+
+    summary = replay_trades_stream_run(run_path)
+
+    assert summary.replayable is True, summary
+    assert summary.findings == []
+    assert summary.trade_id_gap_count == 0
+    assert summary.non_monotonic_count == 0
+
+
+def test_replay_trades_stream_run_flags_non_monotonic_event_time(tmp_path: Path) -> None:
+    """Timestamp going backwards is the one ordering violation a none_native trade
+    stream can detect, and it blocks replay."""
+    run_path = tmp_path / "bybit_trades" / "20260406_000002"
+    _write_trades_run(
+        run_path,
+        [
+            _stream_trade_row(exchange_time="2026-04-06T00:00:05+00:00",
+                              received_at="2026-04-06T00:00:05.050000+00:00"),
+            _stream_trade_row(exchange_time="2026-04-06T00:00:02+00:00",  # backwards
+                              received_at="2026-04-06T00:00:02.050000+00:00"),
+        ],
+    )
+
+    summary = replay_trades_stream_run(run_path)
+
+    assert summary.replayable is False
+    assert "non_monotonic_event_time" in summary.findings
+    assert summary.non_monotonic_count == 1
+
+
+def test_replay_trades_stream_run_flags_invalid_price_and_size(tmp_path: Path) -> None:
+    run_path = tmp_path / "bybit_trades" / "20260406_000003"
+    _write_trades_run(
+        run_path,
+        [
+            _stream_trade_row(price=100.0, size=1.0,
+                              exchange_time="2026-04-06T00:00:01+00:00",
+                              received_at="2026-04-06T00:00:01.050000+00:00"),
+            _stream_trade_row(price=0.0, size=1.0,  # zero price
+                              exchange_time="2026-04-06T00:00:02+00:00",
+                              received_at="2026-04-06T00:00:02.050000+00:00"),
+            _stream_trade_row(price=100.0, size=-0.5,  # negative size
+                              exchange_time="2026-04-06T00:00:03+00:00",
+                              received_at="2026-04-06T00:00:03.050000+00:00"),
+        ],
+    )
+
+    summary = replay_trades_stream_run(run_path)
+
+    assert summary.replayable is False
+    assert "invalid_prices" in summary.findings
+    assert "invalid_sizes" in summary.findings
+    assert summary.invalid_price_count == 1
+    assert summary.invalid_size_count == 1
+
+
+def test_replay_trades_stream_run_flags_excessive_clock_skew(tmp_path: Path) -> None:
+    run_path = tmp_path / "bybit_trades" / "20260406_000004"
+    _write_trades_run(
+        run_path,
+        [
+            _stream_trade_row(
+                exchange_time="2026-04-06T00:00:00+00:00",
+                received_at="2026-04-06T00:02:00+00:00",  # 120s skew > 60s default
+            ),
+        ],
+    )
+
+    summary = replay_trades_stream_run(run_path, max_clock_skew_ms=60_000.0)
+
+    assert summary.replayable is False
+    assert "excessive_clock_skew" in summary.findings
+    assert summary.excessive_clock_skew_count == 1
+
+
+def test_replay_trades_stream_run_with_no_events_is_unreplayable(tmp_path: Path) -> None:
+    run_path = tmp_path / "bybit_trades" / "20260406_000005"
+    _write_trades_run(run_path, [])
+
+    summary = replay_trades_stream_run(run_path)
+
+    assert summary.replayable is False
+    assert summary.event_count == 0
+    assert "no_events" in summary.findings
+    assert summary.gap_detection == "none_native"

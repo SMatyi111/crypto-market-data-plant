@@ -15,13 +15,17 @@ from crypto_collector.cli import (
     _reopen_binance_depth_connection,
     build_parser,
     collect_binance_depth_segment,
+    collect_bybit_trades_segment,
     collect_coinbase_depth_segment,
     collect_coinbase_trades_segment,
+    collect_kraken_trades_segment,
     _is_retryable_connect_error,
 )
 from crypto_collector.market_normalizers import (
+    BybitTradeNormalizer,
     CoinbaseDepthNormalizer,
     CoinbaseTradeNormalizer,
+    KrakenTradeNormalizer,
 )
 from crypto_collector.collectors.generic_ws import (
     GenericWebsocketCollector,
@@ -953,3 +957,406 @@ def test_collect_coinbase_depth_segment_writes_clean_events_and_replay_summary(
     )
     assert summary["gap_detection"] == "none_native"
     assert summary["replayable"] is True
+
+
+# --- Phase 2 #3c: Bybit trades adapter ------------------------------------
+
+
+def _bybit_publictrade_frame(
+    *,
+    trades: list[dict],
+    symbol: str = "BTCUSDT",
+    msg_type: str = "snapshot",
+    ts_ms: int | None = None,
+) -> dict:
+    """Build a Bybit v5 spot publicTrade frame. One frame batches many trades in
+    `data`, and each trade carries `S` (taker side, capitalized), `i` (UUID trade id),
+    and `seq` (cross sequence shared across the batch) — none of which is a dense
+    per-product counter, hence none_native."""
+    return {
+        "topic": f"publicTrade.{symbol}",
+        "type": msg_type,
+        "ts": ts_ms if ts_ms is not None else 0,
+        "data": trades,
+    }
+
+
+def _bybit_trade(
+    *,
+    trade_id: str,
+    price: str,
+    size: str,
+    taker_side: str,
+    time_ms: int,
+    symbol: str = "BTCUSDT",
+    seq: int | None = None,
+) -> dict:
+    trade = {
+        "T": time_ms,
+        "s": symbol,
+        "S": taker_side,
+        "v": size,
+        "p": price,
+        "i": trade_id,
+    }
+    if seq is not None:
+        trade["seq"] = seq
+    return trade
+
+
+def test_bybit_trade_normalizer_uses_taker_side_directly_and_no_sequence() -> None:
+    """Bybit `S` is the taker (aggressor) side already (capitalized), so no flip like
+    Coinbase. The UUID trade id must NOT become a dense `sequence` (gaplessness is
+    unprovable), and buyer_is_maker is derived (taker sold -> buyer was maker)."""
+    raw = RawMessage(
+        source="bybit",
+        received_at=datetime(2026, 5, 28, 12, 0, 0, tzinfo=UTC),
+        payload=_bybit_publictrade_frame(
+            trades=[
+                _bybit_trade(
+                    trade_id="2290000000054b3f0a",
+                    price="50000.5",
+                    size="0.25",
+                    taker_side="Sell",
+                    time_ms=1_780_000_000_000,
+                    seq=99,
+                )
+            ]
+        ),
+    )
+
+    events = BybitTradeNormalizer().normalize_many(raw)
+
+    assert len(events) == 1
+    event = events[0]
+    assert event.side == "sell"  # taker side used directly (no flip)
+    assert event.metadata["buyer_is_maker"] is True  # taker sold -> buyer was maker
+    assert event.price == 50000.5
+    assert event.size == 0.25
+    assert event.channel == "trades"
+    # UUID trade id preserved as a string, but sequence stays None (none_native).
+    assert event.trade_id == "2290000000054b3f0a"
+    assert event.sequence is None
+    # cross sequence kept for forensics only.
+    assert event.metadata["bybit_cross_sequence"] == 99
+
+
+def test_bybit_trade_normalizer_fans_out_batched_data() -> None:
+    """One frame's `data` array fans out to one event per trade via normalize_many."""
+    raw = RawMessage(
+        source="bybit",
+        received_at=utc_now(),
+        payload=_bybit_publictrade_frame(
+            trades=[
+                _bybit_trade(trade_id="a1", price="100.0", size="1.0", taker_side="Buy", time_ms=1_780_000_000_000),
+                _bybit_trade(trade_id="a2", price="101.0", size="2.0", taker_side="Sell", time_ms=1_780_000_000_001),
+                _bybit_trade(trade_id="a3", price="102.0", size="3.0", taker_side="Buy", time_ms=1_780_000_000_002),
+            ]
+        ),
+    )
+
+    events = BybitTradeNormalizer().normalize_many(raw)
+
+    assert [e.trade_id for e in events] == ["a1", "a2", "a3"]
+    assert [e.side for e in events] == ["buy", "sell", "buy"]
+    assert all(e.sequence is None for e in events)
+
+
+def test_bybit_trade_normalizer_resolves_instrument_and_flags_invalid_side() -> None:
+    raw = RawMessage(
+        source="bybit",
+        received_at=utc_now(),
+        payload=_bybit_publictrade_frame(
+            trades=[
+                _bybit_trade(
+                    trade_id="a1",
+                    price="50000",
+                    size="0.1",
+                    taker_side="sideways",  # not Buy/Sell
+                    time_ms=1_780_000_000_000,
+                )
+            ]
+        ),
+    )
+
+    event = BybitTradeNormalizer().normalize_many(raw)[0]
+
+    assert event.product == "BTCUSDT"
+    assert event.metadata["instrument_id"] == "spot:bybit:BTCUSDT"
+    assert event.metadata["canonical_symbol"] == "BTC/USDT"
+    assert event.side is None
+    assert "invalid_side" in event.metadata["parse_errors"]
+
+
+def test_bybit_trade_normalizer_empty_data_yields_nothing() -> None:
+    raw = RawMessage(
+        source="bybit",
+        received_at=utc_now(),
+        payload=_bybit_publictrade_frame(trades=[]),
+    )
+    assert BybitTradeNormalizer().normalize_many(raw) == []
+
+
+def test_cli_parser_bybit_trades_worker_defaults() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["bybit-trades-worker"])
+    assert args.symbol == "BTCUSDT"
+    assert args.channel == "publicTrade"
+    assert args.source_suffix == ""
+    assert args.rotate_at_midnight is False
+
+    suffixed = parser.parse_args(
+        ["bybit-trades-worker", "--symbol", "ETHUSDT", "--source-suffix", "ethusdt"]
+    )
+    assert suffixed.symbol == "ETHUSDT"
+    assert suffixed.source_suffix == "ethusdt"
+
+
+def test_collect_bybit_trades_segment_writes_none_native_replay_summary(
+    tmp_path, monkeypatch
+) -> None:
+    """End-to-end: a Bybit publicTrade stream (batched data arrays) lands in
+    bybit_trades/<ts>/ as clean events and gets a none_native trades replay summary
+    (gap_detection='none_native'), so the existing quarantine/promote chain can curate
+    it without claiming gaplessness it can't prove."""
+    now = utc_now()
+    t_ms = int(now.timestamp() * 1000)
+    ws = _ScriptedDepthWebsocket(
+        frames=[
+            {"success": True, "ret_msg": "subscribe", "op": "subscribe", "conn_id": "x"},  # ack
+            _bybit_publictrade_frame(
+                trades=[
+                    _bybit_trade(trade_id="a1", price="50000.0", size="0.1", taker_side="Buy", time_ms=t_ms),
+                    _bybit_trade(trade_id="a2", price="50001.0", size="0.2", taker_side="Sell", time_ms=t_ms),
+                ],
+            ),
+            _bybit_publictrade_frame(
+                trades=[
+                    _bybit_trade(trade_id="a3", price="50002.0", size="0.3", taker_side="Buy", time_ms=t_ms),
+                ],
+                msg_type="delta",
+            ),
+        ]
+    )
+    _install_fake_trades_runtime(monkeypatch, ws)
+
+    args = SimpleNamespace(
+        symbol="BTCUSDT",
+        channel="publicTrade",
+        count=2,  # frames, not events; 2 frames fan out to 3 trades
+        output_root=tmp_path,
+        max_delay_ms=60_000,
+        max_future_skew_ms=5_000,
+        max_clock_skew_ms=60_000.0,
+        source_suffix="",
+        deadline_utc=None,
+    )
+
+    result = asyncio.run(collect_bybit_trades_segment(args))
+
+    assert result["raw_messages"] == 2, result  # 2 frames
+    assert result["clean_events"] == 3, result  # fanned out to 3 trades
+    assert result["quarantined_events"] == 0
+    assert result["replayable"] is True, result["replay_findings"]
+
+    run_path = Path(result["run_path"])
+    assert run_path.parent.name == "bybit_trades"
+    events = (run_path / "clean" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(events) == 3
+    first = json.loads(events[0])
+    assert first["source"] == "bybit"
+    assert first["side"] == "buy"
+    assert first["sequence"] is None  # none_native — no dense counter
+    summary = json.loads(
+        (run_path / "metrics" / "replay_summary.json").read_text(encoding="utf-8")
+    )
+    assert summary["gap_detection"] == "none_native"
+    assert summary["mode"] == "trade_stream_none_native"
+    assert summary["replayable"] is True
+
+
+# --- Phase 2 #3c: Kraken trades adapter -----------------------------------
+
+
+def _kraken_trade_frame(
+    *,
+    trades: list[dict],
+    msg_type: str = "update",
+) -> dict:
+    """Build a Kraken v2 trade frame. One frame batches several trades in `data`; each
+    carries `side` (taker side, lowercase) and `trade_id` (a dense per-pair counter,
+    so gap detection works -- this is a sequence-bearing feed unlike Bybit)."""
+    return {
+        "channel": "trade",
+        "type": msg_type,
+        "data": trades,
+    }
+
+
+def _kraken_trade(
+    *,
+    trade_id: int,
+    price: float,
+    qty: float,
+    side: str,
+    timestamp_iso: str,
+    symbol: str = "BTC/USD",
+    ord_type: str = "market",
+) -> dict:
+    return {
+        "symbol": symbol,
+        "side": side,
+        "price": price,
+        "qty": qty,
+        "ord_type": ord_type,
+        "trade_id": trade_id,
+        "timestamp": timestamp_iso,
+    }
+
+
+def test_kraken_trade_normalizer_uses_dense_trade_id_as_sequence() -> None:
+    """Kraken v2 `trade_id` is documented as a per-pair sequence number, so unlike
+    Bybit it DOES populate `sequence` (gap detection applies). `side` is the taker side
+    directly (lowercase), so no flip; buyer_is_maker is derived."""
+    raw = RawMessage(
+        source="kraken",
+        received_at=datetime(2026, 5, 28, 12, 0, 0, tzinfo=UTC),
+        payload=_kraken_trade_frame(
+            trades=[
+                _kraken_trade(
+                    trade_id=1001,
+                    price=50000.5,
+                    qty=0.25,
+                    side="sell",
+                    timestamp_iso="2026-05-28T12:00:00.000000Z",
+                )
+            ]
+        ),
+    )
+
+    events = KrakenTradeNormalizer().normalize_many(raw)
+
+    assert len(events) == 1
+    event = events[0]
+    assert event.side == "sell"  # taker side used directly
+    assert event.metadata["buyer_is_maker"] is True  # taker sold -> buyer was maker
+    assert event.price == 50000.5
+    assert event.size == 0.25
+    assert event.channel == "trades"
+    # Dense per-pair trade_id -> both trade_id string and sequence int.
+    assert event.trade_id == "1001"
+    assert event.sequence == 1001
+    assert event.metadata["ord_type"] == "market"
+    assert event.exchange_time == datetime(2026, 5, 28, 12, 0, 0, tzinfo=UTC)
+
+
+def test_kraken_trade_normalizer_fans_out_and_resolves_instrument() -> None:
+    raw = RawMessage(
+        source="kraken",
+        received_at=utc_now(),
+        payload=_kraken_trade_frame(
+            trades=[
+                _kraken_trade(trade_id=1, price=100.0, qty=1.0, side="buy", timestamp_iso="2026-05-28T12:00:00Z"),
+                _kraken_trade(trade_id=2, price=101.0, qty=2.0, side="sell", timestamp_iso="2026-05-28T12:00:01Z"),
+            ]
+        ),
+    )
+
+    events = KrakenTradeNormalizer().normalize_many(raw)
+
+    assert [e.sequence for e in events] == [1, 2]
+    assert [e.side for e in events] == ["buy", "sell"]
+    # Slashed Kraken pair is collapsed before resolving so the instrument isn't None.
+    assert events[0].product == "BTC/USD"
+    assert events[0].metadata["instrument_id"] == "spot:kraken:BTCUSD"
+    assert events[0].metadata["canonical_symbol"] == "BTC/USD"
+
+
+def test_kraken_trade_normalizer_empty_data_yields_nothing() -> None:
+    raw = RawMessage(
+        source="kraken",
+        received_at=utc_now(),
+        payload=_kraken_trade_frame(trades=[]),
+    )
+    assert KrakenTradeNormalizer().normalize_many(raw) == []
+
+
+def test_cli_parser_kraken_trades_worker_defaults() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["kraken-trades-worker"])
+    assert args.symbol == "BTC/USD"
+    assert args.channel == "trade"
+    assert args.source_suffix == ""
+    assert args.rotate_at_midnight is False
+
+    suffixed = parser.parse_args(
+        ["kraken-trades-worker", "--symbol", "ETH/USD", "--source-suffix", "ethusd"]
+    )
+    assert suffixed.symbol == "ETH/USD"
+    assert suffixed.source_suffix == "ethusd"
+
+
+def test_collect_kraken_trades_segment_writes_sequence_replay_summary(
+    tmp_path, monkeypatch
+) -> None:
+    """End-to-end: a Kraken v2 trade stream (snapshot + update frames, batched data)
+    lands in kraken_trades/<ts>/ as clean events and gets a sequence-bearing trades
+    replay summary (gap_detection='sequence'), because Kraken's dense per-pair trade_id
+    makes gaplessness provable."""
+    now = utc_now()
+    t1 = now.isoformat().replace("+00:00", "Z")
+    t2 = (now + timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
+    ws = _ScriptedDepthWebsocket(
+        frames=[
+            {"method": "subscribe", "success": True, "result": {"channel": "trade", "symbol": "BTC/USD"}},  # ack
+            _kraken_trade_frame(
+                trades=[
+                    _kraken_trade(trade_id=1001, price=50000.0, qty=0.1, side="buy", timestamp_iso=t1),
+                    _kraken_trade(trade_id=1002, price=50001.0, qty=0.2, side="sell", timestamp_iso=t1),
+                ],
+                msg_type="snapshot",
+            ),
+            _kraken_trade_frame(
+                trades=[
+                    _kraken_trade(trade_id=1003, price=50002.0, qty=0.3, side="buy", timestamp_iso=t2),
+                ],
+                msg_type="update",
+            ),
+        ]
+    )
+    _install_fake_trades_runtime(monkeypatch, ws)
+
+    args = SimpleNamespace(
+        symbol="BTC/USD",
+        channel="trade",
+        count=2,  # frames; fan out to 3 trades
+        output_root=tmp_path,
+        max_delay_ms=60_000,
+        max_future_skew_ms=5_000,
+        max_clock_skew_ms=60_000.0,
+        source_suffix="",
+        deadline_utc=None,
+    )
+
+    result = asyncio.run(collect_kraken_trades_segment(args))
+
+    assert result["raw_messages"] == 2, result
+    assert result["clean_events"] == 3, result
+    assert result["quarantined_events"] == 0
+    assert result["replayable"] is True, result["replay_findings"]
+
+    run_path = Path(result["run_path"])
+    assert run_path.parent.name == "kraken_trades"
+    events = (run_path / "clean" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(events) == 3
+    first = json.loads(events[0])
+    assert first["source"] == "kraken"
+    assert first["side"] == "buy"
+    assert first["sequence"] == 1001  # dense per-pair counter
+    summary = json.loads(
+        (run_path / "metrics" / "replay_summary.json").read_text(encoding="utf-8")
+    )
+    assert summary["gap_detection"] == "sequence"
+    assert summary["mode"] == "trade_stream"
+    assert summary["replayable"] is True
+    assert summary["last_trade_id"] == 1003

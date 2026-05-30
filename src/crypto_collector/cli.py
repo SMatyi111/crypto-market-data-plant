@@ -30,8 +30,10 @@ from .config import (
 from .market_normalizers import (
     BinanceDepthNormalizer,
     BinanceTradeNormalizer,
+    BybitTradeNormalizer,
     CoinbaseDepthNormalizer,
     CoinbaseTradeNormalizer,
+    KrakenTradeNormalizer,
 )
 from .market_snapshots import fetch_binance_order_book_snapshot, write_snapshot_file
 from .models import RawMessage, utc_now
@@ -58,6 +60,7 @@ from .replay import (
     replay_depth_run,
     replay_depth_stream_run,
     replay_trades_run,
+    replay_trades_stream_run,
 )
 from .research_manifest import DEFAULT_MANIFEST_ROOT, generate_research_manifest
 from .storage import JsonlSink, ParquetDatasetSink, prepare_run_paths
@@ -208,6 +211,85 @@ def build_parser() -> argparse.ArgumentParser:
         "coinbase_depth/.",
     )
     cb_depth_parser.add_argument(
+        "--rotate-at-midnight",
+        action="store_true",
+        help="Rotate the run directory at midnight UTC instead of at --segment-count "
+        "messages. See the depth worker's help text for the same flag.",
+    )
+
+    kraken_trades_parser = subparsers.add_parser(
+        "kraken-trades-worker", help="Run segmented Kraken v2 trade collection"
+    )
+    kraken_trades_parser.add_argument(
+        "--symbol",
+        default="BTC/USD",
+        help="Kraken v2 pair, e.g. BTC/USD / ETH/USD (slash-separated).",
+    )
+    kraken_trades_parser.add_argument(
+        "--channel",
+        default="trade",
+        help="Kraken v2 channel. 'trade' is the public trade feed. Kraken's "
+        "per-pair trade_id is a dense counter, so this is curated as a "
+        "gap-proof sequence-bearing feed (STANDARDS 4.2).",
+    )
+    kraken_trades_parser.add_argument("--segment-count", type=int, default=5000)
+    kraken_trades_parser.add_argument("--max-segments", type=int)
+    kraken_trades_parser.add_argument("--cooldown-seconds", type=float, default=1.0)
+    kraken_trades_parser.add_argument("--output-root", type=Path, default=default_output_root())
+    kraken_trades_parser.add_argument("--ops-root", type=Path, default=default_ops_root())
+    kraken_trades_parser.add_argument("--worker-name", default="kraken-trades-worker")
+    kraken_trades_parser.add_argument("--heartbeat-interval-seconds", type=float, default=30.0)
+    kraken_trades_parser.add_argument("--max-delay-ms", type=int, default=60_000)
+    kraken_trades_parser.add_argument("--max-future-skew-ms", type=int, default=5_000)
+    kraken_trades_parser.add_argument("--max-clock-skew-ms", type=float, default=60_000.0)
+    kraken_trades_parser.add_argument(
+        "--source-suffix",
+        default="",
+        help="Optional per-instrument lane suffix. When non-empty, runs go to "
+        "<output_root>/kraken_trades_<suffix>/<timestamp>/ instead of "
+        "kraken_trades/.",
+    )
+    kraken_trades_parser.add_argument(
+        "--rotate-at-midnight",
+        action="store_true",
+        help="Rotate the run directory at midnight UTC instead of at --segment-count "
+        "messages. See the depth worker's help text for the same flag.",
+    )
+
+    bybit_trades_parser = subparsers.add_parser(
+        "bybit-trades-worker", help="Run segmented Bybit v5 spot trade collection (non-sequence feed)"
+    )
+    bybit_trades_parser.add_argument(
+        "--symbol",
+        default="BTCUSDT",
+        help="Bybit v5 spot symbol, e.g. BTCUSDT / ETHUSDT (no separator).",
+    )
+    bybit_trades_parser.add_argument(
+        "--channel",
+        default="publicTrade",
+        help="Bybit v5 channel. 'publicTrade' is the public trade feed. Bybit's "
+        "trade id is a UUID (not a dense counter), so gaplessness is unprovable: "
+        "this is curated as a non-sequence ('none_native') feed -- structurally "
+        "clean only, NOT gap-proof (STANDARDS 4.3).",
+    )
+    bybit_trades_parser.add_argument("--segment-count", type=int, default=5000)
+    bybit_trades_parser.add_argument("--max-segments", type=int)
+    bybit_trades_parser.add_argument("--cooldown-seconds", type=float, default=1.0)
+    bybit_trades_parser.add_argument("--output-root", type=Path, default=default_output_root())
+    bybit_trades_parser.add_argument("--ops-root", type=Path, default=default_ops_root())
+    bybit_trades_parser.add_argument("--worker-name", default="bybit-trades-worker")
+    bybit_trades_parser.add_argument("--heartbeat-interval-seconds", type=float, default=30.0)
+    bybit_trades_parser.add_argument("--max-delay-ms", type=int, default=60_000)
+    bybit_trades_parser.add_argument("--max-future-skew-ms", type=int, default=5_000)
+    bybit_trades_parser.add_argument("--max-clock-skew-ms", type=float, default=60_000.0)
+    bybit_trades_parser.add_argument(
+        "--source-suffix",
+        default="",
+        help="Optional per-instrument lane suffix. When non-empty, runs go to "
+        "<output_root>/bybit_trades_<suffix>/<timestamp>/ instead of "
+        "bybit_trades/.",
+    )
+    bybit_trades_parser.add_argument(
         "--rotate-at-midnight",
         action="store_true",
         help="Rotate the run directory at midnight UTC instead of at --segment-count "
@@ -643,6 +725,34 @@ async def collect_coinbase_trades_segment(args: argparse.Namespace) -> dict[str,
     )
 
 
+async def collect_kraken_trades_segment(args: argparse.Namespace) -> dict[str, object]:
+    # Kraken v2 `trade_id` is a dense per-pair counter, so the standard
+    # sequence-bearing trades replay (gap-proof, STANDARDS §4.2) applies.
+    return await _collect_trades_segment(
+        args,
+        source="kraken",
+        websocket_url="wss://ws.kraken.com/v2",
+        subscription_style="kraken_v2",
+        normalizer=KrakenTradeNormalizer(),
+        source_base="kraken_trades",
+    )
+
+
+async def collect_bybit_trades_segment(args: argparse.Namespace) -> dict[str, object]:
+    # Bybit spot trade id is a UUID (not a dense counter), so gaplessness is
+    # unprovable: curate as a non-sequence ("none_native") feed — structurally clean
+    # only, NOT gap-proof (STANDARDS §4.3).
+    return await _collect_trades_segment(
+        args,
+        source="bybit",
+        websocket_url="wss://stream.bybit.com/v5/public/spot",
+        subscription_style="bybit",
+        normalizer=BybitTradeNormalizer(),
+        source_base="bybit_trades",
+        replay_fn=replay_trades_stream_run,
+    )
+
+
 async def _collect_trades_segment(
     args: argparse.Namespace,
     *,
@@ -651,12 +761,16 @@ async def _collect_trades_segment(
     subscription_style: str,
     normalizer: object,
     source_base: str,
+    replay_fn=replay_trades_run,
 ) -> dict[str, object]:
     """Venue-agnostic trades segment. The trades pipeline (generic WS collector +
     normalizer + quality gate + trades replay) is identical across venues; only the
-    endpoint, subscription style, normalizer and source-directory base differ, so each
-    venue is a thin wrapper that supplies those four. Keeping one body means the
-    curation contract (`metrics/replay_summary.json`) stays consistent venue-to-venue."""
+    endpoint, subscription style, normalizer, source-directory base and replay function
+    differ, so each venue is a thin wrapper that supplies those. Keeping one body means
+    the curation contract (`metrics/replay_summary.json`) stays consistent
+    venue-to-venue. `replay_fn` is `replay_trades_run` for dense sequence-bearing feeds
+    (Binance/Coinbase/Kraken) and `replay_trades_stream_run` for none_native feeds
+    (Bybit spot)."""
     config = CollectorConfig(
         source=source,
         output_root=args.output_root,
@@ -691,7 +805,7 @@ async def _collect_trades_segment(
     # same way it curates depth runs.
     events_path = run_paths.base / "clean" / "events.jsonl"
     if events_path.exists():
-        replay_summary = replay_trades_run(
+        replay_summary = replay_fn(
             run_paths.base,
             max_clock_skew_ms=float(getattr(args, "max_clock_skew_ms", 60_000.0)),
             write_summary=True,
@@ -898,6 +1012,58 @@ def run_coinbase_depth_worker(args: argparse.Namespace) -> None:
     )
 
 
+def run_kraken_trades_worker(args: argparse.Namespace) -> None:
+    _run_segmented_worker(
+        args=args,
+        default_worker_name="kraken-trades-worker",
+        worker_type="kraken-trades-worker",
+        venue="kraken",
+        build_segment_args=lambda source_args: SimpleNamespace(
+            symbol=source_args.symbol,
+            channel=source_args.channel,
+            count=source_args.segment_count,
+            output_root=source_args.output_root,
+            max_delay_ms=source_args.max_delay_ms,
+            max_future_skew_ms=getattr(source_args, "max_future_skew_ms", 5_000),
+            max_clock_skew_ms=getattr(source_args, "max_clock_skew_ms", 60_000.0),
+            source_suffix=getattr(source_args, "source_suffix", ""),
+            deadline_utc=None,  # _run_segmented_worker overrides this when rotate_at_midnight is set
+        ),
+        collect_segment=collect_kraken_trades_segment,
+        progress_message=lambda segment_index, summary: (
+            "kraken trades segment finished: "
+            f"segment={segment_index} clean_events={summary['clean_events']} "
+            f"replayable={summary.get('replayable')} run_path={summary['run_path']}"
+        ),
+    )
+
+
+def run_bybit_trades_worker(args: argparse.Namespace) -> None:
+    _run_segmented_worker(
+        args=args,
+        default_worker_name="bybit-trades-worker",
+        worker_type="bybit-trades-worker",
+        venue="bybit",
+        build_segment_args=lambda source_args: SimpleNamespace(
+            symbol=source_args.symbol,
+            channel=source_args.channel,
+            count=source_args.segment_count,
+            output_root=source_args.output_root,
+            max_delay_ms=source_args.max_delay_ms,
+            max_future_skew_ms=getattr(source_args, "max_future_skew_ms", 5_000),
+            max_clock_skew_ms=getattr(source_args, "max_clock_skew_ms", 60_000.0),
+            source_suffix=getattr(source_args, "source_suffix", ""),
+            deadline_utc=None,  # _run_segmented_worker overrides this when rotate_at_midnight is set
+        ),
+        collect_segment=collect_bybit_trades_segment,
+        progress_message=lambda segment_index, summary: (
+            "bybit trades segment finished: "
+            f"segment={segment_index} clean_events={summary['clean_events']} "
+            f"replayable={summary.get('replayable')} run_path={summary['run_path']}"
+        ),
+    )
+
+
 def _run_segmented_worker(
     *,
     args: argparse.Namespace,
@@ -1012,6 +1178,12 @@ def _execute_ops_job(job: JobSpec) -> JobExecutionResult | str | None:
     if job.job_type == "coinbase-depth-worker":
         run_coinbase_depth_worker(args)
         return "coinbase depth worker completed"
+    if job.job_type == "kraken-trades-worker":
+        run_kraken_trades_worker(args)
+        return "kraken trades worker completed"
+    if job.job_type == "bybit-trades-worker":
+        run_bybit_trades_worker(args)
+        return "bybit trades worker completed"
     if job.job_type == "book-sync-health":
         run_book_sync_health(args)
         return "book sync health completed"
@@ -1109,6 +1281,40 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             ops_root=Path(raw_args.get("ops_root", default_ops_root())),
             worker_name=raw_args.get("worker_name", "coinbase-depth-worker"),
             heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
+            source_suffix=raw_args.get("source_suffix", ""),
+            rotate_at_midnight=raw_args.get("rotate_at_midnight", False),
+        )
+    if job.job_type == "kraken-trades-worker":
+        return SimpleNamespace(
+            symbol=raw_args.get("symbol", "BTC/USD"),
+            channel=raw_args.get("channel", "trade"),
+            segment_count=raw_args.get("segment_count", 5000),
+            max_segments=raw_args.get("max_segments"),
+            cooldown_seconds=raw_args.get("cooldown_seconds", 1.0),
+            output_root=raw_args.get("output_root", default_output_root()),
+            ops_root=Path(raw_args.get("ops_root", default_ops_root())),
+            worker_name=raw_args.get("worker_name", "kraken-trades-worker"),
+            heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
+            max_delay_ms=raw_args.get("max_delay_ms", 60_000),
+            max_future_skew_ms=raw_args.get("max_future_skew_ms", 5_000),
+            max_clock_skew_ms=raw_args.get("max_clock_skew_ms", 60_000.0),
+            source_suffix=raw_args.get("source_suffix", ""),
+            rotate_at_midnight=raw_args.get("rotate_at_midnight", False),
+        )
+    if job.job_type == "bybit-trades-worker":
+        return SimpleNamespace(
+            symbol=raw_args.get("symbol", "BTCUSDT"),
+            channel=raw_args.get("channel", "publicTrade"),
+            segment_count=raw_args.get("segment_count", 5000),
+            max_segments=raw_args.get("max_segments"),
+            cooldown_seconds=raw_args.get("cooldown_seconds", 1.0),
+            output_root=raw_args.get("output_root", default_output_root()),
+            ops_root=Path(raw_args.get("ops_root", default_ops_root())),
+            worker_name=raw_args.get("worker_name", "bybit-trades-worker"),
+            heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
+            max_delay_ms=raw_args.get("max_delay_ms", 60_000),
+            max_future_skew_ms=raw_args.get("max_future_skew_ms", 5_000),
+            max_clock_skew_ms=raw_args.get("max_clock_skew_ms", 60_000.0),
             source_suffix=raw_args.get("source_suffix", ""),
             rotate_at_midnight=raw_args.get("rotate_at_midnight", False),
         )
@@ -1559,6 +1765,10 @@ def main() -> None:
         run_coinbase_trades_worker(args)
     elif args.command == "coinbase-depth-worker":
         run_coinbase_depth_worker(args)
+    elif args.command == "kraken-trades-worker":
+        run_kraken_trades_worker(args)
+    elif args.command == "bybit-trades-worker":
+        run_bybit_trades_worker(args)
     elif args.command == "ops-runner":
         run_ops_runner(args)
     elif args.command == "health":

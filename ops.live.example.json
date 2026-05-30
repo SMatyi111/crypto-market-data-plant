@@ -152,6 +152,90 @@
       }
     },
     {
+      "// dense sequence trades lane": "Kraken v2 trade_id is a dense per-pair counter, so this lane is gap-proof exactly like Binance/Coinbase trades (STANDARDS 4.2): promoted rows go to trades_replayable and replayable means provably gapless. One WS frame batches several trades; the pipeline fans them out via normalize_many. Symbol is the slash pair (BTC/USD). Set source_suffix for a second pair.",
+      "name": "kraken-btc-trades",
+      "job_type": "kraken-trades-worker",
+      "enabled": false,
+      "interval_seconds": 3600,
+      "args": {
+        "symbol": "BTC/USD",
+        "channel": "trade",
+        "segment_count": 5000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "worker_name": "kraken-trades-worker",
+        "output_root": "D:\\market_archive\\raw\\market",
+        "ops_root": "D:\\market_archive\\ops"
+      }
+    },
+    {
+      "name": "quarantine-kraken-trades",
+      "job_type": "quarantine-runs",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "D:\\market_archive\\raw\\market\\kraken_trades",
+        "quarantine_root": "D:\\market_archive\\quarantine\\market\\kraken_trades",
+        "limit": 20,
+        "max_age_hours": 6
+      }
+    },
+    {
+      "name": "promote-kraken-trades",
+      "job_type": "promote-replayable",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "D:\\market_archive\\raw\\market\\kraken_trades",
+        "target_root": "D:\\market_archive\\curated\\research\\trades_replayable",
+        "quarantine_index": "D:\\market_archive\\quarantine\\market\\kraken_trades\\_quarantine_index.jsonl",
+        "limit": 20,
+        "max_age_hours": 6
+      }
+    },
+    {
+      "// non-sequence trades lane": "Bybit v5 spot publicTrade id is a UUID (not a dense counter), so this is a none_native feed (STANDARDS 4.3): 'replayable' means structurally clean (event_count>0, monotonic timestamps, valid price/size, bounded clock skew) — NOT gap-proof. Promoted rows still go to trades_replayable, but consumers must treat gap_detection=='none_native' trades as best-effort. One WS frame batches several trades; the pipeline fans them out via normalize_many. NOTE: Bybit drops idle connections after ~10min and wants a {op:ping} ~20s; active trade streams stay alive via continuous traffic, so bounded segments complete fine, but a low-volume symbol could see the segment end on a clean close + reconnect.",
+      "name": "bybit-btc-trades",
+      "job_type": "bybit-trades-worker",
+      "enabled": false,
+      "interval_seconds": 3600,
+      "args": {
+        "symbol": "BTCUSDT",
+        "channel": "publicTrade",
+        "segment_count": 5000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "worker_name": "bybit-trades-worker",
+        "output_root": "D:\\market_archive\\raw\\market",
+        "ops_root": "D:\\market_archive\\ops"
+      }
+    },
+    {
+      "name": "quarantine-bybit-trades",
+      "job_type": "quarantine-runs",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "D:\\market_archive\\raw\\market\\bybit_trades",
+        "quarantine_root": "D:\\market_archive\\quarantine\\market\\bybit_trades",
+        "limit": 20,
+        "max_age_hours": 6
+      }
+    },
+    {
+      "name": "promote-bybit-trades",
+      "job_type": "promote-replayable",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "D:\\market_archive\\raw\\market\\bybit_trades",
+        "target_root": "D:\\market_archive\\curated\\research\\trades_replayable",
+        "quarantine_index": "D:\\market_archive\\quarantine\\market\\bybit_trades\\_quarantine_index.jsonl",
+        "limit": 20,
+        "max_age_hours": 6
+      }
+    },
+    {
       "name": "book-sync-health",
       "job_type": "book-sync-health",
       "interval_seconds": 300,
@@ -226,7 +310,9 @@
           "market/binance_depth=14",
           "market/binance_trades=14",
           "market/coinbase_trades=14",
-          "market/coinbase_depth=14"
+          "market/coinbase_depth=14",
+          "market/kraken_trades=14",
+          "market/bybit_trades=14"
         ],
         "apply": false
       }
