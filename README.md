@@ -15,10 +15,33 @@ This repo is a data plant, not a trading bot. It runs public collectors, writes 
 
 ## Supported Production Feeds
 
+Enabled in the live deployment today:
+
 - Binance `BTCUSDT` public depth stream
 - Binance `BTCUSDT` public trade stream
 
-The mock feed exists only for local smoke tests.
+Additional venue adapters are **implemented and tested** but ship **disabled**
+(`enabled: false` in `ops.live.example.json`) so the live Binance collector is
+unaffected. Enable them per lane when you want them:
+
+| Venue    | Trades | Depth | Gap-detection class |
+| -------- | ------ | ----- | ------------------- |
+| Binance  | ✅ live | ✅ live | sequence (gap-proof) |
+| Coinbase | ✅      | ✅      | trades = sequence; depth = `none_native` |
+| Kraken   | ✅      | ✅      | trades = sequence; depth = `none_native` |
+| Bybit    | ✅      | ✅      | both = `none_native` |
+
+`none_native` lanes are curated as *structurally clean*, **not** gap-proof — see
+[`STANDARDS.md`](STANDARDS.md) §4.3. The mock feed exists only for local smoke
+tests.
+
+## Data Contract
+
+[`STANDARDS.md`](STANDARDS.md) is the canonical contract: datasets, on-disk
+layout, event schemas, the precise definition of "replayable" per feed class,
+the per-lane `gap_detection` tag, retention, and the consumer API (read curated,
+check the manifest, pin `schema_version`). Read it before building anything that
+consumes this data.
 
 ## Data Availability
 
@@ -54,27 +77,23 @@ Main outputs:
 D:\market_archive
   raw\
     market\
-      binance_depth\<run_id>\
-        raw\messages.jsonl
-        clean\events.jsonl
-        quarantine\events.jsonl
-        snapshots\book_snapshot.json
+      <lane>\<run_id>\                 # lane = <venue>_<dataset>[_<suffix>]
+        raw\messages.jsonl            # every WS frame, fsync per line, size-rotated
+        clean\events.jsonl            # normalized events that passed the live gate
+        quarantine\events.jsonl       # normalized events that failed, with reasons
+        snapshots\book_snapshot.json  # depth REST anchor (Binance depth only)
         metrics\summary.jsonl
-        metrics\replay_summary.json
-      binance_trades\<run_id>\
-        raw\messages.jsonl
-        clean\events.jsonl
-        quarantine\events.jsonl
-        metrics\summary.jsonl
-  normalized\
-    market\schema_version=v1\source=binance\event_date=YYYY-MM-DD\
-    trades\schema_version=v1\source=binance\event_date=YYYY-MM-DD\
+        metrics\replay_summary.json   # curation verdict (replayable + gap_detection)
+  normalized\                         # all runs, pre-curation Parquet
+    market\schema_version=v1\source=<src>\event_date=YYYY-MM-DD\   # depth
+    trades\schema_version=v1\source=<src>\event_date=YYYY-MM-DD\
   curated\
     research\
-      market_replayable\schema_version=v1\source=binance\event_date=YYYY-MM-DD\
+      market_replayable\schema_version=v1\source=<src>\event_date=YYYY-MM-DD\   # depth
+      trades_replayable\schema_version=v1\source=<src>\event_date=YYYY-MM-DD\
       manifests\
   quarantine\
-    market\binance_depth\
+    market\<lane>\
   ops\
     heartbeat.json
     heartbeat_history.jsonl
@@ -82,6 +101,16 @@ D:\market_archive
     runner.log
     worker_events.jsonl
 ```
+
+Raw/quarantine lane directories are `<venue>_<dataset>[_<suffix>]` —
+`binance_depth`, `binance_trades`, `coinbase_trades`, `coinbase_depth`,
+`kraken_trades`, `kraken_depth`, `bybit_trades`, `bybit_depth`, plus an optional
+per-instrument suffix (`binance_trades_ethusdt`). Depth lanes promote into
+`market_replayable`; trades lanes promote into `trades_replayable`. Normalized
+and curated Parquet are partitioned by `source=<venue>` only — per-instrument
+lanes of the same venue+dataset share Parquet partitions today (the manifest
+still separates them via the promotion index). See
+[`STANDARDS.md`](STANDARDS.md) §2 for the full layout contract.
 
 Override roots with environment variables:
 
@@ -109,17 +138,40 @@ pytest -q
 
 ## Manual Collection
 
-Run one depth segment:
+Run one Binance depth segment:
 
 ```powershell
 market-data-plant binance-depth-worker --symbol btcusdt --speed 100ms --segment-count 5000 --max-segments 1
 ```
 
-Run one trade segment:
+Run one Binance trade segment:
 
 ```powershell
 market-data-plant binance-trades-worker --symbol btcusdt --channel trade --segment-count 5000 --max-segments 1
 ```
+
+Other venue workers (same `--segment-count` / `--max-segments` / `--cooldown-seconds`
+/ `--output-root` / `--ops-root` / `--worker-name` flags). Venue symbol formats
+differ — Coinbase/Kraken are separated (`BTC-USD`, `BTC/USD`), Bybit/Binance are not:
+
+```powershell
+market-data-plant coinbase-trades-worker --symbol BTC-USD --channel matches --max-segments 1
+market-data-plant coinbase-depth-worker  --symbol BTC-USD --channel level2_batch --max-segments 1
+market-data-plant kraken-trades-worker   --symbol BTC/USD --channel trade --max-segments 1
+market-data-plant kraken-depth-worker    --symbol BTC/USD --channel book --max-segments 1
+market-data-plant bybit-trades-worker    --symbol BTCUSDT --channel publicTrade --max-segments 1
+market-data-plant bybit-depth-worker     --symbol BTCUSDT --channel orderbook.50 --max-segments 1
+```
+
+Two cross-cutting lane flags (both default to legacy behavior, so the live BTC
+collector is unaffected):
+
+- `--source-suffix <name>` — write to a per-instrument lane
+  `<venue>_<dataset>_<name>` instead of the bare lane. Empty preserves the legacy
+  single-symbol layout.
+- `--rotate-at-midnight` — end the run at the UTC day boundary instead of after
+  `--segment-count` frames, so a run directory never straddles two `event_date`s.
+  `--segment-count` then acts as a soft memory cap.
 
 ## Continuous Ops
 
@@ -159,7 +211,15 @@ market-data-plant research-manifest --archive-root D:\market_archive --output-ro
 market-data-plant cleanup --raw-days 14
 ```
 
-`cleanup` is dry-run by default. It removes files only when `--apply` is passed.
+The quarantine → promote chain is per-lane: point `--source-root` at any lane
+directory (`...\raw\market\<lane>`) and the matching `--target-root`. Depth lanes
+promote into `curated\research\market_replayable`; trades lanes into
+`curated\research\trades_replayable`. In the live deployment the ops runner does
+this automatically per enabled lane — these commands are for manual/backfill use.
+
+`cleanup` is dry-run by default. It removes files only when `--apply` is passed;
+per-dataset retention is set via the cleanup job's `raw_policy`
+(`market/<lane>=<days>`).
 
 ## Publication Safety
 

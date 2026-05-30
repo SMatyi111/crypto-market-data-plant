@@ -10,37 +10,54 @@ Raw collection runs are timestamped directories under:
 D:\market_archive\raw\market\<source>\<run_id>
 ```
 
+`<source>` is the **lane** directory `<venue>_<dataset>[_<suffix>]`:
+`binance_depth`, `binance_trades`, `coinbase_trades`, `coinbase_depth`,
+`kraken_trades`, `kraken_depth`, `bybit_trades`, `bybit_depth`, plus an optional
+per-instrument suffix (`binance_trades_ethusdt`).
+
 Each run contains:
 
 - `raw/messages.jsonl`: exact received source payloads with receive timestamps
 - `clean/events.jsonl`: normalized events accepted by quality gates
 - `quarantine/events.jsonl`: normalized events rejected by quality gates, with reasons
 - `metrics/summary.jsonl`: collection counters and quality metrics
-- `metrics/replay_summary.json`: depth replay diagnostics, for depth runs
-- `snapshots/book_snapshot.json`: depth snapshot anchor, for depth runs
+- `metrics/replay_summary.json`: the curation verdict (`replayable` + `gap_detection`),
+  for every run
+- `snapshots/book_snapshot.json`: depth REST snapshot anchor, for Binance depth
+  runs only (other depth feeds carry the snapshot in-stream)
 
 ## Normalized Datasets
 
-Normalized datasets are append-only Parquet datasets:
+Normalized datasets are append-only Parquet datasets (every collected run, before
+curation):
 
 ```text
 D:\market_archive\normalized\<dataset>\schema_version=v1\source=<source>\event_date=<YYYY-MM-DD>
 ```
 
-Production datasets:
+Datasets:
 
-- `market`: Binance depth updates
-- `trades`: Binance public trades
+- `market`: depth (order book) updates from all venues
+- `trades`: public trades from all venues
+
+`source=<venue>` is the only venue dimension in the partition path — per-instrument
+lanes of the same venue+dataset share Parquet partitions (the manifest separates
+them via the promotion index; an `instrument=` partition is on the roadmap).
 
 ## Curated Datasets
 
 Curated datasets contain only quality-gated research inputs:
 
 ```text
-D:\market_archive\curated\research\market_replayable
+D:\market_archive\curated\research\market_replayable    # depth
+D:\market_archive\curated\research\trades_replayable     # trades
 ```
 
-Depth runs are promoted only when replay diagnostics mark them replayable and they are not listed in the quarantine index.
+A run is promoted only when its `metrics/replay_summary.json` marks it
+`replayable: true` and it is not listed in the quarantine index. **What
+"replayable" guarantees depends on the feed's `gap_detection` class**
+(`sequence` = provable gaplessness; `none_native` = structurally clean only) —
+see [`../STANDARDS.md`](../STANDARDS.md) §4 for the per-class definition.
 
 ## Ops State
 
