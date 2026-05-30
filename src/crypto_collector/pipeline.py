@@ -59,27 +59,33 @@ class CollectorPipeline:
     ) -> RunSummary:
         """Run the pipeline until the collector stream ends, `limit` is reached, or
         the wall clock crosses `deadline_utc` (for day-bounded rotation). The deadline
-        check happens after each accepted/rejected event so partial work is flushed
-        in the existing finally block."""
+        check happens after each frame so partial work is flushed in the existing
+        finally block.
+
+        `limit` bounds **frames** (raw WS messages), not normalized events. For
+        single-event venues (Binance, Coinbase) one frame is one event so the two are
+        the same; for batched venues (Bybit `publicTrade`, Kraken `trade`) one frame
+        fans out to several events via `normalize_many`, so a frame-bounded segment can
+        contain more clean events than `limit`."""
         summary = RunSummary()
         try:
             async for raw in self.collector.stream(limit=limit):
                 summary.raw_messages += 1
                 self.raw_sink.write(raw.to_dict())
 
-                normalized = self.normalizer.normalize(raw)
-                verdict = self.quality_gate.validate(normalized)
-                if verdict.accepted:
-                    summary.clean_events += 1
-                    normalized_row = normalized.to_dict()
-                    self.clean_sink.write(normalized_row)
-                    if self.parquet_sink is not None:
-                        self.parquet_sink.write(normalized_row)
-                else:
-                    summary.quarantined_events += 1
-                    quarantined_row = normalized.to_dict()
-                    quarantined_row["reasons"] = verdict.reasons
-                    self.quarantine_sink.write(quarantined_row)
+                for normalized in _normalize_events(self.normalizer, raw):
+                    verdict = self.quality_gate.validate(normalized)
+                    if verdict.accepted:
+                        summary.clean_events += 1
+                        normalized_row = normalized.to_dict()
+                        self.clean_sink.write(normalized_row)
+                        if self.parquet_sink is not None:
+                            self.parquet_sink.write(normalized_row)
+                    else:
+                        summary.quarantined_events += 1
+                        quarantined_row = normalized.to_dict()
+                        quarantined_row["reasons"] = verdict.reasons
+                        self.quarantine_sink.write(quarantined_row)
 
                 if deadline_utc is not None and utc_now() >= deadline_utc:
                     summary.deadline_reached = True
@@ -112,4 +118,18 @@ class CollectorPipeline:
             if self.parquet_sink is not None:
                 self.parquet_sink.flush()
         return summary
+
+
+def _normalize_events(normalizer: object, raw: RawMessage) -> list:
+    """Normalize one raw frame into one-or-more normalized events.
+
+    Most venues map a WS frame to a single event and expose only `normalize`. Batched
+    venues (Bybit `publicTrade`, Kraken `trade`/`book`) deliver an array of events per
+    frame and expose `normalize_many` instead. Preferring `normalize_many` when present
+    keeps the fan-out logic with the venue-specific normalizer and leaves the existing
+    single-event normalizers (and this pipeline's per-event accounting) unchanged."""
+    normalize_many = getattr(normalizer, "normalize_many", None)
+    if callable(normalize_many):
+        return list(normalize_many(raw))
+    return [normalizer.normalize(raw)]
 
