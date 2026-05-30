@@ -135,6 +135,92 @@ class CoinbaseTradeNormalizer:
         )
 
 
+class CoinbaseDepthNormalizer:
+    """Normalize Coinbase Exchange `level2` / `level2_batch` depth frames.
+
+    Two structural differences from Binance depth, both of which make this a
+    **non-sequence** ("none_native") feed under STANDARDS §4.3:
+
+    * The book **snapshot arrives in-stream** (`type: "snapshot"`) on subscribe
+      rather than via a separate REST call, so it's emitted as a normal depth event
+      with `event_type="snapshot"` and the full book in `bids`/`asks`.
+    * Diff frames (`type: "l2update"`) carry **no per-message sequence** (no `U`/`u`
+      window). `changes` is `[[side, price, size], ...]` with the *new absolute*
+      size at that level (`0` = remove). We fan them out into `bids`/`asks` to match
+      the `[[price, size]]` shape the depth replay already applies.
+
+    Because there's no sequence, `first_update_id`/`final_update_id` are always None
+    and gaplessness is not provable from the stream — the run is validated by
+    `replay_depth_stream_run`, which downgrades `replayable` to structurally-clean-only.
+    """
+
+    def normalize(self, raw: RawMessage) -> NormalizedDepthUpdate:
+        payload = raw.payload.get("data", raw.payload)
+        parse_errors: list[str] = []
+        product = str(payload.get("product_id") or "UNKNOWN")
+        msg_type = str(payload.get("type") or "l2update")
+        # The snapshot frame has no `time`; l2update carries an ISO-8601 `time`.
+        event_time = _parse_iso_timestamp(payload.get("time"), parse_errors)
+        if msg_type == "snapshot":
+            event_type = "snapshot"
+            bids = _parse_levels(payload.get("bids"), "bids", parse_errors)
+            asks = _parse_levels(payload.get("asks"), "asks", parse_errors)
+        else:
+            event_type = "l2update"
+            bids, asks = _split_l2_changes(payload.get("changes"), parse_errors)
+        instrument = resolve_spot_instrument(
+            _strip_symbol_separators(product), venue=raw.source
+        )
+        return NormalizedDepthUpdate(
+            source=raw.source,
+            product=product,
+            channel="depth",
+            event_type=event_type,
+            event_time=event_time,
+            received_at=raw.received_at,
+            first_update_id=None,
+            final_update_id=None,
+            instrument=instrument,
+            bids=bids,
+            asks=asks,
+            metadata={"parse_errors": parse_errors} if parse_errors else {},
+        )
+
+
+def _split_l2_changes(
+    values: Any,
+    errors: list[str],
+) -> tuple[list[list[float]], list[list[float]]]:
+    """Split Coinbase `changes` (`[[side, price, size], ...]`) into bid/ask levels.
+
+    `buy` updates the bid side, `sell` the ask side; `size` is the new absolute
+    level size (`0` removes the level), matching Binance's `[[price, size]]`
+    convention so the same `_apply_levels` book-building logic works downstream.
+    """
+    bids: list[list[float]] = []
+    asks: list[list[float]] = []
+    if values in (None, ""):
+        return bids, asks
+    if not isinstance(values, list):
+        errors.append("invalid_changes")
+        return bids, asks
+    for item in values:
+        try:
+            side = item[0]
+            price = float(item[1])
+            size = float(item[2])
+        except (TypeError, ValueError, IndexError):
+            errors.append("invalid_changes")
+            continue
+        if side == "buy":
+            bids.append([price, size])
+        elif side == "sell":
+            asks.append([price, size])
+        else:
+            errors.append("invalid_changes")
+    return bids, asks
+
+
 def _parse_timestamp_ms(value: Any, errors: list[str]) -> datetime | None:
     if value in (None, ""):
         return None

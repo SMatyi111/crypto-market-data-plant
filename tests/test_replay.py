@@ -6,6 +6,7 @@ from pathlib import Path
 from crypto_collector.replay import (
     backfill_replay_summaries,
     replay_depth_run,
+    replay_depth_stream_run,
     replay_trades_run,
 )
 
@@ -487,3 +488,196 @@ def test_replay_trades_run_writes_summary_compatible_with_quarantine_chain(tmp_p
     assert isinstance(summary_json["findings"], list)
     assert summary_json["replayable"] is False
     assert "trade_id_gaps" in summary_json["findings"]
+
+
+# --- Phase 2 #3b: non-sequence depth replay (Coinbase level2, STANDARDS 4.3) ---
+
+
+def _write_stream_depth_run(run_path: Path, rows: list[dict]) -> None:
+    clean_path = run_path / "clean"
+    clean_path.mkdir(parents=True)
+    (clean_path / "events.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+
+def _stream_snapshot_row(
+    *,
+    bids: list[list[float]],
+    asks: list[list[float]],
+    received_at: str = "2026-04-06T00:00:00.100000+00:00",
+) -> dict:
+    # The in-stream snapshot carries the full book and, like the live Coinbase feed,
+    # has no exchange `event_time` — so it's skipped from the monotonic-time check.
+    return {
+        "source": "coinbase",
+        "product": "BTC-USD",
+        "channel": "depth",
+        "event_type": "snapshot",
+        "event_time": None,
+        "received_at": received_at,
+        "first_update_id": None,
+        "final_update_id": None,
+        "instrument": {"instrument_id": "spot:coinbase:BTCUSD"},
+        "bids": bids,
+        "asks": asks,
+    }
+
+
+def _stream_l2update_row(
+    *,
+    bids: list[list[float]] | None = None,
+    asks: list[list[float]] | None = None,
+    event_time: str = "2026-04-06T00:00:01+00:00",
+    received_at: str = "2026-04-06T00:00:01.100000+00:00",
+) -> dict:
+    return {
+        "source": "coinbase",
+        "product": "BTC-USD",
+        "channel": "depth",
+        "event_type": "l2update",
+        "event_time": event_time,
+        "received_at": received_at,
+        "first_update_id": None,
+        "final_update_id": None,
+        "instrument": {"instrument_id": "spot:coinbase:BTCUSD"},
+        "bids": bids or [],
+        "asks": asks or [],
+    }
+
+
+def test_replay_depth_stream_run_clean_snapshot_is_replayable_none_native(tmp_path: Path) -> None:
+    """A single in-stream snapshot followed by monotonic l2updates is structurally
+    clean, so it's `replayable` — but tagged `none_native` because gaplessness can't
+    be proven without a sequence (STANDARDS 4.3)."""
+    run_path = tmp_path / "coinbase_depth" / "20260406_000000"
+    _write_stream_depth_run(
+        run_path,
+        [
+            _stream_snapshot_row(bids=[[100.0, 1.0]], asks=[[101.0, 2.0]]),
+            _stream_l2update_row(
+                bids=[[100.0, 0.0], [99.0, 3.0]],
+                event_time="2026-04-06T00:00:01+00:00",
+            ),
+            _stream_l2update_row(
+                asks=[[101.0, 1.5]],
+                event_time="2026-04-06T00:00:02+00:00",
+            ),
+        ],
+    )
+
+    summary = replay_depth_stream_run(run_path)
+
+    assert summary.replayable is True, summary.findings
+    assert summary.gap_detection == "none_native"
+    assert summary.mode == "stream_snapshot"
+    assert summary.event_count == 3
+    # Gaplessness is unprovable: the sequence-only counters stay zero/neutral.
+    assert summary.gap_count == 0
+    assert summary.snapshot_gap_count == 0
+    assert summary.reordered_count == 0
+    assert summary.invalid_range_count == 0
+    assert summary.findings == []
+    # The summary the curation chain reads is written with the downgraded tag.
+    summary_json = json.loads(
+        (run_path / "metrics" / "replay_summary.json").read_text(encoding="utf-8")
+    )
+    assert summary_json["replayable"] is True
+    assert summary_json["gap_detection"] == "none_native"
+
+
+def test_replay_depth_stream_run_no_snapshot_is_not_replayable(tmp_path: Path) -> None:
+    """Without the in-stream snapshot anchor the book can't be seeded, so the run is
+    not replayable even though the diffs are monotonic."""
+    run_path = tmp_path / "coinbase_depth" / "20260406_000001"
+    _write_stream_depth_run(
+        run_path,
+        [
+            _stream_l2update_row(bids=[[100.0, 1.0]], event_time="2026-04-06T00:00:01+00:00"),
+            _stream_l2update_row(asks=[[101.0, 1.0]], event_time="2026-04-06T00:00:02+00:00"),
+        ],
+    )
+
+    summary = replay_depth_stream_run(run_path)
+
+    assert summary.replayable is False
+    assert "no_snapshot_anchor" in summary.findings
+    assert summary.gap_detection == "none_native"
+
+
+def test_replay_depth_stream_run_second_snapshot_breaks_replay(tmp_path: Path) -> None:
+    """A reconnect mid-run yields a *second* in-stream snapshot. Like Binance depth's
+    single-anchor invariant, two anchors mean the run isn't one continuous book, so
+    it's flagged unreplayable and the worker's next segment starts fresh."""
+    run_path = tmp_path / "coinbase_depth" / "20260406_000002"
+    _write_stream_depth_run(
+        run_path,
+        [
+            _stream_snapshot_row(bids=[[100.0, 1.0]], asks=[[101.0, 2.0]]),
+            _stream_l2update_row(bids=[[99.0, 3.0]], event_time="2026-04-06T00:00:01+00:00"),
+            _stream_snapshot_row(
+                bids=[[100.0, 1.0]],
+                asks=[[101.0, 2.0]],
+                received_at="2026-04-06T00:00:02.100000+00:00",
+            ),
+        ],
+    )
+
+    summary = replay_depth_stream_run(run_path)
+
+    assert summary.replayable is False
+    assert "multiple_snapshot_anchors" in summary.findings
+    assert "snapshot_not_first_event" in summary.findings
+
+
+def test_replay_depth_stream_run_non_monotonic_event_time_breaks_replay(tmp_path: Path) -> None:
+    """Diff timestamps must not go backwards. The snapshot has no exchange time so it's
+    skipped; the second l2update predates the first, which is the violation."""
+    run_path = tmp_path / "coinbase_depth" / "20260406_000003"
+    _write_stream_depth_run(
+        run_path,
+        [
+            _stream_snapshot_row(bids=[[100.0, 1.0]], asks=[[101.0, 2.0]]),
+            _stream_l2update_row(bids=[[99.0, 3.0]], event_time="2026-04-06T00:00:05+00:00"),
+            _stream_l2update_row(asks=[[101.0, 1.5]], event_time="2026-04-06T00:00:02+00:00"),
+        ],
+    )
+
+    summary = replay_depth_stream_run(run_path)
+
+    assert summary.replayable is False
+    assert "non_monotonic_event_time" in summary.findings
+
+
+def test_replay_depth_stream_run_with_no_events_is_unreplayable(tmp_path: Path) -> None:
+    run_path = tmp_path / "coinbase_depth" / "20260406_000004"
+    _write_stream_depth_run(run_path, [])
+
+    summary = replay_depth_stream_run(run_path)
+
+    assert summary.replayable is False
+    assert summary.event_count == 0
+    assert "no_events" in summary.findings
+    assert "no_snapshot_anchor" in summary.findings
+    assert summary.gap_detection == "none_native"
+
+
+def test_replay_depth_stream_run_reports_crossed_book_without_blocking(tmp_path: Path) -> None:
+    """A crossed book (best bid >= best ask) is surfaced as a finding for visibility
+    but, consistent with `replay_depth_run`, does not by itself block promotion."""
+    run_path = tmp_path / "coinbase_depth" / "20260406_000005"
+    _write_stream_depth_run(
+        run_path,
+        [
+            # Snapshot is already crossed: bid 102 >= ask 101.
+            _stream_snapshot_row(bids=[[102.0, 1.0]], asks=[[101.0, 2.0]]),
+            _stream_l2update_row(bids=[[100.0, 1.0]], event_time="2026-04-06T00:00:01+00:00"),
+        ],
+    )
+
+    summary = replay_depth_stream_run(run_path)
+
+    assert summary.crossed_book_count >= 1
+    assert "crossed_book_states" in summary.findings
+    assert summary.replayable is True  # reported, not gating

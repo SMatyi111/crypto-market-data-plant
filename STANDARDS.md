@@ -18,11 +18,18 @@ Two normalized datasets, each collected per (venue, instrument) lane:
 
 | Dataset  | Channel  | Normalizer(s)                                  | Curated target            |
 | -------- | -------- | ---------------------------------------------- | ------------------------- |
-| `depth`  | order book diffs | `BinanceDepthNormalizer`               | `market_replayable`       |
+| `depth`  | order book diffs | `BinanceDepthNormalizer`, `CoinbaseDepthNormalizer` | `market_replayable`  |
 | `trades` | trade prints     | `BinanceTradeNormalizer`, `CoinbaseTradeNormalizer` | `trades_replayable` |
 
-Venues live today: **Binance** (depth + trades), **Coinbase** (trades).
+Venues live today: **Binance** (depth + trades), **Coinbase** (trades + depth).
 See Roadmap for the rest.
+
+> **Gap-detection class differs by feed, not just by venue.** Binance depth/trades
+> and Coinbase trades are **sequence-bearing** (§4.1/§4.2 strong gaplessness).
+> Coinbase depth (`level2` / `level2_batch`) is **non-sequence** (`none_native`,
+> §4.3): the snapshot arrives in-stream and diffs carry no `U`/`u`, so `replayable`
+> there means *structurally clean*, **not** gap-proof. The per-lane `gap_detection`
+> tag in the manifest (§6) is how a consumer tells these apart.
 
 ---
 
@@ -43,7 +50,7 @@ A collector "run" is one segment directory:
 
 `<source>` is the lane directory:
 
-- `binance_depth`, `binance_trades`, `coinbase_trades`
+- `binance_depth`, `binance_trades`, `coinbase_trades`, `coinbase_depth`
 - Per-instrument lanes append a sanitized suffix: `binance_trades_ethusdt`, etc.
   (`--source-suffix`; empty preserves the legacy single-symbol layout).
 
@@ -170,10 +177,15 @@ The exact bar depends on what the feed lets us prove.
   `snapshot_anchor_gap`
 - no `reordered_or_duplicate_updates`
 - no `invalid_update_ranges` (`u >= U`)
-- no `crossed_book_states`
 
 This is a **strong, provable gaplessness** guarantee: the book can be
 reconstructed exactly from the snapshot + diffs.
+
+`crossed_book_states` (best bid ≥ best ask) is **reported as a finding for
+visibility but does not by itself block promotion** — a transiently crossed book
+can be a legitimate venue artifact, and the gaplessness proof above is what the
+guarantee rests on. Consumers who require an uncrossed book at every tick should
+check `crossed_book_count` in `replay_summary.json` themselves.
 
 ### 4.2 `trades` (sequence-bearing — Binance, Coinbase)
 
@@ -188,10 +200,11 @@ reconstructed exactly from the snapshot + diffs.
 Findings: `non_monotonic_trade_ids`, `trade_id_gaps`, `invalid_prices`,
 `invalid_sizes`, `excessive_clock_skew`, `no_events`.
 
-### 4.3 Gap policy for non-sequence feeds (Roadmap venues)
+### 4.3 Gap policy for non-sequence depth feeds (`none_native`)
 
-Some feeds carry **no per-message sequence number** (Coinbase public `level2`,
-Kraken `book` v1). Gaplessness is **not provable** from these streams alone.
+Some feeds carry **no per-message sequence number** (Coinbase `level2` /
+`level2_batch`; Kraken `book` v1). Gaplessness is **not provable** from these
+streams alone.
 
 Policy for any such adapter:
 
@@ -204,7 +217,25 @@ Policy for any such adapter:
   message-level sequence (Coinbase Advanced Trade `sequence_num`, Kraken v2,
   Bybit `u`/`seq`) so the strong guarantee in §4.1/§4.2 applies.
 
-No `none_native` adapter exists yet; this fixes the contract before one is built.
+**Live adapter — Coinbase `depth` (`level2` / `level2_batch`).** The book
+snapshot arrives **in-stream** (`event_type == "snapshot"`, full book in
+`bids`/`asks`, no exchange time) instead of via REST, and diff frames
+(`event_type == "l2update"`) carry no `U`/`u`. The whole-run verdict
+(`replay_depth_stream_run`) sets `gap_detection: "none_native"` and:
+
+`replayable` iff **all** hold:
+
+- `event_count > 0`
+- exactly one snapshot anchor, and it is the **first** event in the run
+- event timestamps are monotonic non-decreasing (the snapshot has no exchange
+  time and is skipped from this check)
+
+Findings: `no_events`, `no_snapshot_anchor`, `multiple_snapshot_anchors`,
+`snapshot_not_first_event`, `non_monotonic_event_time`, and (reported but
+non-gating, as in §4.1) `crossed_book_states`. A reconnect mid-run yields a
+*second* in-stream snapshot, which trips `multiple_snapshot_anchors` and ends the
+run unreplayable — mirroring Binance depth's single-anchor invariant, so the
+worker's next segment simply starts a fresh book.
 
 ---
 
@@ -277,6 +308,7 @@ current contract:
 - `instrument=` partition column in the curated/normalized datasets (so
   per-instrument lanes of the same venue+dataset stop sharing Parquet
   partitions; the manifest already separates them via the promotion index).
-- Non-sequence depth adapters (Coinbase `level2`, Kraken `book`) under the §4.3
-  policy; sequence-bearing depth for Coinbase Advanced Trade / Bybit / Kraken v2.
+- More non-sequence depth adapters (Kraken `book` v1) under the §4.3 policy
+  (Coinbase `level2` is already live); sequence-bearing depth for Coinbase
+  Advanced Trade / Bybit / Kraken v2.
 - Continuous day-bounded rotation as the default run model (vs. count-bounded).

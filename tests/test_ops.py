@@ -825,6 +825,47 @@ def test_job_args_coinbase_trades_worker_defaults() -> None:
     assert args.max_clock_skew_ms == 60_000.0
 
 
+def test_job_args_coinbase_depth_worker_defaults() -> None:
+    # The coinbase-depth-worker job_type must build a usable namespace with
+    # Coinbase-shaped depth defaults (dashed product, level2_batch public channel) so
+    # the ops-runner drives the none_native depth lane like the other workers.
+    args = _job_args(
+        JobSpec(
+            name="coinbase-btc-depth",
+            job_type="coinbase-depth-worker",
+            interval_seconds=3600,
+            args={},
+        )
+    )
+
+    assert args.symbol == "BTC-USD"
+    assert args.channel == "level2_batch"
+    assert args.worker_name == "coinbase-depth-worker"
+    assert args.source_suffix == ""
+    assert args.rotate_at_midnight is False
+
+
+def test_job_args_coinbase_depth_worker_threads_lane_flags() -> None:
+    args = _job_args(
+        JobSpec(
+            name="coinbase-eth-depth",
+            job_type="coinbase-depth-worker",
+            interval_seconds=3600,
+            args={
+                "symbol": "ETH-USD",
+                "source_suffix": "ethusd",
+                "rotate_at_midnight": True,
+                "worker_name": "coinbase-depth-worker-ethusd",
+            },
+        )
+    )
+
+    assert args.symbol == "ETH-USD"
+    assert args.source_suffix == "ethusd"
+    assert args.rotate_at_midnight is True
+    assert args.worker_name == "coinbase-depth-worker-ethusd"
+
+
 def test_job_args_lane_flags_default_to_legacy_behavior() -> None:
     # Omitting the flags must preserve the legacy single-symbol layout: empty suffix,
     # rotation off. This is what keeps the live BTC collector unaffected.

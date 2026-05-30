@@ -15,10 +15,14 @@ from crypto_collector.cli import (
     _reopen_binance_depth_connection,
     build_parser,
     collect_binance_depth_segment,
+    collect_coinbase_depth_segment,
     collect_coinbase_trades_segment,
     _is_retryable_connect_error,
 )
-from crypto_collector.market_normalizers import CoinbaseTradeNormalizer
+from crypto_collector.market_normalizers import (
+    CoinbaseDepthNormalizer,
+    CoinbaseTradeNormalizer,
+)
 from crypto_collector.collectors.generic_ws import (
     GenericWebsocketCollector,
     _backoff_delay,
@@ -767,3 +771,185 @@ def test_collect_coinbase_trades_segment_writes_clean_events_and_replay_summary(
     assert first["source"] == "coinbase"
     assert first["side"] == "buy"  # maker sell -> taker buy
     assert (run_path / "metrics" / "replay_summary.json").exists()
+
+
+# --- Phase 2 #3b: Coinbase depth (level2) adapter -------------------------
+
+
+def _coinbase_l2_snapshot(
+    *,
+    bids: list[list[str]],
+    asks: list[list[str]],
+    product_id: str = "BTC-USD",
+) -> dict:
+    # The level2 snapshot frame carries the full book and, unlike l2update, has NO
+    # `time` field — that's exactly what the normalizer / replay rely on to tell the
+    # snapshot anchor apart from the diffs.
+    return {
+        "type": "snapshot",
+        "product_id": product_id,
+        "bids": bids,
+        "asks": asks,
+    }
+
+
+def _coinbase_l2update(
+    *,
+    changes: list[list[str]],
+    time_iso: str,
+    product_id: str = "BTC-USD",
+) -> dict:
+    return {
+        "type": "l2update",
+        "product_id": product_id,
+        "time": time_iso,
+        "changes": changes,
+    }
+
+
+def test_coinbase_depth_normalizer_snapshot_sets_event_type_and_levels() -> None:
+    """The in-stream snapshot must normalize to event_type='snapshot' with the full
+    book in bids/asks and NO sequence ids (this is a none_native feed)."""
+    raw = RawMessage(
+        source="coinbase",
+        received_at=utc_now(),
+        payload=_coinbase_l2_snapshot(
+            bids=[["50000.0", "1.0"], ["49999.0", "2.0"]],
+            asks=[["50001.0", "0.5"]],
+        ),
+    )
+
+    event = CoinbaseDepthNormalizer().normalize(raw)
+
+    assert event.event_type == "snapshot"
+    assert event.channel == "depth"
+    assert event.bids == [[50000.0, 1.0], [49999.0, 2.0]]
+    assert event.asks == [[50001.0, 0.5]]
+    # No per-message sequence on this feed.
+    assert event.first_update_id is None
+    assert event.final_update_id is None
+    assert event.event_time is None  # snapshot has no exchange time
+    assert event.metadata == {}
+    # Dashed product is collapsed before resolving so the instrument isn't None.
+    assert event.instrument is not None
+    assert event.instrument.instrument_id == "spot:coinbase:BTCUSD"
+
+
+def test_coinbase_depth_normalizer_l2update_splits_changes_into_bid_ask() -> None:
+    """`changes` is [[side, price, size], ...]; buy updates the bid side, sell the ask
+    side, and size 0 (a removal) is preserved as a level so replay can drop it."""
+    raw = RawMessage(
+        source="coinbase",
+        received_at=utc_now(),
+        payload=_coinbase_l2update(
+            changes=[
+                ["buy", "50000.0", "1.5"],
+                ["sell", "50001.0", "0.0"],  # removal
+                ["buy", "49999.0", "2.0"],
+            ],
+            time_iso="2026-05-28T12:00:01.000000Z",
+        ),
+    )
+
+    event = CoinbaseDepthNormalizer().normalize(raw)
+
+    assert event.event_type == "l2update"
+    assert event.bids == [[50000.0, 1.5], [49999.0, 2.0]]
+    assert event.asks == [[50001.0, 0.0]]
+    assert event.first_update_id is None
+    assert event.final_update_id is None
+    assert event.event_time == datetime(2026, 5, 28, 12, 0, 1, tzinfo=UTC)
+    assert "parse_errors" not in event.metadata
+
+
+def test_coinbase_depth_normalizer_flags_invalid_changes() -> None:
+    raw = RawMessage(
+        source="coinbase",
+        received_at=utc_now(),
+        payload=_coinbase_l2update(
+            changes=[
+                ["buy", "not-a-number", "1.0"],  # bad price
+                ["sideways", "50000.0", "1.0"],  # unknown side
+            ],
+            time_iso="2026-05-28T12:00:01Z",
+        ),
+    )
+
+    event = CoinbaseDepthNormalizer().normalize(raw)
+
+    assert event.bids == []
+    assert event.asks == []
+    assert event.metadata["parse_errors"].count("invalid_changes") == 2
+
+
+def test_cli_parser_coinbase_depth_worker_defaults() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["coinbase-depth-worker"])
+    assert args.symbol == "BTC-USD"
+    # level2_batch is the unauthenticated public depth feed (plain level2 needs auth).
+    assert args.channel == "level2_batch"
+    assert args.source_suffix == ""
+    assert args.rotate_at_midnight is False
+
+    suffixed = parser.parse_args(
+        ["coinbase-depth-worker", "--symbol", "ETH-USD", "--source-suffix", "ethusd"]
+    )
+    assert suffixed.symbol == "ETH-USD"
+    assert suffixed.source_suffix == "ethusd"
+
+
+def test_collect_coinbase_depth_segment_writes_clean_events_and_replay_summary(
+    tmp_path, monkeypatch
+) -> None:
+    """End-to-end: a Coinbase level2 stream (in-stream snapshot + l2updates) lands in
+    coinbase_depth/<ts>/ as clean events and gets a none_native depth replay summary,
+    so the existing quarantine/promote chain can curate it like any other lane."""
+    now = utc_now()
+    t1 = now.isoformat().replace("+00:00", "Z")
+    t2 = (now + timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
+    ws = _ScriptedDepthWebsocket(
+        frames=[
+            {"type": "subscriptions", "channels": [{"name": "level2_batch"}]},  # ack
+            _coinbase_l2_snapshot(
+                bids=[["50000.0", "1.0"]],
+                asks=[["50001.0", "2.0"]],
+            ),
+            _coinbase_l2update(
+                changes=[["buy", "50000.0", "0.0"], ["buy", "49999.0", "3.0"]],
+                time_iso=t1,
+            ),
+            _coinbase_l2update(
+                changes=[["sell", "50001.0", "1.5"]],
+                time_iso=t2,
+            ),
+        ]
+    )
+    _install_fake_trades_runtime(monkeypatch, ws)
+
+    args = SimpleNamespace(
+        symbol="BTC-USD",
+        channel="level2_batch",
+        count=3,
+        output_root=tmp_path,
+        source_suffix="",
+        deadline_utc=None,
+    )
+
+    result = asyncio.run(collect_coinbase_depth_segment(args))
+
+    assert result["clean_events"] == 3, result
+    assert result["quarantined_events"] == 0
+    assert result["replayable"] is True, result["replay_findings"]
+
+    run_path = Path(result["run_path"])
+    assert run_path.parent.name == "coinbase_depth"
+    events = (run_path / "clean" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(events) == 3
+    first = json.loads(events[0])
+    assert first["source"] == "coinbase"
+    assert first["event_type"] == "snapshot"
+    summary = json.loads(
+        (run_path / "metrics" / "replay_summary.json").read_text(encoding="utf-8")
+    )
+    assert summary["gap_detection"] == "none_native"
+    assert summary["replayable"] is True

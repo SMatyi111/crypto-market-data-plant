@@ -110,6 +110,48 @@
       }
     },
     {
+      "// non-sequence depth lane": "Coinbase level2 depth is a none_native feed (STANDARDS 4.3): the snapshot arrives in-stream and diffs carry no sequence, so 'replayable' means structurally clean (single snapshot anchor, parse-clean, monotonic timestamps) — NOT gap-proof. Promoted rows go to market_replayable just like Binance depth, but consumers must treat gap_detection=='none_native' data as best-effort. channel level2_batch is the unauthenticated public feed; plain level2 needs Coinbase auth.",
+      "name": "coinbase-btc-depth",
+      "job_type": "coinbase-depth-worker",
+      "enabled": false,
+      "interval_seconds": 3600,
+      "args": {
+        "symbol": "BTC-USD",
+        "channel": "level2_batch",
+        "segment_count": 5000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "worker_name": "coinbase-depth-worker",
+        "output_root": "D:\\market_archive\\raw\\market",
+        "ops_root": "D:\\market_archive\\ops"
+      }
+    },
+    {
+      "name": "quarantine-coinbase-depth",
+      "job_type": "quarantine-runs",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "D:\\market_archive\\raw\\market\\coinbase_depth",
+        "quarantine_root": "D:\\market_archive\\quarantine\\market\\coinbase_depth",
+        "limit": 20,
+        "max_age_hours": 6
+      }
+    },
+    {
+      "name": "promote-coinbase-depth",
+      "job_type": "promote-replayable",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "D:\\market_archive\\raw\\market\\coinbase_depth",
+        "target_root": "D:\\market_archive\\curated\\research\\market_replayable",
+        "quarantine_index": "D:\\market_archive\\quarantine\\market\\coinbase_depth\\_quarantine_index.jsonl",
+        "limit": 20,
+        "max_age_hours": 6
+      }
+    },
+    {
       "name": "book-sync-health",
       "job_type": "book-sync-health",
       "interval_seconds": 300,
@@ -182,7 +224,9 @@
         "raw_days": 14,
         "raw_policy": [
           "market/binance_depth=14",
-          "market/binance_trades=14"
+          "market/binance_trades=14",
+          "market/coinbase_trades=14",
+          "market/coinbase_depth=14"
         ],
         "apply": false
       }

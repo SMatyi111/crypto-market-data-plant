@@ -39,6 +39,10 @@ class ReplaySummary:
     findings: list[str]
     top_bids: list[list[float]]
     top_asks: list[list[float]]
+    # "sequence" = U/u-provable gaplessness (Binance, STANDARDS §4.1); "none_native"
+    # = no per-message sequence, so `replayable` means structurally-clean-only and
+    # consumers must not assume completeness (STANDARDS §4.3).
+    gap_detection: str = "sequence"
     summary_path: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -281,6 +285,173 @@ def replay_depth_run(
         )
 
     return summary
+
+
+def replay_depth_stream_run(
+    run_path: Path,
+    *,
+    max_levels: int = 10,
+    write_summary: bool = True,
+) -> ReplaySummary:
+    """Replay-validate a **non-sequence** depth run (STANDARDS §4.3, e.g. Coinbase
+    `level2`). Writes the same `metrics/replay_summary.json` contract as
+    `replay_depth_run` so the existing quarantine + promote chain works unchanged.
+
+    Unlike Binance depth, these feeds carry no per-message sequence (`U`/`u`) and the
+    snapshot arrives **in-stream** (`event_type == "snapshot"`) instead of via REST.
+    Gaplessness is therefore unprovable, so the summary is tagged
+    `gap_detection="none_native"` and `replayable` is downgraded to *structurally
+    clean only*:
+
+    - `event_count > 0`
+    - exactly one snapshot anchor, and it is the first event in the run
+    - event timestamps are monotonic non-decreasing (snapshot has no exchange time
+      and is skipped from the monotonic check)
+
+    `crossed_book_states` is surfaced as a finding for visibility but, consistent
+    with `replay_depth_run`, does not by itself block promotion. Consumers MUST treat
+    `gap_detection == "none_native"` data as best-effort and not assume completeness.
+    """
+    resolved_run_path, events_path, summary_path = _resolve_run_paths(run_path)
+    bids: dict[float, float] = {}
+    asks: dict[float, float] = {}
+    event_count = 0
+    snapshot_count = 0
+    snapshot_not_first_count = 0
+    non_monotonic_time_count = 0
+    crossed_book_count = 0
+    applied_bid_updates = 0
+    applied_ask_updates = 0
+    first_event_time: str | None = None
+    last_event_time: str | None = None
+    previous_event_dt: datetime | None = None
+    source: str | None = None
+    product: str | None = None
+    instrument_id: str | None = None
+
+    for row in _read_jsonl(events_path):
+        event_count += 1
+        source = source or _optional_str(row.get("source"))
+        product = product or _optional_str(row.get("product"))
+        instrument = row.get("instrument")
+        if instrument_id is None and isinstance(instrument, dict):
+            instrument_id = _optional_str(instrument.get("instrument_id"))
+
+        event_type = _optional_str(row.get("event_type"))
+        exchange_time = _optional_str(row.get("event_time"))
+        display_time = exchange_time or _optional_str(row.get("received_at"))
+        if first_event_time is None:
+            first_event_time = display_time
+        last_event_time = display_time
+
+        # Monotonicity is checked on exchange time only; the snapshot frame has no
+        # exchange time, so it's skipped rather than compared against a diff's time.
+        event_dt = _parse_iso_dt(exchange_time)
+        if event_dt is not None:
+            if previous_event_dt is not None and event_dt < previous_event_dt:
+                non_monotonic_time_count += 1
+            if previous_event_dt is None or event_dt >= previous_event_dt:
+                previous_event_dt = event_dt
+
+        bid_updates = _levels_from_row(row.get("bids"))
+        ask_updates = _levels_from_row(row.get("asks"))
+        if event_type == "snapshot":
+            snapshot_count += 1
+            if event_count != 1:
+                snapshot_not_first_count += 1
+            # A snapshot reseeds the book wholesale rather than applying diffs.
+            bids = {price: size for price, size in bid_updates if size > 0}
+            asks = {price: size for price, size in ask_updates if size > 0}
+        else:
+            applied_bid_updates += len(bid_updates)
+            applied_ask_updates += len(ask_updates)
+            _apply_levels(bids, bid_updates)
+            _apply_levels(asks, ask_updates)
+
+        best_bid = max(bids) if bids else None
+        best_ask = min(asks) if asks else None
+        if best_bid is not None and best_ask is not None and best_bid >= best_ask:
+            crossed_book_count += 1
+
+    best_bid = max(bids) if bids else None
+    best_ask = min(asks) if asks else None
+    spread = (best_ask - best_bid) if best_bid is not None and best_ask is not None else None
+
+    findings: list[str] = []
+    if event_count == 0:
+        findings.append("no_events")
+    if snapshot_count == 0:
+        findings.append("no_snapshot_anchor")
+    if snapshot_count > 1:
+        findings.append("multiple_snapshot_anchors")
+    if snapshot_not_first_count:
+        findings.append("snapshot_not_first_event")
+    if non_monotonic_time_count:
+        findings.append("non_monotonic_event_time")
+    if crossed_book_count:
+        findings.append("crossed_book_states")
+
+    replayable = (
+        event_count > 0
+        and snapshot_count == 1
+        and snapshot_not_first_count == 0
+        and non_monotonic_time_count == 0
+    )
+
+    summary = ReplaySummary(
+        replay_type="depth",
+        mode="stream_snapshot",
+        run_path=str(resolved_run_path),
+        events_path=str(events_path),
+        source=source,
+        product=product,
+        instrument_id=instrument_id,
+        snapshot_path=None,
+        snapshot_last_update_id=None,
+        event_count=event_count,
+        applied_bid_updates=applied_bid_updates,
+        applied_ask_updates=applied_ask_updates,
+        gap_count=0,
+        snapshot_gap_count=0,
+        reordered_count=0,
+        invalid_range_count=0,
+        crossed_book_count=crossed_book_count,
+        first_event_time=first_event_time,
+        last_event_time=last_event_time,
+        first_update_id=None,
+        last_update_id=None,
+        bid_levels=len(bids),
+        ask_levels=len(asks),
+        best_bid=best_bid,
+        best_ask=best_ask,
+        spread=spread,
+        replayable=replayable,
+        findings=findings,
+        top_bids=_top_levels(bids, reverse=True, max_levels=max_levels),
+        top_asks=_top_levels(asks, reverse=False, max_levels=max_levels),
+        gap_detection="none_native",
+        summary_path=str(summary_path) if summary_path is not None else None,
+    )
+
+    if write_summary and summary_path is not None:
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text(
+            json.dumps(summary.to_dict(), indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+    return summary
+
+
+def _parse_iso_dt(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        text = value[:-1] + "+00:00" if value.endswith("Z") else value
+        parsed = datetime.fromisoformat(text)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
 def build_book_sync_health_report(

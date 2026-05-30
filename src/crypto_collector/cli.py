@@ -30,6 +30,7 @@ from .config import (
 from .market_normalizers import (
     BinanceDepthNormalizer,
     BinanceTradeNormalizer,
+    CoinbaseDepthNormalizer,
     CoinbaseTradeNormalizer,
 )
 from .market_snapshots import fetch_binance_order_book_snapshot, write_snapshot_file
@@ -55,6 +56,7 @@ from .replay import (
     backfill_replay_summaries,
     build_book_sync_health_report,
     replay_depth_run,
+    replay_depth_stream_run,
     replay_trades_run,
 )
 from .research_manifest import DEFAULT_MANIFEST_ROOT, generate_research_manifest
@@ -168,6 +170,44 @@ def build_parser() -> argparse.ArgumentParser:
         "coinbase_trades/.",
     )
     cb_trades_parser.add_argument(
+        "--rotate-at-midnight",
+        action="store_true",
+        help="Rotate the run directory at midnight UTC instead of at --segment-count "
+        "messages. See the depth worker's help text for the same flag.",
+    )
+
+    cb_depth_parser = subparsers.add_parser(
+        "coinbase-depth-worker",
+        help="Run segmented Coinbase level2 depth collection (non-sequence feed)",
+    )
+    cb_depth_parser.add_argument(
+        "--symbol",
+        default="BTC-USD",
+        help="Coinbase product id, e.g. BTC-USD / ETH-USD (dash-separated).",
+    )
+    cb_depth_parser.add_argument(
+        "--channel",
+        default="level2_batch",
+        help="Coinbase depth channel. 'level2_batch' is the unauthenticated public "
+        "feed; the plain 'level2' channel requires Coinbase auth. Both emit the same "
+        "in-stream snapshot + l2update frames. This is a non-sequence ('none_native') "
+        "feed: replayable means structurally clean, not gap-proof (STANDARDS 4.3).",
+    )
+    cb_depth_parser.add_argument("--segment-count", type=int, default=5000)
+    cb_depth_parser.add_argument("--max-segments", type=int)
+    cb_depth_parser.add_argument("--cooldown-seconds", type=float, default=1.0)
+    cb_depth_parser.add_argument("--output-root", type=Path, default=default_output_root())
+    cb_depth_parser.add_argument("--ops-root", type=Path, default=default_ops_root())
+    cb_depth_parser.add_argument("--worker-name", default="coinbase-depth-worker")
+    cb_depth_parser.add_argument("--heartbeat-interval-seconds", type=float, default=30.0)
+    cb_depth_parser.add_argument(
+        "--source-suffix",
+        default="",
+        help="Optional per-instrument lane suffix. When non-empty, runs go to "
+        "<output_root>/coinbase_depth_<suffix>/<timestamp>/ instead of "
+        "coinbase_depth/.",
+    )
+    cb_depth_parser.add_argument(
         "--rotate-at-midnight",
         action="store_true",
         help="Rotate the run directory at midnight UTC instead of at --segment-count "
@@ -676,6 +716,85 @@ async def _collect_trades_segment(
     }
 
 
+async def collect_coinbase_depth_segment(args: argparse.Namespace) -> dict[str, object]:
+    return await _collect_depth_stream_segment(
+        args,
+        source="coinbase",
+        websocket_url="wss://ws-feed.exchange.coinbase.com",
+        subscription_style="coinbase",
+        normalizer=CoinbaseDepthNormalizer(),
+        source_base="coinbase_depth",
+    )
+
+
+async def _collect_depth_stream_segment(
+    args: argparse.Namespace,
+    *,
+    source: str,
+    websocket_url: str,
+    subscription_style: str,
+    normalizer: object,
+    source_base: str,
+) -> dict[str, object]:
+    """Venue-agnostic depth segment for **non-sequence** ("none_native") feeds.
+
+    Unlike Binance depth (REST snapshot + U/u reconnect-in-place alignment), these
+    feeds deliver the snapshot in-stream and carry no sequence, so there's nothing to
+    align across a reconnect — a reconnect simply yields a second in-stream snapshot,
+    which `replay_depth_stream_run` flags so the run is curated as one clean book or
+    not at all. That makes the depth stream a perfect fit for the same generic
+    pipeline the trades lanes use; only the normalizer, the depth-specific
+    `MetadataQualityGate`, the normalized dataset root and the none-native replay
+    differ from `_collect_trades_segment`."""
+    config = CollectorConfig(
+        source=source,
+        output_root=args.output_root,
+        product=args.symbol,
+        channel=args.channel,
+        websocket_url=websocket_url,
+        subscription_style=subscription_style,
+    )
+    collector = GenericWebsocketCollector(config=config)
+    source_name = _build_source_name(source_base, getattr(args, "source_suffix", ""))
+    run_paths = prepare_run_paths(output_root=config.output_root, source=source_name)
+    pipeline = CollectorPipeline(
+        collector=collector,
+        normalizer=normalizer,
+        # Depth events carry no top-level price/size/side, so the trades QualityGate
+        # doesn't apply; MetadataQualityGate gates on parse errors (and update-range
+        # for sequence feeds), which is the right bar for a depth diff stream.
+        quality_gate=MetadataQualityGate(),
+        run_paths=run_paths,
+        normalized_root=default_normalized_root("market"),
+    )
+    pipeline_summary = await pipeline.run(
+        limit=args.count,
+        deadline_utc=getattr(args, "deadline_utc", None),
+    )
+
+    events_path = run_paths.base / "clean" / "events.jsonl"
+    if events_path.exists():
+        replay_summary = replay_depth_stream_run(run_paths.base, write_summary=True)
+        replayable = replay_summary.replayable
+        replay_findings = list(replay_summary.findings)
+        replay_summary_path = replay_summary.summary_path
+    else:
+        replayable = False
+        replay_findings = ["no_clean_events"]
+        replay_summary_path = None
+
+    return {
+        "raw_messages": pipeline_summary.raw_messages,
+        "clean_events": pipeline_summary.clean_events,
+        "quarantined_events": pipeline_summary.quarantined_events,
+        "run_path": str(run_paths.base),
+        "replayable": replayable,
+        "replay_findings": replay_findings,
+        "replay_summary_path": replay_summary_path,
+        "deadline_reached": bool(pipeline_summary.deadline_reached),
+    }
+
+
 def run_binance_depth_worker(args: argparse.Namespace) -> None:
     _run_segmented_worker(
         args=args,
@@ -750,6 +869,29 @@ def run_coinbase_trades_worker(args: argparse.Namespace) -> None:
         collect_segment=collect_coinbase_trades_segment,
         progress_message=lambda segment_index, summary: (
             "coinbase trades segment finished: "
+            f"segment={segment_index} clean_events={summary['clean_events']} "
+            f"replayable={summary.get('replayable')} run_path={summary['run_path']}"
+        ),
+    )
+
+
+def run_coinbase_depth_worker(args: argparse.Namespace) -> None:
+    _run_segmented_worker(
+        args=args,
+        default_worker_name="coinbase-depth-worker",
+        worker_type="coinbase-depth-worker",
+        venue="coinbase",
+        build_segment_args=lambda source_args: SimpleNamespace(
+            symbol=source_args.symbol,
+            channel=source_args.channel,
+            count=source_args.segment_count,
+            output_root=source_args.output_root,
+            source_suffix=getattr(source_args, "source_suffix", ""),
+            deadline_utc=None,  # _run_segmented_worker overrides this when rotate_at_midnight is set
+        ),
+        collect_segment=collect_coinbase_depth_segment,
+        progress_message=lambda segment_index, summary: (
+            "coinbase depth segment finished: "
             f"segment={segment_index} clean_events={summary['clean_events']} "
             f"replayable={summary.get('replayable')} run_path={summary['run_path']}"
         ),
@@ -867,6 +1009,9 @@ def _execute_ops_job(job: JobSpec) -> JobExecutionResult | str | None:
     if job.job_type == "coinbase-trades-worker":
         run_coinbase_trades_worker(args)
         return "coinbase trades worker completed"
+    if job.job_type == "coinbase-depth-worker":
+        run_coinbase_depth_worker(args)
+        return "coinbase depth worker completed"
     if job.job_type == "book-sync-health":
         run_book_sync_health(args)
         return "book sync health completed"
@@ -947,6 +1092,23 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             max_delay_ms=raw_args.get("max_delay_ms", 60_000),
             max_future_skew_ms=raw_args.get("max_future_skew_ms", 5_000),
             max_clock_skew_ms=raw_args.get("max_clock_skew_ms", 60_000.0),
+            source_suffix=raw_args.get("source_suffix", ""),
+            rotate_at_midnight=raw_args.get("rotate_at_midnight", False),
+        )
+    if job.job_type == "coinbase-depth-worker":
+        return SimpleNamespace(
+            # level2_batch is the unauthenticated public depth channel; the plain
+            # level2 channel requires Coinbase auth. Both emit the same
+            # snapshot/l2update frames the none-native depth replay validates.
+            symbol=raw_args.get("symbol", "BTC-USD"),
+            channel=raw_args.get("channel", "level2_batch"),
+            segment_count=raw_args.get("segment_count", 5000),
+            max_segments=raw_args.get("max_segments"),
+            cooldown_seconds=raw_args.get("cooldown_seconds", 1.0),
+            output_root=raw_args.get("output_root", default_output_root()),
+            ops_root=Path(raw_args.get("ops_root", default_ops_root())),
+            worker_name=raw_args.get("worker_name", "coinbase-depth-worker"),
+            heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
             source_suffix=raw_args.get("source_suffix", ""),
             rotate_at_midnight=raw_args.get("rotate_at_midnight", False),
         )
@@ -1395,6 +1557,8 @@ def main() -> None:
         run_binance_trades_worker(args)
     elif args.command == "coinbase-trades-worker":
         run_coinbase_trades_worker(args)
+    elif args.command == "coinbase-depth-worker":
+        run_coinbase_depth_worker(args)
     elif args.command == "ops-runner":
         run_ops_runner(args)
     elif args.command == "health":
