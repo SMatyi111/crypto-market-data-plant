@@ -1118,10 +1118,13 @@ def _read_latest_summary_row(run_path: Path) -> dict[str, Any] | None:
 def _managed_worker_names(jobs: list[JobSpec] | None) -> set[str]:
     names: set[str] = set()
     for job in jobs or []:
-        if job.job_type == "binance-depth-worker":
-            names.add(str(job.args.get("worker_name") or "binance-depth-worker"))
-        elif job.job_type == "binance-trades-worker":
-            names.add(str(job.args.get("worker_name") or "binance-trades-worker"))
+        # Any *-worker job is a managed standalone worker (binance/coinbase/kraken/bybit,
+        # trades or depth). Each run_*_worker defaults worker_name to its job_type, so an
+        # unset worker_name maps to the job_type — matching what the worker writes to its
+        # heartbeat. Enumerating venues here was the old approach and silently dropped the
+        # non-Binance lanes, flagging healthy workers as unmanaged.
+        if job.job_type.endswith("-worker"):
+            names.add(str(job.args.get("worker_name") or job.job_type))
     return names
 
 

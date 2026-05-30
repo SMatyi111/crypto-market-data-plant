@@ -15,16 +15,20 @@ from crypto_collector.cli import (
     _reopen_binance_depth_connection,
     build_parser,
     collect_binance_depth_segment,
+    collect_bybit_depth_segment,
     collect_bybit_trades_segment,
     collect_coinbase_depth_segment,
     collect_coinbase_trades_segment,
+    collect_kraken_depth_segment,
     collect_kraken_trades_segment,
     _is_retryable_connect_error,
 )
 from crypto_collector.market_normalizers import (
+    BybitDepthNormalizer,
     BybitTradeNormalizer,
     CoinbaseDepthNormalizer,
     CoinbaseTradeNormalizer,
+    KrakenDepthNormalizer,
     KrakenTradeNormalizer,
 )
 from crypto_collector.collectors.generic_ws import (
@@ -1360,3 +1364,348 @@ def test_collect_kraken_trades_segment_writes_sequence_replay_summary(
     assert summary["mode"] == "trade_stream"
     assert summary["replayable"] is True
     assert summary["last_trade_id"] == 1003
+
+
+# --- Phase 2 #3c: Bybit depth (orderbook) adapter -------------------------
+
+
+def _bybit_orderbook_frame(
+    *,
+    bids: list[list[str]],
+    asks: list[list[str]],
+    symbol: str = "BTCUSDT",
+    msg_type: str = "snapshot",
+    update_id: int | None = None,
+    seq: int | None = None,
+    ts_ms: int = 0,
+    cts_ms: int | None = None,
+) -> dict:
+    """Build a Bybit v5 spot orderbook frame. The snapshot/delta `type` is at the frame
+    level; `data.b`/`data.a` are `[[price, size]]` arrays where size '0' removes a level.
+    `u` (update id) and `seq` (cross sequence) are kept for forensics only — neither is a
+    dense gap-detection counter, hence none_native."""
+    data: dict = {"s": symbol, "b": bids, "a": asks}
+    if update_id is not None:
+        data["u"] = update_id
+    if seq is not None:
+        data["seq"] = seq
+    frame: dict = {
+        "topic": f"orderbook.50.{symbol}",
+        "type": msg_type,
+        "ts": ts_ms,
+        "data": data,
+    }
+    if cts_ms is not None:
+        frame["cts"] = cts_ms
+    return frame
+
+
+def test_bybit_depth_normalizer_snapshot_sets_event_type_and_levels() -> None:
+    """The in-stream snapshot must normalize to event_type='snapshot' with the full book
+    in bids/asks and NO sequence ids (none_native); u/seq live in metadata only."""
+    raw = RawMessage(
+        source="bybit",
+        received_at=utc_now(),
+        payload=_bybit_orderbook_frame(
+            bids=[["50000.0", "1.0"], ["49999.0", "2.0"]],
+            asks=[["50001.0", "0.5"]],
+            update_id=18521288,
+            seq=7961638724,
+            cts_ms=1_780_000_000_000,
+        ),
+    )
+
+    event = BybitDepthNormalizer().normalize(raw)
+
+    assert event.event_type == "snapshot"
+    assert event.channel == "depth"
+    assert event.bids == [[50000.0, 1.0], [49999.0, 2.0]]
+    assert event.asks == [[50001.0, 0.5]]
+    # none_native: no per-message sequence is exposed as first/final update id.
+    assert event.first_update_id is None
+    assert event.final_update_id is None
+    # u/seq kept for forensics only, NOT as a dense gap-detection counter.
+    assert event.metadata["bybit_update_id"] == 18521288
+    assert event.metadata["bybit_cross_sequence"] == 7961638724
+    # cts (matching-engine ts) is used as the exchange time when present.
+    assert event.event_time is not None
+    assert event.instrument is not None
+    assert event.instrument.instrument_id == "spot:bybit:BTCUSDT"
+
+
+def test_bybit_depth_normalizer_delta_preserves_removal_and_update_id() -> None:
+    """Deltas use event_type='delta'; size '0' (a removal) is preserved as a level so
+    replay can drop it, and the absent `seq` simply doesn't appear in metadata."""
+    raw = RawMessage(
+        source="bybit",
+        received_at=utc_now(),
+        payload=_bybit_orderbook_frame(
+            bids=[["50000.0", "0"]],  # removal
+            asks=[["50002.0", "1.25"]],
+            msg_type="delta",
+            update_id=18521290,
+        ),
+    )
+
+    event = BybitDepthNormalizer().normalize(raw)
+
+    assert event.event_type == "delta"
+    assert event.bids == [[50000.0, 0.0]]
+    assert event.asks == [[50002.0, 1.25]]
+    assert event.first_update_id is None
+    assert event.final_update_id is None
+    assert event.metadata["bybit_update_id"] == 18521290
+    assert "bybit_cross_sequence" not in event.metadata
+
+
+def test_bybit_depth_normalizer_missing_data_yields_empty_book() -> None:
+    raw = RawMessage(
+        source="bybit",
+        received_at=utc_now(),
+        payload={"topic": "orderbook.50.BTCUSDT", "type": "snapshot"},
+    )
+
+    event = BybitDepthNormalizer().normalize(raw)
+
+    assert event.product == "UNKNOWN"
+    assert event.bids == []
+    assert event.asks == []
+    assert event.metadata == {}
+
+
+def test_cli_parser_bybit_depth_worker_defaults() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["bybit-depth-worker"])
+    assert args.symbol == "BTCUSDT"
+    # orderbook.<depth>; the symbol is appended to form the full topic.
+    assert args.channel == "orderbook.50"
+    assert args.source_suffix == ""
+    assert args.rotate_at_midnight is False
+
+    suffixed = parser.parse_args(
+        ["bybit-depth-worker", "--symbol", "ETHUSDT", "--source-suffix", "ethusdt"]
+    )
+    assert suffixed.symbol == "ETHUSDT"
+    assert suffixed.source_suffix == "ethusdt"
+
+
+def test_collect_bybit_depth_segment_writes_none_native_replay_summary(
+    tmp_path, monkeypatch
+) -> None:
+    """End-to-end: a Bybit orderbook stream (in-stream snapshot + delta) lands in
+    bybit_depth/<ts>/ as clean events and gets a none_native depth replay summary, so the
+    existing quarantine/promote chain can curate it without claiming gaplessness."""
+    now = utc_now()
+    cts = int(now.timestamp() * 1000)
+    ws = _ScriptedDepthWebsocket(
+        frames=[
+            {"success": True, "ret_msg": "subscribe", "op": "subscribe", "conn_id": "x"},  # ack
+            _bybit_orderbook_frame(
+                bids=[["50000.0", "1.0"]],
+                asks=[["50001.0", "2.0"]],
+                msg_type="snapshot",
+                update_id=100,
+                cts_ms=cts,
+            ),
+            _bybit_orderbook_frame(
+                bids=[["50000.0", "0"]],  # removal
+                asks=[["50002.0", "1.5"]],
+                msg_type="delta",
+                update_id=101,
+                cts_ms=cts + 1000,
+            ),
+        ]
+    )
+    _install_fake_trades_runtime(monkeypatch, ws)
+
+    args = SimpleNamespace(
+        symbol="BTCUSDT",
+        channel="orderbook.50",
+        count=2,  # data frames
+        output_root=tmp_path,
+        source_suffix="",
+        deadline_utc=None,
+    )
+
+    result = asyncio.run(collect_bybit_depth_segment(args))
+
+    assert result["clean_events"] == 2, result
+    assert result["quarantined_events"] == 0
+    assert result["replayable"] is True, result["replay_findings"]
+
+    run_path = Path(result["run_path"])
+    assert run_path.parent.name == "bybit_depth"
+    events = (run_path / "clean" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(events) == 2
+    first = json.loads(events[0])
+    assert first["source"] == "bybit"
+    assert first["event_type"] == "snapshot"
+    assert first["first_update_id"] is None
+    summary = json.loads(
+        (run_path / "metrics" / "replay_summary.json").read_text(encoding="utf-8")
+    )
+    assert summary["gap_detection"] == "none_native"
+    assert summary["replayable"] is True
+
+
+# --- Phase 2 #3c: Kraken depth (book) adapter -----------------------------
+
+
+def _kraken_book_level(price: float, qty: float) -> dict:
+    return {"price": price, "qty": qty}
+
+
+def _kraken_book_frame(
+    *,
+    bids: list[dict],
+    asks: list[dict],
+    msg_type: str = "snapshot",
+    symbol: str = "BTC/USD",
+    checksum: int | None = None,
+    timestamp_iso: str | None = None,
+) -> dict:
+    """Build a Kraken v2 book frame. `data` is a list (one entry per symbol); bids/asks
+    are `{price, qty}` objects where qty 0 removes a level. `checksum` (CRC32) is kept in
+    metadata but not validated, so the feed is curated none_native."""
+    entry: dict = {"symbol": symbol, "bids": bids, "asks": asks}
+    if checksum is not None:
+        entry["checksum"] = checksum
+    if timestamp_iso is not None:
+        entry["timestamp"] = timestamp_iso
+    return {"channel": "book", "type": msg_type, "data": [entry]}
+
+
+def test_kraken_depth_normalizer_snapshot_parses_object_levels() -> None:
+    """Kraken book levels are `{price, qty}` objects (not arrays); they must flatten to
+    the `[[price, size]]` shape replay expects, with no sequence ids (none_native) and
+    the CRC32 checksum preserved in metadata for a future validation pass."""
+    raw = RawMessage(
+        source="kraken",
+        received_at=utc_now(),
+        payload=_kraken_book_frame(
+            bids=[_kraken_book_level(50000.0, 1.0), _kraken_book_level(49999.0, 2.0)],
+            asks=[_kraken_book_level(50001.0, 0.5)],
+            msg_type="snapshot",
+            checksum=3093594577,
+        ),
+    )
+
+    events = KrakenDepthNormalizer().normalize_many(raw)
+
+    assert len(events) == 1
+    event = events[0]
+    assert event.event_type == "snapshot"
+    assert event.channel == "depth"
+    assert event.bids == [[50000.0, 1.0], [49999.0, 2.0]]
+    assert event.asks == [[50001.0, 0.5]]
+    assert event.first_update_id is None
+    assert event.final_update_id is None
+    assert event.event_time is None  # snapshot has no timestamp
+    assert event.metadata["kraken_checksum"] == 3093594577
+    # Slashed Kraken pair is collapsed before resolving so the instrument isn't None.
+    assert event.instrument is not None
+    assert event.instrument.instrument_id == "spot:kraken:BTCUSD"
+
+
+def test_kraken_depth_normalizer_update_handles_qty_zero_removal() -> None:
+    raw = RawMessage(
+        source="kraken",
+        received_at=utc_now(),
+        payload=_kraken_book_frame(
+            bids=[_kraken_book_level(50000.0, 0.0)],  # qty 0 = removal
+            asks=[_kraken_book_level(50002.0, 1.25)],
+            msg_type="update",
+            checksum=12345,
+            timestamp_iso="2026-05-28T12:00:01.000000Z",
+        ),
+    )
+
+    event = KrakenDepthNormalizer().normalize_many(raw)[0]
+
+    assert event.event_type == "update"
+    assert event.bids == [[50000.0, 0.0]]
+    assert event.asks == [[50002.0, 1.25]]
+    assert event.event_time == datetime(2026, 5, 28, 12, 0, 1, tzinfo=UTC)
+    assert event.metadata["kraken_checksum"] == 12345
+
+
+def test_kraken_depth_normalizer_non_list_data_yields_nothing() -> None:
+    raw = RawMessage(
+        source="kraken",
+        received_at=utc_now(),
+        payload={"channel": "book", "type": "snapshot"},
+    )
+    assert KrakenDepthNormalizer().normalize_many(raw) == []
+
+
+def test_cli_parser_kraken_depth_worker_defaults() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["kraken-depth-worker"])
+    assert args.symbol == "BTC/USD"
+    assert args.channel == "book"
+    assert args.source_suffix == ""
+    assert args.rotate_at_midnight is False
+
+    suffixed = parser.parse_args(
+        ["kraken-depth-worker", "--symbol", "ETH/USD", "--source-suffix", "ethusd"]
+    )
+    assert suffixed.symbol == "ETH/USD"
+    assert suffixed.source_suffix == "ethusd"
+
+
+def test_collect_kraken_depth_segment_writes_none_native_replay_summary(
+    tmp_path, monkeypatch
+) -> None:
+    """End-to-end: a Kraken v2 book stream (in-stream snapshot + update, object levels)
+    lands in kraken_depth/<ts>/ as clean events and gets a none_native depth replay
+    summary — Kraken's checksum isn't validated here, so gaplessness isn't claimed."""
+    now = utc_now()
+    t1 = (now + timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
+    ws = _ScriptedDepthWebsocket(
+        frames=[
+            {"method": "subscribe", "success": True, "result": {"channel": "book", "symbol": "BTC/USD"}},  # ack
+            _kraken_book_frame(
+                bids=[_kraken_book_level(50000.0, 1.0)],
+                asks=[_kraken_book_level(50001.0, 2.0)],
+                msg_type="snapshot",
+                checksum=111,
+            ),
+            _kraken_book_frame(
+                bids=[_kraken_book_level(50000.0, 0.0), _kraken_book_level(49999.0, 3.0)],
+                asks=[_kraken_book_level(50001.0, 1.5)],
+                msg_type="update",
+                checksum=222,
+                timestamp_iso=t1,
+            ),
+        ]
+    )
+    _install_fake_trades_runtime(monkeypatch, ws)
+
+    args = SimpleNamespace(
+        symbol="BTC/USD",
+        channel="book",
+        count=2,  # data frames
+        output_root=tmp_path,
+        source_suffix="",
+        deadline_utc=None,
+    )
+
+    result = asyncio.run(collect_kraken_depth_segment(args))
+
+    assert result["clean_events"] == 2, result
+    assert result["quarantined_events"] == 0
+    assert result["replayable"] is True, result["replay_findings"]
+
+    run_path = Path(result["run_path"])
+    assert run_path.parent.name == "kraken_depth"
+    events = (run_path / "clean" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(events) == 2
+    first = json.loads(events[0])
+    assert first["source"] == "kraken"
+    assert first["event_type"] == "snapshot"
+    assert first["first_update_id"] is None
+    summary = json.loads(
+        (run_path / "metrics" / "replay_summary.json").read_text(encoding="utf-8")
+    )
+    assert summary["gap_detection"] == "none_native"
+    assert summary["replayable"] is True

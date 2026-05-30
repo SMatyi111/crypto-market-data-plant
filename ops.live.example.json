@@ -236,6 +236,90 @@
       }
     },
     {
+      "// non-sequence depth lane": "Bybit v5 spot orderbook is a none_native feed (STANDARDS 4.3): the snapshot arrives in-stream and deltas carry no dense per-message sequence we trust for spot, so 'replayable' means structurally clean (single snapshot anchor, parse-clean, monotonic timestamps) — NOT gap-proof. Promoted rows go to market_replayable like Binance/Coinbase depth, but consumers must treat gap_detection=='none_native' data as best-effort. channel is the 'orderbook.<depth>' topic prefix (spot supports 1/50/200); the symbol is appended automatically. Same ~10min idle-drop keepalive caveat as the Bybit trades lane.",
+      "name": "bybit-btc-depth",
+      "job_type": "bybit-depth-worker",
+      "enabled": false,
+      "interval_seconds": 3600,
+      "args": {
+        "symbol": "BTCUSDT",
+        "channel": "orderbook.50",
+        "segment_count": 5000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "worker_name": "bybit-depth-worker",
+        "output_root": "D:\\market_archive\\raw\\market",
+        "ops_root": "D:\\market_archive\\ops"
+      }
+    },
+    {
+      "name": "quarantine-bybit-depth",
+      "job_type": "quarantine-runs",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "D:\\market_archive\\raw\\market\\bybit_depth",
+        "quarantine_root": "D:\\market_archive\\quarantine\\market\\bybit_depth",
+        "limit": 20,
+        "max_age_hours": 6
+      }
+    },
+    {
+      "name": "promote-bybit-depth",
+      "job_type": "promote-replayable",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "D:\\market_archive\\raw\\market\\bybit_depth",
+        "target_root": "D:\\market_archive\\curated\\research\\market_replayable",
+        "quarantine_index": "D:\\market_archive\\quarantine\\market\\bybit_depth\\_quarantine_index.jsonl",
+        "limit": 20,
+        "max_age_hours": 6
+      }
+    },
+    {
+      "// non-sequence depth lane": "Kraken v2 book is a none_native feed (STANDARDS 4.3): the snapshot arrives in-stream and updates carry a CRC32 checksum we don't yet validate (lossy from float storage), so 'replayable' means structurally clean (single snapshot anchor, parse-clean, monotonic timestamps) — NOT gap-proof. Promoted rows go to market_replayable like Binance/Coinbase depth, but consumers must treat gap_detection=='none_native' data as best-effort. One WS frame's data list fans out via normalize_many. Symbol is the slash pair (BTC/USD); channel 'book' uses Kraken's default depth (10).",
+      "name": "kraken-btc-depth",
+      "job_type": "kraken-depth-worker",
+      "enabled": false,
+      "interval_seconds": 3600,
+      "args": {
+        "symbol": "BTC/USD",
+        "channel": "book",
+        "segment_count": 5000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "worker_name": "kraken-depth-worker",
+        "output_root": "D:\\market_archive\\raw\\market",
+        "ops_root": "D:\\market_archive\\ops"
+      }
+    },
+    {
+      "name": "quarantine-kraken-depth",
+      "job_type": "quarantine-runs",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "D:\\market_archive\\raw\\market\\kraken_depth",
+        "quarantine_root": "D:\\market_archive\\quarantine\\market\\kraken_depth",
+        "limit": 20,
+        "max_age_hours": 6
+      }
+    },
+    {
+      "name": "promote-kraken-depth",
+      "job_type": "promote-replayable",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "D:\\market_archive\\raw\\market\\kraken_depth",
+        "target_root": "D:\\market_archive\\curated\\research\\market_replayable",
+        "quarantine_index": "D:\\market_archive\\quarantine\\market\\kraken_depth\\_quarantine_index.jsonl",
+        "limit": 20,
+        "max_age_hours": 6
+      }
+    },
+    {
       "name": "book-sync-health",
       "job_type": "book-sync-health",
       "interval_seconds": 300,
@@ -312,7 +396,9 @@
           "market/coinbase_trades=14",
           "market/coinbase_depth=14",
           "market/kraken_trades=14",
-          "market/bybit_trades=14"
+          "market/bybit_trades=14",
+          "market/bybit_depth=14",
+          "market/kraken_depth=14"
         ],
         "apply": false
       }

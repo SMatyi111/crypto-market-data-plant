@@ -30,9 +30,11 @@ from .config import (
 from .market_normalizers import (
     BinanceDepthNormalizer,
     BinanceTradeNormalizer,
+    BybitDepthNormalizer,
     BybitTradeNormalizer,
     CoinbaseDepthNormalizer,
     CoinbaseTradeNormalizer,
+    KrakenDepthNormalizer,
     KrakenTradeNormalizer,
 )
 from .market_snapshots import fetch_binance_order_book_snapshot, write_snapshot_file
@@ -290,6 +292,82 @@ def build_parser() -> argparse.ArgumentParser:
         "bybit_trades/.",
     )
     bybit_trades_parser.add_argument(
+        "--rotate-at-midnight",
+        action="store_true",
+        help="Rotate the run directory at midnight UTC instead of at --segment-count "
+        "messages. See the depth worker's help text for the same flag.",
+    )
+
+    bybit_depth_parser = subparsers.add_parser(
+        "bybit-depth-worker",
+        help="Run segmented Bybit v5 spot orderbook depth collection (non-sequence feed)",
+    )
+    bybit_depth_parser.add_argument(
+        "--symbol",
+        default="BTCUSDT",
+        help="Bybit v5 spot symbol, e.g. BTCUSDT / ETHUSDT (no separator).",
+    )
+    bybit_depth_parser.add_argument(
+        "--channel",
+        default="orderbook.50",
+        help="Bybit v5 depth topic prefix '<orderbook>.<depth>', e.g. orderbook.50 "
+        "(spot supports 1/50/200). The symbol is appended to form the full topic "
+        "orderbook.<depth>.<symbol>. Bybit ships an in-stream snapshot + deltas with no "
+        "dense per-message sequence we trust for spot, so this is a non-sequence "
+        "('none_native') feed: replayable means structurally clean, not gap-proof "
+        "(STANDARDS 4.3).",
+    )
+    bybit_depth_parser.add_argument("--segment-count", type=int, default=5000)
+    bybit_depth_parser.add_argument("--max-segments", type=int)
+    bybit_depth_parser.add_argument("--cooldown-seconds", type=float, default=1.0)
+    bybit_depth_parser.add_argument("--output-root", type=Path, default=default_output_root())
+    bybit_depth_parser.add_argument("--ops-root", type=Path, default=default_ops_root())
+    bybit_depth_parser.add_argument("--worker-name", default="bybit-depth-worker")
+    bybit_depth_parser.add_argument("--heartbeat-interval-seconds", type=float, default=30.0)
+    bybit_depth_parser.add_argument(
+        "--source-suffix",
+        default="",
+        help="Optional per-instrument lane suffix. When non-empty, runs go to "
+        "<output_root>/bybit_depth_<suffix>/<timestamp>/ instead of bybit_depth/.",
+    )
+    bybit_depth_parser.add_argument(
+        "--rotate-at-midnight",
+        action="store_true",
+        help="Rotate the run directory at midnight UTC instead of at --segment-count "
+        "messages. See the depth worker's help text for the same flag.",
+    )
+
+    kraken_depth_parser = subparsers.add_parser(
+        "kraken-depth-worker",
+        help="Run segmented Kraken v2 book depth collection (non-sequence feed)",
+    )
+    kraken_depth_parser.add_argument(
+        "--symbol",
+        default="BTC/USD",
+        help="Kraken v2 pair, e.g. BTC/USD / ETH/USD (slash-separated).",
+    )
+    kraken_depth_parser.add_argument(
+        "--channel",
+        default="book",
+        help="Kraken v2 channel. 'book' is the public order book feed (default depth "
+        "10). Kraken ships an in-stream snapshot + updates plus a CRC32 checksum we "
+        "don't yet validate, so this is a non-sequence ('none_native') feed: replayable "
+        "means structurally clean, not gap-proof (STANDARDS 4.3).",
+    )
+    kraken_depth_parser.add_argument("--segment-count", type=int, default=5000)
+    kraken_depth_parser.add_argument("--max-segments", type=int)
+    kraken_depth_parser.add_argument("--cooldown-seconds", type=float, default=1.0)
+    kraken_depth_parser.add_argument("--output-root", type=Path, default=default_output_root())
+    kraken_depth_parser.add_argument("--ops-root", type=Path, default=default_ops_root())
+    kraken_depth_parser.add_argument("--worker-name", default="kraken-depth-worker")
+    kraken_depth_parser.add_argument("--heartbeat-interval-seconds", type=float, default=30.0)
+    kraken_depth_parser.add_argument(
+        "--source-suffix",
+        default="",
+        help="Optional per-instrument lane suffix. When non-empty, runs go to "
+        "<output_root>/kraken_depth_<suffix>/<timestamp>/ instead of kraken_depth/.",
+    )
+    kraken_depth_parser.add_argument(
         "--rotate-at-midnight",
         action="store_true",
         help="Rotate the run directory at midnight UTC instead of at --segment-count "
@@ -841,6 +919,34 @@ async def collect_coinbase_depth_segment(args: argparse.Namespace) -> dict[str, 
     )
 
 
+async def collect_bybit_depth_segment(args: argparse.Namespace) -> dict[str, object]:
+    # Bybit orderbook delivers an in-stream snapshot + deltas with no dense per-message
+    # sequence we can trust for spot, so curate as a non-sequence ("none_native") feed:
+    # structurally clean only, NOT gap-proof (STANDARDS 4.3).
+    return await _collect_depth_stream_segment(
+        args,
+        source="bybit",
+        websocket_url="wss://stream.bybit.com/v5/public/spot",
+        subscription_style="bybit",
+        normalizer=BybitDepthNormalizer(),
+        source_base="bybit_depth",
+    )
+
+
+async def collect_kraken_depth_segment(args: argparse.Namespace) -> dict[str, object]:
+    # Kraken v2 book delivers an in-stream snapshot + updates plus a CRC32 checksum we
+    # don't yet validate (lossy from float storage), so curate as a non-sequence
+    # ("none_native") feed: structurally clean only, NOT gap-proof (STANDARDS 4.3).
+    return await _collect_depth_stream_segment(
+        args,
+        source="kraken",
+        websocket_url="wss://ws.kraken.com/v2",
+        subscription_style="kraken_v2",
+        normalizer=KrakenDepthNormalizer(),
+        source_base="kraken_depth",
+    )
+
+
 async def _collect_depth_stream_segment(
     args: argparse.Namespace,
     *,
@@ -1064,6 +1170,52 @@ def run_bybit_trades_worker(args: argparse.Namespace) -> None:
     )
 
 
+def run_bybit_depth_worker(args: argparse.Namespace) -> None:
+    _run_segmented_worker(
+        args=args,
+        default_worker_name="bybit-depth-worker",
+        worker_type="bybit-depth-worker",
+        venue="bybit",
+        build_segment_args=lambda source_args: SimpleNamespace(
+            symbol=source_args.symbol,
+            channel=source_args.channel,
+            count=source_args.segment_count,
+            output_root=source_args.output_root,
+            source_suffix=getattr(source_args, "source_suffix", ""),
+            deadline_utc=None,  # _run_segmented_worker overrides this when rotate_at_midnight is set
+        ),
+        collect_segment=collect_bybit_depth_segment,
+        progress_message=lambda segment_index, summary: (
+            "bybit depth segment finished: "
+            f"segment={segment_index} clean_events={summary['clean_events']} "
+            f"replayable={summary.get('replayable')} run_path={summary['run_path']}"
+        ),
+    )
+
+
+def run_kraken_depth_worker(args: argparse.Namespace) -> None:
+    _run_segmented_worker(
+        args=args,
+        default_worker_name="kraken-depth-worker",
+        worker_type="kraken-depth-worker",
+        venue="kraken",
+        build_segment_args=lambda source_args: SimpleNamespace(
+            symbol=source_args.symbol,
+            channel=source_args.channel,
+            count=source_args.segment_count,
+            output_root=source_args.output_root,
+            source_suffix=getattr(source_args, "source_suffix", ""),
+            deadline_utc=None,  # _run_segmented_worker overrides this when rotate_at_midnight is set
+        ),
+        collect_segment=collect_kraken_depth_segment,
+        progress_message=lambda segment_index, summary: (
+            "kraken depth segment finished: "
+            f"segment={segment_index} clean_events={summary['clean_events']} "
+            f"replayable={summary.get('replayable')} run_path={summary['run_path']}"
+        ),
+    )
+
+
 def _run_segmented_worker(
     *,
     args: argparse.Namespace,
@@ -1184,6 +1336,12 @@ def _execute_ops_job(job: JobSpec) -> JobExecutionResult | str | None:
     if job.job_type == "bybit-trades-worker":
         run_bybit_trades_worker(args)
         return "bybit trades worker completed"
+    if job.job_type == "bybit-depth-worker":
+        run_bybit_depth_worker(args)
+        return "bybit depth worker completed"
+    if job.job_type == "kraken-depth-worker":
+        run_kraken_depth_worker(args)
+        return "kraken depth worker completed"
     if job.job_type == "book-sync-health":
         run_book_sync_health(args)
         return "book sync health completed"
@@ -1315,6 +1473,35 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             max_delay_ms=raw_args.get("max_delay_ms", 60_000),
             max_future_skew_ms=raw_args.get("max_future_skew_ms", 5_000),
             max_clock_skew_ms=raw_args.get("max_clock_skew_ms", 60_000.0),
+            source_suffix=raw_args.get("source_suffix", ""),
+            rotate_at_midnight=raw_args.get("rotate_at_midnight", False),
+        )
+    if job.job_type == "bybit-depth-worker":
+        return SimpleNamespace(
+            symbol=raw_args.get("symbol", "BTCUSDT"),
+            # orderbook.<depth>; the symbol is appended to form the full topic.
+            channel=raw_args.get("channel", "orderbook.50"),
+            segment_count=raw_args.get("segment_count", 5000),
+            max_segments=raw_args.get("max_segments"),
+            cooldown_seconds=raw_args.get("cooldown_seconds", 1.0),
+            output_root=raw_args.get("output_root", default_output_root()),
+            ops_root=Path(raw_args.get("ops_root", default_ops_root())),
+            worker_name=raw_args.get("worker_name", "bybit-depth-worker"),
+            heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
+            source_suffix=raw_args.get("source_suffix", ""),
+            rotate_at_midnight=raw_args.get("rotate_at_midnight", False),
+        )
+    if job.job_type == "kraken-depth-worker":
+        return SimpleNamespace(
+            symbol=raw_args.get("symbol", "BTC/USD"),
+            channel=raw_args.get("channel", "book"),
+            segment_count=raw_args.get("segment_count", 5000),
+            max_segments=raw_args.get("max_segments"),
+            cooldown_seconds=raw_args.get("cooldown_seconds", 1.0),
+            output_root=raw_args.get("output_root", default_output_root()),
+            ops_root=Path(raw_args.get("ops_root", default_ops_root())),
+            worker_name=raw_args.get("worker_name", "kraken-depth-worker"),
+            heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
             source_suffix=raw_args.get("source_suffix", ""),
             rotate_at_midnight=raw_args.get("rotate_at_midnight", False),
         )
@@ -1769,6 +1956,10 @@ def main() -> None:
         run_kraken_trades_worker(args)
     elif args.command == "bybit-trades-worker":
         run_bybit_trades_worker(args)
+    elif args.command == "bybit-depth-worker":
+        run_bybit_depth_worker(args)
+    elif args.command == "kraken-depth-worker":
+        run_kraken_depth_worker(args)
     elif args.command == "ops-runner":
         run_ops_runner(args)
     elif args.command == "health":

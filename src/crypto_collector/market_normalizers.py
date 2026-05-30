@@ -311,6 +311,127 @@ class KrakenTradeNormalizer:
         )
 
 
+class BybitDepthNormalizer:
+    """Normalize Bybit v5 spot `orderbook.{depth}.{symbol}` frames.
+
+    Bybit depth arrives as an **in-stream snapshot** (`type:"snapshot"`) on subscribe
+    followed by **deltas** (`type:"delta"`); `b`/`a` are `[[price, size]]` arrays (same
+    shape as Binance) where a size of `"0"` removes the level. This is a **non-sequence**
+    ("none_native") feed under STANDARDS 4.3:
+
+    * The snapshot arrives in-stream rather than via a separate REST call, so it's
+      emitted as a normal depth event with `event_type="snapshot"` and the full book.
+    * Bybit's orderbook `u` (update id) is monotonic but **not** a guaranteed dense `+1`
+      counter for spot, and `seq` (cross sequence) is a cross-topic cursor — neither
+      supports `delta == 1` gap detection. Both are kept in metadata for forensics only.
+
+    `first_update_id`/`final_update_id` are therefore always None and gaplessness is not
+    provable from the stream; the run is validated by `replay_depth_stream_run`, which
+    downgrades `replayable` to structurally-clean-only.
+    """
+
+    def normalize(self, raw: RawMessage) -> NormalizedDepthUpdate:
+        payload = raw.payload
+        parse_errors: list[str] = []
+        data = payload.get("data")
+        data = data if isinstance(data, dict) else {}
+        product = str(data.get("s") or "UNKNOWN")
+        frame_type = payload.get("type")
+        event_type = "snapshot" if frame_type == "snapshot" else "delta"
+        # `cts` is the matching-engine timestamp (preferred); `ts` is the frame send time.
+        event_time = _parse_timestamp_ms(
+            payload.get("cts") if payload.get("cts") is not None else payload.get("ts"),
+            parse_errors,
+        )
+        bids = _parse_levels(data.get("b"), "bids", parse_errors)
+        asks = _parse_levels(data.get("a"), "asks", parse_errors)
+        instrument = resolve_spot_instrument(
+            _strip_symbol_separators(product), venue=raw.source
+        )
+        metadata: dict[str, Any] = {
+            # Kept for forensics only — NOT used as a dense gap-detection sequence.
+            "bybit_update_id": _optional_int(data.get("u"), "update_id", parse_errors),
+            "bybit_cross_sequence": _optional_int(data.get("seq"), "cross_sequence", parse_errors),
+        }
+        if parse_errors:
+            metadata["parse_errors"] = parse_errors
+        return NormalizedDepthUpdate(
+            source=raw.source,
+            product=product,
+            channel="depth",
+            event_type=event_type,
+            event_time=event_time,
+            received_at=raw.received_at,
+            first_update_id=None,
+            final_update_id=None,
+            instrument=instrument,
+            bids=bids,
+            asks=asks,
+            metadata={key: value for key, value in metadata.items() if value is not None},
+        )
+
+
+class KrakenDepthNormalizer:
+    """Normalize Kraken v2 `book` channel frames.
+
+    Like the Kraken trade feed, `data` is a **list** (one entry per symbol), so this
+    exposes `normalize_many`. The book is an **in-stream snapshot** (`type:"snapshot"`)
+    on subscribe followed by **updates** (`type:"update"`); `bids`/`asks` are lists of
+    `{"price":.., "qty":..}` objects where a `qty` of `0` removes the level.
+
+    Kraken ships a **CRC32 `checksum`** per book message for integrity, but validating it
+    requires each pair's exact price/qty decimal precision to rebuild the canonical
+    digest string — and the normalized archive stores prices as floats (losing trailing
+    zeros), so checksum validation from the archive would be lossy and produce false
+    quarantines. So this is curated as a **non-sequence** ("none_native") feed under
+    STANDARDS 4.3 (structurally clean, not gap-proof); the `checksum` is preserved in
+    metadata for a future checksum-validated gap-proofing pass.
+    """
+
+    def normalize_many(self, raw: RawMessage) -> list[NormalizedDepthUpdate]:
+        data = raw.payload.get("data")
+        if not isinstance(data, list):
+            return []
+        frame_type = raw.payload.get("type")
+        event_type = "snapshot" if frame_type == "snapshot" else "update"
+        return [self._normalize_one(item, raw, event_type) for item in data]
+
+    def _normalize_one(
+        self, item: Any, raw: RawMessage, event_type: str
+    ) -> NormalizedDepthUpdate:
+        item = item if isinstance(item, dict) else {}
+        parse_errors: list[str] = []
+        product = str(item.get("symbol") or "UNKNOWN")
+        # The snapshot frame has no `timestamp`; updates carry an RFC3339 `timestamp`.
+        event_time = _parse_iso_timestamp(item.get("timestamp"), parse_errors)
+        bids = _parse_kraken_book_levels(item.get("bids"), "bids", parse_errors)
+        asks = _parse_kraken_book_levels(item.get("asks"), "asks", parse_errors)
+        instrument = resolve_spot_instrument(
+            _strip_symbol_separators(product), venue=raw.source
+        )
+        metadata: dict[str, Any] = {
+            # Kraken's CRC32 book checksum — preserved for a future checksum-validated
+            # gap-proofing pass; NOT validated here (see class docstring).
+            "kraken_checksum": _optional_int(item.get("checksum"), "checksum", parse_errors),
+        }
+        if parse_errors:
+            metadata["parse_errors"] = parse_errors
+        return NormalizedDepthUpdate(
+            source=raw.source,
+            product=product,
+            channel="depth",
+            event_type=event_type,
+            event_time=event_time,
+            received_at=raw.received_at,
+            first_update_id=None,
+            final_update_id=None,
+            instrument=instrument,
+            bids=bids,
+            asks=asks,
+            metadata={key: value for key, value in metadata.items() if value is not None},
+        )
+
+
 def _bybit_taker_side(value: Any, errors: list[str]) -> str | None:
     # Bybit `S` is the taker (aggressor) side, capitalized.
     if value == "Buy":
@@ -463,6 +584,30 @@ def _parse_levels(
             price = float(item[0])
             size = float(item[1])
         except (TypeError, ValueError, IndexError):
+            errors.append(f"invalid_{field_name}")
+            continue
+        levels.append([price, size])
+    return levels
+
+
+def _parse_kraken_book_levels(
+    values: Any,
+    field_name: str,
+    errors: list[str],
+) -> list[list[float]]:
+    """Parse Kraken v2 book levels (`[{"price":.., "qty":..}, ...]`) into the
+    `[[price, size]]` shape `_apply_levels` expects. A `qty` of `0` removes the level."""
+    if values in (None, ""):
+        return []
+    if not isinstance(values, list):
+        errors.append(f"invalid_{field_name}")
+        return []
+    levels: list[list[float]] = []
+    for item in values:
+        try:
+            price = float(item["price"])
+            size = float(item["qty"])
+        except (TypeError, ValueError, KeyError):
             errors.append(f"invalid_{field_name}")
             continue
         levels.append([price, size])

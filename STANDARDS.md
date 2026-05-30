@@ -18,21 +18,24 @@ Two normalized datasets, each collected per (venue, instrument) lane:
 
 | Dataset  | Channel  | Normalizer(s)                                  | Curated target            |
 | -------- | -------- | ---------------------------------------------- | ------------------------- |
-| `depth`  | order book diffs | `BinanceDepthNormalizer`, `CoinbaseDepthNormalizer` | `market_replayable`  |
+| `depth`  | order book diffs | `BinanceDepthNormalizer`, `CoinbaseDepthNormalizer`, `BybitDepthNormalizer`, `KrakenDepthNormalizer` | `market_replayable`  |
 | `trades` | trade prints     | `BinanceTradeNormalizer`, `CoinbaseTradeNormalizer`, `KrakenTradeNormalizer`, `BybitTradeNormalizer` | `trades_replayable` |
 
 Venues live today: **Binance** (depth + trades), **Coinbase** (trades + depth),
-**Kraken** (trades), **Bybit** (trades). See Roadmap for the rest.
+**Kraken** (trades + depth), **Bybit** (trades + depth). See Roadmap for the rest.
 
 > **Gap-detection class differs by feed, not just by venue.** Binance depth/trades,
 > Coinbase trades, and **Kraken trades** are **sequence-bearing** (§4.1/§4.2 strong
 > gaplessness — Kraken v2 `trade_id` is a dense per-pair counter). Coinbase depth
-> (`level2` / `level2_batch`) and **Bybit spot trades** (`publicTrade`, whose trade
-> id is a UUID, not a dense counter) are **non-sequence** (`none_native`, §4.3):
+> (`level2` / `level2_batch`), **Bybit spot trades** (`publicTrade`, whose trade
+> id is a UUID, not a dense counter), and **both new depth feeds — Bybit spot
+> `orderbook` and Kraken `book`** — are **non-sequence** (`none_native`, §4.3):
 > `replayable` there means *structurally clean*, **not** gap-proof. The per-lane
 > `gap_detection` tag in the manifest (§6) is how a consumer tells these apart —
-> note that two `trades` lanes can have **different** classes (Kraken `sequence`
-> vs. Bybit `none_native`), so key off the tag, not the dataset name.
+> note that two lanes of the same dataset can have **different** classes (e.g.
+> Binance depth `sequence` vs. Bybit/Kraken depth `none_native`; Kraken trades
+> `sequence` vs. Bybit trades `none_native`), so key off the tag, not the dataset
+> name.
 
 ---
 
@@ -54,7 +57,7 @@ A collector "run" is one segment directory:
 `<source>` is the lane directory:
 
 - `binance_depth`, `binance_trades`, `coinbase_trades`, `coinbase_depth`,
-  `kraken_trades`, `bybit_trades`
+  `kraken_trades`, `bybit_trades`, `bybit_depth`, `kraken_depth`
 - Per-instrument lanes append a sanitized suffix: `binance_trades_ethusdt`, etc.
   (`--source-suffix`; empty preserves the legacy single-symbol layout).
 
@@ -132,7 +135,7 @@ Parquet rows.
 | `source`          | str             | venue, e.g. `binance` |
 | `product`         | str             | venue symbol, e.g. `BTCUSDT` |
 | `channel`         | str             | `depth` |
-| `event_type`      | str             | `depthUpdate` / `snapshot` |
+| `event_type`      | str             | `snapshot` / `depthUpdate` (Binance) / `l2update` (Coinbase) / `delta` (Bybit) / `update` (Kraken) |
 | `event_time`      | ISO-8601 \| null | exchange event time (UTC) |
 | `received_at`     | ISO-8601        | collector receipt time (UTC) |
 | `first_update_id` | int \| null     | Binance `U` (sequence window start) |
@@ -252,6 +255,49 @@ non-gating, as in §4.1) `crossed_book_states`. A reconnect mid-run yields a
 run unreplayable — mirroring Binance depth's single-anchor invariant, so the
 worker's next segment simply starts a fresh book.
 
+**Live adapter — Bybit spot `depth` (`orderbook.{depth}`).** Bybit's spot
+orderbook stream sends a frame-level `type` of `"snapshot"` (full book) then
+`"delta"` frames (changed levels only, size `"0"` = remove). The diff key
+(`data.u`) is monotonic but **not** a dense `+1` counter for spot, and the cross
+sequence (`data.seq`) is shared across symbols — neither proves `delta == 1`, so
+the lane is `none_native` and reuses the in-stream-snapshot replay path
+(`replay_depth_stream_run`, `mode: "stream_snapshot"`). Both ids are preserved in
+`metadata` (`bybit_update_id`, `bybit_cross_sequence`) for any future tightening.
+Exchange time prefers the matching-engine timestamp (`cts`) and falls back to the
+frame timestamp (`ts`).
+
+`replayable` iff **all** hold:
+
+- `event_count > 0`
+- exactly one snapshot anchor, and it is the **first** event in the run
+- event timestamps are monotonic non-decreasing
+
+Findings: `no_events`, `no_snapshot_anchor`, `multiple_snapshot_anchors`,
+`snapshot_not_first_event`, `non_monotonic_event_time`, and (reported but
+non-gating) `crossed_book_states`. As with Coinbase depth, a reconnect yields a
+second snapshot and ends the run unreplayable; the next segment starts fresh.
+
+**Live adapter — Kraken `depth` (`book`).** Kraken's v2 `book` channel sends a
+frame-level `type` of `"snapshot"` then `"update"` frames; `data` is a **list**
+(one entry per symbol), fanned out via `normalize_many`. Levels are objects
+(`{"price", "qty"}`, `qty 0` = remove) flattened to `[[price, size]]`. There is
+**no message sequence number**; each frame carries a CRC32 `checksum` over the
+top-of-book, which the collector **does not validate today** (it requires
+reconstructing the book at venue-native per-pair precision, which the float
+storage layer loses — see Roadmap). So the lane is `none_native` with the same
+in-stream-snapshot verdict as Coinbase/Bybit depth. The raw checksum is preserved
+in `metadata` (`kraken_checksum`) for future validation. Only `update` frames
+carry a `timestamp`; the snapshot has none and is skipped from the monotonicity
+check.
+
+`replayable` iff **all** hold:
+
+- `event_count > 0`
+- exactly one snapshot anchor, and it is the **first** event in the run
+- event timestamps are monotonic non-decreasing
+
+Findings: same set as Bybit depth above.
+
 **Live adapter — Bybit spot `trades` (`publicTrade`).** Bybit batches many trades
 per WS frame (`data: [...]`), fanned out via `normalize_many`. The per-trade id
 (`i`) is a **UUID**, and the only other ordering field (`seq`, the cross sequence)
@@ -275,10 +321,11 @@ consumer that needs provable completeness MUST gate on the lane's
 
 > **Bybit keepalive limitation.** Bybit drops idle public connections after
 > ~10 min and expects a `{"op":"ping"}` roughly every 20 s. The collector does not
-> send app-level pings today; an active trade stream stays alive on its own traffic
-> so bounded segments complete fine, but a **low-volume** symbol can have its
-> segment end early on a clean server close (the collector then reconnects / the
-> worker starts a fresh segment — no data loss, just shorter runs).
+> send app-level pings today; an active trade or orderbook stream stays alive on its
+> own traffic so bounded segments complete fine, but a **low-volume** symbol (on
+> either the trades or depth lane) can have its segment end early on a clean server
+> close (the collector then reconnects / the worker starts a fresh segment — no data
+> loss, just shorter runs).
 
 ---
 
@@ -351,10 +398,18 @@ current contract:
 - `instrument=` partition column in the curated/normalized datasets (so
   per-instrument lanes of the same venue+dataset stop sharing Parquet
   partitions; the manifest already separates them via the promotion index).
-- **Depth** for Kraken and Bybit (their trades lanes are already live): Bybit
-  `orderbook.{depth}` (snapshot/delta keyed on `u`, snapshot-anchored — a
-  middle-ground sequence) and Kraken v2 `book` (CRC32 checksum, no sequence — a
-  §4.3 `none_native` feed integrity-checked by the checksum).
+- **Checksum-validated gap-proofing for Kraken `depth`.** The `book` channel
+  ships a CRC32 `checksum` per frame (preserved in `metadata.kraken_checksum`).
+  Validating it would let the Kraken depth lane *detect* dropped/reordered frames
+  and graduate from §4.3 `none_native` toward a stronger guarantee — but it needs
+  the book reconstructed at Kraken's venue-native per-pair price/qty precision,
+  which today's float storage loses. Requires carrying raw string levels (or
+  per-pair precision metadata) through the pipeline first.
+- **Tighter gap detection for Bybit `depth`.** `data.u` is monotonic and the
+  cross sequence `data.seq` is preserved (`metadata.bybit_update_id` /
+  `bybit_cross_sequence`); if Bybit's spot `u` proves dense enough per-symbol, the
+  lane could move from §4.3 toward a §4.1-style snapshot-anchored sequence proof.
 - App-level keepalive ping for Bybit (`{"op":"ping"}` ~20 s) so low-volume Bybit
-  lanes don't end segments early on the ~10 min idle drop (see §4.3).
+  lanes (trades or depth) don't end segments early on the ~10 min idle drop
+  (see §4.3).
 - Continuous day-bounded rotation as the default run model (vs. count-bounded).

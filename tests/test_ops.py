@@ -950,6 +950,90 @@ def test_job_args_bybit_trades_worker_threads_lane_flags() -> None:
     assert args.worker_name == "bybit-trades-worker-ethusdt"
 
 
+def test_job_args_bybit_depth_worker_defaults() -> None:
+    # The bybit-depth-worker job_type must build a usable namespace with Bybit v5 spot
+    # orderbook defaults (no-separator symbol, orderbook.50 topic prefix) so the
+    # ops-runner drives the none_native Bybit depth lane like the other workers.
+    args = _job_args(
+        JobSpec(
+            name="bybit-btc-depth",
+            job_type="bybit-depth-worker",
+            interval_seconds=3600,
+            args={},
+        )
+    )
+
+    assert args.symbol == "BTCUSDT"
+    assert args.channel == "orderbook.50"
+    assert args.worker_name == "bybit-depth-worker"
+    assert args.source_suffix == ""
+    assert args.rotate_at_midnight is False
+
+
+def test_job_args_bybit_depth_worker_threads_lane_flags() -> None:
+    args = _job_args(
+        JobSpec(
+            name="bybit-eth-depth",
+            job_type="bybit-depth-worker",
+            interval_seconds=3600,
+            args={
+                "symbol": "ETHUSDT",
+                "channel": "orderbook.200",
+                "source_suffix": "ethusdt",
+                "rotate_at_midnight": True,
+                "worker_name": "bybit-depth-worker-ethusdt",
+            },
+        )
+    )
+
+    assert args.symbol == "ETHUSDT"
+    assert args.channel == "orderbook.200"
+    assert args.source_suffix == "ethusdt"
+    assert args.rotate_at_midnight is True
+    assert args.worker_name == "bybit-depth-worker-ethusdt"
+
+
+def test_job_args_kraken_depth_worker_defaults() -> None:
+    # The kraken-depth-worker job_type must build a usable namespace with Kraken v2 book
+    # defaults (slash pair, book channel) so the ops-runner drives the none_native
+    # Kraken depth lane like the other workers.
+    args = _job_args(
+        JobSpec(
+            name="kraken-btc-depth",
+            job_type="kraken-depth-worker",
+            interval_seconds=3600,
+            args={},
+        )
+    )
+
+    assert args.symbol == "BTC/USD"
+    assert args.channel == "book"
+    assert args.worker_name == "kraken-depth-worker"
+    assert args.source_suffix == ""
+    assert args.rotate_at_midnight is False
+
+
+def test_job_args_kraken_depth_worker_threads_lane_flags() -> None:
+    args = _job_args(
+        JobSpec(
+            name="kraken-eth-depth",
+            job_type="kraken-depth-worker",
+            interval_seconds=3600,
+            args={
+                "symbol": "ETH/USD",
+                "source_suffix": "ethusd",
+                "rotate_at_midnight": True,
+                "worker_name": "kraken-depth-worker-ethusd",
+            },
+        )
+    )
+
+    assert args.symbol == "ETH/USD"
+    assert args.source_suffix == "ethusd"
+    assert args.rotate_at_midnight is True
+    assert args.worker_name == "kraken-depth-worker-ethusd"
+
+
 def test_job_args_lane_flags_default_to_legacy_behavior() -> None:
     # Omitting the flags must preserve the legacy single-symbol layout: empty suffix,
     # rotation off. This is what keeps the live BTC collector unaffected.
