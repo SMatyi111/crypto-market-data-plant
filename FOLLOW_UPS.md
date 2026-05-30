@@ -31,14 +31,18 @@ What "done" looks like, eventually:
   what the guarantees are: schema per dataset, gap policy, what "replayable"
   actually means, retention SLA, how to consume.
 
-### Gap from today
+### Gap from today (updated 2026-05-30, after Phase 2)
 
-- One pair (BTCUSDT), one venue (Binance) for depth/trades.
-- Hour-bounded run directories — analyst has to glob across them to assemble
-  a day.
-- Manifest exists at `D:\market_archive\curated\research\manifests\` but isn't
-  the canonical "what's ready" artifact downstream tools key off of.
-- No published standards doc.
+Most of the north-star scaffolding now exists. What's left:
+
+- New venue lanes are **code-complete but never run against a real socket**, and
+  ship `enabled: false` — so "multi-venue" is still aspirational in production
+  (live = Binance BTCUSDT depth + trades only).
+- `--rotate-at-midnight` exists but is **opt-in**; the live model is still
+  count-bounded segments, so an analyst still globs runs to assemble a day.
+- Curated/normalized Parquet is partitioned by `source=<venue>` only — no
+  `instrument=` column, so per-instrument lanes of the same venue+dataset share
+  partitions (manifest separates them via the promotion index).
 
 ### Rough order if/when this becomes the focus
 
@@ -55,20 +59,76 @@ What "done" looks like, eventually:
    on the deadline (the existing parquet flush + replay summary + metrics
    write all run), exposed via `deadline_reached` in the segment summary.
    Default off preserves the count-based behavior the live BTC collector uses.
-3. **Add Coinbase + Bybit + Kraken adapters** — each needs a normalizer
-   (like `BinanceDepthNormalizer`) and venue-specific subscription / snapshot
-   handling. Generic collector already handles `subscription_style` so most
-   of the framework is there.
-4. **Curated layout by event_date** — already partitioned that way at the
-   Parquet layer; just need the manifest to surface it as the contract.
-5. **`STANDARDS.md`** at repo root: schema, gap policy, replayable definition,
-   retention, consumer API. Tag manifest output with the standards version.
+3. **Add Coinbase + Bybit + Kraken adapters** — DONE. All three venues now have
+   trades + depth normalizers and verticals (Coinbase `matches`/`level2_batch`,
+   Kraken v2 `trade`/`book`, Bybit v5 `publicTrade`/`orderbook`). Trades:
+   Coinbase + Kraken are `sequence` (gap-proof), Bybit is `none_native`. Depth:
+   Coinbase + Kraken + Bybit are all `none_native` (in-stream snapshot, no dense
+   sequence we trust). All ship `enabled: false` in `ops.live.example.json`.
+   **Caveat:** validated only against scripted WebSockets — never a real socket
+   (see "Next steps after Phase 2" #1 below).
+4. **Curated layout by event_date** — DONE for the manifest contract. The
+   `research-manifest` job now emits per-`(venue, instrument, dataset,
+   event_date)` `lanes` with `gap_detection` + `readiness`, tagged with
+   `standards_version`. **Not** done: an `instrument=` Parquet partition column
+   (see "Next steps after Phase 2" #2).
+5. **`STANDARDS.md`** at repo root — DONE. `STANDARDS_VERSION = 1`; covers
+   schema, gap policy, replayable definition per feed class, retention, consumer
+   API. Manifest output carries `standards_version`.
 
 ### Risk
 
 This is the actual product. Until it exists, "research-ready data" means
 "depth from Binance BTCUSDT, hour by hour, manually assembled." Worth
 investing in once the immediate hardening list above is closed out.
+
+---
+
+## Next steps after Phase 2 (captured 2026-05-30)
+
+Candidate next focuses, in rough value order. Each is **paused pending a
+decision** — every high-value item touches the live deployment, the live data
+layout, or an external venue, so none should be started silently.
+
+1. **Validate the new venue adapters against real exchanges, then enable them
+   live.** Biggest trust gap: Coinbase / Kraken / Bybit (trades + depth) have
+   only ever been exercised against *scripted* WebSockets. Before flipping any
+   `enabled: true`, each lane needs a real-socket smoke test — subscription ack →
+   live frame shapes match the normalizer's assumptions → a full
+   collect → replay → promote cycle on a short bounded segment. Then enable the
+   validated lanes in `ops.live.local.json`. **Needs a go-ahead** (touches the
+   live runner + outbound exchange connections). Highest payoff.
+
+2. **`instrument=` partition column** (north-star item #4's remaining half). Make
+   data pullable by `(venue, instrument, event_date)` instead of sharing
+   `source=<venue>` partitions. **Not a backward-compatible flag** like the
+   others: `ParquetDatasetSink` partitions on
+   `["schema_version", "source", "event_date"]` and `source` is the venue, so
+   adding `instrument=` changes the on-disk layout for the **live** collector
+   too. Clean path = a `schema_version` `v1→v2` cutover (old `v1` data untouched;
+   new writes go to `v2/source=…/instrument=…/event_date=…`) — but that's a
+   deliberate change to the live data contract and would strand any reader still
+   pinned to `v1` until it adopts `v2`. Also touches the manifest builder,
+   promotion index, and `STANDARDS.md` (bump `STANDARDS_VERSION`). **Needs a
+   decision on the cutover** before starting.
+
+3. **App-level keepalive ping for Bybit** (`{"op":"ping"}` ~20 s). Small,
+   self-contained, no live-layout impact (only affects Bybit connections; other
+   venues unchanged). Stops low-volume Bybit lanes from ending segments early on
+   the ~10 min idle drop. Mostly matters once Bybit is enabled live (#1), so
+   best bundled with that.
+
+4. **Stronger gap-proofing for the `none_native` depth lanes.** Validate
+   Kraken's per-frame CRC32 `checksum` (preserved in `metadata.kraken_checksum`)
+   and/or tighten Bybit's `data.u` into a §4.1-style snapshot-anchored sequence
+   proof. Largest effort: Kraken checksum validation needs the book reconstructed
+   at venue-native per-pair price/qty precision, which today's float storage
+   loses — so it first requires carrying raw string levels (or precision
+   metadata) through the pipeline.
+
+Also still parked: the **L3 collection project** re-enable (see bottom of this
+file) and making **day-bounded rotation the default** run model (currently
+opt-in via `--rotate-at-midnight`).
 
 ---
 
