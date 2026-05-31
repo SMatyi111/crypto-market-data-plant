@@ -110,14 +110,14 @@
       }
     },
     {
-      "// non-sequence depth lane": "Coinbase level2 depth is a none_native feed (STANDARDS 4.3): the snapshot arrives in-stream and diffs carry no sequence, so 'replayable' means structurally clean (single snapshot anchor, parse-clean, monotonic timestamps) — NOT gap-proof. Promoted rows go to market_replayable just like Binance depth, but consumers must treat gap_detection=='none_native' data as best-effort. channel level2_batch is the unauthenticated public feed; plain level2 needs Coinbase auth.",
+      "// non-sequence depth lane": "Coinbase level2 depth is a none_native feed (STANDARDS 4.3): the snapshot arrives in-stream and diffs carry no sequence, so 'replayable' means structurally clean (single snapshot anchor, parse-clean, monotonic timestamps) — NOT gap-proof. Promoted rows go to market_replayable just like Binance depth, but consumers must treat gap_detection=='none_native' data as best-effort. channel level2_50 is the unauthenticated public feed (verified live 2026-05-31); plain level2/level2_batch now need Coinbase auth. The level2_50 snapshot is the full book (~1.4 MiB) so the collector raises the WS max frame size.",
       "name": "coinbase-btc-depth",
       "job_type": "coinbase-depth-worker",
       "enabled": false,
       "interval_seconds": 3600,
       "args": {
         "symbol": "BTC-USD",
-        "channel": "level2_batch",
+        "channel": "level2_50",
         "segment_count": 5000,
         "max_segments": 1,
         "cooldown_seconds": 1.0,

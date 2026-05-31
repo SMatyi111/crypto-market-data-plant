@@ -156,7 +156,7 @@ differ — Coinbase/Kraken are separated (`BTC-USD`, `BTC/USD`), Bybit/Binance a
 
 ```powershell
 market-data-plant coinbase-trades-worker --symbol BTC-USD --channel matches --max-segments 1
-market-data-plant coinbase-depth-worker  --symbol BTC-USD --channel level2_batch --max-segments 1
+market-data-plant coinbase-depth-worker  --symbol BTC-USD --channel level2_50 --max-segments 1
 market-data-plant kraken-trades-worker   --symbol BTC/USD --channel trade --max-segments 1
 market-data-plant kraken-depth-worker    --symbol BTC/USD --channel book --max-segments 1
 market-data-plant bybit-trades-worker    --symbol BTCUSDT --channel publicTrade --max-segments 1

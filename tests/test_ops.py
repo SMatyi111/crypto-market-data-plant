@@ -827,7 +827,7 @@ def test_job_args_coinbase_trades_worker_defaults() -> None:
 
 def test_job_args_coinbase_depth_worker_defaults() -> None:
     # The coinbase-depth-worker job_type must build a usable namespace with
-    # Coinbase-shaped depth defaults (dashed product, level2_batch public channel) so
+    # Coinbase-shaped depth defaults (dashed product, level2_50 public channel) so
     # the ops-runner drives the none_native depth lane like the other workers.
     args = _job_args(
         JobSpec(
@@ -839,7 +839,7 @@ def test_job_args_coinbase_depth_worker_defaults() -> None:
     )
 
     assert args.symbol == "BTC-USD"
-    assert args.channel == "level2_batch"
+    assert args.channel == "level2_50"
     assert args.worker_name == "coinbase-depth-worker"
     assert args.source_suffix == ""
     assert args.rotate_at_midnight is False

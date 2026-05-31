@@ -266,7 +266,10 @@ class _FakeWebsocketsModule:
         self._websockets = list(websockets)
         self.opened: list[_FakeConnection] = []
 
-    def connect(self, url: str) -> _FakeConnection:
+    def connect(self, url: str, **kwargs: object) -> _FakeConnection:
+        # Accept (and record) connect kwargs like max_size so the collector's
+        # websockets.connect(..., max_size=...) call works against the fake.
+        self.connect_kwargs = kwargs
         if not self._websockets:
             raise AssertionError(f"unexpected extra connection to {url}")
         ws = self._websockets.pop(0)
@@ -1014,8 +1017,9 @@ def test_cli_parser_coinbase_depth_worker_defaults() -> None:
     parser = build_parser()
     args = parser.parse_args(["coinbase-depth-worker"])
     assert args.symbol == "BTC-USD"
-    # level2_batch is the unauthenticated public depth feed (plain level2 needs auth).
-    assert args.channel == "level2_batch"
+    # level2_50 is the unauthenticated public depth feed (plain level2/level2_batch
+    # now need auth). Verified against the live socket 2026-05-31.
+    assert args.channel == "level2_50"
     assert args.source_suffix == ""
     assert args.rotate_at_midnight is False
 
@@ -1037,7 +1041,7 @@ def test_collect_coinbase_depth_segment_writes_clean_events_and_replay_summary(
     t2 = (now + timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
     ws = _ScriptedDepthWebsocket(
         frames=[
-            {"type": "subscriptions", "channels": [{"name": "level2_batch"}]},  # ack
+            {"type": "subscriptions", "channels": [{"name": "level2_50"}]},  # ack
             _coinbase_l2_snapshot(
                 bids=[["50000.0", "1.0"]],
                 asks=[["50001.0", "2.0"]],
@@ -1056,7 +1060,7 @@ def test_collect_coinbase_depth_segment_writes_clean_events_and_replay_summary(
 
     args = SimpleNamespace(
         symbol="BTC-USD",
-        channel="level2_batch",
+        channel="level2_50",
         count=3,
         output_root=tmp_path,
         source_suffix="",

@@ -63,6 +63,13 @@ class CollectorConfig:
     # of every other (incl. the live Binance) collector.
     ping_interval_seconds: float = 0.0
     ping_message: dict | None = None
+    # Max inbound WS frame size handed to `websockets.connect(max_size=...)`. The
+    # library default is 1 MiB, which silently kills any feed that sends a large
+    # snapshot — Coinbase's `level2_50` full-book snapshot is ~1.4 MiB and trips it
+    # (close 1009 "message too big"). 16 MiB gives ~11x headroom for deep books;
+    # small-frame venues (Binance depth/trades) are unaffected — this only raises a
+    # ceiling, it never changes normal-frame handling. Set None to disable the limit.
+    max_message_bytes: int | None = 16 * 1024 * 1024
 
 
 @dataclass(slots=True)

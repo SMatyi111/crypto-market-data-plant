@@ -136,7 +136,8 @@ class CoinbaseTradeNormalizer:
 
 
 class CoinbaseDepthNormalizer:
-    """Normalize Coinbase Exchange `level2` / `level2_batch` depth frames.
+    """Normalize Coinbase Exchange `level2_50` depth frames (same `snapshot` /
+    `l2update` shape the deprecated public `level2` / `level2_batch` channels used).
 
     Two structural differences from Binance depth, both of which make this a
     **non-sequence** ("none_native") feed under STANDARDS §4.3:

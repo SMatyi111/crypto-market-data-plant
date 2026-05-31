@@ -27,7 +27,7 @@ Venues live today: **Binance** (depth + trades), **Coinbase** (trades + depth),
 > **Gap-detection class differs by feed, not just by venue.** Binance depth/trades,
 > Coinbase trades, and **Kraken trades** are **sequence-bearing** (§4.1/§4.2 strong
 > gaplessness — Kraken v2 `trade_id` is a dense per-pair counter). Coinbase depth
-> (`level2` / `level2_batch`), **Bybit spot trades** (`publicTrade`, whose trade
+> (`level2_50`), **Bybit spot trades** (`publicTrade`, whose trade
 > id is a UUID, not a dense counter), and **both new depth feeds — Bybit spot
 > `orderbook` and Kraken `book`** — are **non-sequence** (`none_native`, §4.3):
 > `replayable` there means *structurally clean*, **not** gap-proof. The per-lane
@@ -219,7 +219,7 @@ via `normalize_many`, but each event still carries its own dense `sequence`.)
 ### 4.3 Gap policy for non-sequence feeds (`none_native`)
 
 Some feeds carry **no usable dense sequence number** — either no per-message
-sequence at all (Coinbase `level2` / `level2_batch` depth; Kraken `book` v1) or
+sequence at all (Coinbase `level2_50` depth; Kraken `book` v1) or
 only an opaque/UUID id that can't prove `delta == 1` (Bybit spot `publicTrade`,
 whose `i` is a UUID and `seq` is shared across batched messages). Gaplessness is
 **not provable** from these streams alone.
@@ -235,11 +235,15 @@ Policy for any such adapter:
   message-level sequence (Coinbase Advanced Trade `sequence_num`, Kraken v2,
   Bybit `u`/`seq`) so the strong guarantee in §4.1/§4.2 applies.
 
-**Live adapter — Coinbase `depth` (`level2` / `level2_batch`).** The book
+**Live adapter — Coinbase `depth` (`level2_50`).** The public channel is
+`level2_50` (verified against the live socket 2026-05-31); the plain `level2` /
+`level2_batch` channels now require Coinbase auth, so they are not used. The book
 snapshot arrives **in-stream** (`event_type == "snapshot"`, full book in
-`bids`/`asks`, no exchange time) instead of via REST, and diff frames
-(`event_type == "l2update"`) carry no `U`/`u`. The whole-run verdict
-(`replay_depth_stream_run`) sets `gap_detection: "none_native"` and:
+`bids`/`asks` — ~1.4 MiB, which is why the collector raises the WS max frame size
+above the 1 MiB library default; see `CollectorConfig.max_message_bytes`), with no
+exchange time, instead of via REST; diff frames (`event_type == "l2update"`) carry
+no `U`/`u`. The whole-run verdict (`replay_depth_stream_run`) sets
+`gap_detection: "none_native"` and:
 
 `replayable` iff **all** hold:
 

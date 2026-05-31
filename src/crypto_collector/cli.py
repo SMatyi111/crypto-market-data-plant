@@ -192,11 +192,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cb_depth_parser.add_argument(
         "--channel",
-        default="level2_batch",
-        help="Coinbase depth channel. 'level2_batch' is the unauthenticated public "
-        "feed; the plain 'level2' channel requires Coinbase auth. Both emit the same "
-        "in-stream snapshot + l2update frames. This is a non-sequence ('none_native') "
-        "feed: replayable means structurally clean, not gap-proof (STANDARDS 4.3).",
+        default="level2_50",
+        help="Coinbase depth channel. 'level2_50' is the unauthenticated public feed "
+        "(emits the same in-stream `snapshot` + `l2update` frames the normalizer parses); "
+        "the plain 'level2'/'level2_batch' channels now require Coinbase auth. The "
+        "level2_50 snapshot is the full book (~1.4 MiB), so the collector raises the WS "
+        "max frame size (CollectorConfig.max_message_bytes). This is a non-sequence "
+        "('none_native') feed: replayable means structurally clean, not gap-proof "
+        "(STANDARDS 4.3).",
     )
     cb_depth_parser.add_argument("--segment-count", type=int, default=5000)
     cb_depth_parser.add_argument("--max-segments", type=int)
@@ -1450,11 +1453,11 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
         )
     if job.job_type == "coinbase-depth-worker":
         return SimpleNamespace(
-            # level2_batch is the unauthenticated public depth channel; the plain
-            # level2 channel requires Coinbase auth. Both emit the same
-            # snapshot/l2update frames the none-native depth replay validates.
+            # level2_50 is the unauthenticated public depth channel; the plain
+            # level2/level2_batch channels now require Coinbase auth. level2_50 emits
+            # the same snapshot/l2update frames the none-native depth replay validates.
             symbol=raw_args.get("symbol", "BTC-USD"),
-            channel=raw_args.get("channel", "level2_batch"),
+            channel=raw_args.get("channel", "level2_50"),
             segment_count=raw_args.get("segment_count", 5000),
             max_segments=raw_args.get("max_segments"),
             cooldown_seconds=raw_args.get("cooldown_seconds", 1.0),

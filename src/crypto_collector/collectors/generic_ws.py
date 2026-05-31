@@ -30,7 +30,9 @@ class GenericWebsocketCollector(BaseCollector):
         max_attempts = max(1, int(self.config.connect_retries))
         while True:
             try:
-                async with websockets.connect(self.config.websocket_url) as websocket:
+                async with websockets.connect(
+                    self.config.websocket_url, max_size=self.config.max_message_bytes
+                ) as websocket:
                     pending = await self._subscribe(websocket)
                     attempt = 0
                     # Start the app-level keepalive (if configured) only after the
