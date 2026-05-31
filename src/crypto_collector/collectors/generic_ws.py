@@ -33,26 +33,35 @@ class GenericWebsocketCollector(BaseCollector):
                 async with websockets.connect(self.config.websocket_url) as websocket:
                     pending = await self._subscribe(websocket)
                     attempt = 0
-                    for raw in pending:
-                        payload = raw.payload
-                        if not self._should_emit(payload):
-                            continue
-                        yield raw
-                        message_count += 1
-                        if limit is not None and message_count >= limit:
-                            return
-                    async for message in websocket:
-                        payload = json.loads(message)
-                        if not self._should_emit(payload):
-                            continue
-                        yield RawMessage(
-                            source=self.config.source,
-                            received_at=utc_now(),
-                            payload=payload,
-                        )
-                        message_count += 1
-                        if limit is not None and message_count >= limit:
-                            return
+                    # Start the app-level keepalive (if configured) only after the
+                    # subscription handshake, so a pong reply can never be mistaken
+                    # for the subscribe ack. Always torn down in `finally` — on a
+                    # reconnect, an exception, or `return` when `limit` is reached —
+                    # so a stale ping task can't outlive its socket.
+                    keepalive_task = self._start_keepalive(websocket)
+                    try:
+                        for raw in pending:
+                            payload = raw.payload
+                            if not self._should_emit(payload):
+                                continue
+                            yield raw
+                            message_count += 1
+                            if limit is not None and message_count >= limit:
+                                return
+                        async for message in websocket:
+                            payload = json.loads(message)
+                            if not self._should_emit(payload):
+                                continue
+                            yield RawMessage(
+                                source=self.config.source,
+                                received_at=utc_now(),
+                                payload=payload,
+                            )
+                            message_count += 1
+                            if limit is not None and message_count >= limit:
+                                return
+                    finally:
+                        await self._stop_keepalive(keepalive_task)
                 # Server closed the stream cleanly — reconnect so we keep recording.
                 logger.warning("websocket closed cleanly; reconnecting source=%s", self.config.source)
             except Exception as exc:  # noqa: BLE001
@@ -72,6 +81,40 @@ class GenericWebsocketCollector(BaseCollector):
                     exc,
                 )
                 await asyncio.sleep(delay)
+
+    def _start_keepalive(self, websocket: object) -> asyncio.Task | None:
+        """Spawn the app-level ping task if configured; otherwise return None.
+
+        Sending happens in a separate task while the main loop awaits `recv` —
+        the websockets library permits concurrent send + recv. Bybit's pong reply
+        carries no `topic`, so `_should_emit` already drops it from the data path.
+        """
+        interval = float(self.config.ping_interval_seconds or 0.0)
+        message = self.config.ping_message
+        if interval <= 0 or not message:
+            return None
+        return asyncio.ensure_future(self._keepalive_loop(websocket, interval, message))
+
+    async def _keepalive_loop(self, websocket: object, interval: float, message: dict) -> None:
+        payload = json.dumps(message)
+        # CancelledError is a BaseException and propagates out of this `except` —
+        # so a normal teardown (cancel) ends the task cleanly, while a dead socket
+        # (send raises) just ends the ping loop and lets the main loop reconnect.
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                await websocket.send(payload)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("keepalive ping ended source=%s error=%s", self.config.source, exc)
+
+    async def _stop_keepalive(self, task: asyncio.Task | None) -> None:
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
     async def _subscribe(self, websocket: object) -> list[RawMessage]:
         """Send subscription and wait for an ack. Returns any data frames received during the wait

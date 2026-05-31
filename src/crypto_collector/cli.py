@@ -816,6 +816,14 @@ async def collect_kraken_trades_segment(args: argparse.Namespace) -> dict[str, o
     )
 
 
+# Bybit drops idle public connections after ~10 min and documents an application-
+# level {"op":"ping"} heartbeat roughly every 20 s. Both Bybit lanes opt into the
+# collector's generic keepalive with these; every other venue leaves it off and
+# relies on the websockets library's protocol-level ping/pong (STANDARDS §4.3).
+_BYBIT_PING_MESSAGE = {"op": "ping"}
+_BYBIT_PING_INTERVAL_SECONDS = 20.0
+
+
 async def collect_bybit_trades_segment(args: argparse.Namespace) -> dict[str, object]:
     # Bybit spot trade id is a UUID (not a dense counter), so gaplessness is
     # unprovable: curate as a non-sequence ("none_native") feed — structurally clean
@@ -828,6 +836,8 @@ async def collect_bybit_trades_segment(args: argparse.Namespace) -> dict[str, ob
         normalizer=BybitTradeNormalizer(),
         source_base="bybit_trades",
         replay_fn=replay_trades_stream_run,
+        ping_message=_BYBIT_PING_MESSAGE,
+        ping_interval_seconds=_BYBIT_PING_INTERVAL_SECONDS,
     )
 
 
@@ -840,6 +850,8 @@ async def _collect_trades_segment(
     normalizer: object,
     source_base: str,
     replay_fn=replay_trades_run,
+    ping_message: dict | None = None,
+    ping_interval_seconds: float = 0.0,
 ) -> dict[str, object]:
     """Venue-agnostic trades segment. The trades pipeline (generic WS collector +
     normalizer + quality gate + trades replay) is identical across venues; only the
@@ -848,7 +860,8 @@ async def _collect_trades_segment(
     the curation contract (`metrics/replay_summary.json`) stays consistent
     venue-to-venue. `replay_fn` is `replay_trades_run` for dense sequence-bearing feeds
     (Binance/Coinbase/Kraken) and `replay_trades_stream_run` for none_native feeds
-    (Bybit spot)."""
+    (Bybit spot). `ping_message`/`ping_interval_seconds` opt a venue into the collector's
+    app-level keepalive (Bybit only); default off leaves every other venue unchanged."""
     config = CollectorConfig(
         source=source,
         output_root=args.output_root,
@@ -858,6 +871,8 @@ async def _collect_trades_segment(
         subscription_style=subscription_style,
         max_delay_ms=args.max_delay_ms,
         max_future_skew_ms=getattr(args, "max_future_skew_ms", 5_000),
+        ping_message=ping_message,
+        ping_interval_seconds=ping_interval_seconds,
     )
     collector = GenericWebsocketCollector(config=config)
     source_name = _build_source_name(source_base, getattr(args, "source_suffix", ""))
@@ -930,6 +945,8 @@ async def collect_bybit_depth_segment(args: argparse.Namespace) -> dict[str, obj
         subscription_style="bybit",
         normalizer=BybitDepthNormalizer(),
         source_base="bybit_depth",
+        ping_message=_BYBIT_PING_MESSAGE,
+        ping_interval_seconds=_BYBIT_PING_INTERVAL_SECONDS,
     )
 
 
@@ -955,6 +972,8 @@ async def _collect_depth_stream_segment(
     subscription_style: str,
     normalizer: object,
     source_base: str,
+    ping_message: dict | None = None,
+    ping_interval_seconds: float = 0.0,
 ) -> dict[str, object]:
     """Venue-agnostic depth segment for **non-sequence** ("none_native") feeds.
 
@@ -965,7 +984,9 @@ async def _collect_depth_stream_segment(
     not at all. That makes the depth stream a perfect fit for the same generic
     pipeline the trades lanes use; only the normalizer, the depth-specific
     `MetadataQualityGate`, the normalized dataset root and the none-native replay
-    differ from `_collect_trades_segment`."""
+    differ from `_collect_trades_segment`. `ping_message`/`ping_interval_seconds` opt
+    a venue into the collector's app-level keepalive (Bybit only); default off leaves
+    every other venue unchanged."""
     config = CollectorConfig(
         source=source,
         output_root=args.output_root,
@@ -973,6 +994,8 @@ async def _collect_depth_stream_segment(
         channel=args.channel,
         websocket_url=websocket_url,
         subscription_style=subscription_style,
+        ping_message=ping_message,
+        ping_interval_seconds=ping_interval_seconds,
     )
     collector = GenericWebsocketCollector(config=config)
     source_name = _build_source_name(source_base, getattr(args, "source_suffix", ""))

@@ -54,6 +54,15 @@ class CollectorConfig:
     retry_backoff_seconds: float = 1.0
     max_backoff_seconds: float = 60.0
     subscription_ack_timeout_seconds: float = 5.0
+    # App-level keepalive. When ping_interval_seconds > 0 AND ping_message is set,
+    # the collector sends ping_message on the open socket every interval. Default
+    # OFF — venues rely on the websockets library's protocol-level ping/pong unless
+    # they need an application-level heartbeat. Bybit is the one that does: it drops
+    # idle public connections after ~10 min and documents a {"op":"ping"} roughly
+    # every 20 s, so its lanes opt in. Leaving this off preserves the exact behavior
+    # of every other (incl. the live Binance) collector.
+    ping_interval_seconds: float = 0.0
+    ping_message: dict | None = None
 
 
 @dataclass(slots=True)

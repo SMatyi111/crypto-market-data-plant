@@ -275,6 +275,126 @@ class _FakeWebsocketsModule:
         return connection
 
 
+class _KeepaliveProbeWebsocket:
+    """Fake WS for the app-level keepalive tests. `recv` returns one subscription
+    ack (drives `_subscribe`); the async iterator can optionally block its first
+    data frame until a keepalive ping has actually been sent, so the test asserts
+    on observed behavior, not on wall-clock timing."""
+
+    def __init__(self, ack: dict, data_frames: list[dict], *, wait_for_ping: bool = False) -> None:
+        self._ack = ack
+        self._data_frames = list(data_frames)
+        self._wait_for_ping = wait_for_ping
+        self.sent: list[str] = []
+        self._recv_used = False
+
+    async def send(self, message: str) -> None:
+        self.sent.append(message)
+
+    async def recv(self) -> str:
+        if not self._recv_used:
+            self._recv_used = True
+            return json.dumps(self._ack)
+        await asyncio.sleep(3600)  # ack already delivered; iterator drives the rest
+        raise RuntimeError("unreachable")
+
+    def ping_count(self) -> int:
+        return sum(1 for m in self.sent if json.loads(m) == {"op": "ping"})
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> str:
+        if self._wait_for_ping:
+            for _ in range(2000):
+                if self.ping_count() >= 1:
+                    break
+                await asyncio.sleep(0.001)
+            else:
+                raise AssertionError("keepalive ping was never sent")
+            self._wait_for_ping = False  # only gate the first frame
+        if not self._data_frames:
+            raise StopAsyncIteration
+        return json.dumps(self._data_frames.pop(0))
+
+
+def _run_stream(collector: GenericWebsocketCollector, *, limit: int) -> list[RawMessage]:
+    async def _drive() -> list[RawMessage]:
+        out: list[RawMessage] = []
+        async for raw in collector.stream(limit=limit):
+            out.append(raw)
+        return out
+
+    return asyncio.run(_drive())
+
+
+def test_collector_sends_app_level_keepalive_ping(monkeypatch) -> None:
+    """When ping_message + a positive interval are configured (Bybit), the collector
+    sends the app-level ping on the open socket, concurrently with the receive loop,
+    after the subscription handshake."""
+    import sys
+
+    probe = _KeepaliveProbeWebsocket(
+        ack={"op": "subscribe", "success": True},
+        data_frames=[{"topic": "orderbook.50.BTCUSDT", "data": {}}],
+        wait_for_ping=True,
+    )
+    fake_mod = _FakeWebsocketsModule([probe])
+    monkeypatch.setitem(sys.modules, "websockets", SimpleNamespace(connect=fake_mod.connect))
+
+    collector = GenericWebsocketCollector(
+        CollectorConfig(
+            source="bybit",
+            output_root=Path("data"),
+            product="BTCUSDT",
+            channel="orderbook.50",
+            websocket_url="wss://example.test",
+            subscription_style="bybit",
+            ping_message={"op": "ping"},
+            ping_interval_seconds=0.005,
+        )
+    )
+
+    emitted = _run_stream(collector, limit=1)
+
+    assert len(emitted) == 1  # the one data frame was forwarded
+    assert probe.ping_count() >= 1  # at least one {"op":"ping"} went out
+    # The subscribe message is also sent, so the ping is an *addition*, not a swap.
+    assert any(json.loads(m) == {"op": "subscribe", "args": ["orderbook.50.BTCUSDT"]} for m in probe.sent)
+
+
+def test_collector_without_ping_config_sends_no_keepalive(monkeypatch) -> None:
+    """Default config (no ping_message) — e.g. the live Binance collector — must send
+    only the subscription and never an app-level ping. Guards 'live collector
+    unaffected'."""
+    import sys
+
+    probe = _KeepaliveProbeWebsocket(
+        ack={"result": None, "id": 1},
+        data_frames=[{"e": "depthUpdate"}, {"e": "depthUpdate"}],
+        wait_for_ping=False,
+    )
+    fake_mod = _FakeWebsocketsModule([probe])
+    monkeypatch.setitem(sys.modules, "websockets", SimpleNamespace(connect=fake_mod.connect))
+
+    collector = GenericWebsocketCollector(
+        CollectorConfig(
+            source="binance",
+            output_root=Path("data"),
+            product="BTCUSDT",
+            channel="depth",
+            websocket_url="wss://example.test",
+            subscription_style="binance",
+        )
+    )
+
+    emitted = _run_stream(collector, limit=2)
+
+    assert len(emitted) == 2
+    assert probe.ping_count() == 0
+    assert len(probe.sent) == 1  # only the SUBSCRIBE frame, nothing else
+
+
 def test_reopen_binance_depth_connection_buffers_frames_no_snapshot_fetch(monkeypatch) -> None:
     """`_reopen_binance_depth_connection` must NOT call the REST snapshot endpoint;
     that's the whole point of reconnect-in-place. It returns buffered data frames so the

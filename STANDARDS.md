@@ -319,13 +319,16 @@ consumer that needs provable completeness MUST gate on the lane's
 `gap_detection == "sequence"` (Kraken/Binance/Coinbase trades), not just on the
 `trades` dataset.
 
-> **Bybit keepalive limitation.** Bybit drops idle public connections after
-> ~10 min and expects a `{"op":"ping"}` roughly every 20 s. The collector does not
-> send app-level pings today; an active trade or orderbook stream stays alive on its
-> own traffic so bounded segments complete fine, but a **low-volume** symbol (on
-> either the trades or depth lane) can have its segment end early on a clean server
-> close (the collector then reconnects / the worker starts a fresh segment — no data
-> loss, just shorter runs).
+> **Bybit keepalive.** Bybit drops idle public connections after ~10 min and
+> expects a `{"op":"ping"}` roughly every 20 s. Both Bybit lanes opt into the
+> collector's app-level keepalive (`CollectorConfig.ping_message` +
+> `ping_interval_seconds=20`), which sends the ping on the open socket every
+> interval, concurrently with the receive loop, so a low-volume symbol no longer
+> ends its segment early on the idle drop. The pong reply carries no `topic`, so
+> the data path drops it (`_should_emit`) and it can't be mistaken for the
+> subscription ack. Every other venue leaves the keepalive off and relies on the
+> `websockets` library's protocol-level ping/pong — the live Binance collector is
+> unchanged.
 
 ---
 
@@ -409,7 +412,4 @@ current contract:
   cross sequence `data.seq` is preserved (`metadata.bybit_update_id` /
   `bybit_cross_sequence`); if Bybit's spot `u` proves dense enough per-symbol, the
   lane could move from §4.3 toward a §4.1-style snapshot-anchored sequence proof.
-- App-level keepalive ping for Bybit (`{"op":"ping"}` ~20 s) so low-volume Bybit
-  lanes (trades or depth) don't end segments early on the ~10 min idle drop
-  (see §4.3).
 - Continuous day-bounded rotation as the default run model (vs. count-bounded).

@@ -112,11 +112,13 @@ layout, or an external venue, so none should be started silently.
    promotion index, and `STANDARDS.md` (bump `STANDARDS_VERSION`). **Needs a
    decision on the cutover** before starting.
 
-3. **App-level keepalive ping for Bybit** (`{"op":"ping"}` ~20 s). Small,
-   self-contained, no live-layout impact (only affects Bybit connections; other
-   venues unchanged). Stops low-volume Bybit lanes from ending segments early on
-   the ~10 min idle drop. Mostly matters once Bybit is enabled live (#1), so
-   best bundled with that.
+3. **App-level keepalive ping for Bybit** — DONE (2026-05-31). Added opt-in
+   `CollectorConfig.ping_message` + `ping_interval_seconds`; `GenericWebsocketCollector`
+   runs a per-connection keepalive task (spawned after the subscription handshake,
+   torn down in `finally` on reconnect/limit/error). Both Bybit lanes opt in at
+   `{"op":"ping"}` / 20 s; every other venue (incl. live Binance) leaves it off and
+   relies on protocol-level ping/pong. Deterministic tests cover ping-sent (Bybit)
+   and no-ping (default). STANDARDS §4.3 + §8 updated.
 
 4. **Stronger gap-proofing for the `none_native` depth lanes.** Validate
    Kraken's per-frame CRC32 `checksum` (preserved in `metadata.kraken_checksum`)
