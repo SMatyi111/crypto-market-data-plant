@@ -28,7 +28,7 @@ unaffected. Enable them per lane when you want them:
 | -------- | ------ | ----- | ------------------- |
 | Binance  | ✅ live | ✅ live | sequence (gap-proof) |
 | Coinbase | ✅      | ✅      | trades = sequence; depth = `none_native` |
-| Kraken   | ✅      | ✅      | trades = sequence; depth = `none_native` |
+| Kraken   | ✅      | ✅      | trades = sequence; depth = `checksum` (CRC32) |
 | Bybit    | ✅      | ✅      | trades = `none_native`; depth = sequence (`data.u` +1) |
 
 `none_native` lanes are curated as *structurally clean*, **not** gap-proof — see

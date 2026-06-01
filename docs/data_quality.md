@@ -21,12 +21,14 @@ The bar a run must clear is set by its `gap_detection` class, recorded in
   `orderbook` depth) — carries a dense per-stream counter (Bybit orderbook `data.u`
   is +1 per message), so gaplessness is **provable**. `replayable` here means
   gap-proof.
-- **`none_native`** (Coinbase/Kraken depth, Bybit trades) — no usable dense
-  sequence (no sequence at all, or only a UUID / shared counter / unvalidated
-  checksum). `replayable` is downgraded to **structurally clean only**: a single
-  snapshot anchor that is the first event, parse-clean events, monotonic
-  timestamps — **not** gap-proof. Consumers MUST key off the lane's
-  `gap_detection` tag, not the dataset name.
+- **`checksum`** (Kraken `book` depth) — a per-frame CRC32 over the reconstructed
+  top-10 book is validated, so a dropped/corrupted update is caught. Also
+  **provable** — `replayable` means gap-proof.
+- **`none_native`** (Coinbase depth, Bybit trades) — no usable integrity signal
+  (no sequence at all, or only a UUID / shared counter). `replayable` is downgraded
+  to **structurally clean only**: a single snapshot anchor that is the first event,
+  parse-clean events, monotonic timestamps — **not** gap-proof. Consumers MUST key
+  off the lane's `gap_detection` tag, not the dataset name.
 
 ## Quality Gates (live filter)
 

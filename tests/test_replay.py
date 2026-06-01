@@ -4,12 +4,37 @@ import json
 from pathlib import Path
 
 from crypto_collector.replay import (
+    _kraken_book_crc32,
     backfill_replay_summaries,
     replay_depth_run,
     replay_depth_stream_run,
     replay_trades_run,
     replay_trades_stream_run,
 )
+
+
+# Real Kraken v2 `book` snapshot (BTC/USD, depth 10) captured from the live socket
+# 2026-06-01, frozen as a golden CRC32 vector. If the checksum algorithm ever drifts
+# from Kraken's spec, this fails — independent of any code that produced the data.
+_KRAKEN_GOLDEN_CHECKSUM = 4017594139
+_KRAKEN_GOLDEN_ASKS = [
+    [71753.2, 0.827788], [71753.3, 0.49278855], [71754.9, 1.114559], [71757.4, 0.43581603],
+    [71760.5, 0.0641], [71763.1, 0.4], [71764.8, 0.03490782], [71768.9, 0.001393],
+    [71770.1, 0.09999999], [71770.3, 0.67008108],
+]
+_KRAKEN_GOLDEN_BIDS = [
+    [71741.4, 0.0001], [71741.3, 0.06855], [71738.9, 5.1e-05], [71735.3, 5.1e-05],
+    [71732.5, 1.39340999], [71732.3, 0.85375328], [71732.2, 0.663889], [71732.0, 1.114563],
+    [71731.8, 5.1e-05], [71730.8, 5.039e-05],
+]
+
+
+def test_kraken_book_crc32_matches_real_capture() -> None:
+    """Golden vector: the CRC32 of a real Kraken BTC/USD snapshot (price 1dp, qty 8dp)
+    must reproduce the checksum Kraken sent."""
+    bids = {p: q for p, q in _KRAKEN_GOLDEN_BIDS}
+    asks = {p: q for p, q in _KRAKEN_GOLDEN_ASKS}
+    assert _kraken_book_crc32(bids, asks, 1, 8) == _KRAKEN_GOLDEN_CHECKSUM
 
 
 def test_replay_depth_run_reconstructs_book_and_writes_summary(tmp_path: Path) -> None:
@@ -699,6 +724,94 @@ def test_replay_depth_stream_run_without_sequence_key_stays_none_native(tmp_path
     assert summary.mode == "stream_snapshot"
     assert summary.replayable is True  # gap is invisible without the sequence
     assert "update_id_gaps" not in summary.findings
+
+
+def _kraken_stream_row(
+    *,
+    event_type: str,
+    checksum: int | None,
+    bids: list[list[float]] | None = None,
+    asks: list[list[float]] | None = None,
+    event_time: str | None = None,
+) -> dict:
+    metadata: dict = {}
+    if checksum is not None:
+        metadata["kraken_checksum"] = checksum
+    return {
+        "source": "kraken",
+        "product": "BTC/USD",
+        "channel": "depth",
+        "event_type": event_type,
+        "event_time": event_time,
+        "received_at": "2026-04-06T00:00:00.100000+00:00",
+        "first_update_id": None,
+        "final_update_id": None,
+        "instrument": {"instrument_id": "spot:kraken:BTCUSD"},
+        "bids": bids or [],
+        "asks": asks or [],
+        "metadata": metadata,
+    }
+
+
+def test_replay_depth_stream_run_checksum_validates_clean(tmp_path: Path) -> None:
+    """With checksum_metadata_key + precision (Kraken), a run whose every per-frame CRC
+    matches the reconstructed top-10 book is `gap_detection="checksum"` and replayable."""
+    # Compute the venue checksum each frame would carry, from the post-apply book state.
+    cs_snap = _kraken_book_crc32({100.0: 1.0}, {101.0: 2.0}, 1, 8)
+    cs_upd = _kraken_book_crc32({100.0: 1.0, 99.0: 3.0}, {101.0: 1.5}, 1, 8)
+    run_path = tmp_path / "kraken_depth" / "20260406_000000"
+    _write_stream_depth_run(
+        run_path,
+        [
+            _kraken_stream_row(event_type="snapshot", checksum=cs_snap, bids=[[100.0, 1.0]], asks=[[101.0, 2.0]]),
+            _kraken_stream_row(
+                event_type="update", checksum=cs_upd,
+                bids=[[99.0, 3.0]], asks=[[101.0, 1.5]],
+                event_time="2026-04-06T00:00:01+00:00",
+            ),
+        ],
+    )
+
+    summary = replay_depth_stream_run(
+        run_path,
+        checksum_metadata_key="kraken_checksum",
+        checksum_price_precision=1,
+        checksum_qty_precision=8,
+    )
+
+    assert summary.replayable is True, summary.findings
+    assert summary.gap_detection == "checksum"
+    assert summary.mode == "stream_snapshot_checksum"
+    assert summary.findings == []
+
+
+def test_replay_depth_stream_run_checksum_mismatch_blocks_promotion(tmp_path: Path) -> None:
+    """A wrong checksum (a dropped/corrupted update would diverge the local book) flags
+    `checksum_mismatch` and blocks promotion."""
+    cs_snap = _kraken_book_crc32({100.0: 1.0}, {101.0: 2.0}, 1, 8)
+    run_path = tmp_path / "kraken_depth" / "20260406_000001"
+    _write_stream_depth_run(
+        run_path,
+        [
+            _kraken_stream_row(event_type="snapshot", checksum=cs_snap, bids=[[100.0, 1.0]], asks=[[101.0, 2.0]]),
+            _kraken_stream_row(
+                event_type="update", checksum=999999,  # wrong
+                bids=[[99.0, 3.0]], asks=[[101.0, 1.5]],
+                event_time="2026-04-06T00:00:01+00:00",
+            ),
+        ],
+    )
+
+    summary = replay_depth_stream_run(
+        run_path,
+        checksum_metadata_key="kraken_checksum",
+        checksum_price_precision=1,
+        checksum_qty_precision=8,
+    )
+
+    assert summary.replayable is False
+    assert summary.gap_detection == "checksum"
+    assert "checksum_mismatch" in summary.findings
 
 
 def test_replay_depth_stream_run_no_snapshot_is_not_replayable(tmp_path: Path) -> None:

@@ -133,17 +133,18 @@ layout, or an external venue, so none should be started silently.
      so Bybit depth was upgraded from `none_native` to a provable `sequence`
      guarantee via `replay_depth_stream_run(sequence_metadata_key="bybit_update_id")`
      — a `data.u` gap now blocks promotion. `STANDARDS_VERSION` bumped 1→2.
-   - **Kraken CRC32 `checksum` — STILL OPEN (the precision-heavy half).** Validating
-     the per-frame checksum (preserved in `metadata.kraken_checksum`) would detect
-     dropped/reordered frames and upgrade Kraken depth too. It needs the top-10 book
-     reconstructed at Kraken's venue-native per-pair price/qty **precision**, which
-     today's float storage loses. Two candidate approaches, both a design decision:
-     (a) carry raw string levels through the pipeline (NormalizedDepthUpdate schema
-     change → another `STANDARDS_VERSION` bump); or (b) a collect-time stateful
-     checksum validator that reads raw frame strings, maintains the book, and writes
-     only a per-run pass/fail (no schema change, but Kraken-specific pipeline logic).
-     Also needs the per-pair precision (Kraken REST `AssetPairs`, or hardcode BTC/USD)
-     and the exact CRC32 string-building spec.
+   - **Kraken CRC32 `checksum` — DONE (2026-06-01).** The exact CRC32 spec was
+     solved empirically against a real captured snapshot (asks top-10 asc then bids
+     top-10 desc, each `price`@price-prec + `qty`@qty-prec, decimal removed + leading
+     zeros stripped) and verified to reproduce the snapshot **and** update checksums.
+     It turned out the precision-from-float reconstruction works (values have ≤8
+     decimals), so **no schema change was needed**: `replay_depth_stream_run` gained
+     `checksum_metadata_key` + precisions, rebuilds the top-10 book from stored floats,
+     and recomputes the CRC after every event. BTC/USD precision `(1, 8)` lives in
+     `_KRAKEN_BOOK_PRECISION`; unknown pairs fall back to `none_native`. Kraken depth
+     is now `gap_detection="checksum"` (provable integrity); `STANDARDS_VERSION` 2→3.
+     A frozen golden-vector test guards the CRC algorithm against real venue data.
+     Remaining: add other pairs' precision (or auto-fetch from REST `AssetPairs`).
 
 5. **Data-arrival watchdog for the WS collector** (NEW — surfaced by the #1
    real-socket validation). A feed that **acks the subscription but then sends no

@@ -278,7 +278,7 @@
       }
     },
     {
-      "// non-sequence depth lane": "Kraken v2 book is a none_native feed (STANDARDS 4.3): the snapshot arrives in-stream and updates carry a CRC32 checksum we don't yet validate (lossy from float storage), so 'replayable' means structurally clean (single snapshot anchor, parse-clean, monotonic timestamps) — NOT gap-proof. Promoted rows go to market_replayable like Binance/Coinbase depth, but consumers must treat gap_detection=='none_native' data as best-effort. One WS frame's data list fans out via normalize_many. Symbol is the slash pair (BTC/USD); channel 'book' uses Kraken's default depth (10).",
+      "// checksum depth lane": "Kraken v2 book: the snapshot arrives in-stream, and every frame carries a CRC32 checksum over the top-10 book that the collector now VALIDATES at replay time for known-precision pairs (BTC/USD = price 1dp, qty 8dp). So this lane is curated 'checksum' (STANDARDS 4.3): provable integrity — a dropped/corrupted update diverges the book and is caught, blocking promotion. Promoted rows go to market_replayable like Binance/Coinbase depth, and gap_detection=='checksum' means consumers can rely on completeness. Other Kraken pairs fall back to none_native until their precision is added. One WS frame's data list fans out via normalize_many. Symbol is the slash pair (BTC/USD); channel 'book' uses Kraken's default depth (10).",
       "name": "kraken-btc-depth",
       "job_type": "kraken-depth-worker",
       "enabled": false,

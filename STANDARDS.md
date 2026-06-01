@@ -1,7 +1,11 @@
 # Data Standards
 
-`STANDARDS_VERSION = 2`
+`STANDARDS_VERSION = 3`
 
+> **v3 (2026-06-01):** Kraken `book` depth moved from `none_native` to a provable
+> `checksum` guarantee — its per-frame CRC32 is now validated against the
+> reconstructed top-10 book (BTC/USD), so a dropped/corrupted update is detectable
+> and blocks promotion.
 > **v2 (2026-06-01):** Bybit spot `orderbook` depth moved from `none_native` to a
 > provable `sequence` guarantee — its `data.u` increments by exactly 1 per message
 > (verified live), so dropped messages are now detectable and block promotion.
@@ -28,18 +32,23 @@ Two normalized datasets, each collected per (venue, instrument) lane:
 Venues live today: **Binance** (depth + trades), **Coinbase** (trades + depth),
 **Kraken** (trades + depth), **Bybit** (trades + depth). See Roadmap for the rest.
 
-> **Gap-detection class differs by feed, not just by venue.** Binance depth/trades,
-> Coinbase trades, **Kraken trades**, and **Bybit spot `orderbook` depth** are
-> **sequence-bearing** (§4.1/§4.2 strong gaplessness — Kraken v2 `trade_id` is a
-> dense per-pair counter; Bybit orderbook `data.u` increments by exactly 1 per
-> message). Coinbase depth (`level2_50`), **Kraken `book` depth**, and **Bybit spot
-> trades** (`publicTrade`, whose trade id is a UUID, not a dense counter) are
-> **non-sequence** (`none_native`, §4.3): `replayable` there means *structurally
-> clean*, **not** gap-proof. The per-lane `gap_detection` tag in the manifest (§6)
-> is how a consumer tells these apart — note that two lanes of the same dataset can
-> have **different** classes (e.g. Bybit depth `sequence` vs. Kraken/Coinbase depth
-> `none_native`; Kraken trades `sequence` vs. Bybit trades `none_native`), so key
-> off the tag, not the dataset name.
+> **Gap-detection class differs by feed, not just by venue.** Three classes, tagged
+> per lane as `gap_detection` in the manifest (§6):
+>
+> - **`sequence`** — a dense per-message counter proves gaplessness (§4.1/§4.2):
+>   Binance depth/trades, Coinbase trades, **Kraken trades** (`trade_id` is a dense
+>   per-pair counter), and **Bybit spot `orderbook` depth** (`data.u` increments by
+>   exactly 1 per message).
+> - **`checksum`** — a per-frame CRC32 over the reconstructed book proves integrity,
+>   so a dropped/corrupted update is caught (§4.3): **Kraken `book` depth**.
+> - **`none_native`** — no usable integrity signal, so `replayable` means
+>   *structurally clean*, **not** gap-proof: Coinbase depth (`level2_50`) and **Bybit
+>   spot trades** (`publicTrade`, whose trade id is a UUID).
+>
+> `sequence` and `checksum` are both **provable** (consumers can rely on
+> completeness); `none_native` is best-effort. Two lanes of the same dataset can
+> have **different** classes (e.g. Bybit depth `sequence` vs. Kraken depth `checksum`
+> vs. Coinbase depth `none_native`), so key off the tag, not the dataset name.
 
 ---
 
@@ -292,26 +301,36 @@ reconstructed exactly). Findings: `no_events`, `no_snapshot_anchor`,
 A reconnect yields a second snapshot and ends the run unreplayable; the next
 segment starts fresh.
 
-**Live adapter — Kraken `depth` (`book`).** Kraken's v2 `book` channel sends a
-frame-level `type` of `"snapshot"` then `"update"` frames; `data` is a **list**
-(one entry per symbol), fanned out via `normalize_many`. Levels are objects
-(`{"price", "qty"}`, `qty 0` = remove) flattened to `[[price, size]]`. There is
-**no message sequence number**; each frame carries a CRC32 `checksum` over the
-top-of-book, which the collector **does not validate today** (it requires
-reconstructing the book at venue-native per-pair precision, which the float
-storage layer loses — see Roadmap). So the lane is `none_native` with the same
-in-stream-snapshot verdict as Coinbase/Bybit depth. The raw checksum is preserved
-in `metadata` (`kraken_checksum`) for future validation. Only `update` frames
-carry a `timestamp`; the snapshot has none and is skipped from the monotonicity
-check.
+**Live adapter — Kraken `depth` (`book`) — `checksum` (not none_native).** Kraken's
+v2 `book` channel sends a frame-level `type` of `"snapshot"` then `"update"` frames;
+`data` is a **list** (one entry per symbol), fanned out via `normalize_many`. Levels
+are objects (`{"price", "qty"}`, `qty 0` = remove) flattened to `[[price, size]]`.
+There is **no message sequence number**, but every frame carries a CRC32 `checksum`
+over the top-10 book (preserved in `metadata.kraken_checksum`). For a pair whose
+native `(price, qty)` decimal precision is known (`_KRAKEN_BOOK_PRECISION`; BTC/USD
+= `(1, 8)`, from the REST `AssetPairs` `pair_decimals`/`lot_decimals`),
+`replay_depth_stream_run` reconstructs the top-10 book from the stored levels and
+**recomputes that CRC32 after every event**, requiring it to match — a
+dropped/corrupted update diverges the local book and is caught. So a known-precision
+pair is `gap_detection: "checksum"`, `mode: "stream_snapshot_checksum"` (a pair
+absent from the table falls back to `none_native` — no false validation). The CRC32
+spec (verified against the live socket 2026-06-01, snapshot + updates all reproduced):
+asks top-10 ascending then bids top-10 descending, each level `price`@price-precision
++ `qty`@qty-precision with the decimal removed and leading zeros stripped. Only
+`update` frames carry a `timestamp`; the snapshot has none and is skipped from the
+monotonicity check.
 
 `replayable` iff **all** hold:
 
 - `event_count > 0`
 - exactly one snapshot anchor, and it is the **first** event in the run
 - event timestamps are monotonic non-decreasing
+- every event carries a checksum and all match the reconstructed book
 
-Findings: same set as Bybit depth above.
+A checksum mismatch (or a missing checksum) now **blocks** promotion. Findings:
+`no_events`, `no_snapshot_anchor`, `multiple_snapshot_anchors`,
+`snapshot_not_first_event`, `non_monotonic_event_time`, `missing_checksum`,
+`checksum_mismatch`, and (reported but non-gating) `crossed_book_states`.
 
 **Live adapter — Bybit spot `trades` (`publicTrade`).** Bybit batches many trades
 per WS frame (`data: [...]`), fanned out via `normalize_many`. The per-trade id
@@ -416,11 +435,9 @@ current contract:
 - `instrument=` partition column in the curated/normalized datasets (so
   per-instrument lanes of the same venue+dataset stop sharing Parquet
   partitions; the manifest already separates them via the promotion index).
-- **Checksum-validated gap-proofing for Kraken `depth`.** The `book` channel
-  ships a CRC32 `checksum` per frame (preserved in `metadata.kraken_checksum`).
-  Validating it would let the Kraken depth lane *detect* dropped/reordered frames
-  and graduate from §4.3 `none_native` toward a stronger guarantee — but it needs
-  the book reconstructed at Kraken's venue-native per-pair price/qty precision,
-  which today's float storage loses. Requires carrying raw string levels (or
-  per-pair precision metadata) through the pipeline first.
+- **Per-pair precision table for Kraken `depth` checksum validation.** Checksum
+  validation is live for BTC/USD (`_KRAKEN_BOOK_PRECISION`); other Kraken pairs
+  fall back to `none_native` until their `(price, qty)` precision is added (from
+  the REST `AssetPairs` `pair_decimals`/`lot_decimals`). Could be auto-fetched at
+  collect time instead of hardcoded.
 - Continuous day-bounded rotation as the default run model (vs. count-bounded).

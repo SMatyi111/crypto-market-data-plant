@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import zlib
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -287,12 +288,44 @@ def replay_depth_run(
     return summary
 
 
+def _kraken_book_crc32(
+    bids: dict[float, float],
+    asks: dict[float, float],
+    price_precision: int,
+    qty_precision: int,
+) -> int:
+    """Kraken v2 `book` CRC32 over the top-10 asks then top-10 bids.
+
+    Spec verified against the live socket (2026-06-01, snapshot + updates all
+    reproduced): asks sorted ascending (best = lowest price), bids descending
+    (best = highest); for each level format price to `price_precision` decimals and
+    qty to `qty_precision` decimals, remove the decimal point, strip leading zeros,
+    concatenate; CRC32 the resulting ASCII string. Validating it proves the local
+    book matches Kraken's at that tick — a dropped/corrupted update diverges the
+    book and is caught.
+    """
+
+    def tok(value: float, prec: int) -> str:
+        return (f"{value:.{prec}f}".replace(".", "").lstrip("0")) or "0"
+
+    top_asks = sorted(asks.items(), key=lambda kv: kv[0])[:10]
+    top_bids = sorted(bids.items(), key=lambda kv: kv[0], reverse=True)[:10]
+    parts: list[str] = []
+    for levels in (top_asks, top_bids):
+        for price, qty in levels:
+            parts.append(tok(price, price_precision) + tok(qty, qty_precision))
+    return zlib.crc32("".join(parts).encode("ascii"))
+
+
 def replay_depth_stream_run(
     run_path: Path,
     *,
     max_levels: int = 10,
     write_summary: bool = True,
     sequence_metadata_key: str | None = None,
+    checksum_metadata_key: str | None = None,
+    checksum_price_precision: int | None = None,
+    checksum_qty_precision: int | None = None,
 ) -> ReplaySummary:
     """Replay-validate an **in-stream-snapshot** depth run. Writes the same
     `metrics/replay_summary.json` contract as `replay_depth_run` so the existing
@@ -322,6 +355,16 @@ def replay_depth_stream_run(
     and an id gap now *blocks* promotion (a dropped message means the book can't be
     reconstructed). A reconnect mid-run still yields a second snapshot, caught by the
     single-anchor invariant before the id check matters.
+
+    **`checksum` (when `checksum_metadata_key` + precisions are set — Kraken `book`).**
+    Kraken carries no dense sequence, but every frame ships a CRC32 `checksum` over
+    the top-10 book at the pair's native precision. When the checksum field and the
+    pair's `(price, qty)` precision are supplied, this run reconstructs the book and
+    recomputes that CRC after every event, requiring it to match Kraken's. A
+    dropped/corrupted update diverges the local book from Kraken's and the checksum
+    mismatches, so this is **provable integrity** (equivalent gaplessness guarantee):
+    `gap_detection="checksum"`, `mode="stream_snapshot_checksum"`, and a mismatch
+    *blocks* promotion.
 
     `crossed_book_states` is surfaced as a finding for visibility but, consistent
     with `replay_depth_run`, does not by itself block promotion. Consumers MUST treat
@@ -353,6 +396,17 @@ def replay_depth_stream_run(
     previous_uid: int | None = None
     first_uid: int | None = None
     last_uid: int | None = None
+
+    # Optional per-frame CRC32 checksum validation (Kraken book). When enabled, the
+    # reconstructed top-10 book's checksum must match the venue's after every event.
+    checksum_enabled = (
+        checksum_metadata_key is not None
+        and checksum_price_precision is not None
+        and checksum_qty_precision is not None
+    )
+    checksum_checked_count = 0
+    checksum_mismatch_count = 0
+    checksum_missing_count = 0
 
     for row in _read_jsonl(events_path):
         event_count += 1
@@ -415,6 +469,19 @@ def replay_depth_stream_run(
         if best_bid is not None and best_ask is not None and best_bid >= best_ask:
             crossed_book_count += 1
 
+        if checksum_enabled:
+            metadata = row.get("metadata")
+            expected = _optional_int(metadata.get(checksum_metadata_key)) if isinstance(metadata, dict) else None
+            if expected is None:
+                checksum_missing_count += 1
+            else:
+                checksum_checked_count += 1
+                actual = _kraken_book_crc32(
+                    bids, asks, checksum_price_precision, checksum_qty_precision
+                )
+                if actual != expected:
+                    checksum_mismatch_count += 1
+
     best_bid = max(bids) if bids else None
     best_ask = min(asks) if asks else None
     spread = (best_ask - best_bid) if best_bid is not None and best_ask is not None else None
@@ -439,6 +506,11 @@ def replay_depth_stream_run(
             findings.append("update_id_gaps")
         if update_id_reorder_count:
             findings.append("non_monotonic_update_id")
+    if checksum_enabled:
+        if checksum_missing_count:
+            findings.append("missing_checksum")
+        if checksum_mismatch_count:
+            findings.append("checksum_mismatch")
 
     replayable = (
         event_count > 0
@@ -454,10 +526,24 @@ def replay_depth_stream_run(
             and update_id_gap_count == 0
             and update_id_reorder_count == 0
         )
+    if checksum_enabled:
+        # A per-frame CRC makes corruption/drops provable: every event must carry a
+        # checksum and all must match, else the local book diverged from Kraken's.
+        replayable = replayable and (
+            checksum_checked_count > 0
+            and checksum_missing_count == 0
+            and checksum_mismatch_count == 0
+        )
 
     summary = ReplaySummary(
         replay_type="depth",
-        mode="stream_snapshot_sequence" if seq_enabled else "stream_snapshot",
+        mode=(
+            "stream_snapshot_checksum"
+            if checksum_enabled
+            else "stream_snapshot_sequence"
+            if seq_enabled
+            else "stream_snapshot"
+        ),
         run_path=str(resolved_run_path),
         events_path=str(events_path),
         source=source,
@@ -486,7 +572,9 @@ def replay_depth_stream_run(
         findings=findings,
         top_bids=_top_levels(bids, reverse=True, max_levels=max_levels),
         top_asks=_top_levels(asks, reverse=False, max_levels=max_levels),
-        gap_detection="sequence" if seq_enabled else "none_native",
+        gap_detection=(
+            "checksum" if checksum_enabled else "sequence" if seq_enabled else "none_native"
+        ),
         summary_path=str(summary_path) if summary_path is not None else None,
     )
 

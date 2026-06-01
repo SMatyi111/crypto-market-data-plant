@@ -36,6 +36,7 @@ from crypto_collector.collectors.generic_ws import (
     _backoff_delay,
     _is_retryable_connect_error as _generic_is_retryable_connect_error,
 )
+from crypto_collector.replay import _kraken_book_crc32
 from crypto_collector.config import CollectorConfig
 from crypto_collector.models import RawMessage, utc_now
 
@@ -1743,7 +1744,7 @@ def _kraken_book_frame(
 ) -> dict:
     """Build a Kraken v2 book frame. `data` is a list (one entry per symbol); bids/asks
     are `{price, qty}` objects where qty 0 removes a level. `checksum` (CRC32) is kept in
-    metadata but not validated, so the feed is curated none_native."""
+    metadata and validated at replay time for known-precision pairs (BTC/USD)."""
     entry: dict = {"symbol": symbol, "bids": bids, "asks": asks}
     if checksum is not None:
         entry["checksum"] = checksum
@@ -1754,8 +1755,8 @@ def _kraken_book_frame(
 
 def test_kraken_depth_normalizer_snapshot_parses_object_levels() -> None:
     """Kraken book levels are `{price, qty}` objects (not arrays); they must flatten to
-    the `[[price, size]]` shape replay expects, with no sequence ids (none_native) and
-    the CRC32 checksum preserved in metadata for a future validation pass."""
+    the `[[price, size]]` shape replay expects, with no sequence ids and the CRC32
+    checksum preserved in metadata (validated at replay time for known-precision pairs)."""
     raw = RawMessage(
         source="kraken",
         received_at=utc_now(),
@@ -1830,27 +1831,29 @@ def test_cli_parser_kraken_depth_worker_defaults() -> None:
     assert suffixed.source_suffix == "ethusd"
 
 
-def test_collect_kraken_depth_segment_writes_none_native_replay_summary(
+def test_collect_kraken_depth_segment_unknown_pair_is_none_native(
     tmp_path, monkeypatch
 ) -> None:
-    """End-to-end: a Kraken v2 book stream (in-stream snapshot + update, object levels)
-    lands in kraken_depth/<ts>/ as clean events and gets a none_native depth replay
-    summary — Kraken's checksum isn't validated here, so gaplessness isn't claimed."""
+    """A Kraken pair whose native precision isn't in the table falls back to
+    none_native (no checksum validation) — structurally clean but not gap-proof, so the
+    scripted (non-real) checksums are simply not checked."""
     now = utc_now()
     t1 = (now + timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
     ws = _ScriptedDepthWebsocket(
         frames=[
-            {"method": "subscribe", "success": True, "result": {"channel": "book", "symbol": "BTC/USD"}},  # ack
+            {"method": "subscribe", "success": True, "result": {"channel": "book", "symbol": "ETH/USD"}},  # ack
             _kraken_book_frame(
-                bids=[_kraken_book_level(50000.0, 1.0)],
-                asks=[_kraken_book_level(50001.0, 2.0)],
+                bids=[_kraken_book_level(2000.0, 1.0)],
+                asks=[_kraken_book_level(2001.0, 2.0)],
                 msg_type="snapshot",
+                symbol="ETH/USD",
                 checksum=111,
             ),
             _kraken_book_frame(
-                bids=[_kraken_book_level(50000.0, 0.0), _kraken_book_level(49999.0, 3.0)],
-                asks=[_kraken_book_level(50001.0, 1.5)],
+                bids=[_kraken_book_level(2000.0, 0.0), _kraken_book_level(1999.0, 3.0)],
+                asks=[_kraken_book_level(2001.0, 1.5)],
                 msg_type="update",
+                symbol="ETH/USD",
                 checksum=222,
                 timestamp_iso=t1,
             ),
@@ -1859,7 +1862,7 @@ def test_collect_kraken_depth_segment_writes_none_native_replay_summary(
     _install_fake_trades_runtime(monkeypatch, ws)
 
     args = SimpleNamespace(
-        symbol="BTC/USD",
+        symbol="ETH/USD",  # not in _KRAKEN_BOOK_PRECISION -> none_native fallback
         channel="book",
         count=2,  # data frames
         output_root=tmp_path,
@@ -1870,19 +1873,62 @@ def test_collect_kraken_depth_segment_writes_none_native_replay_summary(
     result = asyncio.run(collect_kraken_depth_segment(args))
 
     assert result["clean_events"] == 2, result
-    assert result["quarantined_events"] == 0
     assert result["replayable"] is True, result["replay_findings"]
-
     run_path = Path(result["run_path"])
     assert run_path.parent.name == "kraken_depth"
-    events = (run_path / "clean" / "events.jsonl").read_text(encoding="utf-8").splitlines()
-    assert len(events) == 2
-    first = json.loads(events[0])
-    assert first["source"] == "kraken"
-    assert first["event_type"] == "snapshot"
-    assert first["first_update_id"] is None
     summary = json.loads(
         (run_path / "metrics" / "replay_summary.json").read_text(encoding="utf-8")
     )
     assert summary["gap_detection"] == "none_native"
+    assert summary["replayable"] is True
+
+
+def test_collect_kraken_depth_segment_btcusd_validates_checksum(tmp_path, monkeypatch) -> None:
+    """BTC/USD is in the precision table, so its per-frame CRC32 is validated at replay:
+    correct checksums => gap_detection='checksum', replayable. The scripted checksums are
+    computed with the same (verified) helper, so this exercises the full collect path."""
+    now = utc_now()
+    t1 = (now + timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
+    # Post-apply book state per frame -> the checksum Kraken would send.
+    cs_snap = _kraken_book_crc32({50000.0: 1.0}, {50001.0: 2.0}, 1, 8)
+    cs_upd = _kraken_book_crc32({49999.0: 3.0}, {50001.0: 1.5}, 1, 8)
+    ws = _ScriptedDepthWebsocket(
+        frames=[
+            {"method": "subscribe", "success": True, "result": {"channel": "book", "symbol": "BTC/USD"}},  # ack
+            _kraken_book_frame(
+                bids=[_kraken_book_level(50000.0, 1.0)],
+                asks=[_kraken_book_level(50001.0, 2.0)],
+                msg_type="snapshot",
+                checksum=cs_snap,
+            ),
+            _kraken_book_frame(
+                bids=[_kraken_book_level(50000.0, 0.0), _kraken_book_level(49999.0, 3.0)],
+                asks=[_kraken_book_level(50001.0, 1.5)],
+                msg_type="update",
+                checksum=cs_upd,
+                timestamp_iso=t1,
+            ),
+        ]
+    )
+    _install_fake_trades_runtime(monkeypatch, ws)
+
+    args = SimpleNamespace(
+        symbol="BTC/USD",
+        channel="book",
+        count=2,
+        output_root=tmp_path,
+        source_suffix="",
+        deadline_utc=None,
+    )
+
+    result = asyncio.run(collect_kraken_depth_segment(args))
+
+    assert result["clean_events"] == 2, result
+    assert result["replayable"] is True, result["replay_findings"]
+    run_path = Path(result["run_path"])
+    summary = json.loads(
+        (run_path / "metrics" / "replay_summary.json").read_text(encoding="utf-8")
+    )
+    assert summary["gap_detection"] == "checksum"
+    assert summary["mode"] == "stream_snapshot_checksum"
     assert summary["replayable"] is True

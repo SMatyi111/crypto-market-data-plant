@@ -353,9 +353,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--channel",
         default="book",
         help="Kraken v2 channel. 'book' is the public order book feed (default depth "
-        "10). Kraken ships an in-stream snapshot + updates plus a CRC32 checksum we "
-        "don't yet validate, so this is a non-sequence ('none_native') feed: replayable "
-        "means structurally clean, not gap-proof (STANDARDS 4.3).",
+        "10). Kraken ships an in-stream snapshot + updates plus a per-frame CRC32 "
+        "checksum. For a pair whose native precision is known (BTC/USD), the collector "
+        "validates that checksum at replay time, so the lane is curated 'checksum' "
+        "(provable integrity — a dropped/corrupted update is caught and blocks "
+        "promotion); other pairs fall back to none_native (STANDARDS 4.3).",
     )
     kraken_depth_parser.add_argument("--segment-count", type=int, default=5000)
     kraken_depth_parser.add_argument("--max-segments", type=int)
@@ -956,10 +958,30 @@ async def collect_bybit_depth_segment(args: argparse.Namespace) -> dict[str, obj
     )
 
 
+# Kraken v2 `book` CRC32 checksum is computed over the top-10 book at each pair's
+# native (price, qty) decimal precision (pair_decimals, lot_decimals from the REST
+# AssetPairs endpoint). Validating it proves the local book matches Kraken's, so a
+# known-precision pair is curated as `gap_detection="checksum"` (provable integrity);
+# a pair absent from this table falls back to none_native (no false validation).
+# BTC/USD = (price 1dp, qty 8dp), verified against the live socket 2026-06-01.
+_KRAKEN_BOOK_PRECISION: dict[str, tuple[int, int]] = {
+    "BTC/USD": (1, 8),
+}
+
+
 async def collect_kraken_depth_segment(args: argparse.Namespace) -> dict[str, object]:
-    # Kraken v2 book delivers an in-stream snapshot + updates plus a CRC32 checksum we
-    # don't yet validate (lossy from float storage), so curate as a non-sequence
-    # ("none_native") feed: structurally clean only, NOT gap-proof (STANDARDS 4.3).
+    # Kraken v2 book delivers an in-stream snapshot + updates plus a per-frame CRC32
+    # checksum. For a pair whose native precision we know, validate that checksum at
+    # replay time (provable integrity, gap_detection="checksum"); otherwise fall back
+    # to none_native — structurally clean only (STANDARDS 4.3).
+    precision = _KRAKEN_BOOK_PRECISION.get(getattr(args, "symbol", ""))
+    checksum_kwargs: dict[str, object] = {}
+    if precision is not None:
+        checksum_kwargs = {
+            "checksum_metadata_key": "kraken_checksum",
+            "checksum_price_precision": precision[0],
+            "checksum_qty_precision": precision[1],
+        }
     return await _collect_depth_stream_segment(
         args,
         source="kraken",
@@ -967,6 +989,7 @@ async def collect_kraken_depth_segment(args: argparse.Namespace) -> dict[str, ob
         subscription_style="kraken_v2",
         normalizer=KrakenDepthNormalizer(),
         source_base="kraken_depth",
+        **checksum_kwargs,
     )
 
 
@@ -981,6 +1004,9 @@ async def _collect_depth_stream_segment(
     ping_message: dict | None = None,
     ping_interval_seconds: float = 0.0,
     sequence_metadata_key: str | None = None,
+    checksum_metadata_key: str | None = None,
+    checksum_price_precision: int | None = None,
+    checksum_qty_precision: int | None = None,
 ) -> dict[str, object]:
     """Venue-agnostic in-stream-snapshot depth segment.
 
@@ -1028,6 +1054,9 @@ async def _collect_depth_stream_segment(
             run_paths.base,
             write_summary=True,
             sequence_metadata_key=sequence_metadata_key,
+            checksum_metadata_key=checksum_metadata_key,
+            checksum_price_precision=checksum_price_precision,
+            checksum_qty_precision=checksum_qty_precision,
         )
         replayable = replay_summary.replayable
         replay_findings = list(replay_summary.findings)
