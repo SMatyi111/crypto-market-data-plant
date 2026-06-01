@@ -91,13 +91,20 @@ decision** — every high-value item touches the live deployment, the live data
 layout, or an external venue, so none should be started silently.
 
 1. **Validate the new venue adapters against real exchanges, then enable them
-   live.** Biggest trust gap: Coinbase / Kraken / Bybit (trades + depth) have
-   only ever been exercised against *scripted* WebSockets. Before flipping any
-   `enabled: true`, each lane needs a real-socket smoke test — subscription ack →
-   live frame shapes match the normalizer's assumptions → a full
-   collect → replay → promote cycle on a short bounded segment. Then enable the
-   validated lanes in `ops.live.local.json`. **Needs a go-ahead** (touches the
-   live runner + outbound exchange connections). Highest payoff.
+   live.** — DONE (2026-05-31). All 6 lanes ran bounded real-socket segments to a
+   throwaway temp archive (`MARKET_DATA_ARCHIVE_ROOT`) and produced
+   `replayable: true` with the expected contract: coinbase/kraken trades =
+   `sequence`; bybit trades + all three depth lanes = `none_native` /
+   `stream_snapshot`. One real bug found + fixed: **Coinbase depth `level2_batch`
+   is dead** (public `level2`/`level2_batch` now require auth) — switched to
+   `level2_50` (same frame shape) and raised the WS `max_size` for its ~1.4 MiB
+   full-book snapshot (commit `d616e52`). All 6 lanes + full curation chains
+   (quarantine+promote, depth→`market_replayable` / trades→`trades_replayable`) +
+   cleanup retention are now enabled in `ops.live.local.json` (backed up to
+   `ops.live.local.json.bak`; validated through `load_ops_config`). **Activation:**
+   the ops-runner reads its config once at startup, so the new lanes go live on the
+   next runner restart (reboot or manual restart of the `CryptoMarketDataPlant`
+   task) — the currently-running Binance collector is untouched until then.
 
 2. **`instrument=` partition column** (north-star item #4's remaining half). Make
    data pullable by `(venue, instrument, event_date)` instead of sharing
@@ -127,6 +134,17 @@ layout, or an external venue, so none should be started silently.
    at venue-native per-pair price/qty precision, which today's float storage
    loses — so it first requires carrying raw string levels (or precision
    metadata) through the pipeline.
+
+5. **Data-arrival watchdog for the WS collector** (NEW — surfaced by the #1
+   real-socket validation). A feed that **acks the subscription but then sends no
+   data** makes `GenericWebsocketCollector.stream` block forever in
+   `async for message in websocket` — the segment never reaches `segment_count`,
+   never writes a replay summary, and the lane silently stops producing without
+   raising. This is exactly how the dead Coinbase `level2_batch` channel hung
+   (acked, zero frames). It's a real unsupervised-operation risk for any enabled
+   lane whose venue goes silent-but-connected. Fix: an idle timeout (no data frame
+   in N s) that closes + reconnects (or ends the segment cleanly), surfaced as a
+   metric/finding. Layout-neutral, fully offline-testable.
 
 Also still parked: the **L3 collection project** re-enable (see bottom of this
 file) and making **day-bounded rotation the default** run model (currently
