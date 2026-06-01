@@ -127,13 +127,23 @@ layout, or an external venue, so none should be started silently.
    relies on protocol-level ping/pong. Deterministic tests cover ping-sent (Bybit)
    and no-ping (default). STANDARDS §4.3 + §8 updated.
 
-4. **Stronger gap-proofing for the `none_native` depth lanes.** Validate
-   Kraken's per-frame CRC32 `checksum` (preserved in `metadata.kraken_checksum`)
-   and/or tighten Bybit's `data.u` into a §4.1-style snapshot-anchored sequence
-   proof. Largest effort: Kraken checksum validation needs the book reconstructed
-   at venue-native per-pair price/qty precision, which today's float storage
-   loses — so it first requires carrying raw string levels (or precision
-   metadata) through the pipeline.
+4. **Stronger gap-proofing for the `none_native` depth lanes.**
+   - **Bybit `data.u` — DONE (2026-06-01, commit `b5ca110`).** Real-socket
+     validation showed `data.u` increments by exactly 1 per message (60/60 frames),
+     so Bybit depth was upgraded from `none_native` to a provable `sequence`
+     guarantee via `replay_depth_stream_run(sequence_metadata_key="bybit_update_id")`
+     — a `data.u` gap now blocks promotion. `STANDARDS_VERSION` bumped 1→2.
+   - **Kraken CRC32 `checksum` — STILL OPEN (the precision-heavy half).** Validating
+     the per-frame checksum (preserved in `metadata.kraken_checksum`) would detect
+     dropped/reordered frames and upgrade Kraken depth too. It needs the top-10 book
+     reconstructed at Kraken's venue-native per-pair price/qty **precision**, which
+     today's float storage loses. Two candidate approaches, both a design decision:
+     (a) carry raw string levels through the pipeline (NormalizedDepthUpdate schema
+     change → another `STANDARDS_VERSION` bump); or (b) a collect-time stateful
+     checksum validator that reads raw frame strings, maintains the book, and writes
+     only a per-run pass/fail (no schema change, but Kraken-specific pipeline logic).
+     Also needs the per-pair precision (Kraken REST `AssetPairs`, or hardcode BTC/USD)
+     and the exact CRC32 string-building spec.
 
 5. **Data-arrival watchdog for the WS collector** (NEW — surfaced by the #1
    real-socket validation). A feed that **acks the subscription but then sends no
