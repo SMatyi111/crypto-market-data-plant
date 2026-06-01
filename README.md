@@ -29,7 +29,7 @@ unaffected. Enable them per lane when you want them:
 | Binance  | ✅ live | ✅ live | sequence (gap-proof) |
 | Coinbase | ✅      | ✅      | trades = sequence; depth = `none_native` |
 | Kraken   | ✅      | ✅      | trades = sequence; depth = `none_native` |
-| Bybit    | ✅      | ✅      | both = `none_native` |
+| Bybit    | ✅      | ✅      | trades = `none_native`; depth = sequence (`data.u` +1) |
 
 `none_native` lanes are curated as *structurally clean*, **not** gap-proof — see
 [`STANDARDS.md`](STANDARDS.md) §4.3. The mock feed exists only for local smoke

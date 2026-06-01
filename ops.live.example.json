@@ -236,7 +236,7 @@
       }
     },
     {
-      "// non-sequence depth lane": "Bybit v5 spot orderbook is a none_native feed (STANDARDS 4.3): the snapshot arrives in-stream and deltas carry no dense per-message sequence we trust for spot, so 'replayable' means structurally clean (single snapshot anchor, parse-clean, monotonic timestamps) — NOT gap-proof. Promoted rows go to market_replayable like Binance/Coinbase depth, but consumers must treat gap_detection=='none_native' data as best-effort. channel is the 'orderbook.<depth>' topic prefix (spot supports 1/50/200); the symbol is appended automatically. Same ~10min idle-drop keepalive caveat as the Bybit trades lane.",
+      "// sequence depth lane": "Bybit v5 spot orderbook: the snapshot arrives in-stream, but data.u increments by exactly 1 per message (verified live), so this lane is curated as a PROVABLE 'sequence' feed (STANDARDS 4.1/4.3): replayable means gapless, and a data.u gap blocks promotion. Promoted rows go to market_replayable like Binance/Coinbase depth, and gap_detection=='sequence' means consumers can rely on completeness. channel is the 'orderbook.<depth>' topic prefix (spot supports 1/50/200); the symbol is appended automatically. Same ~10min idle-drop keepalive caveat as the Bybit trades lane.",
       "name": "bybit-btc-depth",
       "job_type": "bybit-depth-worker",
       "enabled": false,

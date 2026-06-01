@@ -17,10 +17,11 @@ There are two checkpoints:
 The bar a run must clear is set by its `gap_detection` class, recorded in
 `replay_summary.json`:
 
-- **`sequence`** (Binance depth/trades, Coinbase trades, Kraken trades) — carries
-  a dense per-stream counter, so gaplessness is **provable**. `replayable` here
-  means gap-proof.
-- **`none_native`** (Coinbase/Kraken/Bybit depth, Bybit trades) — no usable dense
+- **`sequence`** (Binance depth/trades, Coinbase trades, Kraken trades, Bybit
+  `orderbook` depth) — carries a dense per-stream counter (Bybit orderbook `data.u`
+  is +1 per message), so gaplessness is **provable**. `replayable` here means
+  gap-proof.
+- **`none_native`** (Coinbase/Kraken depth, Bybit trades) — no usable dense
   sequence (no sequence at all, or only a UUID / shared counter / unvalidated
   checksum). `replayable` is downgraded to **structurally clean only**: a single
   snapshot anchor that is the first event, parse-clean events, monotonic

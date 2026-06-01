@@ -588,6 +588,119 @@ def test_replay_depth_stream_run_clean_snapshot_is_replayable_none_native(tmp_pa
     assert summary_json["gap_detection"] == "none_native"
 
 
+def _bybit_stream_row(
+    *,
+    event_type: str,
+    update_id: int | None,
+    bids: list[list[float]] | None = None,
+    asks: list[list[float]] | None = None,
+    event_time: str | None = None,
+) -> dict:
+    # Mirrors a normalized Bybit orderbook event: the dense per-symbol id lives in
+    # metadata["bybit_update_id"], not the event-level first/final_update_id.
+    metadata: dict = {}
+    if update_id is not None:
+        metadata["bybit_update_id"] = update_id
+    return {
+        "source": "bybit",
+        "product": "BTCUSDT",
+        "channel": "depth",
+        "event_type": event_type,
+        "event_time": event_time,
+        "received_at": "2026-04-06T00:00:00.100000+00:00",
+        "first_update_id": None,
+        "final_update_id": None,
+        "instrument": {"instrument_id": "spot:bybit:BTCUSDT"},
+        "bids": bids or [],
+        "asks": asks or [],
+        "metadata": metadata,
+    }
+
+
+def test_replay_depth_stream_run_sequence_contiguous_is_gap_proof(tmp_path: Path) -> None:
+    """With sequence_metadata_key set (Bybit), a contiguous +1 update id across the run
+    upgrades the verdict from none_native to a provable `sequence` gap proof."""
+    run_path = tmp_path / "bybit_depth" / "20260406_000000"
+    _write_stream_depth_run(
+        run_path,
+        [
+            _bybit_stream_row(event_type="snapshot", update_id=100, bids=[[100.0, 1.0]], asks=[[101.0, 2.0]]),
+            _bybit_stream_row(event_type="delta", update_id=101, bids=[[100.0, 0.0]], event_time="2026-04-06T00:00:01+00:00"),
+            _bybit_stream_row(event_type="delta", update_id=102, asks=[[101.0, 1.5]], event_time="2026-04-06T00:00:02+00:00"),
+        ],
+    )
+
+    summary = replay_depth_stream_run(run_path, sequence_metadata_key="bybit_update_id")
+
+    assert summary.replayable is True, summary.findings
+    assert summary.gap_detection == "sequence"
+    assert summary.mode == "stream_snapshot_sequence"
+    assert summary.first_update_id == 100
+    assert summary.last_update_id == 102
+    assert summary.gap_count == 0
+    assert summary.reordered_count == 0
+    assert summary.findings == []
+
+
+def test_replay_depth_stream_run_sequence_gap_blocks_promotion(tmp_path: Path) -> None:
+    """A jump in the update id (a dropped message) is now provable, so it flags
+    `update_id_gaps` and is NOT replayable."""
+    run_path = tmp_path / "bybit_depth" / "20260406_000001"
+    _write_stream_depth_run(
+        run_path,
+        [
+            _bybit_stream_row(event_type="snapshot", update_id=100, bids=[[100.0, 1.0]], asks=[[101.0, 2.0]]),
+            _bybit_stream_row(event_type="delta", update_id=104, asks=[[101.0, 1.5]], event_time="2026-04-06T00:00:02+00:00"),
+        ],
+    )
+
+    summary = replay_depth_stream_run(run_path, sequence_metadata_key="bybit_update_id")
+
+    assert summary.replayable is False
+    assert summary.gap_detection == "sequence"
+    assert "update_id_gaps" in summary.findings
+    assert summary.gap_count == 1
+
+
+def test_replay_depth_stream_run_sequence_reorder_blocks_promotion(tmp_path: Path) -> None:
+    """A backwards/duplicate update id (reorder or service reset) flags
+    `non_monotonic_update_id` and blocks promotion."""
+    run_path = tmp_path / "bybit_depth" / "20260406_000002"
+    _write_stream_depth_run(
+        run_path,
+        [
+            _bybit_stream_row(event_type="snapshot", update_id=100, bids=[[100.0, 1.0]], asks=[[101.0, 2.0]]),
+            _bybit_stream_row(event_type="delta", update_id=100, asks=[[101.0, 1.5]], event_time="2026-04-06T00:00:02+00:00"),
+        ],
+    )
+
+    summary = replay_depth_stream_run(run_path, sequence_metadata_key="bybit_update_id")
+
+    assert summary.replayable is False
+    assert "non_monotonic_update_id" in summary.findings
+    assert summary.reordered_count == 1
+
+
+def test_replay_depth_stream_run_without_sequence_key_stays_none_native(tmp_path: Path) -> None:
+    """The same events WITHOUT a sequence_metadata_key keep the none_native verdict —
+    the upgrade is strictly opt-in, so Coinbase/Kraken depth are unaffected."""
+    run_path = tmp_path / "bybit_depth" / "20260406_000003"
+    _write_stream_depth_run(
+        run_path,
+        [
+            _bybit_stream_row(event_type="snapshot", update_id=100, bids=[[100.0, 1.0]], asks=[[101.0, 2.0]]),
+            _bybit_stream_row(event_type="delta", update_id=104, asks=[[101.0, 1.5]], event_time="2026-04-06T00:00:02+00:00"),
+        ],
+    )
+
+    summary = replay_depth_stream_run(run_path)  # no key
+
+    assert summary.gap_detection == "none_native"
+    assert summary.mode == "stream_snapshot"
+    assert summary.replayable is True  # gap is invisible without the sequence
+    assert "update_id_gaps" not in summary.findings
+
+
 def test_replay_depth_stream_run_no_snapshot_is_not_replayable(tmp_path: Path) -> None:
     """Without the in-stream snapshot anchor the book can't be seeded, so the run is
     not replayable even though the diffs are monotonic."""

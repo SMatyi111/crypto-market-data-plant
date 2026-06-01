@@ -1,6 +1,10 @@
 # Data Standards
 
-`STANDARDS_VERSION = 1`
+`STANDARDS_VERSION = 2`
+
+> **v2 (2026-06-01):** Bybit spot `orderbook` depth moved from `none_native` to a
+> provable `sequence` guarantee — its `data.u` increments by exactly 1 per message
+> (verified live), so dropped messages are now detectable and block promotion.
 
 This is the contract for what the crypto market-data plant produces and what
 "replayable / research-ready" means. It describes the system **as it actually
@@ -25,17 +29,17 @@ Venues live today: **Binance** (depth + trades), **Coinbase** (trades + depth),
 **Kraken** (trades + depth), **Bybit** (trades + depth). See Roadmap for the rest.
 
 > **Gap-detection class differs by feed, not just by venue.** Binance depth/trades,
-> Coinbase trades, and **Kraken trades** are **sequence-bearing** (§4.1/§4.2 strong
-> gaplessness — Kraken v2 `trade_id` is a dense per-pair counter). Coinbase depth
-> (`level2_50`), **Bybit spot trades** (`publicTrade`, whose trade
-> id is a UUID, not a dense counter), and **both new depth feeds — Bybit spot
-> `orderbook` and Kraken `book`** — are **non-sequence** (`none_native`, §4.3):
-> `replayable` there means *structurally clean*, **not** gap-proof. The per-lane
-> `gap_detection` tag in the manifest (§6) is how a consumer tells these apart —
-> note that two lanes of the same dataset can have **different** classes (e.g.
-> Binance depth `sequence` vs. Bybit/Kraken depth `none_native`; Kraken trades
-> `sequence` vs. Bybit trades `none_native`), so key off the tag, not the dataset
-> name.
+> Coinbase trades, **Kraken trades**, and **Bybit spot `orderbook` depth** are
+> **sequence-bearing** (§4.1/§4.2 strong gaplessness — Kraken v2 `trade_id` is a
+> dense per-pair counter; Bybit orderbook `data.u` increments by exactly 1 per
+> message). Coinbase depth (`level2_50`), **Kraken `book` depth**, and **Bybit spot
+> trades** (`publicTrade`, whose trade id is a UUID, not a dense counter) are
+> **non-sequence** (`none_native`, §4.3): `replayable` there means *structurally
+> clean*, **not** gap-proof. The per-lane `gap_detection` tag in the manifest (§6)
+> is how a consumer tells these apart — note that two lanes of the same dataset can
+> have **different** classes (e.g. Bybit depth `sequence` vs. Kraken/Coinbase depth
+> `none_native`; Kraken trades `sequence` vs. Bybit trades `none_native`), so key
+> off the tag, not the dataset name.
 
 ---
 
@@ -259,27 +263,34 @@ non-gating, as in §4.1) `crossed_book_states`. A reconnect mid-run yields a
 run unreplayable — mirroring Binance depth's single-anchor invariant, so the
 worker's next segment simply starts a fresh book.
 
-**Live adapter — Bybit spot `depth` (`orderbook.{depth}`).** Bybit's spot
-orderbook stream sends a frame-level `type` of `"snapshot"` (full book) then
-`"delta"` frames (changed levels only, size `"0"` = remove). The diff key
-(`data.u`) is monotonic but **not** a dense `+1` counter for spot, and the cross
-sequence (`data.seq`) is shared across symbols — neither proves `delta == 1`, so
-the lane is `none_native` and reuses the in-stream-snapshot replay path
-(`replay_depth_stream_run`, `mode: "stream_snapshot"`). Both ids are preserved in
-`metadata` (`bybit_update_id`, `bybit_cross_sequence`) for any future tightening.
-Exchange time prefers the matching-engine timestamp (`cts`) and falls back to the
-frame timestamp (`ts`).
+**Live adapter — Bybit spot `depth` (`orderbook.{depth}`) — `sequence` (not
+none_native).** Bybit's spot orderbook stream sends a frame-level `type` of
+`"snapshot"` (full book) then `"delta"` frames (changed levels only, size `"0"` =
+remove). It shares the in-stream-snapshot replay machinery described in this
+section, **but** its diff key (`data.u`) increments by **exactly 1 per message**
+(snapshot included — verified against the live socket 2026-06-01, 60 consecutive
+frames all `+1`). So `replay_depth_stream_run` is called with
+`sequence_metadata_key="bybit_update_id"`, which upgrades the lane to a **provable
+`sequence` guarantee** (§4.1 class): `mode: "stream_snapshot_sequence"`,
+`gap_detection: "sequence"`. The update id and the (cross-symbol, non-dense) cross
+sequence are both preserved in `metadata` (`bybit_update_id`,
+`bybit_cross_sequence`). Exchange time prefers the matching-engine timestamp
+(`cts`) and falls back to the frame timestamp (`ts`).
 
 `replayable` iff **all** hold:
 
 - `event_count > 0`
 - exactly one snapshot anchor, and it is the **first** event in the run
 - event timestamps are monotonic non-decreasing
+- `data.u` advances by exactly 1 across every event
 
-Findings: `no_events`, `no_snapshot_anchor`, `multiple_snapshot_anchors`,
-`snapshot_not_first_event`, `non_monotonic_event_time`, and (reported but
-non-gating) `crossed_book_states`. As with Coinbase depth, a reconnect yields a
-second snapshot and ends the run unreplayable; the next segment starts fresh.
+A `data.u` gap now **blocks** promotion (a dropped message means the book can't be
+reconstructed exactly). Findings: `no_events`, `no_snapshot_anchor`,
+`multiple_snapshot_anchors`, `snapshot_not_first_event`, `non_monotonic_event_time`,
+`missing_update_id`, `update_id_gaps` (`delta > 1`), `non_monotonic_update_id`
+(`delta <= 0` — reorder/reset), and (reported but non-gating) `crossed_book_states`.
+A reconnect yields a second snapshot and ends the run unreplayable; the next
+segment starts fresh.
 
 **Live adapter — Kraken `depth` (`book`).** Kraken's v2 `book` channel sends a
 frame-level `type` of `"snapshot"` then `"update"` frames; `data` is a **list**
@@ -412,8 +423,4 @@ current contract:
   the book reconstructed at Kraken's venue-native per-pair price/qty precision,
   which today's float storage loses. Requires carrying raw string levels (or
   per-pair precision metadata) through the pipeline first.
-- **Tighter gap detection for Bybit `depth`.** `data.u` is monotonic and the
-  cross sequence `data.seq` is preserved (`metadata.bybit_update_id` /
-  `bybit_cross_sequence`); if Bybit's spot `u` proves dense enough per-symbol, the
-  lane could move from §4.3 toward a §4.1-style snapshot-anchored sequence proof.
 - Continuous day-bounded rotation as the default run model (vs. count-bounded).

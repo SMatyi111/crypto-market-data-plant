@@ -315,10 +315,10 @@ def build_parser() -> argparse.ArgumentParser:
         default="orderbook.50",
         help="Bybit v5 depth topic prefix '<orderbook>.<depth>', e.g. orderbook.50 "
         "(spot supports 1/50/200). The symbol is appended to form the full topic "
-        "orderbook.<depth>.<symbol>. Bybit ships an in-stream snapshot + deltas with no "
-        "dense per-message sequence we trust for spot, so this is a non-sequence "
-        "('none_native') feed: replayable means structurally clean, not gap-proof "
-        "(STANDARDS 4.3).",
+        "orderbook.<depth>.<symbol>. Bybit ships an in-stream snapshot + deltas whose "
+        "data.u increments by exactly 1 per message, so this lane is curated as a "
+        "provable 'sequence' feed (delta==1, gap-proof) — a dropped message is caught "
+        "and blocks promotion (STANDARDS 4.1/4.3).",
     )
     bybit_depth_parser.add_argument("--segment-count", type=int, default=5000)
     bybit_depth_parser.add_argument("--max-segments", type=int)
@@ -938,9 +938,11 @@ async def collect_coinbase_depth_segment(args: argparse.Namespace) -> dict[str, 
 
 
 async def collect_bybit_depth_segment(args: argparse.Namespace) -> dict[str, object]:
-    # Bybit orderbook delivers an in-stream snapshot + deltas with no dense per-message
-    # sequence we can trust for spot, so curate as a non-sequence ("none_native") feed:
-    # structurally clean only, NOT gap-proof (STANDARDS 4.3).
+    # Bybit orderbook delivers an in-stream snapshot + deltas AND a dense per-symbol
+    # update id (data.u) that increments by exactly 1 per message (verified live
+    # 2026-06-01). Passing sequence_metadata_key promotes this lane from none_native
+    # to a provable `sequence` gap proof (delta==1), so a dropped message is caught
+    # and blocks promotion (STANDARDS 4.1 / 4.3).
     return await _collect_depth_stream_segment(
         args,
         source="bybit",
@@ -950,6 +952,7 @@ async def collect_bybit_depth_segment(args: argparse.Namespace) -> dict[str, obj
         source_base="bybit_depth",
         ping_message=_BYBIT_PING_MESSAGE,
         ping_interval_seconds=_BYBIT_PING_INTERVAL_SECONDS,
+        sequence_metadata_key="bybit_update_id",
     )
 
 
@@ -977,8 +980,9 @@ async def _collect_depth_stream_segment(
     source_base: str,
     ping_message: dict | None = None,
     ping_interval_seconds: float = 0.0,
+    sequence_metadata_key: str | None = None,
 ) -> dict[str, object]:
-    """Venue-agnostic depth segment for **non-sequence** ("none_native") feeds.
+    """Venue-agnostic in-stream-snapshot depth segment.
 
     Unlike Binance depth (REST snapshot + U/u reconnect-in-place alignment), these
     feeds deliver the snapshot in-stream and carry no sequence, so there's nothing to
@@ -1020,7 +1024,11 @@ async def _collect_depth_stream_segment(
 
     events_path = run_paths.base / "clean" / "events.jsonl"
     if events_path.exists():
-        replay_summary = replay_depth_stream_run(run_paths.base, write_summary=True)
+        replay_summary = replay_depth_stream_run(
+            run_paths.base,
+            write_summary=True,
+            sequence_metadata_key=sequence_metadata_key,
+        )
         replayable = replay_summary.replayable
         replay_findings = list(replay_summary.findings)
         replay_summary_path = replay_summary.summary_path

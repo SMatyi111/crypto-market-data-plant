@@ -1613,12 +1613,13 @@ def test_cli_parser_bybit_depth_worker_defaults() -> None:
     assert suffixed.source_suffix == "ethusdt"
 
 
-def test_collect_bybit_depth_segment_writes_none_native_replay_summary(
+def test_collect_bybit_depth_segment_writes_sequence_replay_summary(
     tmp_path, monkeypatch
 ) -> None:
     """End-to-end: a Bybit orderbook stream (in-stream snapshot + delta) lands in
-    bybit_depth/<ts>/ as clean events and gets a none_native depth replay summary, so the
-    existing quarantine/promote chain can curate it without claiming gaplessness."""
+    bybit_depth/<ts>/ as clean events. Bybit's data.u increments by exactly 1, so the
+    lane is curated as a provable `sequence` gap proof (not none_native): contiguous
+    update ids => replayable, gap_detection='sequence'."""
     now = utc_now()
     cts = int(now.timestamp() * 1000)
     ws = _ScriptedDepthWebsocket(
@@ -1635,7 +1636,7 @@ def test_collect_bybit_depth_segment_writes_none_native_replay_summary(
                 bids=[["50000.0", "0"]],  # removal
                 asks=[["50002.0", "1.5"]],
                 msg_type="delta",
-                update_id=101,
+                update_id=101,  # contiguous +1
                 cts_ms=cts + 1000,
             ),
         ]
@@ -1664,12 +1665,64 @@ def test_collect_bybit_depth_segment_writes_none_native_replay_summary(
     first = json.loads(events[0])
     assert first["source"] == "bybit"
     assert first["event_type"] == "snapshot"
+    # The event-level first_update_id stays None; the dense id lives in metadata.
     assert first["first_update_id"] is None
     summary = json.loads(
         (run_path / "metrics" / "replay_summary.json").read_text(encoding="utf-8")
     )
-    assert summary["gap_detection"] == "none_native"
+    assert summary["gap_detection"] == "sequence"
+    assert summary["mode"] == "stream_snapshot_sequence"
+    assert summary["first_update_id"] == 100
+    assert summary["last_update_id"] == 101
     assert summary["replayable"] is True
+
+
+def test_collect_bybit_depth_segment_flags_update_id_gap(tmp_path, monkeypatch) -> None:
+    """A jump in Bybit's data.u (a dropped message) must be caught now that the lane is
+    sequence-bearing: update_id_gaps finding + NOT replayable, so the run is quarantined
+    instead of falsely promoted as gapless."""
+    now = utc_now()
+    cts = int(now.timestamp() * 1000)
+    ws = _ScriptedDepthWebsocket(
+        frames=[
+            {"success": True, "ret_msg": "subscribe", "op": "subscribe", "conn_id": "x"},  # ack
+            _bybit_orderbook_frame(
+                bids=[["50000.0", "1.0"]],
+                asks=[["50001.0", "2.0"]],
+                msg_type="snapshot",
+                update_id=100,
+                cts_ms=cts,
+            ),
+            _bybit_orderbook_frame(
+                bids=[["49999.0", "1.0"]],
+                asks=[["50002.0", "1.5"]],
+                msg_type="delta",
+                update_id=103,  # gap: skipped 101, 102 (dropped messages)
+                cts_ms=cts + 1000,
+            ),
+        ]
+    )
+    _install_fake_trades_runtime(monkeypatch, ws)
+
+    args = SimpleNamespace(
+        symbol="BTCUSDT",
+        channel="orderbook.50",
+        count=2,
+        output_root=tmp_path,
+        source_suffix="",
+        deadline_utc=None,
+    )
+
+    result = asyncio.run(collect_bybit_depth_segment(args))
+
+    run_path = Path(result["run_path"])
+    summary = json.loads(
+        (run_path / "metrics" / "replay_summary.json").read_text(encoding="utf-8")
+    )
+    assert summary["gap_detection"] == "sequence"
+    assert "update_id_gaps" in summary["findings"]
+    assert summary["gap_count"] == 1
+    assert summary["replayable"] is False
 
 
 # --- Phase 2 #3c: Kraken depth (book) adapter -----------------------------
