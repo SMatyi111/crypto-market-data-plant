@@ -131,6 +131,12 @@ def test_run_ops_runner_rejects_empty_enabled_job_set(tmp_path: Path) -> None:
         )
 
 
+def test_startup_task_installer_disables_execution_time_limit() -> None:
+    script = Path("scripts/install_startup_task.ps1").read_text(encoding="utf-8")
+
+    assert "-ExecutionTimeLimit (New-TimeSpan -Seconds 0)" in script
+
+
 def test_run_ops_runner_rejects_duplicate_lock(tmp_path: Path) -> None:
     config_path = tmp_path / "ops.json"
     config_path.write_text(
@@ -707,6 +713,110 @@ def test_health_does_not_flag_high_quarantine_for_stopped_workers(tmp_path: Path
     )
 
 
+def test_health_surfaces_idle_timeout_finding_for_active_worker(tmp_path: Path) -> None:
+    """Per FOLLOW_UPS #5: when the data-arrival watchdog fired on an active run
+    (idle_timeout_count > 0 in the latest summary.jsonl row), the health report must
+    surface an `idle_timeout:<worker>` finding so an operator notices a venue that went
+    silent-but-connected. It is non-blocking — the lane self-heals via a fresh segment."""
+    ops_root = tmp_path / "ops"
+    workers_root = ops_root / "standalone_workers"
+    workers_root.mkdir(parents=True)
+    now = datetime.now(tz=UTC)
+    (ops_root / "heartbeat.json").write_text(
+        json.dumps({"status": "running", "last_seen": now.isoformat(), "job_counters": {}}),
+        encoding="utf-8",
+    )
+
+    run_path = tmp_path / "raw" / "market" / "coinbase_depth" / "20260601_120000"
+    run_path.mkdir(parents=True)
+    _write_summary_jsonl(
+        run_path,
+        [
+            {
+                "raw_messages": 5,
+                "clean_events": 5,
+                "quarantined_events": 0,
+                "idle_timeout_count": 2,  # watchdog fired twice on this run
+                "partial": False,
+            }
+        ],
+    )
+    (workers_root / "coinbase-depth-worker.json").write_text(
+        json.dumps(
+            {
+                "worker_name": "coinbase-depth-worker",
+                "worker_type": "coinbase-depth-worker",
+                "status": "running",
+                "pid": os.getpid(),
+                "last_seen": now.isoformat(),
+                "current_segment": {
+                    "index": 1,
+                    "started_at": now.isoformat(),
+                    "run_path": str(run_path),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = build_health_report(ops_root=ops_root, jobs=None, stale_after_seconds=300)
+
+    worker = next(
+        row for row in report.standalone_workers if row["name"] == "coinbase-depth-worker"
+    )
+    assert worker["partial_metrics"]["idle_timeout_count"] == 2
+    assert any(
+        item.startswith("idle_timeout:") or item.startswith("unmanaged_idle_timeout:")
+        for item in report.findings
+    )
+    # Idle timeout self-heals (the worker opens a fresh segment), so it is NOT a blocking
+    # finding the way a missing PID / high quarantine ratio is.
+    assert "idle_timeout" not in worker["findings"]
+    assert worker["blocking"] is False
+
+
+def test_health_does_not_flag_idle_timeout_for_stopped_worker(tmp_path: Path) -> None:
+    """A historical idle timeout on a stopped worker is not an in-flight problem, so no
+    finding fires (mirrors the high_quarantine_ratio active-only rule)."""
+    ops_root = tmp_path / "ops"
+    workers_root = ops_root / "standalone_workers"
+    workers_root.mkdir(parents=True)
+    now = datetime.now(tz=UTC)
+    (ops_root / "heartbeat.json").write_text(
+        json.dumps({"status": "running", "last_seen": now.isoformat(), "job_counters": {}}),
+        encoding="utf-8",
+    )
+
+    run_path = tmp_path / "raw" / "market" / "coinbase_depth" / "20260601_110000"
+    run_path.mkdir(parents=True)
+    _write_summary_jsonl(
+        run_path,
+        [{"raw_messages": 1, "clean_events": 1, "quarantined_events": 0, "idle_timeout_count": 3, "partial": False}],
+    )
+    (workers_root / "coinbase-depth-worker.json").write_text(
+        json.dumps(
+            {
+                "worker_name": "coinbase-depth-worker",
+                "worker_type": "coinbase-depth-worker",
+                "status": "stopped",  # not active
+                "pid": os.getpid(),
+                "last_seen": now.isoformat(),
+                "last_run_path": str(run_path),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = build_health_report(ops_root=ops_root, jobs=None, stale_after_seconds=300)
+
+    worker = next(
+        row for row in report.standalone_workers if row["name"] == "coinbase-depth-worker"
+    )
+    # The count is still surfaced for context, but no finding fires.
+    assert worker["partial_metrics"]["idle_timeout_count"] == 3
+    assert not any("idle_timeout:coinbase-depth-worker" in item for item in report.findings)
+
+
 def test_health_partial_metrics_handles_missing_summary_jsonl(tmp_path: Path) -> None:
     """If the worker just started and hasn't written summary.jsonl yet, the report
     should not crash — partial_metrics is just None."""
@@ -1048,3 +1158,241 @@ def test_job_args_lane_flags_default_to_legacy_behavior() -> None:
     assert depth.rotate_at_midnight is False
     assert trades.source_suffix == ""
     assert trades.rotate_at_midnight is False
+
+
+# ---------------------------------------------------------------------------
+# Parallel collection runner (collector_concurrency)
+# ---------------------------------------------------------------------------
+
+
+def _collector_job(name: str, job_type: str, *, interval_seconds: int = 3600) -> JobSpec:
+    return JobSpec(name=name, job_type=job_type, interval_seconds=interval_seconds)
+
+
+def test_collectors_run_concurrently_with_concurrency_above_one(tmp_path: Path) -> None:
+    """With collector_concurrency=3, three due collector jobs must overlap. A Barrier
+    that requires all three to arrive proves true simultaneity — if they were serialized
+    the barrier would time out and the runs would be recorded as errors."""
+    runner = OpsRunner(tmp_path / "ops", poll_seconds=0, collector_concurrency=3)
+    barrier = threading.Barrier(3, timeout=5.0)
+
+    def execute_job(job: JobSpec) -> str:
+        barrier.wait()  # raises BrokenBarrierError unless all three are running at once
+        return f"ran {job.name}"
+
+    jobs = [
+        _collector_job("coinbase-btc-trades", "coinbase-trades-worker"),
+        _collector_job("kraken-btc-trades", "kraken-trades-worker"),
+        _collector_job("bybit-btc-trades", "bybit-trades-worker"),
+    ]
+
+    executed = runner.run(jobs, execute_job=execute_job, max_runs=3)
+
+    assert executed == 3
+    run_lines = (tmp_path / "ops" / "job_runs.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    assert len(run_lines) == 3
+    # All three reached the barrier together -> all succeeded -> concurrency confirmed.
+    assert all(json.loads(line)["status"] == "success" for line in run_lines)
+
+
+def test_same_collector_job_not_launched_twice_while_running(tmp_path: Path) -> None:
+    """A single collector job that is always due (interval 0) must never have two
+    instances in flight at once, even when concurrency capacity is available."""
+    runner = OpsRunner(tmp_path / "ops", poll_seconds=0, collector_concurrency=4)
+    lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    def execute_job(_job: JobSpec) -> str:
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.15)
+        with lock:
+            active -= 1
+        return "ok"
+
+    jobs = [_collector_job("coinbase-btc-trades", "coinbase-trades-worker", interval_seconds=0)]
+
+    executed = runner.run(jobs, execute_job=execute_job, max_runs=3)
+
+    assert executed == 3
+    assert max_active == 1
+
+
+def test_maintenance_jobs_stay_serialized_when_multiple_due(tmp_path: Path) -> None:
+    """Two maintenance jobs that are both due must run one after another, never at the
+    same time, regardless of collector concurrency capacity."""
+    runner = OpsRunner(tmp_path / "ops", poll_seconds=0, collector_concurrency=4)
+    lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    def execute_job(_job: JobSpec) -> str:
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.1)
+        with lock:
+            active -= 1
+        return "ok"
+
+    jobs = [
+        JobSpec(name="quarantine", job_type="quarantine-nonreplayable", interval_seconds=3600),
+        JobSpec(name="promote", job_type="promote-replayable", interval_seconds=3600),
+    ]
+
+    executed = runner.run(jobs, execute_job=execute_job, max_runs=2)
+
+    assert executed == 2
+    assert max_active == 1
+
+
+def test_maintenance_runs_while_a_collector_is_active(tmp_path: Path) -> None:
+    """A maintenance job may run concurrently with an in-flight collector. The collector
+    blocks until the test releases it; the maintenance job records whether the collector
+    was already running when it executed."""
+    runner = OpsRunner(tmp_path / "ops", poll_seconds=0, collector_concurrency=2)
+    collector_running = threading.Event()
+    release = threading.Event()
+    observed: dict[str, bool] = {}
+
+    def execute_job(job: JobSpec) -> str:
+        if job.job_type == "coinbase-trades-worker":
+            collector_running.set()
+            release.wait(timeout=5.0)
+            return "collector done"
+        observed["collector_active"] = collector_running.wait(timeout=5.0)
+        return "maintenance done"
+
+    jobs = [
+        _collector_job("coinbase-btc-trades", "coinbase-trades-worker"),
+        JobSpec(name="manifest", job_type="build-manifest", interval_seconds=3600),
+    ]
+
+    thread = threading.Thread(
+        target=runner.run,
+        kwargs={"jobs": jobs, "execute_job": execute_job, "max_runs": 2},
+        daemon=True,
+    )
+    thread.start()
+
+    deadline = time.time() + 5.0
+    while "collector_active" not in observed and time.time() < deadline:
+        time.sleep(0.01)
+
+    assert observed.get("collector_active") is True
+    release.set()
+    thread.join(timeout=5.0)
+    assert not thread.is_alive()
+
+    run_lines = (tmp_path / "ops" / "job_runs.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    assert len(run_lines) == 2
+    assert all(json.loads(line)["status"] == "success" for line in run_lines)
+
+
+def test_heartbeat_reports_current_jobs_and_preserves_current_job(tmp_path: Path) -> None:
+    """The heartbeat must expose current_jobs (the full active set) and keep current_job
+    pointing at the oldest active job for backward compatibility."""
+    runner = OpsRunner(
+        tmp_path / "ops", poll_seconds=0, heartbeat_interval_seconds=0.05, collector_concurrency=2
+    )
+    release = threading.Event()
+
+    def execute_job(_job: JobSpec) -> str:
+        release.wait(timeout=5.0)
+        return "ok"
+
+    jobs = [
+        _collector_job("coinbase-btc-trades", "coinbase-trades-worker"),
+        _collector_job("kraken-btc-trades", "kraken-trades-worker"),
+    ]
+
+    thread = threading.Thread(
+        target=runner.run,
+        kwargs={"jobs": jobs, "execute_job": execute_job, "max_runs": 2},
+        daemon=True,
+    )
+    thread.start()
+
+    heartbeat_path = tmp_path / "ops" / "heartbeat.json"
+    deadline = time.time() + 5.0
+    current_jobs: list = []
+    heartbeat: dict = {}
+    while time.time() < deadline:
+        if heartbeat_path.exists():
+            heartbeat = json.loads(heartbeat_path.read_text(encoding="utf-8"))
+            current_jobs = heartbeat.get("current_jobs") or []
+            if len(current_jobs) == 2:
+                break
+        time.sleep(0.02)
+
+    try:
+        assert isinstance(current_jobs, list)
+        assert len(current_jobs) == 2
+        names = {entry["name"] for entry in current_jobs}
+        assert names == {"coinbase-btc-trades", "kraken-btc-trades"}
+        for entry in current_jobs:
+            assert set(entry) >= {"name", "job_type", "started_at"}
+        # current_job is the oldest active job and matches the first current_jobs entry.
+        assert heartbeat["current_job"] is not None
+        assert heartbeat["current_job"]["name"] == current_jobs[0]["name"]
+    finally:
+        release.set()
+        thread.join(timeout=5.0)
+
+    assert not thread.is_alive()
+
+
+def test_health_does_not_flag_running_collector_as_stale(tmp_path: Path) -> None:
+    """A collector listed in current_jobs is in progress, so health must not mark it as a
+    stale job even when it has never produced a completed run yet."""
+    ops_root = tmp_path / "ops"
+    ops_root.mkdir(parents=True)
+    now = datetime.now(tz=UTC)
+    (ops_root / "heartbeat.json").write_text(
+        json.dumps(
+            {
+                "runner_name": "market-data-plant",
+                "status": "running",
+                "last_seen": now.isoformat(),
+                "job_counters": {},
+                "current_jobs": [
+                    {
+                        "name": "coinbase-btc-trades",
+                        "job_type": "coinbase-trades-worker",
+                        "started_at": now.isoformat(),
+                    }
+                ],
+                "current_job": {
+                    "name": "coinbase-btc-trades",
+                    "job_type": "coinbase-trades-worker",
+                    "started_at": now.isoformat(),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    jobs = [_collector_job("coinbase-btc-trades", "coinbase-trades-worker", interval_seconds=60)]
+    report = build_health_report(ops_root=ops_root, jobs=jobs, stale_after_seconds=300)
+
+    job_row = next(row for row in report.jobs if row["name"] == "coinbase-btc-trades")
+    assert job_row["in_progress"] is True
+    assert job_row["stale"] is False
+    assert "stale_job:coinbase-btc-trades" not in report.findings
+
+
+def test_ops_runner_collector_concurrency_defaults_to_one(tmp_path: Path) -> None:
+    parser = build_parser()
+    config = str(tmp_path / "ops.json")
+
+    default_args = parser.parse_args(["ops-runner", "--config", config])
+    assert default_args.collector_concurrency == 1
+
+    explicit_args = parser.parse_args(
+        ["ops-runner", "--config", config, "--collector-concurrency", "4"]
+    )
+    assert explicit_args.collector_concurrency == 4

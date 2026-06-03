@@ -19,3 +19,9 @@ venv/
 dist/
 build/
 *.egg-info/
+
+# Local scratch / agent / editor artifacts (never committed)
+.claude/
+.tmp_research/
+*.bak*
+screen-*.png

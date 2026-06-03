@@ -1,7 +1,14 @@
 # Data Standards
 
-`STANDARDS_VERSION = 3`
+`STANDARDS_VERSION = 4`
 
+> **v4 (2026-06-01):** normalized + curated Parquet gained an `instrument=` partition
+> (the sanitized canonical symbol) via a Parquet `schema_version` `v1`→`v2` cutover —
+> data is now pullable by `(venue, instrument, event_date)`. Existing `v1` data is
+> untouched; new writes go to `schema_version=v2/source=…/instrument=…/event_date=…`.
+> The resolved `InstrumentRef` detail moved to an `instrument_ref` column. (Note:
+> `STANDARDS_VERSION` and the Parquet partition `schema_version` are different numbers
+> — the latter is `v2`.)
 > **v3 (2026-06-01):** Kraken `book` depth moved from `none_native` to a provable
 > `checksum` guarantee — its per-frame CRC32 is now validated against the
 > reconstructed top-10 book (BTC/USD), so a dropped/corrupted update is detectable
@@ -77,7 +84,10 @@ A collector "run" is one segment directory:
 The `YYYYMMDD_HHMMSS` prefix is the run's start time. The first 8 chars
 (`YYYYMMDD`) are the **run day** used by the manifest. With
 `--rotate-at-midnight`, a run ends at the UTC day boundary so a run dir never
-straddles two days.
+straddles two days. A lane configured with the data-arrival watchdog
+(`CollectorConfig.idle_timeout_seconds`) also ends a run cleanly if the feed goes
+silent-but-connected — the run still finalizes (metrics + replay summary) and the
+worker opens a fresh segment (see the watchdog note in §4).
 
 **Durability:** raw JSONL is fsync'd per line, so a hard kill / power loss never
 leaves a torn line — raw is the source of truth you can always rebuild from. The
@@ -89,23 +99,28 @@ if they disagree.
 
 ```
 <archive>/normalized/{market,trades}/
-  schema_version=v1/source=<src>/event_date=<YYYY-MM-DD>/part-*.parquet
+  schema_version=v2/source=<venue>/instrument=<canonical>/event_date=<YYYY-MM-DD>/part-*.parquet
 ```
 
-(`market` holds depth.) Written live as the run collects. Includes both clean and
-quarantined-eligible rows? No — only clean events are written here.
+(`market` holds depth.) Written live as the run collects; only clean events land
+here. `<instrument>` is the **sanitized canonical symbol** (`BTC/USDT` → `BTC-USDT`),
+falling back to the venue product then `unknown` when an instrument can't be
+resolved. The resolved `InstrumentRef` detail is kept in an `instrument_ref` column.
+Legacy `schema_version=v1` data (no `instrument=` level) predates the cutover and is
+left in place — read both if you need history across the boundary.
 
 ### 2.3 Curated Parquet (replayable only)
 
 ```
 <archive>/curated/research/{market_replayable,trades_replayable}/
-  schema_version=v1/source=<src>/event_date=<YYYY-MM-DD>/part-*.parquet
+  schema_version=v2/source=<venue>/instrument=<canonical>/event_date=<YYYY-MM-DD>/part-*.parquet
   _promotion_index.jsonl
 ```
 
 Only runs whose `replay_summary.json` says `replayable: true` are promoted here.
-**This is what an analyst should read.** `_promotion_index.jsonl` records each
-promoted run (`run_path`, `promoted_rows`, `promoted_at`).
+**This is what an analyst should read** — pull by `(venue, instrument, event_date)`
+straight off the path. `_promotion_index.jsonl` records each promoted run
+(`run_path`, `promoted_rows`, `promoted_at`).
 
 ### 2.4 Quarantine
 
@@ -128,18 +143,21 @@ deleted (forensics).
 
 See §6.
 
-> **Partition note:** the live partition key set is
-> `schema_version / source / event_date`. There is **no `instrument` partition
-> column yet** — a lane's instrument is encoded in the `<source>` directory
-> suffix, not a partition. Per-instrument partitioning is Roadmap.
+> **Partition note:** the v2 partition key set is
+> `schema_version / source / instrument / event_date` — `instrument` is the
+> sanitized canonical symbol, derived per row (canonical symbol → venue product →
+> `unknown`). Legacy v1 data uses the 3-key `schema_version / source / event_date`
+> set (no `instrument`); a reader spanning the cutover must handle both depths
+> (pyarrow hive partitioning extracts each key by name regardless of order/depth).
 
 ---
 
 ## 3. Event schemas
 
 JSON keys are stable; Parquet columns mirror them (plus the partition columns
-`schema_version`, `source`, `event_date`). `None`/null fields are dropped from
-Parquet rows.
+`schema_version`, `source`, `instrument`, `event_date` in v2). `None`/null fields
+are dropped from Parquet rows. In v2 the row's resolved `InstrumentRef` is stored
+under `instrument_ref` (the `instrument` column name is taken by the partition).
 
 ### 3.1 `depth` event (`NormalizedDepthUpdate`)
 
@@ -364,6 +382,24 @@ consumer that needs provable completeness MUST gate on the lane's
 > `websockets` library's protocol-level ping/pong — the live Binance collector is
 > unchanged.
 
+> **Data-arrival watchdog.** A feed can ack the subscription and then go
+> *silent-but-connected* — keepalive/ping still flowing, but zero data frames (exactly
+> how Coinbase's now-dead `level2_batch` channel presented: acked, then nothing). Left
+> unguarded, `GenericWebsocketCollector.stream` blocks forever in `async for message in
+> websocket`, so the segment never reaches its count, never writes a replay summary, and
+> the lane silently stops producing without raising. A collector configured with
+> `CollectorConfig.idle_timeout_seconds > 0` bounds the wait for each next data frame; if
+> none arrives in time it **ends the segment cleanly** (the run finalizes — metrics +
+> replay summary written — and the worker loop opens a fresh segment) rather than hanging
+> in `recv`. Each fire increments `idle_timeout_count`, recorded in
+> `metrics/summary.jsonl` and surfaced by `health` as a non-blocking
+> `idle_timeout:<worker>` finding for active workers (it self-heals via the fresh
+> segment, so it does not mark the worker blocking). **Default off** (`0.0`) — the live
+> Binance lanes are unaffected; enable per-lane via the ops config
+> (`idle_timeout_seconds`). Complementary to the Bybit keepalive above: keepalive keeps
+> the connection from being dropped; the watchdog catches a connection that stays up but
+> stops delivering.
+
 ---
 
 ## 5. Live quality gate (pre-replay)
@@ -390,11 +426,11 @@ verdict that gates promotion.
    - `lanes` — the canonical per-`(venue, instrument, dataset)` readiness. Each
      lane is discovered from its raw lane directory
      (`<venue>_<dataset>[_<instrument>]`), carries a `gap_detection` tag
-     (`sequence` = §4.1/§4.2 strong gaplessness; `none_native` = §4.3 best-effort),
-     and lists per-`event_date` `readiness`. Readiness is driven by the curated
-     promotion index (`run_path` → lane, accurate per instrument) and the lane's
-     raw replay summaries — **not** the Parquet partitions, which are only
-     venue-partitioned today (see the partition note in §2).
+     (`sequence`/`checksum` = provable; `none_native` = §4.3 best-effort), and lists
+     per-`event_date` `readiness`. Readiness is driven by the curated promotion index
+     (`run_path` → lane, accurate per instrument) and the lane's raw replay
+     summaries — **not** the Parquet partitions (which, since v2, do carry an
+     `instrument` partition; see §2).
    - `days` — the legacy single global day timeline (Binance depth) kept for
      back-compat; prefer `lanes`.
 
@@ -408,11 +444,12 @@ verdict that gates promotion.
    change columns under you. Pin `standards_version` from the manifest too if you
    key off its shape.
 
-> **Current limitation:** curated/normalized Parquet is partitioned by
-> `source=<venue>` only, so per-instrument lanes of the same venue+dataset share
-> Parquet partitions. The manifest's per-instrument readiness comes from the
-> promotion index (which records the originating lane), not the Parquet layout.
-> An `instrument=` partition column is still Roadmap (§8).
+> **Note (v2):** curated/normalized Parquet now carries an `instrument=` partition
+> (the sanitized canonical symbol), so per-instrument lanes of the same venue no
+> longer share partitions — pull by `(venue, instrument, event_date)` straight off
+> the path. The manifest's readiness still comes from the promotion index + raw
+> replay summaries (authoritative per originating lane), not from globbing the
+> Parquet layout. Legacy v1 partitions (venue-only) coexist for pre-cutover data.
 
 ---
 
@@ -432,9 +469,6 @@ verdict that gates promotion.
 These are aspirations in `FOLLOW_UPS.md`, listed so nobody mistakes them for the
 current contract:
 
-- `instrument=` partition column in the curated/normalized datasets (so
-  per-instrument lanes of the same venue+dataset stop sharing Parquet
-  partitions; the manifest already separates them via the promotion index).
 - **Per-pair precision table for Kraken `depth` checksum validation.** Checksum
   validation is live for BTC/USD (`_KRAKEN_BOOK_PRECISION`); other Kraken pairs
   fall back to `none_native` until their `(price, qty)` precision is added (from

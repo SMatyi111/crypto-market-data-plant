@@ -60,6 +60,69 @@ def test_parquet_dataset_sink_writes_partitioned_dataset(tmp_path: Path) -> None
     assert rows[0]["event_date"] == "2026-04-06"
 
 
+def test_parquet_dataset_sink_v2_adds_instrument_partition(tmp_path: Path) -> None:
+    """v2 (default) adds an `instrument=` partition keyed by the sanitized canonical
+    symbol, and preserves the resolved InstrumentRef detail under `instrument_ref`."""
+    sink = ParquetDatasetSink(tmp_path / "market", batch_size=10)  # default schema_version=v2
+    assert sink.schema_version == "v2"
+    sink.write(
+        {
+            "source": "binance",
+            "event_time": "2026-04-06T08:00:00+00:00",
+            "received_at": "2026-04-06T08:00:01+00:00",
+            "product": "BTCUSDT",
+            "instrument": {"instrument_id": "spot:binance:BTCUSDT", "canonical_symbol": "BTC/USDT"},
+            "price": 70000.0,
+        }
+    )
+    sink.flush()
+
+    # The partition directory uses the sanitized canonical symbol (slash -> dash).
+    assert (tmp_path / "market" / "schema_version=v2" / "source=binance").exists()
+    instrument_dirs = sorted(p.name for p in (tmp_path / "market").rglob("instrument=*"))
+    assert instrument_dirs == ["instrument=BTC-USDT"]
+
+    dataset = ds.dataset(tmp_path / "market", format="parquet", partitioning="hive")
+    rows = dataset.to_table().to_pylist()
+    assert len(rows) == 1
+    assert rows[0]["schema_version"] == "v2"
+    assert rows[0]["instrument"] == "BTC-USDT"
+    # The nested InstrumentRef detail is preserved under instrument_ref.
+    assert rows[0]["instrument_ref"]["instrument_id"] == "spot:binance:BTCUSDT"
+
+
+def test_parquet_dataset_sink_v2_instrument_falls_back_to_product_then_unknown(tmp_path: Path) -> None:
+    """With no resolved instrument, the partition falls back to the venue product, then
+    to 'unknown' — so every v2 row always has an instrument partition value."""
+    sink = ParquetDatasetSink(tmp_path / "m", batch_size=10)
+    sink.write({"source": "kraken", "received_at": "2026-04-06T08:00:01+00:00", "product": "BTC/USD"})
+    sink.write({"source": "kraken", "received_at": "2026-04-06T08:00:02+00:00"})  # no product
+    sink.flush()
+
+    dataset = ds.dataset(tmp_path / "m", format="parquet", partitioning="hive")
+    instruments = sorted(r["instrument"] for r in dataset.to_table().to_pylist())
+    assert instruments == ["BTC-USD", "unknown"]  # product sanitized; missing -> unknown
+
+
+def test_parquet_dataset_sink_v1_keeps_legacy_layout_without_instrument(tmp_path: Path) -> None:
+    """A v1-tagged sink must keep the legacy 3-level layout (no instrument partition) so
+    existing on-disk v1 data stays consistent."""
+    sink = ParquetDatasetSink(tmp_path / "m", schema_version="v1", batch_size=10)
+    sink.write(
+        {
+            "source": "binance",
+            "received_at": "2026-04-06T08:00:01+00:00",
+            "instrument": {"instrument_id": "spot:binance:BTCUSDT", "canonical_symbol": "BTC/USDT"},
+        }
+    )
+    sink.flush()
+
+    assert not list((tmp_path / "m").rglob("instrument=*"))  # no instrument partition dir
+    rows = ds.dataset(tmp_path / "m", format="parquet", partitioning="hive").to_table().to_pylist()
+    # v1 leaves the nested instrument field as-is (no instrument_ref rename).
+    assert rows[0]["instrument"]["instrument_id"] == "spot:binance:BTCUSDT"
+
+
 def test_parquet_dataset_sink_handles_optional_fields_across_batches(tmp_path: Path) -> None:
     sink = ParquetDatasetSink(tmp_path / "trades", schema_version="v1", batch_size=1)
     sink.write(

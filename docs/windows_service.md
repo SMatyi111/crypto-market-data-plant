@@ -19,6 +19,11 @@ scripts\run_ops_runner.ps1
 
 The runner selects `ops.live.local.json` if present, otherwise `ops.live.example.json`.
 
+The task is installed with no execution time limit. This matters because Windows
+Task Scheduler's default limit is 72 hours; a continuous data plant can otherwise
+be stopped by Windows after three days even though the runner is healthy. Re-run
+the installer after pulling changes to update an existing task.
+
 ### Wake-from-sleep caveat
 
 The installer sets `-WakeToRun` on the task, but with only an `-AtStartup` (or
@@ -55,6 +60,20 @@ task that "ran" but produced nothing:
   guarantees only one runner is active. A second invocation logs
   "ops runner already active, exiting" and exits 0 — so a boot trigger firing
   while a logon-triggered runner is already up is harmless.
+- **Parallel collection**: the script passes `-CollectorConcurrency 4` (override
+  with the param), so up to 4 collector jobs (the `*-worker` types) run at once
+  in a thread pool. Maintenance jobs (quarantine, promote, manifest, cleanup,
+  health) stay serialized in the scheduler loop — at most one runs at a time, and
+  it may run alongside active collectors but never alongside another maintenance
+  job. A given job is never launched a second time while its previous run is still
+  in flight. Default concurrency is `1` (fully serial) when the flag is omitted, so
+  nothing changes for callers that do not pass it. The live BTC Binance lanes are
+  unaffected by the change in dispatch order.
+- **Heartbeat active set**: `heartbeat.json` reports `current_jobs` — the full list
+  of in-flight jobs (`name`, `job_type`, `started_at`) — and keeps `current_job`
+  pointing at the oldest active job (or `null` when idle) for older readers. Health
+  treats any job in `current_jobs` as in progress, so long-running collectors are
+  not mistaken for stale.
 
 ## Logs
 

@@ -32,7 +32,7 @@ Normalized datasets are append-only Parquet datasets (every collected run, befor
 curation):
 
 ```text
-D:\market_archive\normalized\<dataset>\schema_version=v1\source=<source>\event_date=<YYYY-MM-DD>
+D:\market_archive\normalized\<dataset>\schema_version=v2\source=<venue>\instrument=<canonical>\event_date=<YYYY-MM-DD>
 ```
 
 Datasets:
@@ -40,9 +40,11 @@ Datasets:
 - `market`: depth (order book) updates from all venues
 - `trades`: public trades from all venues
 
-`source=<venue>` is the only venue dimension in the partition path — per-instrument
-lanes of the same venue+dataset share Parquet partitions (the manifest separates
-them via the promotion index; an `instrument=` partition is on the roadmap).
+Since the `schema_version=v2` cutover the path carries an `instrument=` partition
+(the sanitized canonical symbol, e.g. `BTC-USDT`), so per-instrument lanes of the
+same venue no longer share partitions — pull by `(venue, instrument, event_date)`.
+Legacy `v1` data (venue-only, no `instrument=` level) coexists for pre-cutover
+history. The resolved `InstrumentRef` detail is kept in the `instrument_ref` column.
 
 ## Curated Datasets
 

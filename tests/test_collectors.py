@@ -399,6 +399,167 @@ def test_collector_without_ping_config_sends_no_keepalive(monkeypatch) -> None:
     assert len(probe.sent) == 1  # only the SUBSCRIBE frame, nothing else
 
 
+# --- Phase 2 #5: data-arrival watchdog (idle timeout) ---------------------
+
+
+class _StallingWebsocket:
+    """Fake WS that acks the subscription (via `recv`, driving `_subscribe`) and then
+    forwards any queued data frames before stalling on the async iterator — simulating a
+    feed that acks then goes silent-but-connected. Once the queued frames run out,
+    `__anext__` blocks forever (never another frame, never a close), so a collector with
+    NO idle timeout hangs here; the watchdog must break the wait and end the stream."""
+
+    def __init__(self, ack: dict, data_frames: list[dict] | None = None) -> None:
+        self._ack = ack
+        self._data_frames = list(data_frames or [])
+        self.sent: list[str] = []
+        self._ack_delivered = False
+
+    async def send(self, message: str) -> None:
+        self.sent.append(message)
+
+    async def recv(self) -> str:
+        if not self._ack_delivered:
+            self._ack_delivered = True
+            return json.dumps(self._ack)
+        await asyncio.sleep(3600)  # ack delivered; data flows via the iterator
+        raise RuntimeError("unreachable")
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> str:
+        if self._data_frames:
+            return json.dumps(self._data_frames.pop(0))
+        await asyncio.sleep(3600)  # silent-but-connected: never another frame
+        raise RuntimeError("unreachable")
+
+
+def _install_collector(monkeypatch, websockets_list, **config_kwargs) -> GenericWebsocketCollector:
+    """Wire a GenericWebsocketCollector to a scripted websockets module (a list of fake
+    sockets handed out in connect order)."""
+    import sys
+
+    fake_mod = _FakeWebsocketsModule(websockets_list)
+    monkeypatch.setitem(sys.modules, "websockets", SimpleNamespace(connect=fake_mod.connect))
+    config = CollectorConfig(
+        source=config_kwargs.pop("source", "binance"),
+        output_root=Path("data"),
+        product="BTCUSDT",
+        channel=config_kwargs.pop("channel", "depth"),
+        websocket_url="wss://example.test",
+        subscription_style=config_kwargs.pop("subscription_style", "binance"),
+        **config_kwargs,
+    )
+    return GenericWebsocketCollector(config=config)
+
+
+def test_collector_idle_timeout_fires_and_ends_on_silent_feed(monkeypatch) -> None:
+    """A feed that acks then sends zero data frames must NOT hang. With the watchdog on,
+    the bounded wait times out, idle_timeout_count increments, and the stream ends
+    cleanly (returns) rather than blocking forever in recv."""
+    ws = _StallingWebsocket(ack={"result": None, "id": 1}, data_frames=[])
+    collector = _install_collector(monkeypatch, [ws], idle_timeout_seconds=0.02)
+
+    emitted = _run_stream(collector, limit=5)
+
+    assert emitted == []  # the feed never sent a data frame
+    assert collector.idle_timeout_count == 1  # watchdog fired exactly once, then ended
+
+
+def test_collector_idle_timeout_forwards_frames_then_ends(monkeypatch) -> None:
+    """The watchdog only bounds the wait for the NEXT frame: frames that do arrive are
+    forwarded normally, and the timeout fires only once the feed goes silent."""
+    ws = _StallingWebsocket(
+        ack={"result": None, "id": 1},
+        data_frames=[{"e": "depthUpdate", "s": "BTCUSDT"}, {"e": "depthUpdate", "s": "BTCUSDT"}],
+    )
+    collector = _install_collector(monkeypatch, [ws], idle_timeout_seconds=0.02)
+
+    emitted = _run_stream(collector, limit=10)
+
+    assert len(emitted) == 2  # both real frames forwarded before the feed went silent
+    assert collector.idle_timeout_count == 1
+
+
+def test_collector_without_idle_timeout_blocks_on_silent_feed(monkeypatch) -> None:
+    """Guards that the watchdog is the thing that breaks the hang: with the default
+    config (idle_timeout_seconds=0.0) the same silent feed blocks forever, so a bounded
+    outer wait times out. This is exactly the hang the watchdog fixes."""
+    import pytest
+
+    ws = _StallingWebsocket(ack={"result": None, "id": 1}, data_frames=[])
+    collector = _install_collector(monkeypatch, [ws])  # idle timeout OFF (default)
+    assert collector.config.idle_timeout_seconds == 0.0
+
+    async def _drive() -> None:
+        async for _ in collector.stream(limit=1):
+            pass
+
+    with pytest.raises((asyncio.TimeoutError, TimeoutError)):
+        asyncio.run(asyncio.wait_for(_drive(), timeout=0.1))
+    assert collector.idle_timeout_count == 0  # never fired — the watchdog was off
+
+
+def test_collector_idle_timeout_enabled_still_reconnects_on_clean_close(monkeypatch) -> None:
+    """With the watchdog on, a clean server close mid-stream (StopAsyncIteration through
+    the bounded wait) must still flow through the existing reconnect path — frames arrive
+    instantly so the timeout never trips, and the count stays 0. Guards that wrapping the
+    iterator in wait_for doesn't break normal clean-close reconnection."""
+    ws_initial = _ScriptedDepthWebsocket(
+        frames=[{"result": None, "id": 1}, {"e": "depthUpdate", "s": "BTCUSDT"}]
+    )  # exhausts -> StopAsyncIteration (clean close)
+    ws_reopen = _ScriptedDepthWebsocket(
+        frames=[{"result": None, "id": 1}, {"e": "depthUpdate", "s": "BTCUSDT"}]
+    )
+    collector = _install_collector(
+        monkeypatch, [ws_initial, ws_reopen], idle_timeout_seconds=0.5
+    )
+
+    emitted = _run_stream(collector, limit=2)
+
+    assert len(emitted) == 2  # one frame from each connection
+    assert collector.idle_timeout_count == 0  # clean close, not an idle timeout
+
+
+def test_collect_depth_segment_idle_timeout_surfaces_metric(tmp_path, monkeypatch) -> None:
+    """End-to-end: a silent-but-connected depth feed ends the segment cleanly (no hang),
+    the run still finalizes (metrics + replay summary written), and idle_timeout_count is
+    surfaced both in the segment result and in metrics/summary.jsonl so the health report
+    can see the silent venue."""
+    ws = _StallingWebsocket(
+        ack={"type": "subscriptions", "channels": [{"name": "level2_50"}]},
+        data_frames=[_coinbase_l2_snapshot(bids=[["50000.0", "1.0"]], asks=[["50001.0", "2.0"]])],
+    )
+    _install_fake_trades_runtime(monkeypatch, ws)
+
+    args = SimpleNamespace(
+        symbol="BTC-USD",
+        channel="level2_50",
+        count=100,  # we won't reach this — the idle timeout ends the segment first
+        output_root=tmp_path,
+        source_suffix="",
+        deadline_utc=None,
+        idle_timeout_seconds=0.02,
+    )
+
+    result = asyncio.run(collect_coinbase_depth_segment(args))
+
+    # The lone snapshot was forwarded, then the feed went silent and the watchdog ended
+    # the segment cleanly instead of hanging.
+    assert result["idle_timeout_count"] == 1, result
+    assert result["clean_events"] == 1, result
+    run_path = Path(result["run_path"])
+    summary_rows = [
+        json.loads(line)
+        for line in (run_path / "metrics" / "summary.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert summary_rows[-1]["idle_timeout_count"] == 1
+    # The run still finalized: the replay summary was written despite the idle end.
+    assert (run_path / "metrics" / "replay_summary.json").exists()
+
+
 def test_reopen_binance_depth_connection_buffers_frames_no_snapshot_fetch(monkeypatch) -> None:
     """`_reopen_binance_depth_connection` must NOT call the REST snapshot endpoint;
     that's the whole point of reconnect-in-place. It returns buffered data frames so the

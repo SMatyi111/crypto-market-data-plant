@@ -1,7 +1,10 @@
 param(
     [string]$ConfigPath,
     [string]$OpsRoot = "D:\market_archive\ops",
-    [string]$LogPath
+    [string]$LogPath,
+    # Live default: run up to 4 collector jobs concurrently. Maintenance jobs
+    # (quarantine/promote/manifest/cleanup/health) stay serialized in the runner.
+    [int]$CollectorConcurrency = 4
 )
 
 $ErrorActionPreference = "Stop"
@@ -86,7 +89,7 @@ try {
         $savedErrorActionPreference = $ErrorActionPreference
         $ErrorActionPreference = "Continue"
         try {
-            & $pythonPath -m crypto_collector.cli ops-runner --config $resolvedConfig --ops-root $resolvedOpsRoot *>> $LogPath
+            & $pythonPath -m crypto_collector.cli ops-runner --config $resolvedConfig --ops-root $resolvedOpsRoot --collector-concurrency $CollectorConcurrency *>> $LogPath
             $exitCode = $LASTEXITCODE
         }
         finally {

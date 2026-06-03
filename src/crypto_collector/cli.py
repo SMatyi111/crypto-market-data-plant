@@ -385,6 +385,15 @@ def build_parser() -> argparse.ArgumentParser:
     ops_parser.add_argument("--poll-seconds", type=int, default=5)
     ops_parser.add_argument("--max-runs", type=int)
     ops_parser.add_argument("--stop-on-error", action="store_true")
+    ops_parser.add_argument(
+        "--collector-concurrency",
+        type=int,
+        default=1,
+        help=(
+            "Maximum collector jobs (the *-worker types) to run concurrently. "
+            "Maintenance jobs stay serialized regardless. Defaults to 1 (serial)."
+        ),
+    )
 
     health_parser = subparsers.add_parser("health", help="Inspect runner and archive health")
     health_parser.add_argument("--ops-root", type=Path, default=default_ops_root())
@@ -878,6 +887,7 @@ async def _collect_trades_segment(
         max_future_skew_ms=getattr(args, "max_future_skew_ms", 5_000),
         ping_message=ping_message,
         ping_interval_seconds=ping_interval_seconds,
+        idle_timeout_seconds=float(getattr(args, "idle_timeout_seconds", 0.0) or 0.0),
     )
     collector = GenericWebsocketCollector(config=config)
     source_name = _build_source_name(source_base, getattr(args, "source_suffix", ""))
@@ -925,6 +935,7 @@ async def _collect_trades_segment(
         "replay_findings": replay_findings,
         "replay_summary_path": replay_summary_path,
         "deadline_reached": bool(pipeline_summary.deadline_reached),
+        "idle_timeout_count": collector.idle_timeout_count,
     }
 
 
@@ -1029,6 +1040,7 @@ async def _collect_depth_stream_segment(
         subscription_style=subscription_style,
         ping_message=ping_message,
         ping_interval_seconds=ping_interval_seconds,
+        idle_timeout_seconds=float(getattr(args, "idle_timeout_seconds", 0.0) or 0.0),
     )
     collector = GenericWebsocketCollector(config=config)
     source_name = _build_source_name(source_base, getattr(args, "source_suffix", ""))
@@ -1075,6 +1087,7 @@ async def _collect_depth_stream_segment(
         "replay_findings": replay_findings,
         "replay_summary_path": replay_summary_path,
         "deadline_reached": bool(pipeline_summary.deadline_reached),
+        "idle_timeout_count": collector.idle_timeout_count,
     }
 
 
@@ -1331,6 +1344,12 @@ def _run_segmented_worker(
                     segment_args = build_segment_args(args)
                     if segment_deadline_utc is not None:
                         segment_args.deadline_utc = segment_deadline_utc
+                    # Thread the per-lane data-arrival watchdog timeout onto each segment
+                    # (0.0 = off). Centralized here so every build_segment_args stays
+                    # untouched; the generic-WS segments read it via getattr.
+                    segment_args.idle_timeout_seconds = float(
+                        getattr(args, "idle_timeout_seconds", 0.0) or 0.0
+                    )
                     summary = asyncio.run(collect_segment(segment_args))
                 except Exception as exc:
                     runtime.record_event("segment_error", details={"segment_index": segment_index, "error": str(exc)})
@@ -1371,7 +1390,12 @@ def run_ops_runner(args: argparse.Namespace) -> None:
     if not jobs:
         raise ValueError(f"no enabled jobs found in ops config: {args.config}")
     with OpsRunnerLock(args.ops_root, runner_name="market-data-plant"):
-        runner = OpsRunner(args.ops_root, runner_name="market-data-plant", poll_seconds=args.poll_seconds)
+        runner = OpsRunner(
+            args.ops_root,
+            runner_name="market-data-plant",
+            poll_seconds=args.poll_seconds,
+            collector_concurrency=getattr(args, "collector_concurrency", 1),
+        )
         executed = runner.run(jobs, execute_job=_execute_ops_job, max_runs=args.max_runs, stop_on_error=args.stop_on_error)
     print(f"ops runner finished: {executed} job runs -> {args.ops_root}")
 
@@ -1453,6 +1477,10 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             # binance_depth/ because the segment builder reads them via getattr.
             source_suffix=raw_args.get("source_suffix", ""),
             rotate_at_midnight=raw_args.get("rotate_at_midnight", False),
+            # Per-lane data-arrival watchdog (0.0 = off; see
+            # CollectorConfig.idle_timeout_seconds). Honored by the generic-WS lanes;
+            # the Binance depth lane runs its own socket loop and ignores it.
+            idle_timeout_seconds=raw_args.get("idle_timeout_seconds", 0.0),
         )
     if job.job_type == "binance-trades-worker":
         return SimpleNamespace(
@@ -1470,6 +1498,10 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             max_clock_skew_ms=raw_args.get("max_clock_skew_ms", 60_000.0),
             source_suffix=raw_args.get("source_suffix", ""),
             rotate_at_midnight=raw_args.get("rotate_at_midnight", False),
+            # Per-lane data-arrival watchdog (0.0 = off; see
+            # CollectorConfig.idle_timeout_seconds). Honored by the generic-WS lanes;
+            # the Binance depth lane runs its own socket loop and ignores it.
+            idle_timeout_seconds=raw_args.get("idle_timeout_seconds", 0.0),
         )
     if job.job_type == "coinbase-trades-worker":
         return SimpleNamespace(
@@ -1487,6 +1519,10 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             max_clock_skew_ms=raw_args.get("max_clock_skew_ms", 60_000.0),
             source_suffix=raw_args.get("source_suffix", ""),
             rotate_at_midnight=raw_args.get("rotate_at_midnight", False),
+            # Per-lane data-arrival watchdog (0.0 = off; see
+            # CollectorConfig.idle_timeout_seconds). Honored by the generic-WS lanes;
+            # the Binance depth lane runs its own socket loop and ignores it.
+            idle_timeout_seconds=raw_args.get("idle_timeout_seconds", 0.0),
         )
     if job.job_type == "coinbase-depth-worker":
         return SimpleNamespace(
@@ -1504,6 +1540,10 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
             source_suffix=raw_args.get("source_suffix", ""),
             rotate_at_midnight=raw_args.get("rotate_at_midnight", False),
+            # Per-lane data-arrival watchdog (0.0 = off; see
+            # CollectorConfig.idle_timeout_seconds). Honored by the generic-WS lanes;
+            # the Binance depth lane runs its own socket loop and ignores it.
+            idle_timeout_seconds=raw_args.get("idle_timeout_seconds", 0.0),
         )
     if job.job_type == "kraken-trades-worker":
         return SimpleNamespace(
@@ -1521,6 +1561,10 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             max_clock_skew_ms=raw_args.get("max_clock_skew_ms", 60_000.0),
             source_suffix=raw_args.get("source_suffix", ""),
             rotate_at_midnight=raw_args.get("rotate_at_midnight", False),
+            # Per-lane data-arrival watchdog (0.0 = off; see
+            # CollectorConfig.idle_timeout_seconds). Honored by the generic-WS lanes;
+            # the Binance depth lane runs its own socket loop and ignores it.
+            idle_timeout_seconds=raw_args.get("idle_timeout_seconds", 0.0),
         )
     if job.job_type == "bybit-trades-worker":
         return SimpleNamespace(
@@ -1538,6 +1582,10 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             max_clock_skew_ms=raw_args.get("max_clock_skew_ms", 60_000.0),
             source_suffix=raw_args.get("source_suffix", ""),
             rotate_at_midnight=raw_args.get("rotate_at_midnight", False),
+            # Per-lane data-arrival watchdog (0.0 = off; see
+            # CollectorConfig.idle_timeout_seconds). Honored by the generic-WS lanes;
+            # the Binance depth lane runs its own socket loop and ignores it.
+            idle_timeout_seconds=raw_args.get("idle_timeout_seconds", 0.0),
         )
     if job.job_type == "bybit-depth-worker":
         return SimpleNamespace(
@@ -1553,6 +1601,10 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
             source_suffix=raw_args.get("source_suffix", ""),
             rotate_at_midnight=raw_args.get("rotate_at_midnight", False),
+            # Per-lane data-arrival watchdog (0.0 = off; see
+            # CollectorConfig.idle_timeout_seconds). Honored by the generic-WS lanes;
+            # the Binance depth lane runs its own socket loop and ignores it.
+            idle_timeout_seconds=raw_args.get("idle_timeout_seconds", 0.0),
         )
     if job.job_type == "kraken-depth-worker":
         return SimpleNamespace(
@@ -1567,6 +1619,10 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
             source_suffix=raw_args.get("source_suffix", ""),
             rotate_at_midnight=raw_args.get("rotate_at_midnight", False),
+            # Per-lane data-arrival watchdog (0.0 = off; see
+            # CollectorConfig.idle_timeout_seconds). Honored by the generic-WS lanes;
+            # the Binance depth lane runs its own socket loop and ignores it.
+            idle_timeout_seconds=raw_args.get("idle_timeout_seconds", 0.0),
         )
     if job.job_type in {"book-sync-health", "backfill-replay"}:
         return SimpleNamespace(

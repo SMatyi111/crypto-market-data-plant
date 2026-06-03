@@ -15,6 +15,11 @@ logger = logging.getLogger(__name__)
 class GenericWebsocketCollector(BaseCollector):
     def __init__(self, config: CollectorConfig) -> None:
         self.config = config
+        # Number of times the data-arrival watchdog fired (no data frame within
+        # `idle_timeout_seconds`). Read by the pipeline into metrics/summary.jsonl so
+        # the health report can see a silent-but-connected feed. Stays 0 when the
+        # watchdog is disabled (the default) or never trips.
+        self.idle_timeout_count = 0
 
     async def stream(self, limit: int | None = None) -> AsyncIterator[RawMessage]:
         try:
@@ -50,7 +55,40 @@ class GenericWebsocketCollector(BaseCollector):
                             message_count += 1
                             if limit is not None and message_count >= limit:
                                 return
-                        async for message in websocket:
+                        # Data-arrival watchdog: when idle_timeout > 0 each wait for the
+                        # next frame is bounded, so a feed that acks then goes silent
+                        # can't hang the loop forever. idle_timeout <= 0 (the default)
+                        # is the exact `async for message in websocket` behavior.
+                        idle_timeout = float(self.config.idle_timeout_seconds or 0.0)
+                        message_iter = websocket.__aiter__()
+                        while True:
+                            try:
+                                if idle_timeout > 0:
+                                    message = await asyncio.wait_for(
+                                        message_iter.__anext__(), timeout=idle_timeout
+                                    )
+                                else:
+                                    message = await message_iter.__anext__()
+                            except StopAsyncIteration:
+                                # Server closed the stream cleanly — leave the loop so
+                                # the reconnect path below runs (unchanged behavior).
+                                break
+                            except (asyncio.TimeoutError, TimeoutError):
+                                # No data frame within idle_timeout: the feed acked the
+                                # subscription but went silent-but-connected. End the
+                                # stream cleanly so the consumer finalizes (writes
+                                # metrics + replay summary) and the worker opens a fresh
+                                # segment, instead of blocking forever in recv.
+                                self.idle_timeout_count += 1
+                                logger.warning(
+                                    "websocket idle timeout source=%s channel=%s "
+                                    "timeout=%.1fs idle_timeout_count=%d; ending segment",
+                                    self.config.source,
+                                    self.config.channel,
+                                    idle_timeout,
+                                    self.idle_timeout_count,
+                                )
+                                return
                             payload = json.loads(message)
                             if not self._should_emit(payload):
                                 continue

@@ -125,7 +125,7 @@ class ParquetDatasetSink:
         self,
         root: Path,
         *,
-        schema_version: str = "v1",
+        schema_version: str = "v2",
         batch_size: int = 100,
     ) -> None:
         # batch_size caps how many normalized rows live in memory before a flush.
@@ -134,14 +134,34 @@ class ParquetDatasetSink:
         # normalized layer briefly disagrees with raw. 100 keeps the lost-on-kill
         # window to ~100 events of disagreement at the cost of more, smaller
         # part-files in the Parquet dataset.
+        #
+        # Partition layout is keyed off schema_version: v1 is the legacy
+        # schema_version/source/event_date tree (no instrument level); v2+ adds an
+        # `instrument=` partition (the sanitized canonical symbol) so data is
+        # pullable by (venue, instrument, event_date). Existing v1 data on disk is
+        # untouched — a v1-tagged sink keeps writing the 3-level layout.
         self.root = root
         self.schema_version = schema_version
         self.batch_size = batch_size
+        self._partition_by_instrument = schema_version != "v1"
+        # v2 puts `instrument` ABOVE `event_date` so one instrument's full history
+        # lives under a single dir (the north-star pull-by-instrument layout); v1 is
+        # the legacy source/event_date tree.
+        if self._partition_by_instrument:
+            self._partition_cols = ["schema_version", "source", "instrument", "event_date"]
+        else:
+            self._partition_cols = ["schema_version", "source", "event_date"]
         self._rows: list[dict[str, Any]] = []
         self.root.mkdir(parents=True, exist_ok=True)
 
     def write(self, row: dict[str, Any]) -> None:
-        self._rows.append(_with_partitions(row, schema_version=self.schema_version))
+        self._rows.append(
+            _with_partitions(
+                row,
+                schema_version=self.schema_version,
+                partition_by_instrument=self._partition_by_instrument,
+            )
+        )
         if len(self._rows) >= self.batch_size:
             self.flush()
 
@@ -158,13 +178,18 @@ class ParquetDatasetSink:
         pq.write_to_dataset(
             table,
             root_path=str(self.root),
-            partition_cols=["schema_version", "source", "event_date"],
+            partition_cols=self._partition_cols,
             basename_template=f"part-{uuid4().hex}-{{i}}.parquet",
         )
         self._rows.clear()
 
 
-def _with_partitions(row: dict[str, Any], *, schema_version: str) -> dict[str, Any]:
+def _with_partitions(
+    row: dict[str, Any],
+    *,
+    schema_version: str,
+    partition_by_instrument: bool = True,
+) -> dict[str, Any]:
     partitioned: dict[str, Any] = {}
     for key, value in row.items():
         normalized = _normalize_for_parquet(value)
@@ -174,7 +199,35 @@ def _with_partitions(row: dict[str, Any], *, schema_version: str) -> dict[str, A
     partitioned["schema_version"] = schema_version
     partitioned["event_date"] = _event_date_for_row(partitioned)
     partitioned.setdefault("source", "unknown")
+    if partition_by_instrument:
+        # The `instrument` partition value is the sanitized canonical symbol. To free
+        # the `instrument` column name for the (string) partition without losing the
+        # resolved InstrumentRef detail, the nested struct is preserved under
+        # `instrument_ref` (v2 schema). v1 leaves the nested `instrument` field as-is.
+        instrument_struct = partitioned.pop("instrument", _MISSING)
+        if instrument_struct is not _MISSING:
+            partitioned["instrument_ref"] = instrument_struct
+        partitioned["instrument"] = _instrument_partition(row)
     return partitioned
+
+
+def _instrument_partition(row: dict[str, Any]) -> str:
+    """Derive the `instrument=` partition value: the resolved canonical symbol, else
+    the venue product, else 'unknown' — sanitized for a filesystem/Hive path."""
+    instrument = row.get("instrument")
+    canonical = instrument.get("canonical_symbol") if isinstance(instrument, dict) else None
+    value = canonical or row.get("product") or "unknown"
+    return _sanitize_partition_value(str(value))
+
+
+def _sanitize_partition_value(value: str) -> str:
+    # Canonical symbols use '/' (e.g. "BTC/USDT"), which would split the partition
+    # directory, so map it to '-' ("BTC-USDT", as in the curated layout) and replace
+    # any other non-[alnum_-.] char with '_'. Hive partition values must be one path
+    # segment.
+    collapsed = value.replace("/", "-")
+    safe = "".join(ch if (ch.isalnum() or ch in "-_.") else "_" for ch in collapsed)
+    return safe or "unknown"
 
 
 def _event_date_for_row(row: dict[str, Any]) -> str:

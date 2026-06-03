@@ -12,7 +12,7 @@ DEFAULT_ARCHIVE_ROOT = Path(r"D:\market_archive")
 # in STANDARDS.md (repo root); bump both together when the schema, partition
 # layout, or the definition of "replayable" changes. The research manifest tags
 # its output with this so downstream readers can pin to a known contract.
-STANDARDS_VERSION = 3
+STANDARDS_VERSION = 4
 
 _FALLBACK_WARNED: set[str] = set()
 
@@ -70,6 +70,17 @@ class CollectorConfig:
     # small-frame venues (Binance depth/trades) are unaffected — this only raises a
     # ceiling, it never changes normal-frame handling. Set None to disable the limit.
     max_message_bytes: int | None = 16 * 1024 * 1024
+    # Data-arrival watchdog. When idle_timeout_seconds > 0, the receive loop bounds the
+    # wait for each next *data* frame; if none arrives within the timeout the stream
+    # ends cleanly so the consumer finalizes (metrics + replay summary get written) and
+    # the worker loop opens a fresh segment, instead of blocking forever in `recv`. This
+    # guards against a feed that acks the subscription but then goes silent-but-connected
+    # — exactly how Coinbase's dead `level2_batch` channel hung during real-socket
+    # validation. Each fire increments the collector's `idle_timeout_count`, surfaced in
+    # metrics/summary.jsonl + the health report (`idle_timeout:<worker>` finding). Default
+    # 0.0 = OFF, preserving the exact `async for message in websocket` behavior for every
+    # existing lane (incl. the live Binance collector); enable per-lane via the ops config.
+    idle_timeout_seconds: float = 0.0
 
 
 @dataclass(slots=True)

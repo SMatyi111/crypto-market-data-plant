@@ -33,16 +33,16 @@ What "done" looks like, eventually:
 
 ### Gap from today (updated 2026-05-30, after Phase 2)
 
-Most of the north-star scaffolding now exists. What's left:
+Most of the north-star scaffolding now exists. Snapshot of what was left as of
+2026-05-30, with status after the 2026-06-01 "Next steps" work below:
 
-- New venue lanes are **code-complete but never run against a real socket**, and
-  ship `enabled: false` — so "multi-venue" is still aspirational in production
-  (live = Binance BTCUSDT depth + trades only).
+- ~~New venue lanes never run against a real socket / ship disabled~~ — **DONE**:
+  all 6 validated live and enabled in `ops.live.local.json` (#1 below).
 - `--rotate-at-midnight` exists but is **opt-in**; the live model is still
-  count-bounded segments, so an analyst still globs runs to assemble a day.
-- Curated/normalized Parquet is partitioned by `source=<venue>` only — no
-  `instrument=` column, so per-instrument lanes of the same venue+dataset share
-  partitions (manifest separates them via the promotion index).
+  count-bounded segments, so an analyst still globs runs to assemble a day. (Still
+  open — see the roadmap note on day-bounded rotation as the default.)
+- ~~Parquet partitioned by `source=<venue>` only, no `instrument=` column~~ —
+  **DONE**: v1→v2 cutover added the `instrument=` partition (#2 below).
 
 ### Rough order if/when this becomes the focus
 
@@ -106,18 +106,17 @@ layout, or an external venue, so none should be started silently.
    next runner restart (reboot or manual restart of the `CryptoMarketDataPlant`
    task) — the currently-running Binance collector is untouched until then.
 
-2. **`instrument=` partition column** (north-star item #4's remaining half). Make
-   data pullable by `(venue, instrument, event_date)` instead of sharing
-   `source=<venue>` partitions. **Not a backward-compatible flag** like the
-   others: `ParquetDatasetSink` partitions on
-   `["schema_version", "source", "event_date"]` and `source` is the venue, so
-   adding `instrument=` changes the on-disk layout for the **live** collector
-   too. Clean path = a `schema_version` `v1→v2` cutover (old `v1` data untouched;
-   new writes go to `v2/source=…/instrument=…/event_date=…`) — but that's a
-   deliberate change to the live data contract and would strand any reader still
-   pinned to `v1` until it adopts `v2`. Also touches the manifest builder,
-   promotion index, and `STANDARDS.md` (bump `STANDARDS_VERSION`). **Needs a
-   decision on the cutover** before starting.
+2. **`instrument=` partition column** — DONE (2026-06-01). Implemented as a Parquet
+   `schema_version` `v1→v2` cutover: `ParquetDatasetSink` now partitions on
+   `["schema_version", "source", "instrument", "event_date"]` for v2 (the default),
+   deriving `instrument` from the row's canonical symbol (→ venue product → `unknown`),
+   sanitized for the path (`BTC/USDT`→`BTC-USDT`); the resolved `InstrumentRef` moves
+   to an `instrument_ref` column. Old `v1` data is untouched (a v1-tagged sink keeps
+   the 3-level layout). Promotion re-writes rows through the same sink (auto-gets the
+   partition); the manifest reads by key name (depth-agnostic) so it's unaffected.
+   `STANDARDS_VERSION` 3→4. Verified live: a real run writes
+   `schema_version=v2/source=coinbase/instrument=BTC-USD/event_date=…`. Storage v2
+   tests added.
 
 3. **App-level keepalive ping for Bybit** — DONE (2026-05-31). Added opt-in
    `CollectorConfig.ping_message` + `ping_interval_seconds`; `GenericWebsocketCollector`
@@ -146,16 +145,48 @@ layout, or an external venue, so none should be started silently.
      A frozen golden-vector test guards the CRC algorithm against real venue data.
      Remaining: add other pairs' precision (or auto-fetch from REST `AssetPairs`).
 
-5. **Data-arrival watchdog for the WS collector** (NEW — surfaced by the #1
-   real-socket validation). A feed that **acks the subscription but then sends no
-   data** makes `GenericWebsocketCollector.stream` block forever in
-   `async for message in websocket` — the segment never reaches `segment_count`,
-   never writes a replay summary, and the lane silently stops producing without
-   raising. This is exactly how the dead Coinbase `level2_batch` channel hung
-   (acked, zero frames). It's a real unsupervised-operation risk for any enabled
-   lane whose venue goes silent-but-connected. Fix: an idle timeout (no data frame
-   in N s) that closes + reconnects (or ends the segment cleanly), surfaced as a
-   metric/finding. Layout-neutral, fully offline-testable.
+5. **Data-arrival watchdog for the WS collector** — DONE (2026-06-01). Added opt-in
+   `CollectorConfig.idle_timeout_seconds` (default `0.0` = OFF). When set, the
+   `GenericWebsocketCollector.stream` receive loop bounds each wait for the next data
+   frame (`asyncio.wait_for` around the iterator); if none arrives in time it ends the
+   segment **cleanly** (the pipeline `finally` still writes `metrics/summary.jsonl` +
+   the segment writes `replay_summary.json`, and the worker loop opens a fresh segment)
+   instead of blocking forever — chosen over in-place reconnect because for the
+   in-stream-snapshot depth lanes a fresh segment yields a clean single-snapshot run,
+   not a quarantined multi-snapshot one. Each fire increments the collector's
+   `idle_timeout_count`, threaded by the pipeline into `metrics/summary.jsonl` and
+   surfaced by `build_health_report` as a non-blocking `idle_timeout:<worker>` finding
+   for active workers (self-heals via the fresh segment). Wired through the ops config
+   per-lane via `_job_args` → `_run_segmented_worker` (the Binance depth lane runs its
+   own socket loop and ignores it; default-off leaves every live lane unchanged).
+   Deterministic tests use a fake WS whose async iterator stalls: timeout fires + ends
+   (no hang), frames-then-stall, disabled-blocks-forever contrast, clean-close still
+   reconnects, and an end-to-end segment surfacing `idle_timeout_count` in
+   `summary.jsonl`. STANDARDS §2.1 + §4 updated (no `STANDARDS_VERSION` bump — the data
+   schema, partition layout, and "replayable" definition are unchanged; this adds an
+   operational metric/finding only).
+
+6. **Parallel collection runner** — DONE (2026-06-03). `OpsRunner` now dispatches the
+   8 collector job types (`*-worker`) through a `ThreadPoolExecutor` sized by
+   `--collector-concurrency` (CLI flag, default `1` = legacy serial; live scheduled task
+   passes `4` via `run_ops_runner.ps1 -CollectorConcurrency 4`). Each collector reaps on
+   completion → writes `job_runs.jsonl`, updates counters, increments `run_count`, and
+   reschedules from `finished_at + interval_seconds`. A job is never launched twice while
+   its previous run is still in flight (active-set guard). Maintenance jobs
+   (quarantine/promote/manifest/cleanup/health) stay serialized: they run one at a time in
+   the scheduler thread, may overlap active collectors, but never overlap each other.
+   Heartbeat gained `current_jobs` (full active set: `name`/`job_type`/`started_at`) while
+   `current_job` is preserved as the oldest active job (or `null`) for backward compat; a
+   single background refresher thread keeps `last_seen`/`current_jobs` fresh.
+   `build_health_report` now treats any job present in `current_jobs` as in progress, so
+   long-running collectors are not flagged stale (legacy `current_job` still honored).
+   Tests cover: concurrent collectors (barrier-proven), no double-launch of the same job,
+   maintenance serialized when multiple due, maintenance running while a collector is
+   active, heartbeat `current_jobs` + preserved `current_job`, health not flagging a
+   running collector, and the `--collector-concurrency` default. No `STANDARDS_VERSION`
+   bump — the on-disk data schema, partition layout, and "replayable" definition are
+   unchanged; this is a scheduler/telemetry change only. The live Binance lanes are
+   unaffected (default-1 behavior is identical; concurrency only changes dispatch order).
 
 Also still parked: the **L3 collection project** re-enable (see bottom of this
 file) and making **day-bounded rotation the default** run model (currently

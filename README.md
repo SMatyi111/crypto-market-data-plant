@@ -85,12 +85,12 @@ D:\market_archive
         metrics\summary.jsonl
         metrics\replay_summary.json   # curation verdict (replayable + gap_detection)
   normalized\                         # all runs, pre-curation Parquet
-    market\schema_version=v1\source=<src>\event_date=YYYY-MM-DD\   # depth
-    trades\schema_version=v1\source=<src>\event_date=YYYY-MM-DD\
+    market\schema_version=v2\source=<venue>\instrument=<canonical>\event_date=YYYY-MM-DD\   # depth
+    trades\schema_version=v2\source=<venue>\instrument=<canonical>\event_date=YYYY-MM-DD\
   curated\
     research\
-      market_replayable\schema_version=v1\source=<src>\event_date=YYYY-MM-DD\   # depth
-      trades_replayable\schema_version=v1\source=<src>\event_date=YYYY-MM-DD\
+      market_replayable\schema_version=v2\source=<venue>\instrument=<canonical>\event_date=YYYY-MM-DD\   # depth
+      trades_replayable\schema_version=v2\source=<venue>\instrument=<canonical>\event_date=YYYY-MM-DD\
       manifests\
   quarantine\
     market\<lane>\
@@ -106,10 +106,11 @@ Raw/quarantine lane directories are `<venue>_<dataset>[_<suffix>]` —
 `binance_depth`, `binance_trades`, `coinbase_trades`, `coinbase_depth`,
 `kraken_trades`, `kraken_depth`, `bybit_trades`, `bybit_depth`, plus an optional
 per-instrument suffix (`binance_trades_ethusdt`). Depth lanes promote into
-`market_replayable`; trades lanes promote into `trades_replayable`. Normalized
-and curated Parquet are partitioned by `source=<venue>` only — per-instrument
-lanes of the same venue+dataset share Parquet partitions today (the manifest
-still separates them via the promotion index). See
+`market_replayable`; trades lanes promote into `trades_replayable`. Since the
+`schema_version=v2` cutover, normalized and curated Parquet carry an
+`instrument=<canonical>` partition (the sanitized canonical symbol, e.g.
+`BTC-USDT`), so you can pull by `(venue, instrument, event_date)` straight off the
+path; legacy `v1` data (venue-only) coexists for pre-cutover history. See
 [`STANDARDS.md`](STANDARDS.md) §2 for the full layout contract.
 
 Override roots with environment variables:

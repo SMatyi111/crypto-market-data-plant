@@ -102,6 +102,7 @@ class CollectorPipeline:
                         {
                             **summary.to_dict(),
                             "reject_counts": self.quality_gate.metrics(),
+                            "idle_timeout_count": getattr(self.collector, "idle_timeout_count", 0),
                             "partial": True,
                         }
                     )
@@ -112,6 +113,10 @@ class CollectorPipeline:
                 {
                     **summary.to_dict(),
                     "reject_counts": self.quality_gate.metrics(),
+                    # Surface the data-arrival watchdog count so the health report can
+                    # see a feed that went silent-but-connected (0 when disabled / never
+                    # tripped). getattr keeps non-WS collectors (mock) working.
+                    "idle_timeout_count": getattr(self.collector, "idle_timeout_count", 0),
                     "partial": False,
                 }
             )

@@ -4,6 +4,7 @@ import json
 import os
 import socket
 import sys
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -14,6 +15,27 @@ from typing import Any, Callable
 
 from .config import default_normalized_root
 from .storage import JsonlSink
+
+# Job types treated as long-running *collector* jobs by the ops runner. These may run
+# concurrently with one another (up to --collector-concurrency); every other job type
+# is a maintenance job and stays serialized in the scheduler loop. Keep this in sync
+# with the worker dispatch table in cli.py::_execute_ops_job.
+COLLECTOR_JOB_TYPES: frozenset[str] = frozenset(
+    {
+        "binance-depth-worker",
+        "binance-trades-worker",
+        "coinbase-trades-worker",
+        "coinbase-depth-worker",
+        "kraken-trades-worker",
+        "kraken-depth-worker",
+        "bybit-trades-worker",
+        "bybit-depth-worker",
+    }
+)
+
+
+def is_collector_job(job: "JobSpec") -> bool:
+    return job.job_type in COLLECTOR_JOB_TYPES
 
 
 @dataclass(slots=True)
@@ -373,11 +395,13 @@ class OpsRunner:
         runner_name: str = "collector-ops",
         poll_seconds: int = 5,
         heartbeat_interval_seconds: float = 30.0,
+        collector_concurrency: int = 1,
     ) -> None:
         self.ops_root = ops_root
         self.runner_name = runner_name
         self.poll_seconds = poll_seconds
         self.heartbeat_interval_seconds = heartbeat_interval_seconds
+        self.collector_concurrency = max(1, int(collector_concurrency))
         self.ops_root.mkdir(parents=True, exist_ok=True)
         self.runs_sink = JsonlSink(self.ops_root, "job_runs.jsonl")
         self.heartbeat_history = JsonlSink(self.ops_root, "heartbeat_history.jsonl")
@@ -386,6 +410,14 @@ class OpsRunner:
         self._last_heartbeat_write: datetime | None = None
         self._job_counters: dict[str, dict[str, Any]] = {}
         self._heartbeat_lock = threading.Lock()
+        # Live scheduling state, guarded by _run_lock so the heartbeat refresher thread
+        # and the pool worker threads can read/update it without tearing.
+        self._run_lock = threading.Lock()
+        self._sched_jobs: list[JobSpec] = []
+        self._sched_run_count = 0
+        self._sched_next_run_at: dict[str, datetime] = {}
+        self._sched_active: dict[str, dict[str, Any]] = {}
+        self._sched_last_result: JobRunResult | None = None
 
     def run(
         self,
@@ -395,172 +427,287 @@ class OpsRunner:
         max_runs: int | None = None,
         stop_on_error: bool = False,
     ) -> int:
-        run_count = 0
-        next_run_at = {job.name: datetime.now(tz=UTC) for job in jobs}
-        self._write_heartbeat(status="starting", run_count=run_count, jobs=jobs, next_run_at=next_run_at)
+        concurrency = self.collector_concurrency
+        with self._run_lock:
+            self._sched_jobs = list(jobs)
+            self._sched_run_count = 0
+            self._sched_next_run_at = {job.name: datetime.now(tz=UTC) for job in jobs}
+            self._sched_active = {}
+            self._sched_last_result = None
+        self._write_heartbeat_snapshot(status="starting")
 
-        while max_runs is None or run_count < max_runs:
-            now = datetime.now(tz=UTC)
-            due_jobs = [job for job in jobs if now >= next_run_at[job.name]]
-            if not due_jobs:
-                self._write_heartbeat(
-                    status="idle",
-                    run_count=run_count,
-                    jobs=jobs,
-                    next_run_at=next_run_at,
-                )
-                time.sleep(self.poll_seconds if self.poll_seconds > 0 else 0.1)
-                continue
+        heartbeat_interval = max(0.1, float(self.heartbeat_interval_seconds))
+        heartbeat_stop = threading.Event()
+        heartbeat_thread = threading.Thread(
+            target=self._heartbeat_refresher,
+            args=(heartbeat_stop, heartbeat_interval),
+            name=f"ops-heartbeat-{self.runner_name}",
+            daemon=True,
+        )
+        heartbeat_thread.start()
 
-            for job in due_jobs:
-                started_at = datetime.now(tz=UTC)
-                status = "success"
-                message: str | None = None
-                retry_count = 0
-                heartbeat_stop = threading.Event()
-                heartbeat_thread = self._start_running_heartbeat(
-                    stop_event=heartbeat_stop,
-                    run_count=run_count,
-                    jobs=jobs,
-                    next_run_at=next_run_at,
-                    job=job,
-                    started_at=started_at,
-                )
-                try:
-                    execution = _normalize_job_execution_result(execute_job(job))
-                    message = execution.message
-                    retry_count = execution.retry_count
-                except Exception as exc:  # noqa: BLE001
-                    status = "error"
-                    message = str(exc)
-                    heartbeat_stop.set()
-                    heartbeat_thread.join(timeout=self.heartbeat_interval_seconds + 1.0)
-                    if stop_on_error:
-                        finished_at = datetime.now(tz=UTC)
-                        result = JobRunResult(
-                            job_name=job.name,
-                            job_type=job.job_type,
-                            started_at=started_at,
-                            finished_at=finished_at,
-                            status=status,
-                            message=message,
-                            retry_count=retry_count,
-                        )
-                        self._update_job_counters(result)
-                        self.runs_sink.write(result.to_dict())
-                        self._write_heartbeat(
-                            status="error",
-                            run_count=run_count,
-                            jobs=jobs,
-                            next_run_at=next_run_at,
-                            last_result=result,
-                        )
-                        raise
-                else:
-                    heartbeat_stop.set()
-                    heartbeat_thread.join(timeout=self.heartbeat_interval_seconds + 1.0)
-
-                finished_at = datetime.now(tz=UTC)
-                result = JobRunResult(
-                    job_name=job.name,
-                    job_type=job.job_type,
-                    started_at=started_at,
-                    finished_at=finished_at,
-                    status=status,
-                    message=message,
-                    retry_count=retry_count,
-                )
-                self._update_job_counters(result)
-                self.runs_sink.write(result.to_dict())
-                run_count += 1
-                next_run_at[job.name] = finished_at + timedelta(seconds=job.interval_seconds)
-                self._write_heartbeat(
-                    status="running",
-                    run_count=run_count,
-                    jobs=jobs,
-                    next_run_at=next_run_at,
-                    last_result=result,
-                )
+        pool = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="ops-collector")
+        futures: dict[Future, JobSpec] = {}
+        pending_error: BaseException | None = None
+        try:
+            while True:
+                with self._run_lock:
+                    run_count = self._sched_run_count
                 if max_runs is not None and run_count >= max_runs:
                     break
 
-        self._write_heartbeat(status="stopped", run_count=run_count, jobs=jobs, next_run_at=next_run_at)
-        return run_count
+                # 1. Reap finished collector jobs (each records its own result).
+                stop_now = False
+                for future in [f for f in list(futures) if f.done()]:
+                    job = futures.pop(future)
+                    result = future.result()
+                    self._finalize_run(job, result)
+                    self._write_heartbeat_snapshot()
+                    if result.status == "error" and stop_on_error:
+                        pending_error = RuntimeError(
+                            f"collector job {job.name} failed: {result.message}"
+                        )
+                        stop_now = True
+                        break
+                if stop_now:
+                    break
 
-    def _start_running_heartbeat(
+                with self._run_lock:
+                    run_count = self._sched_run_count
+                    active_names = set(self._sched_active)
+                    next_run_at = dict(self._sched_next_run_at)
+                    active_collectors = sum(
+                        1
+                        for entry in self._sched_active.values()
+                        if entry["job_type"] in COLLECTOR_JOB_TYPES
+                    )
+                if max_runs is not None and run_count >= max_runs:
+                    break
+
+                now = datetime.now(tz=UTC)
+                due = [
+                    job
+                    for job in jobs
+                    if now >= next_run_at[job.name] and job.name not in active_names
+                ]
+                collector_due = [job for job in due if job.job_type in COLLECTOR_JOB_TYPES]
+                maintenance_due = [job for job in due if job.job_type not in COLLECTOR_JOB_TYPES]
+
+                # `started` counts runs already finished plus runs in flight, so a bounded
+                # (max_runs) run never launches more work than it will eventually report.
+                started = run_count + len(futures)
+
+                # 2. Dispatch collector jobs up to the concurrency budget; never launch a
+                #    second instance of a job that is already active.
+                dispatched = False
+                for job in collector_due:
+                    if active_collectors >= concurrency:
+                        break
+                    if max_runs is not None and started >= max_runs:
+                        break
+                    job_started_at = datetime.now(tz=UTC)
+                    with self._run_lock:
+                        self._sched_active[job.name] = {
+                            "name": job.name,
+                            "job_type": job.job_type,
+                            "started_at": job_started_at,
+                        }
+                    future = pool.submit(self._run_collector_job, job, execute_job, job_started_at)
+                    futures[future] = job
+                    active_collectors += 1
+                    started += 1
+                    dispatched = True
+                if dispatched:
+                    self._write_heartbeat_snapshot()
+
+                # 3. Run at most one maintenance job per tick. Synchronous execution in the
+                #    scheduler thread keeps maintenance strictly serialized with itself
+                #    while collectors keep running in the pool.
+                ran_maintenance = False
+                if maintenance_due and not (max_runs is not None and started >= max_runs):
+                    self._run_maintenance_job(
+                        maintenance_due[0], execute_job, stop_on_error=stop_on_error
+                    )
+                    ran_maintenance = True
+
+                if dispatched or ran_maintenance:
+                    # Did real work this tick; loop immediately to keep latency low.
+                    continue
+                if futures:
+                    # Collectors are in flight but nothing new is due — poll for completion
+                    # without pegging a core.
+                    time.sleep(self.poll_seconds if self.poll_seconds > 0 else 0.05)
+                    continue
+                # Fully idle.
+                self._write_heartbeat_snapshot(status="idle")
+                time.sleep(self.poll_seconds if self.poll_seconds > 0 else 0.1)
+        finally:
+            heartbeat_stop.set()
+            heartbeat_thread.join(timeout=heartbeat_interval + 1.0)
+            # Drain any still-running collectors so their results are not lost.
+            pool.shutdown(wait=True)
+            for future in [f for f in list(futures) if f.done()]:
+                job = futures.pop(future)
+                try:
+                    result = future.result()
+                except Exception as exc:  # noqa: BLE001 - defensive; worker catches its own
+                    moment = datetime.now(tz=UTC)
+                    result = JobRunResult(
+                        job_name=job.name,
+                        job_type=job.job_type,
+                        started_at=moment,
+                        finished_at=moment,
+                        status="error",
+                        message=str(exc),
+                    )
+                self._finalize_run(job, result)
+
+        if pending_error is not None:
+            self._write_heartbeat_snapshot(status="error")
+            raise pending_error
+
+        self._write_heartbeat_snapshot(status="stopped")
+        with self._run_lock:
+            return self._sched_run_count
+
+    def _run_collector_job(
         self,
-        *,
-        stop_event: threading.Event,
-        run_count: int,
-        jobs: list[JobSpec],
-        next_run_at: dict[str, datetime],
         job: JobSpec,
+        execute_job: Callable[[JobSpec], JobExecutionResult | str | None],
         started_at: datetime,
-    ) -> threading.Thread:
-        interval_seconds = max(0.1, float(self.heartbeat_interval_seconds))
+    ) -> JobRunResult:
+        """Run one collector job on a pool thread. Never raises — a failure is captured
+        into an error JobRunResult so the scheduler always reaps a result."""
+        status = "success"
+        message: str | None = None
+        retry_count = 0
+        try:
+            execution = _normalize_job_execution_result(execute_job(job))
+            message = execution.message
+            retry_count = execution.retry_count
+        except Exception as exc:  # noqa: BLE001
+            status = "error"
+            message = str(exc)
+        finished_at = datetime.now(tz=UTC)
+        return JobRunResult(
+            job_name=job.name,
+            job_type=job.job_type,
+            started_at=started_at,
+            finished_at=finished_at,
+            status=status,
+            message=message,
+            retry_count=retry_count,
+        )
 
-        def refresh() -> None:
-            self._write_heartbeat(
-                status="running",
-                run_count=run_count,
-                jobs=jobs,
-                next_run_at=next_run_at,
-                current_job=job,
-                current_job_started_at=started_at,
-            )
-            while not stop_event.wait(interval_seconds):
-                self._write_heartbeat(
-                    status="running",
-                    run_count=run_count,
-                    jobs=jobs,
-                    next_run_at=next_run_at,
-                    current_job=job,
-                    current_job_started_at=started_at,
-                )
-
-        thread = threading.Thread(target=refresh, name=f"ops-heartbeat-{job.name}", daemon=True)
-        thread.start()
-        return thread
-
-    def _write_heartbeat(
+    def _run_maintenance_job(
         self,
+        job: JobSpec,
+        execute_job: Callable[[JobSpec], JobExecutionResult | str | None],
         *,
-        status: str,
-        run_count: int,
-        jobs: list[JobSpec],
-        next_run_at: dict[str, datetime],
-        last_result: JobRunResult | None = None,
-        current_job: JobSpec | None = None,
-        current_job_started_at: datetime | None = None,
+        stop_on_error: bool,
     ) -> None:
-        with self._heartbeat_lock:
-            payload = {
-                "runner_name": self.runner_name,
-                "status": status,
-                "last_seen": datetime.now(tz=UTC).isoformat(),
-                "run_count": run_count,
-                "job_count": len(jobs),
-                "next_run_at": {
-                    name: value.isoformat()
-                    for name, value in next_run_at.items()
-                },
-                "job_counters": {
-                    name: dict(self._job_counters.get(name, {}))
-                    for name in sorted(job.name for job in jobs)
-                },
-                "last_result": last_result.to_dict() if last_result is not None else None,
-                "current_job": (
-                    {
-                        "name": current_job.name,
-                        "job_type": current_job.job_type,
-                        "started_at": current_job_started_at.isoformat() if current_job_started_at is not None else None,
-                    }
-                    if current_job is not None
-                    else None
-                ),
+        started_at = datetime.now(tz=UTC)
+        with self._run_lock:
+            self._sched_active[job.name] = {
+                "name": job.name,
+                "job_type": job.job_type,
+                "started_at": started_at,
             }
+        self._write_heartbeat_snapshot()
+        status = "success"
+        message: str | None = None
+        retry_count = 0
+        try:
+            execution = _normalize_job_execution_result(execute_job(job))
+            message = execution.message
+            retry_count = execution.retry_count
+        except Exception as exc:  # noqa: BLE001
+            status = "error"
+            message = str(exc)
+        finished_at = datetime.now(tz=UTC)
+        result = JobRunResult(
+            job_name=job.name,
+            job_type=job.job_type,
+            started_at=started_at,
+            finished_at=finished_at,
+            status=status,
+            message=message,
+            retry_count=retry_count,
+        )
+        self._finalize_run(job, result)
+        if status == "error" and stop_on_error:
+            self._write_heartbeat_snapshot(status="error")
+            raise RuntimeError(f"maintenance job {job.name} failed: {message}")
+        self._write_heartbeat_snapshot()
+
+    def _finalize_run(self, job: JobSpec, result: JobRunResult) -> None:
+        """Record a completed run: drop it from the active set, update counters, advance
+        its next-run time, and append to job_runs.jsonl. Safe to call for either a
+        collector (from the scheduler thread after the future completes) or a maintenance
+        job (inline)."""
+        with self._run_lock:
+            self._sched_active.pop(job.name, None)
+            self._update_job_counters(result)
+            self._sched_run_count += 1
+            self._sched_next_run_at[job.name] = result.finished_at + timedelta(
+                seconds=job.interval_seconds
+            )
+            self._sched_last_result = result
+        self.runs_sink.write(result.to_dict())
+
+    def _heartbeat_refresher(self, stop_event: threading.Event, interval_seconds: float) -> None:
+        while not stop_event.wait(interval_seconds):
+            self._write_heartbeat_snapshot()
+
+    def _write_heartbeat_snapshot(self, *, status: str | None = None) -> None:
+        with self._run_lock:
+            resolved = (
+                status if status is not None else ("running" if self._sched_active else "idle")
+            )
+            payload = self._build_heartbeat_payload(resolved)
+        self._emit_heartbeat(payload)
+
+    def _build_heartbeat_payload(self, status: str) -> dict[str, Any]:
+        """Build the heartbeat payload from live scheduling state. Caller must hold
+        self._run_lock."""
+        active_sorted = sorted(
+            self._sched_active.values(), key=lambda entry: entry["started_at"]
+        )
+        current_jobs = [
+            {
+                "name": entry["name"],
+                "job_type": entry["job_type"],
+                "started_at": entry["started_at"].isoformat(),
+            }
+            for entry in active_sorted
+        ]
+        return {
+            "runner_name": self.runner_name,
+            "status": status,
+            "last_seen": datetime.now(tz=UTC).isoformat(),
+            "run_count": self._sched_run_count,
+            "job_count": len(self._sched_jobs),
+            "next_run_at": {
+                name: value.isoformat() for name, value in self._sched_next_run_at.items()
+            },
+            "job_counters": {
+                name: dict(self._job_counters.get(name, {}))
+                for name in sorted(job.name for job in self._sched_jobs)
+            },
+            "last_result": self._sched_last_result.to_dict()
+            if self._sched_last_result is not None
+            else None,
+            # current_jobs is the full active set; current_job is kept for backward
+            # compatibility and points at the oldest active job (None when idle).
+            "current_jobs": current_jobs,
+            "current_job": current_jobs[0] if current_jobs else None,
+        }
+
+    def _emit_heartbeat(self, payload: dict[str, Any]) -> None:
+        with self._heartbeat_lock:
             _write_json_atomic(self.heartbeat_path, payload)
             now = datetime.now(tz=UTC)
+            status = payload["status"]
             should_append_history = (
                 self._last_heartbeat_status != status
                 or self._last_heartbeat_write is None
@@ -622,9 +769,18 @@ def build_health_report(
             findings.append("runner_error_state")
     job_counters = heartbeat.get("job_counters", {}) if isinstance(heartbeat, dict) else {}
     runner_status = str(heartbeat.get("status") or "") if isinstance(heartbeat, dict) else ""
+    # Active jobs: prefer the current_jobs list written by the parallel runner; fall
+    # back to the legacy single current_job for older heartbeats. A job that appears
+    # here is treated as in progress, which suppresses stale-job warnings for it.
+    current_jobs_raw = heartbeat.get("current_jobs") if isinstance(heartbeat, dict) else None
     current_job = heartbeat.get("current_job") if isinstance(heartbeat, dict) else None
-    current_job_name = str(current_job.get("name") or "") if isinstance(current_job, dict) else ""
-    current_job_started_at = _parse_dt(current_job.get("started_at")) if isinstance(current_job, dict) else None
+    active_started_by_name: dict[str, datetime | None] = {}
+    if isinstance(current_jobs_raw, list):
+        for item in current_jobs_raw:
+            if isinstance(item, dict) and item.get("name"):
+                active_started_by_name[str(item["name"])] = _parse_dt(item.get("started_at"))
+    elif isinstance(current_job, dict) and current_job.get("name"):
+        active_started_by_name[str(current_job["name"])] = _parse_dt(current_job.get("started_at"))
     heartbeat_is_fresh = heartbeat_age_seconds is not None and heartbeat_age_seconds <= stale_after_seconds
 
     run_rows = _read_jsonl(job_runs_path)
@@ -666,15 +822,16 @@ def build_health_report(
             finished_at = _parse_dt(latest.get("finished_at")) if latest else None
             age_seconds = (checked_at - finished_at).total_seconds() if finished_at else None
             stale_threshold = job.interval_seconds * job_stale_multiplier
+            job_started_at = active_started_by_name.get(job.name)
             in_progress = (
                 runner_status == "running"
                 and heartbeat_is_fresh
-                and current_job_name == job.name
-                and current_job_started_at is not None
+                and job.name in active_started_by_name
+                and job_started_at is not None
             )
             current_job_age_seconds = (
-                (checked_at - current_job_started_at).total_seconds()
-                if in_progress and current_job_started_at is not None
+                (checked_at - job_started_at).total_seconds()
+                if in_progress and job_started_at is not None
                 else None
             )
             long_running = (
@@ -715,7 +872,7 @@ def build_health_report(
                     "last_finished_at": finished_at.isoformat() if finished_at else None,
                     "age_seconds": age_seconds,
                     "in_progress": in_progress,
-                    "current_job_started_at": current_job_started_at.isoformat() if in_progress and current_job_started_at is not None else None,
+                    "current_job_started_at": job_started_at.isoformat() if in_progress and job_started_at is not None else None,
                     "current_job_age_seconds": current_job_age_seconds,
                     "long_running": long_running,
                     "long_running_threshold_seconds": stale_threshold,
@@ -1053,6 +1210,22 @@ def _standalone_worker_rows(
                     row_findings.append("high_quarantine_ratio")
                     findings.append(
                         f"{'high_quarantine_ratio' if managed else 'unmanaged_high_quarantine_ratio'}:{name}"
+                    )
+
+                # The data-arrival watchdog fired on this run — the feed acked then went
+                # silent-but-connected, so the collector ended the segment instead of
+                # hanging. Surface it as a (non-blocking, warn-level) finding for active
+                # workers so an operator notices a silent venue; a healthy next segment
+                # writes idle_timeout_count=0 and clears it. Not row_findings: the lane
+                # self-heals (worker opens a fresh segment), so it isn't "blocking".
+                idle_timeout_count = partial_metrics.get("idle_timeout_count")
+                if (
+                    isinstance(idle_timeout_count, (int, float))
+                    and idle_timeout_count > 0
+                    and active
+                ):
+                    findings.append(
+                        f"{'idle_timeout' if managed else 'unmanaged_idle_timeout'}:{name}"
                     )
 
         rows.append(

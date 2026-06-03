@@ -40,6 +40,7 @@ $settings = New-ScheduledTaskSettingsSet `
     -MultipleInstances IgnoreNew `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
+    -ExecutionTimeLimit (New-TimeSpan -Seconds 0) `
     -WakeToRun
 # -WakeToRun lets a time-based or repetition trigger pull the PC out of S3/S4
 # sleep so collection resumes without a manual lid-open. With only an
