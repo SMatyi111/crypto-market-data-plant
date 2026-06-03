@@ -188,6 +188,26 @@ layout, or an external venue, so none should be started silently.
    unchanged; this is a scheduler/telemetry change only. The live Binance lanes are
    unaffected (default-1 behavior is identical; concurrency only changes dispatch order).
 
+7. **Multi-anchor stream-depth replay + backfill** — DONE (2026-06-03). Root cause of
+   Coinbase/Bybit/Kraken depth showing **0 curated rows** while raw collection was clean:
+   `replay_depth_stream_run` required exactly one snapshot anchor at position 0 (the
+   Binance REST model), but stream-snapshot venues re-snapshot mid-run by design (~4
+   anchors per 5,000-event segment), so every run was rejected. Fixed by (a) re-anchoring
+   at each in-stream `snapshot` and validating sequence/checksum **within each sub-book**
+   (gate is now "run starts with a snapshot" + integrity-per-sub-book; retired
+   `multiple_snapshot_anchors`/`snapshot_not_first_event`, added
+   `run_does_not_start_with_snapshot`), and (b) a `book_depth` param that trims Kraken's
+   book to the subscribed top-N after each mutation (Kraken silently evicts the worst
+   level past depth without a delete, so an unbounded book diverges the CRC — empirically
+   ~90% of frames mismatched). Verified against today's live captured runs: bybit/kraken/
+   coinbase all `replayable=True`, 0 findings (kraken 5,000 frames, 0 CRC mismatch). Added
+   the `backfill-stream-depth` CLI (dry-run default; `--apply` regenerates each backlog
+   run's `replay_summary.json` and promotes the replayable ones) — dry-run over the live
+   backlog reports 11 coinbase + 10 bybit + 10 kraken depth runs all now replayable.
+   `STANDARDS_VERSION` 4→5; §4 updated. **Operational rollout still pending the maintainer:**
+   restart the ops-runner (so the live collector loads this code — briefly interrupts the
+   Binance lane) and run `backfill-stream-depth --apply` for the existing backlog.
+
 Also still parked: the **L3 collection project** re-enable (see bottom of this
 file) and making **day-bounded rotation the default** run model (currently
 opt-in via `--rotate-at-midnight`).

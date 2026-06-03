@@ -465,6 +465,36 @@ def build_parser() -> argparse.ArgumentParser:
     manifest_parser.add_argument("--current-date")
     manifest_parser.add_argument("--format", choices=["json", "text"], default="text")
 
+    backfill_parser = subparsers.add_parser(
+        "backfill-stream-depth",
+        help=(
+            "Re-replay already-collected stream-snapshot depth runs "
+            "(Coinbase/Bybit/Kraken) with the current multi-anchor logic, then "
+            "optionally promote the replayable ones. Dry-run unless --apply."
+        ),
+    )
+    backfill_parser.add_argument("--raw-root", type=Path, default=default_output_root())
+    backfill_parser.add_argument(
+        "--source",
+        nargs="+",
+        default=["coinbase_depth", "bybit_depth", "kraken_depth"],
+        help="Raw source directory names under --raw-root to backfill.",
+    )
+    backfill_parser.add_argument(
+        "--target-root", type=Path, default=default_curated_root("market_replayable")
+    )
+    backfill_parser.add_argument("--limit", type=int, default=200)
+    backfill_parser.add_argument("--max-age-hours", type=float, default=720.0)
+    backfill_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help=(
+            "Regenerate each run's metrics/replay_summary.json and promote the "
+            "replayable runs. Without this flag the command is a read-only dry run."
+        ),
+    )
+    backfill_parser.add_argument("--format", choices=["json", "text"], default="text")
+
     subparsers.add_parser("state", help="Show archive and package state")
     return parser
 
@@ -965,7 +995,7 @@ async def collect_bybit_depth_segment(args: argparse.Namespace) -> dict[str, obj
         source_base="bybit_depth",
         ping_message=_BYBIT_PING_MESSAGE,
         ping_interval_seconds=_BYBIT_PING_INTERVAL_SECONDS,
-        sequence_metadata_key="bybit_update_id",
+        **_stream_depth_replay_kwargs("bybit", getattr(args, "symbol", None)),
     )
 
 
@@ -986,19 +1016,35 @@ _KRAKEN_BOOK_PRECISION: dict[str, tuple[int, int]] = {
 _KRAKEN_BOOK_DEPTH = 10
 
 
+def _stream_depth_replay_kwargs(source: str, symbol: str | None = None) -> dict[str, object]:
+    """Per-venue kwargs for `replay_depth_stream_run`. Single source of truth shared by
+    the live depth collectors (`collect_*_depth_segment`) and the offline backfill tool
+    (`backfill-stream-depth`) so the two cannot drift:
+
+    - bybit  -> provable `sequence` via the dense `bybit_update_id`
+    - kraken -> provable `checksum` (when the pair precision is known) + depth-bounded book
+    - others -> none_native (structural-only)
+    """
+    if source == "bybit":
+        return {"sequence_metadata_key": "bybit_update_id"}
+    if source == "kraken":
+        kwargs: dict[str, object] = {"book_depth": _KRAKEN_BOOK_DEPTH}
+        precision = _KRAKEN_BOOK_PRECISION.get(symbol or "")
+        if precision is not None:
+            kwargs.update(
+                checksum_metadata_key="kraken_checksum",
+                checksum_price_precision=precision[0],
+                checksum_qty_precision=precision[1],
+            )
+        return kwargs
+    return {}
+
+
 async def collect_kraken_depth_segment(args: argparse.Namespace) -> dict[str, object]:
     # Kraken v2 book delivers an in-stream snapshot + updates plus a per-frame CRC32
     # checksum. For a pair whose native precision we know, validate that checksum at
     # replay time (provable integrity, gap_detection="checksum"); otherwise fall back
     # to none_native — structurally clean only (STANDARDS 4.3).
-    precision = _KRAKEN_BOOK_PRECISION.get(getattr(args, "symbol", ""))
-    checksum_kwargs: dict[str, object] = {}
-    if precision is not None:
-        checksum_kwargs = {
-            "checksum_metadata_key": "kraken_checksum",
-            "checksum_price_precision": precision[0],
-            "checksum_qty_precision": precision[1],
-        }
     return await _collect_depth_stream_segment(
         args,
         source="kraken",
@@ -1006,8 +1052,7 @@ async def collect_kraken_depth_segment(args: argparse.Namespace) -> dict[str, ob
         subscription_style="kraken_v2",
         normalizer=KrakenDepthNormalizer(),
         source_base="kraken_depth",
-        book_depth=_KRAKEN_BOOK_DEPTH,
-        **checksum_kwargs,
+        **_stream_depth_replay_kwargs("kraken", getattr(args, "symbol", None)),
     )
 
 
@@ -1773,6 +1818,125 @@ def run_backfill_replay(args: argparse.Namespace) -> None:
     print(f"findings={','.join(report.findings) if report.findings else 'none'}")
 
 
+def _backfill_first_event_product(run_dir: Path) -> str | None:
+    """Read the venue product (e.g. 'BTC/USD') from a run's first clean event so the
+    backfill can select the right per-venue replay kwargs (Kraken precision)."""
+    events_path = run_dir / "clean" / "events.jsonl"
+    if not events_path.exists():
+        return None
+    try:
+        with events_path.open(encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                product = row.get("product")
+                return str(product) if product is not None else None
+    except (OSError, json.JSONDecodeError):
+        return None
+    return None
+
+
+def run_backfill_stream_depth(args: argparse.Namespace) -> None:
+    """Re-replay already-collected stream-snapshot depth runs with the current
+    multi-anchor logic and (with --apply) promote the replayable ones. The live
+    collector writes its own replay summary at collection time; this rescues the
+    backlog collected before the multi-anchor logic existed."""
+    raw_root: Path = args.raw_root
+    apply = bool(getattr(args, "apply", False))
+    summary_rows: list[dict[str, object]] = []
+    for source_dir_name in args.source:
+        venue = (
+            source_dir_name[: -len("_depth")]
+            if source_dir_name.endswith("_depth")
+            else source_dir_name
+        )
+        source_root = raw_root / source_dir_name
+        run_dirs = (
+            sorted(d for d in source_root.glob("*") if d.is_dir())[-args.limit :]
+            if source_root.is_dir()
+            else []
+        )
+        scanned = 0
+        replayable = 0
+        finding_counts: dict[str, int] = {}
+        for run_dir in run_dirs:
+            if not (run_dir / "clean" / "events.jsonl").exists():
+                continue
+            symbol = _backfill_first_event_product(run_dir)
+            kwargs = _stream_depth_replay_kwargs(venue, symbol)
+            try:
+                result = replay_depth_stream_run(run_dir, write_summary=apply, **kwargs)
+            except Exception:  # noqa: BLE001 - keep going; tally as a finding
+                finding_counts["replay_error"] = finding_counts.get("replay_error", 0) + 1
+                continue
+            scanned += 1
+            if result.replayable:
+                replayable += 1
+            else:
+                for finding in result.findings:
+                    finding_counts[finding] = finding_counts.get(finding, 0) + 1
+        promotion: dict[str, int] | None = None
+        if apply and replayable > 0:
+            report = promote_replayable_runs(
+                source_root=source_root,
+                target_root=args.target_root,
+                limit=args.limit,
+                max_age_hours=args.max_age_hours,
+            )
+            promotion = {
+                "promoted_run_count": report.promoted_run_count,
+                "promoted_row_count": report.promoted_row_count,
+                "skipped_count": report.skipped_count,
+                "failed_count": report.failed_count,
+            }
+        summary_rows.append(
+            {
+                "source": source_dir_name,
+                "venue": venue,
+                "scanned": scanned,
+                "replayable": replayable,
+                "not_replayable": scanned - replayable,
+                "findings": finding_counts,
+                "promotion": promotion,
+            }
+        )
+
+    payload = {
+        "mode": "apply" if apply else "dry_run",
+        "raw_root": str(raw_root),
+        "target_root": str(args.target_root),
+        "sources": summary_rows,
+    }
+    if args.format == "json":
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    print(f"backfill-stream-depth mode={'APPLY' if apply else 'dry-run (no writes)'}")
+    print(f"raw_root={raw_root}")
+    if apply:
+        print(f"target_root={args.target_root}")
+    for row in summary_rows:
+        print(
+            f"  {row['source']:16s} scanned={row['scanned']:4d} "
+            f"replayable={row['replayable']:4d} not_replayable={row['not_replayable']:4d}"
+        )
+        if row["findings"]:
+            findings_str = ", ".join(f"{k}={v}" for k, v in sorted(row["findings"].items()))
+            print(f"      findings: {findings_str}")
+        if row["promotion"] is not None:
+            p = row["promotion"]
+            print(
+                f"      promoted: runs={p['promoted_run_count']} rows={p['promoted_row_count']} "
+                f"skipped={p['skipped_count']} failed={p['failed_count']}"
+            )
+    if not apply:
+        print(
+            "Dry run only (no files written). Re-run with --apply to regenerate "
+            "replay summaries and promote the replayable runs."
+        )
+
+
 def run_quarantine_runs(args: argparse.Namespace) -> None:
     report = quarantine_bad_runs(args.source_root, quarantine_root=args.quarantine_root, limit=args.limit, max_age_hours=args.max_age_hours)
     if args.format == "json":
@@ -2102,6 +2266,8 @@ def main() -> None:
         run_book_sync_health(args)
     elif args.command == "backfill-replay":
         run_backfill_replay(args)
+    elif args.command == "backfill-stream-depth":
+        run_backfill_stream_depth(args)
     elif args.command == "quarantine-runs":
         run_quarantine_runs(args)
     elif args.command == "promote-replayable":

@@ -1214,3 +1214,83 @@ def test_replay_trades_stream_run_with_no_events_is_unreplayable(tmp_path: Path)
     assert summary.event_count == 0
     assert "no_events" in summary.findings
     assert summary.gap_detection == "none_native"
+
+
+def test_backfill_stream_depth_dry_run_reports_without_writing(tmp_path: Path, capsys) -> None:
+    """Dry run re-replays each backlog run with the multi-anchor logic and reports how
+    many would become replayable, writing nothing."""
+    from types import SimpleNamespace
+
+    from crypto_collector.cli import run_backfill_stream_depth
+
+    raw_root = tmp_path / "raw"
+    run_path = raw_root / "bybit_depth" / "20260406_000000"
+    _write_stream_depth_run(
+        run_path,
+        [
+            _bybit_stream_row(event_type="snapshot", update_id=100, bids=[[100.0, 1.0]], asks=[[101.0, 2.0]]),
+            _bybit_stream_row(event_type="delta", update_id=101, asks=[[101.0, 1.5]], event_time="2026-04-06T00:00:01+00:00"),
+        ],
+    )
+    args = SimpleNamespace(
+        raw_root=raw_root,
+        source=["bybit_depth"],
+        target_root=tmp_path / "curated",
+        limit=200,
+        max_age_hours=1_000_000.0,
+        apply=False,
+        format="json",
+    )
+
+    run_backfill_stream_depth(args)
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["mode"] == "dry_run"
+    src = out["sources"][0]
+    assert src["scanned"] == 1
+    assert src["replayable"] == 1
+    assert src["promotion"] is None
+    # Dry run writes nothing.
+    assert not (run_path / "metrics" / "replay_summary.json").exists()
+
+
+def test_backfill_stream_depth_apply_regenerates_summary_and_promotes(
+    tmp_path: Path, capsys
+) -> None:
+    """--apply regenerates each run's replay_summary.json with the new verdict and
+    promotes the replayable runs into curated Parquet."""
+    from types import SimpleNamespace
+
+    from crypto_collector.cli import run_backfill_stream_depth
+
+    raw_root = tmp_path / "raw"
+    run_path = raw_root / "bybit_depth" / "20260406_000001"
+    _write_stream_depth_run(
+        run_path,
+        [
+            _bybit_stream_row(event_type="snapshot", update_id=100, bids=[[100.0, 1.0]], asks=[[101.0, 2.0]]),
+            _bybit_stream_row(event_type="delta", update_id=101, asks=[[101.0, 1.5]], event_time="2026-04-06T00:00:01+00:00"),
+        ],
+    )
+    args = SimpleNamespace(
+        raw_root=raw_root,
+        source=["bybit_depth"],
+        target_root=tmp_path / "curated",
+        limit=200,
+        max_age_hours=1_000_000.0,
+        apply=True,
+        format="json",
+    )
+
+    run_backfill_stream_depth(args)
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["mode"] == "apply"
+    summary_path = run_path / "metrics" / "replay_summary.json"
+    assert summary_path.exists()
+    on_disk = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert on_disk["replayable"] is True
+    assert on_disk["gap_detection"] == "sequence"
+    promotion = out["sources"][0]["promotion"]
+    assert promotion is not None
+    assert promotion["promoted_run_count"] == 1

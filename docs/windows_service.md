@@ -104,6 +104,44 @@ fall back to `ops.live.example.json` only if no local config exists. Checking th
 example config when the runner is actually using the local one will report on the
 wrong job set.
 
+## Deploying code changes (restart the runner)
+
+The runner reads the ops config **and loads the Python code once at process
+start**. Pulling new code or editing `ops.live.local.json` therefore has **no
+effect until the runner is restarted**. To deploy:
+
+```powershell
+Stop-ScheduledTask  -TaskName CryptoMarketDataPlant   # stops the running runner
+Start-ScheduledTask -TaskName CryptoMarketDataPlant   # relaunches with new code/config
+market-data-plant health --config .\ops.live.local.json
+```
+
+> ⚠️ The restart briefly interrupts **every** lane, including the live Binance
+> BTCUSDT collector — its current segment ends and a fresh one starts (a clean
+> segment boundary, not data loss). Only restart when you intend to deploy.
+
+## Backfilling stream-depth replay
+
+`replay_summary.json` is written by the collector at segment-collection time, so
+runs collected **before** a replay-logic change keep their old verdict. To rescore
+the already-collected Coinbase/Bybit/Kraken depth backlog with the current logic
+(e.g. after the multi-anchor / Kraken depth-bounded fix) and promote what now
+qualifies:
+
+```powershell
+# Dry run first — read-only, regenerates nothing, just reports counts:
+market-data-plant backfill-stream-depth --raw-root D:\market_archive\raw\market
+
+# Apply — regenerate each run's replay_summary.json AND promote the replayable ones:
+market-data-plant backfill-stream-depth --raw-root D:\market_archive\raw\market --apply
+```
+
+Defaults cover `coinbase_depth`, `bybit_depth`, `kraken_depth` (override with
+`--source`), the most recent `--limit 200` runs within `--max-age-hours 720`, and
+promote into the curated `market_replayable` root. The backfill does **not** touch
+the live collector; it only reads raw runs and writes curated Parquet, so it is safe
+to run while collection continues.
+
 ## Remove
 
 ```powershell
