@@ -326,6 +326,7 @@ def replay_depth_stream_run(
     checksum_metadata_key: str | None = None,
     checksum_price_precision: int | None = None,
     checksum_qty_precision: int | None = None,
+    book_depth: int | None = None,
 ) -> ReplaySummary:
     """Replay-validate an **in-stream-snapshot** depth run. Writes the same
     `metrics/replay_summary.json` contract as `replay_depth_run` so the existing
@@ -340,7 +341,10 @@ def replay_depth_stream_run(
     `replayable` is *structurally clean only*:
 
     - `event_count > 0`
-    - exactly one snapshot anchor, and it is the first event in the run
+    - the run starts with a snapshot anchor; the venue may re-snapshot mid-run
+      (reconnect / periodic resync), so every `event_type == "snapshot"` reseeds the
+      book and begins a new anchored sub-book — multiple anchors are expected, not a
+      defect (validation is applied *within* each anchored sub-book)
     - event timestamps are monotonic non-decreasing (snapshot has no exchange time
       and is skipped from the monotonic check)
 
@@ -353,8 +357,10 @@ def replay_depth_stream_run(
     no reorder/reset `delta <= 0`). That is a **provable gaplessness** guarantee, so
     the summary is tagged `gap_detection="sequence"`, `mode="stream_snapshot_sequence"`,
     and an id gap now *blocks* promotion (a dropped message means the book can't be
-    reconstructed). A reconnect mid-run still yields a second snapshot, caught by the
-    single-anchor invariant before the id check matters.
+    reconstructed). Contiguity is checked **within each anchored sub-book**: a snapshot
+    reseeds the baseline, so the id jump at a re-snapshot is never miscounted as a gap —
+    only a missing/duplicate/regressed id *between consecutive deltas of the same
+    sub-book* blocks promotion.
 
     **`checksum` (when `checksum_metadata_key` + precisions are set — Kraken `book`).**
     Kraken carries no dense sequence, but every frame ships a CRC32 `checksum` over
@@ -366,6 +372,13 @@ def replay_depth_stream_run(
     `gap_detection="checksum"`, `mode="stream_snapshot_checksum"`, and a mismatch
     *blocks* promotion.
 
+    **Depth-bounded book (`book_depth`).** Kraken maintains a fixed-depth book (the
+    subscribed `book.{N}`) and silently evicts the worst level when a better one
+    arrives — without sending a delete. Pass `book_depth=N` to trim each side to its
+    `N` best levels after every mutation so the reconstructed top-10 matches Kraken's;
+    without it the local book accrues stale deep levels and the CRC diverges as soon
+    as the book churns past the initial snapshot.
+
     `crossed_book_states` is surfaced as a finding for visibility but, consistent
     with `replay_depth_run`, does not by itself block promotion. Consumers MUST treat
     `gap_detection == "none_native"` data as best-effort and not assume completeness.
@@ -375,7 +388,7 @@ def replay_depth_stream_run(
     asks: dict[float, float] = {}
     event_count = 0
     snapshot_count = 0
-    snapshot_not_first_count = 0
+    first_event_is_snapshot = False
     non_monotonic_time_count = 0
     crossed_book_count = 0
     applied_bid_updates = 0
@@ -416,6 +429,11 @@ def replay_depth_stream_run(
         if instrument_id is None and isinstance(instrument, dict):
             instrument_id = _optional_str(instrument.get("instrument_id"))
 
+        event_type = _optional_str(row.get("event_type"))
+        is_snapshot = event_type == "snapshot"
+        if event_count == 1:
+            first_event_is_snapshot = is_snapshot
+
         if seq_enabled:
             metadata = row.get("metadata")
             uid = _optional_int(metadata.get(sequence_metadata_key)) if isinstance(metadata, dict) else None
@@ -425,15 +443,19 @@ def replay_depth_stream_run(
                 if first_uid is None:
                     first_uid = uid
                 last_uid = uid
-                if previous_uid is not None:
-                    delta = uid - previous_uid
-                    if delta <= 0:
-                        update_id_reorder_count += 1
-                    elif delta > 1:
-                        update_id_gap_count += 1
-                previous_uid = uid
+                if is_snapshot:
+                    # A snapshot reseeds the book and the id baseline; the jump from the
+                    # previous sub-book's last id is expected, not a gap.
+                    previous_uid = uid
+                else:
+                    if previous_uid is not None:
+                        delta = uid - previous_uid
+                        if delta <= 0:
+                            update_id_reorder_count += 1
+                        elif delta > 1:
+                            update_id_gap_count += 1
+                    previous_uid = uid
 
-        event_type = _optional_str(row.get("event_type"))
         exchange_time = _optional_str(row.get("event_time"))
         display_time = exchange_time or _optional_str(row.get("received_at"))
         if first_event_time is None:
@@ -451,11 +473,11 @@ def replay_depth_stream_run(
 
         bid_updates = _levels_from_row(row.get("bids"))
         ask_updates = _levels_from_row(row.get("asks"))
-        if event_type == "snapshot":
+        if is_snapshot:
             snapshot_count += 1
-            if event_count != 1:
-                snapshot_not_first_count += 1
-            # A snapshot reseeds the book wholesale rather than applying diffs.
+            # A snapshot reseeds the book wholesale rather than applying diffs. The
+            # venue may re-snapshot mid-run (reconnect/resync); each anchor begins a
+            # fresh sub-book that is validated independently.
             bids = {price: size for price, size in bid_updates if size > 0}
             asks = {price: size for price, size in ask_updates if size > 0}
         else:
@@ -463,6 +485,13 @@ def replay_depth_stream_run(
             applied_ask_updates += len(ask_updates)
             _apply_levels(bids, bid_updates)
             _apply_levels(asks, ask_updates)
+
+        if book_depth is not None:
+            # Depth-bounded venues (Kraken) silently evict the worst level past the
+            # subscribed depth without sending a delete; trim to keep the reconstructed
+            # top-of-book byte-identical to the venue's (so its CRC32 matches).
+            _trim_book(bids, book_depth, keep_highest=True)
+            _trim_book(asks, book_depth, keep_highest=False)
 
         best_bid = max(bids) if bids else None
         best_ask = min(asks) if asks else None
@@ -491,10 +520,10 @@ def replay_depth_stream_run(
         findings.append("no_events")
     if snapshot_count == 0:
         findings.append("no_snapshot_anchor")
-    if snapshot_count > 1:
-        findings.append("multiple_snapshot_anchors")
-    if snapshot_not_first_count:
-        findings.append("snapshot_not_first_event")
+    elif not first_event_is_snapshot:
+        # The run must open on an anchor so its first events can be reconstructed; a
+        # mid-run re-snapshot is fine (each anchor reseeds its own sub-book).
+        findings.append("run_does_not_start_with_snapshot")
     if non_monotonic_time_count:
         findings.append("non_monotonic_event_time")
     if crossed_book_count:
@@ -514,8 +543,8 @@ def replay_depth_stream_run(
 
     replayable = (
         event_count > 0
-        and snapshot_count == 1
-        and snapshot_not_first_count == 0
+        and snapshot_count >= 1
+        and first_event_is_snapshot
         and non_monotonic_time_count == 0
     )
     if seq_enabled:
@@ -1211,6 +1240,18 @@ def _apply_levels(book: dict[float, float], levels: list[tuple[float, float]]) -
             book.pop(price, None)
         else:
             book[price] = size
+
+
+def _trim_book(book: dict[float, float], depth: int, *, keep_highest: bool) -> None:
+    """Trim `book` in place to its `depth` best price levels (bids keep the highest
+    prices, asks the lowest), evicting the rest. Models a fixed-depth venue book (Kraken
+    `book.{N}`) that silently drops the worst level when a better one arrives without
+    emitting a delete for it."""
+    if depth <= 0 or len(book) <= depth:
+        return
+    keep = set(sorted(book, reverse=keep_highest)[:depth])
+    for price in [p for p in book if p not in keep]:
+        del book[price]
 
 
 def _book_from_snapshot(value: Any) -> dict[float, float]:

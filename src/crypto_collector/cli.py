@@ -979,6 +979,12 @@ _KRAKEN_BOOK_PRECISION: dict[str, tuple[int, int]] = {
     "BTC/USD": (1, 8),
 }
 
+# Kraken v2 `book` (no explicit depth) maintains the top-10 levels per side and the
+# per-frame CRC32 is taken over exactly that top-10. Kraken silently drops the worst
+# level past depth 10 without sending a delete, so replay must trim to 10 per side or
+# the reconstructed top-10 (and its CRC) diverges once the book churns past the snapshot.
+_KRAKEN_BOOK_DEPTH = 10
+
 
 async def collect_kraken_depth_segment(args: argparse.Namespace) -> dict[str, object]:
     # Kraken v2 book delivers an in-stream snapshot + updates plus a per-frame CRC32
@@ -1000,6 +1006,7 @@ async def collect_kraken_depth_segment(args: argparse.Namespace) -> dict[str, ob
         subscription_style="kraken_v2",
         normalizer=KrakenDepthNormalizer(),
         source_base="kraken_depth",
+        book_depth=_KRAKEN_BOOK_DEPTH,
         **checksum_kwargs,
     )
 
@@ -1018,6 +1025,7 @@ async def _collect_depth_stream_segment(
     checksum_metadata_key: str | None = None,
     checksum_price_precision: int | None = None,
     checksum_qty_precision: int | None = None,
+    book_depth: int | None = None,
 ) -> dict[str, object]:
     """Venue-agnostic in-stream-snapshot depth segment.
 
@@ -1069,6 +1077,7 @@ async def _collect_depth_stream_segment(
             checksum_metadata_key=checksum_metadata_key,
             checksum_price_precision=checksum_price_precision,
             checksum_qty_precision=checksum_qty_precision,
+            book_depth=book_depth,
         )
         replayable = replay_summary.replayable
         replay_findings = list(replay_summary.findings)

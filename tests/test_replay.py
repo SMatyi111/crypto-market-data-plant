@@ -833,15 +833,41 @@ def test_replay_depth_stream_run_no_snapshot_is_not_replayable(tmp_path: Path) -
     assert summary.gap_detection == "none_native"
 
 
-def test_replay_depth_stream_run_second_snapshot_breaks_replay(tmp_path: Path) -> None:
-    """A reconnect mid-run yields a *second* in-stream snapshot. Like Binance depth's
-    single-anchor invariant, two anchors mean the run isn't one continuous book, so
-    it's flagged unreplayable and the worker's next segment starts fresh."""
+def test_replay_depth_stream_run_mid_run_resnapshot_reanchors(tmp_path: Path) -> None:
+    """Stream-snapshot venues re-snapshot mid-run by design (reconnect / periodic
+    resync). Each `snapshot` reseeds the book and begins a new anchored sub-book, so a
+    second snapshot no longer breaks the run — it stays replayable (none_native:
+    structurally clean). The old single-anchor invariant is gone."""
     run_path = tmp_path / "coinbase_depth" / "20260406_000002"
     _write_stream_depth_run(
         run_path,
         [
             _stream_snapshot_row(bids=[[100.0, 1.0]], asks=[[101.0, 2.0]]),
+            _stream_l2update_row(bids=[[99.0, 3.0]], event_time="2026-04-06T00:00:01+00:00"),
+            _stream_snapshot_row(
+                bids=[[100.0, 1.0]],
+                asks=[[101.0, 2.0]],
+                received_at="2026-04-06T00:00:02.100000+00:00",
+            ),
+            _stream_l2update_row(bids=[[98.0, 4.0]], event_time="2026-04-06T00:00:03+00:00"),
+        ],
+    )
+
+    summary = replay_depth_stream_run(run_path)
+
+    assert summary.replayable is True, summary.findings
+    assert "multiple_snapshot_anchors" not in summary.findings
+    assert "snapshot_not_first_event" not in summary.findings
+
+
+def test_replay_depth_stream_run_run_must_start_with_snapshot(tmp_path: Path) -> None:
+    """A run whose first event is a delta (no opening anchor) can't be reconstructed
+    from the start, so it's flagged and not replayable — even if later snapshots
+    appear."""
+    run_path = tmp_path / "coinbase_depth" / "20260406_000004"
+    _write_stream_depth_run(
+        run_path,
+        [
             _stream_l2update_row(bids=[[99.0, 3.0]], event_time="2026-04-06T00:00:01+00:00"),
             _stream_snapshot_row(
                 bids=[[100.0, 1.0]],
@@ -854,8 +880,119 @@ def test_replay_depth_stream_run_second_snapshot_breaks_replay(tmp_path: Path) -
     summary = replay_depth_stream_run(run_path)
 
     assert summary.replayable is False
-    assert "multiple_snapshot_anchors" in summary.findings
-    assert "snapshot_not_first_event" in summary.findings
+    assert "run_does_not_start_with_snapshot" in summary.findings
+
+
+def test_replay_depth_stream_run_multi_anchor_sequence_reanchors_each_subbook(
+    tmp_path: Path,
+) -> None:
+    """Bybit re-snapshots mid-run; the update id jumps at the new anchor. That jump is
+    NOT a gap because the snapshot reseeds the baseline — each sub-book is checked for
+    +1 contiguity independently, so a clean multi-anchor run stays gap-proof."""
+    run_path = tmp_path / "bybit_depth" / "20260406_000010"
+    _write_stream_depth_run(
+        run_path,
+        [
+            _bybit_stream_row(event_type="snapshot", update_id=100, bids=[[100.0, 1.0]], asks=[[101.0, 2.0]]),
+            _bybit_stream_row(event_type="delta", update_id=101, bids=[[100.0, 0.0]], event_time="2026-04-06T00:00:01+00:00"),
+            # Re-snapshot: id jumps 101 -> 5000 (venue resync). Not a gap.
+            _bybit_stream_row(event_type="snapshot", update_id=5000, bids=[[100.0, 1.0]], asks=[[101.0, 2.0]]),
+            _bybit_stream_row(event_type="delta", update_id=5001, asks=[[101.0, 1.5]], event_time="2026-04-06T00:00:03+00:00"),
+        ],
+    )
+
+    summary = replay_depth_stream_run(run_path, sequence_metadata_key="bybit_update_id")
+
+    assert summary.replayable is True, summary.findings
+    assert summary.gap_detection == "sequence"
+    assert summary.gap_count == 0
+    assert summary.reordered_count == 0
+    assert summary.findings == []
+
+
+def test_replay_depth_stream_run_gap_within_subbook_still_blocks(tmp_path: Path) -> None:
+    """A gap *between consecutive deltas of the same sub-book* is still a dropped
+    message and still blocks promotion — re-anchoring does not mask intra-sub-book
+    gaps."""
+    run_path = tmp_path / "bybit_depth" / "20260406_000011"
+    _write_stream_depth_run(
+        run_path,
+        [
+            _bybit_stream_row(event_type="snapshot", update_id=100, bids=[[100.0, 1.0]], asks=[[101.0, 2.0]]),
+            _bybit_stream_row(event_type="delta", update_id=101, bids=[[100.0, 0.0]], event_time="2026-04-06T00:00:01+00:00"),
+            _bybit_stream_row(event_type="snapshot", update_id=5000, bids=[[100.0, 1.0]], asks=[[101.0, 2.0]]),
+            # Gap WITHIN the second sub-book: 5000 -> 5002 (5001 dropped).
+            _bybit_stream_row(event_type="delta", update_id=5002, asks=[[101.0, 1.5]], event_time="2026-04-06T00:00:03+00:00"),
+        ],
+    )
+
+    summary = replay_depth_stream_run(run_path, sequence_metadata_key="bybit_update_id")
+
+    assert summary.replayable is False
+    assert "update_id_gaps" in summary.findings
+    assert summary.gap_count == 1
+
+
+def test_replay_depth_stream_run_checksum_multi_anchor_is_replayable(tmp_path: Path) -> None:
+    """A Kraken run with a mid-run re-snapshot validates: the book resets at each anchor,
+    so every per-frame CRC matches within its sub-book."""
+    cs_a = _kraken_book_crc32({100.0: 1.0}, {101.0: 2.0}, 1, 8)
+    cs_a_upd = _kraken_book_crc32({100.0: 1.0, 99.0: 3.0}, {101.0: 2.0}, 1, 8)
+    cs_b = _kraken_book_crc32({200.0: 1.0}, {201.0: 2.0}, 1, 8)
+    run_path = tmp_path / "kraken_depth" / "20260406_000010"
+    _write_stream_depth_run(
+        run_path,
+        [
+            _kraken_stream_row(event_type="snapshot", checksum=cs_a, bids=[[100.0, 1.0]], asks=[[101.0, 2.0]]),
+            _kraken_stream_row(event_type="update", checksum=cs_a_upd, bids=[[99.0, 3.0]], event_time="2026-04-06T00:00:01+00:00"),
+            # Re-snapshot wholly reseeds the book at a different price region.
+            _kraken_stream_row(event_type="snapshot", checksum=cs_b, bids=[[200.0, 1.0]], asks=[[201.0, 2.0]]),
+        ],
+    )
+
+    summary = replay_depth_stream_run(
+        run_path,
+        checksum_metadata_key="kraken_checksum",
+        checksum_price_precision=1,
+        checksum_qty_precision=8,
+        book_depth=10,
+    )
+
+    assert summary.replayable is True, summary.findings
+    assert summary.gap_detection == "checksum"
+    assert "checksum_mismatch" not in summary.findings
+
+
+def test_replay_depth_stream_run_book_depth_trim_required_for_checksum(tmp_path: Path) -> None:
+    """Kraken evicts the worst level past the subscribed depth without a delete. With
+    book_depth the reconstructed top-N matches the venue's CRC; WITHOUT it the stale
+    deep level diverges the book and the checksum mismatches."""
+    # Subscribed depth 2 per side. A better ask arrives; Kraken drops the old worst ask
+    # (102.0) silently, so its checksum is over the trimmed top-2 {100.5, 101.0}.
+    cs_snap = _kraken_book_crc32({100.0: 1.0, 99.0: 1.0}, {101.0: 2.0, 102.0: 1.0}, 1, 8)
+    cs_trimmed = _kraken_book_crc32({100.0: 1.0, 99.0: 1.0}, {100.5: 1.0, 101.0: 2.0}, 1, 8)
+    run_path = tmp_path / "kraken_depth" / "20260406_000011"
+    rows = [
+        _kraken_stream_row(
+            event_type="snapshot", checksum=cs_snap,
+            bids=[[100.0, 1.0], [99.0, 1.0]], asks=[[101.0, 2.0], [102.0, 1.0]],
+        ),
+        _kraken_stream_row(
+            event_type="update", checksum=cs_trimmed,
+            asks=[[100.5, 1.0]], event_time="2026-04-06T00:00:01+00:00",
+        ),
+    ]
+    _write_stream_depth_run(run_path, rows)
+
+    kw = dict(checksum_metadata_key="kraken_checksum", checksum_price_precision=1, checksum_qty_precision=8)
+
+    trimmed = replay_depth_stream_run(run_path, book_depth=2, **kw)
+    assert trimmed.replayable is True, trimmed.findings
+    assert "checksum_mismatch" not in trimmed.findings
+
+    untrimmed = replay_depth_stream_run(run_path, **kw)  # no book_depth -> stale 102.0 stays
+    assert untrimmed.replayable is False
+    assert "checksum_mismatch" in untrimmed.findings
 
 
 def test_replay_depth_stream_run_non_monotonic_event_time_breaks_replay(tmp_path: Path) -> None:

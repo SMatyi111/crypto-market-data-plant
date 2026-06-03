@@ -1,7 +1,17 @@
 # Data Standards
 
-`STANDARDS_VERSION = 4`
+`STANDARDS_VERSION = 5`
 
+> **v5 (2026-06-03):** in-stream-snapshot depth replay now handles **multiple snapshot
+> anchors per run**. Stream-snapshot venues (Coinbase/Bybit/Kraken) re-snapshot mid-run
+> by design (reconnect/resync); replay re-anchors at each `snapshot` and validates each
+> sub-book independently instead of rejecting the run. The single-anchor requirement is
+> replaced by "run must start with a snapshot" (`multiple_snapshot_anchors` /
+> `snapshot_not_first_event` retired; new `run_does_not_start_with_snapshot`). Kraken
+> additionally gets a **depth-bounded book** (`book_depth=10`): the worst level past the
+> subscribed depth is evicted (Kraken drops it without a delete) so the CRC32 matches.
+> This is what makes Coinbase/Bybit/Kraken depth promotable to curated. No on-disk
+> schema or partition change — replay/curation semantics only.
 > **v4 (2026-06-01):** normalized + curated Parquet gained an `instrument=` partition
 > (the sanitized canonical symbol) via a Parquet `schema_version` `v1`→`v2` cutover —
 > data is now pullable by `(venue, instrument, event_date)`. Existing `v1` data is
@@ -279,16 +289,23 @@ no `U`/`u`. The whole-run verdict (`replay_depth_stream_run`) sets
 `replayable` iff **all** hold:
 
 - `event_count > 0`
-- exactly one snapshot anchor, and it is the **first** event in the run
+- the run **starts** with a snapshot anchor (the first event is a `snapshot`)
 - event timestamps are monotonic non-decreasing (the snapshot has no exchange
   time and is skipped from this check)
 
-Findings: `no_events`, `no_snapshot_anchor`, `multiple_snapshot_anchors`,
-`snapshot_not_first_event`, `non_monotonic_event_time`, and (reported but
-non-gating, as in §4.1) `crossed_book_states`. A reconnect mid-run yields a
-*second* in-stream snapshot, which trips `multiple_snapshot_anchors` and ends the
-run unreplayable — mirroring Binance depth's single-anchor invariant, so the
-worker's next segment simply starts a fresh book.
+**Multi-anchor (re-snapshot) handling.** Unlike Binance depth (one REST snapshot +
+reconnect-in-place alignment), stream-snapshot venues re-snapshot mid-run *by
+design* — on reconnect or periodic resync the venue simply pushes a fresh
+`snapshot` frame. So a run legitimately contains several snapshot anchors. Replay
+treats each `event_type == "snapshot"` as a **re-anchor**: it reseeds the book
+wholesale and begins a new anchored sub-book, and all integrity checks (sequence,
+checksum) are applied **within** each sub-book, never across an anchor boundary.
+Multiple anchors are therefore expected, not a defect; only a run that does **not**
+open on a snapshot is unreplayable.
+
+Findings: `no_events`, `no_snapshot_anchor`, `run_does_not_start_with_snapshot`,
+`non_monotonic_event_time`, and (reported but non-gating, as in §4.1)
+`crossed_book_states`.
 
 **Live adapter — Bybit spot `depth` (`orderbook.{depth}`) — `sequence` (not
 none_native).** Bybit's spot orderbook stream sends a frame-level `type` of
@@ -307,17 +324,19 @@ sequence are both preserved in `metadata` (`bybit_update_id`,
 `replayable` iff **all** hold:
 
 - `event_count > 0`
-- exactly one snapshot anchor, and it is the **first** event in the run
+- the run **starts** with a snapshot anchor
 - event timestamps are monotonic non-decreasing
-- `data.u` advances by exactly 1 across every event
+- `data.u` advances by exactly 1 across every event **within each anchored
+  sub-book** (a snapshot reseeds the id baseline, so the id jump at a re-snapshot is
+  not a gap)
 
-A `data.u` gap now **blocks** promotion (a dropped message means the book can't be
-reconstructed exactly). Findings: `no_events`, `no_snapshot_anchor`,
-`multiple_snapshot_anchors`, `snapshot_not_first_event`, `non_monotonic_event_time`,
-`missing_update_id`, `update_id_gaps` (`delta > 1`), `non_monotonic_update_id`
-(`delta <= 0` — reorder/reset), and (reported but non-gating) `crossed_book_states`.
-A reconnect yields a second snapshot and ends the run unreplayable; the next
-segment starts fresh.
+A `data.u` gap *between consecutive deltas of the same sub-book* now **blocks**
+promotion (a dropped message means the book can't be reconstructed exactly).
+Findings: `no_events`, `no_snapshot_anchor`, `run_does_not_start_with_snapshot`,
+`non_monotonic_event_time`, `missing_update_id`, `update_id_gaps` (`delta > 1`),
+`non_monotonic_update_id` (`delta <= 0` — reorder/reset), and (reported but
+non-gating) `crossed_book_states`. A reconnect yields a second snapshot, which
+re-anchors the book; the run stays replayable as long as each sub-book is contiguous.
 
 **Live adapter — Kraken `depth` (`book`) — `checksum` (not none_native).** Kraken's
 v2 `book` channel sends a frame-level `type` of `"snapshot"` then `"update"` frames;
@@ -338,17 +357,27 @@ asks top-10 ascending then bids top-10 descending, each level `price`@price-prec
 `update` frames carry a `timestamp`; the snapshot has none and is skipped from the
 monotonicity check.
 
+**Depth-bounded book.** Kraken maintains a fixed-depth book (the subscribed
+`book.{N}`, default 10) and **silently evicts** the worst level once a better one
+arrives past depth `N` — it does **not** send a delete for the evicted level. Replay
+is therefore called with `book_depth=10` and trims each side to its `N` best levels
+after every mutation, so the reconstructed top-10 stays byte-identical to Kraken's.
+Without the trim the local book accrues stale deep levels and the CRC32 diverges as
+soon as the book churns past the opening snapshot (empirically ~90% of frames in a
+5,000-event segment).
+
 `replayable` iff **all** hold:
 
 - `event_count > 0`
-- exactly one snapshot anchor, and it is the **first** event in the run
+- the run **starts** with a snapshot anchor (each mid-run re-snapshot reseeds the
+  book and is validated as its own sub-book)
 - event timestamps are monotonic non-decreasing
-- every event carries a checksum and all match the reconstructed book
+- every event carries a checksum and all match the reconstructed (depth-trimmed) book
 
 A checksum mismatch (or a missing checksum) now **blocks** promotion. Findings:
-`no_events`, `no_snapshot_anchor`, `multiple_snapshot_anchors`,
-`snapshot_not_first_event`, `non_monotonic_event_time`, `missing_checksum`,
-`checksum_mismatch`, and (reported but non-gating) `crossed_book_states`.
+`no_events`, `no_snapshot_anchor`, `run_does_not_start_with_snapshot`,
+`non_monotonic_event_time`, `missing_checksum`, `checksum_mismatch`, and (reported
+but non-gating) `crossed_book_states`.
 
 **Live adapter — Bybit spot `trades` (`publicTrade`).** Bybit batches many trades
 per WS frame (`data: [...]`), fanned out via `normalize_many`. The per-trade id
