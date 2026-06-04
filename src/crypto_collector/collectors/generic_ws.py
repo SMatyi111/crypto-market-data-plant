@@ -89,7 +89,7 @@ class GenericWebsocketCollector(BaseCollector):
                                     self.idle_timeout_count,
                                 )
                                 return
-                            payload = json.loads(message)
+                            payload = self._decode_frame(message)
                             if not self._should_emit(payload):
                                 continue
                             yield RawMessage(
@@ -156,6 +156,21 @@ class GenericWebsocketCollector(BaseCollector):
         except asyncio.CancelledError:
             pass
 
+    def _decode_frame(self, message: object) -> dict:
+        """Turn one raw WS frame into a payload dict.
+
+        Default path is `json.loads` — exactly what every JSON venue used before.
+        When `config.message_decoder` is set (MEXC), a **binary** frame is handed to
+        that callable (protobuf decode) instead; text frames (subscription ack, PONG)
+        still go through `json.loads`, so the shared control-frame handling is
+        unchanged. Leaving the decoder unset preserves byte-for-byte behavior for
+        every other lane, including the live Binance collector.
+        """
+        decoder = self.config.message_decoder
+        if decoder is not None and isinstance(message, (bytes, bytearray)):
+            return decoder(bytes(message))
+        return json.loads(message)
+
     async def _subscribe(self, websocket: object) -> list[RawMessage]:
         """Send subscription and wait for an ack. Returns any data frames received during the wait
         so the caller can forward them instead of dropping recorded traffic on the floor."""
@@ -177,8 +192,11 @@ class GenericWebsocketCollector(BaseCollector):
                 )
             raw = await asyncio.wait_for(websocket.recv(), timeout=remaining)
             try:
-                payload = json.loads(raw)
-            except (TypeError, ValueError):
+                payload = self._decode_frame(raw)
+            except Exception:  # noqa: BLE001 - malformed frame during ack wait; skip it
+                # json.loads raises ValueError/TypeError; the optional binary decoder
+                # (MEXC protobuf) can raise its own DecodeError. Either way a single
+                # undecodable buffered frame is skipped, not fatal to the handshake.
                 continue
             if self._is_subscription_error(payload):
                 raise RuntimeError(f"subscription rejected: {payload}")
@@ -207,6 +225,11 @@ class GenericWebsocketCollector(BaseCollector):
         if self.config.subscription_style == "kraken_v2":
             # {"method":"subscribe","success":true,...}; one ack per symbol.
             return payload.get("method") == "subscribe" and payload.get("success") is True
+        if self.config.subscription_style == "mexc":
+            # {"id":0,"code":0,"msg":"<topic>"}; code 0 = success. The PONG reply also
+            # has code 0 + msg:"PONG", but the keepalive only starts AFTER this
+            # handshake, so a pong can't be mistaken for the ack here.
+            return payload.get("code") == 0 and "msg" in payload
         return False
 
     def _is_subscription_error(self, payload: object) -> bool:
@@ -224,6 +247,10 @@ class GenericWebsocketCollector(BaseCollector):
             return payload.get("op") == "subscribe" and payload.get("success") is False
         if self.config.subscription_style == "kraken_v2":
             return payload.get("method") == "subscribe" and payload.get("success") is False
+        if self.config.subscription_style == "mexc":
+            # A non-zero code is an error (e.g. a blocked / unknown subscription).
+            code = payload.get("code")
+            return "code" in payload and code not in (None, 0)
         return False
 
     def _subscription_message(self) -> dict[str, object]:
@@ -256,6 +283,11 @@ class GenericWebsocketCollector(BaseCollector):
                     "symbol": [self.config.product],
                 },
             }
+        if self.config.subscription_style == "mexc":
+            # config.channel carries the full topic the worker built, e.g.
+            # "spot@public.aggre.deals.v3.api.pb@100ms@BTCUSDT" (trades) or
+            # "spot@public.limit.depth.v3.api.pb@BTCUSDT@20" (limit depth).
+            return {"method": "SUBSCRIPTION", "params": [self.config.channel]}
         raise ValueError(f"Unsupported subscription_style: {self.config.subscription_style}")
 
     def _should_emit(self, payload: object) -> bool:
@@ -275,6 +307,12 @@ class GenericWebsocketCollector(BaseCollector):
         if self.config.subscription_style == "kraken_v2":
             # Data frames are channel trade/book; drop heartbeat/status/pong + acks.
             return payload.get("channel") in {"trade", "book"} and "data" in payload
+        if self.config.subscription_style == "mexc":
+            # Decoded protobuf data frames carry "channel" + one of the public bodies;
+            # the JSON ack / PONG reply carry code+msg and no channel, so they're dropped.
+            return "channel" in payload and (
+                "publicAggreDeals" in payload or "publicLimitDepths" in payload
+            )
         return True
 
 

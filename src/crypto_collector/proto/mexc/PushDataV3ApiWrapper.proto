@@ -1,0 +1,43 @@
+// PushDataV3ApiWrapper - top-level envelope for every MEXC spot v3 protobuf push.
+//
+// Adapted from https://github.com/mexcdevelop/websocket-proto
+// (PushDataV3ApiWrapper.proto). The upstream wrapper's `oneof body` lists all 15
+// public+private stream payload types (each importing its own .proto). This data
+// plant subscribes to exactly two PUBLIC market-data streams - aggregated deals
+// and limit (partial-book) depth - so the oneof here is SCOPED to those two
+// branches. The field numbers are preserved verbatim from upstream
+// (publicLimitDepths = 303, publicAggreDeals = 314, channel = 1, symbol = 3,
+// symbolId = 4, createTime = 5, sendTime = 6), so the wire decode of those two
+// branches is byte-for-byte identical to decoding against the full upstream
+// wrapper. We only ever receive these two bodies because we only subscribe to
+// their channels; any other oneof branch would simply be an unparsed field.
+//
+// If you add another MEXC stream (e.g. publicIncreaseDepths = 302), vendor that
+// body's .proto here and add its branch with the upstream field number. Do not
+// renumber existing branches. See proto/mexc/README.md for the provenance + the
+// pre-rollout live-frame verification gate.
+
+syntax = "proto3";
+
+import "PublicLimitDepthsV3Api.proto";
+import "PublicAggreDealsV3Api.proto";
+
+option java_package = "com.mxc.push.common.protobuf";
+option optimize_for = SPEED;
+option java_multiple_files = true;
+option java_outer_classname = "PushDataV3ApiWrapperProto";
+
+message PushDataV3ApiWrapper {
+
+  string channel = 1;
+
+  oneof body {
+    PublicLimitDepthsV3Api publicLimitDepths = 303;
+    PublicAggreDealsV3Api publicAggreDeals = 314;
+  }
+
+  optional string symbol = 3;
+  optional string symbolId = 4;
+  optional int64 createTime = 5;
+  optional int64 sendTime = 6;
+}

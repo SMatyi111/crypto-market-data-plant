@@ -1,0 +1,28 @@
+// spot@public.limit.depth.v3.api.pb
+//
+// Vendored verbatim from https://github.com/mexcdevelop/websocket-proto
+// (PublicLimitDepthsV3Api.proto). Do not edit by hand - regenerate the bindings
+// from this file (see proto/mexc/README.md). The limit-depth stream pushes the
+// full top-N book on every update (each frame is a complete partial-book
+// snapshot), with a per-frame `version`. See proto/mexc/README.md for why this
+// lane is curated as STANDARDS 4.3 none_native.
+
+syntax = "proto3";
+
+option java_package = "com.mxc.push.common.protobuf";
+option optimize_for = SPEED;
+option java_multiple_files = true;
+option java_outer_classname = "PublicLimitDepthsV3ApiProto";
+
+message PublicLimitDepthsV3Api {
+
+  repeated PublicLimitDepthV3ApiItem asks  = 1;
+  repeated PublicLimitDepthV3ApiItem bids  = 2;
+  string eventType = 3;
+  string version = 4;
+}
+
+message PublicLimitDepthV3ApiItem {
+  string price = 1;
+  string quantity = 2;
+}

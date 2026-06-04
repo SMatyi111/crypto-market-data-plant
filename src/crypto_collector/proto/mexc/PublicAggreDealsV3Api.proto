@@ -1,0 +1,28 @@
+// spot@public.aggre.deals.v3.api.pb
+//
+// Vendored verbatim from https://github.com/mexcdevelop/websocket-proto
+// (PublicAggreDealsV3Api.proto). Do not edit by hand - regenerate the bindings
+// from this file (see proto/mexc/README.md). The aggregated-deals stream batches
+// individual trades pushed on an interval (10ms|100ms); each item carries
+// price/quantity/tradeType/time and NO per-trade id - see the gap-detection
+// note in proto/mexc/README.md (MEXC trades are STANDARDS 4.3 none_native).
+
+syntax = "proto3";
+
+option java_package = "com.mxc.push.common.protobuf";
+option optimize_for = SPEED;
+option java_multiple_files = true;
+option java_outer_classname = "PublicAggreDealsV3ApiProto";
+
+message PublicAggreDealsV3Api {
+
+  repeated PublicAggreDealsV3ApiItem deals  = 1;
+  string eventType = 2;
+}
+
+message PublicAggreDealsV3ApiItem {
+  string price = 1;
+  string quantity = 2;
+  int32 tradeType = 3;
+  int64 time = 4;
+}

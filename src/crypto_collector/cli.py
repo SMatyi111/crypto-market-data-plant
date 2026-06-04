@@ -17,6 +17,16 @@ from .collectors.generic_ws import (
     _backoff_delay,
     _is_retryable_connect_error,
 )
+from .collectors.mexc import (
+    MEXC_DEALS_CHANNEL,
+    MEXC_LIMIT_DEPTH_CHANNEL,
+    MEXC_PING_INTERVAL_SECONDS,
+    MEXC_PING_MESSAGE,
+    MEXC_WS_URL,
+    build_deals_topic,
+    build_limit_depth_topic,
+    decode_mexc_frame,
+)
 from .collectors.mock_l3 import MockL3Collector
 from .config import (
     DEFAULT_ARCHIVE_ROOT,
@@ -36,6 +46,8 @@ from .market_normalizers import (
     CoinbaseTradeNormalizer,
     KrakenDepthNormalizer,
     KrakenTradeNormalizer,
+    MexcDepthNormalizer,
+    MexcTradeNormalizer,
 )
 from .market_snapshots import fetch_binance_order_book_snapshot, write_snapshot_file
 from .models import RawMessage, utc_now
@@ -376,6 +388,105 @@ def build_parser() -> argparse.ArgumentParser:
         "--rotate-at-midnight",
         action="store_true",
         help="Rotate the run directory at midnight UTC instead of at --segment-count "
+        "messages. See the depth worker's help text for the same flag.",
+    )
+
+    mexc_trades_parser = subparsers.add_parser(
+        "mexc-trades-worker",
+        help="Run segmented MEXC spot aggregated-deals collection (protobuf, non-sequence feed)",
+    )
+    mexc_trades_parser.add_argument(
+        "--symbol",
+        default="BTCUSDT",
+        help="MEXC spot symbol, e.g. BTCUSDT / ETHUSDT (no separator).",
+    )
+    mexc_trades_parser.add_argument(
+        "--channel",
+        default=MEXC_DEALS_CHANNEL,
+        help="MEXC aggregated-deals protobuf channel prefix. The interval and symbol "
+        "are appended to form the topic '<channel>@<interval>@<SYMBOL>' (e.g. "
+        "spot@public.aggre.deals.v3.api.pb@100ms@BTCUSDT). MEXC retired its JSON "
+        "websocket on 2025-08-04, so market-data frames are Protocol Buffers and are "
+        "decoded via the vendored bindings (requires the 'protobuf' runtime). The "
+        "deals stream carries no per-trade id, so this lane is curated as a "
+        "non-sequence ('none_native') feed -- structurally clean only, NOT gap-proof "
+        "(STANDARDS 4.3).",
+    )
+    mexc_trades_parser.add_argument(
+        "--interval",
+        default="100ms",
+        choices=["10ms", "100ms"],
+        help="Aggregation push interval for the deals stream.",
+    )
+    mexc_trades_parser.add_argument("--segment-count", type=int, default=5000)
+    mexc_trades_parser.add_argument("--max-segments", type=int)
+    mexc_trades_parser.add_argument("--cooldown-seconds", type=float, default=1.0)
+    mexc_trades_parser.add_argument("--output-root", type=Path, default=default_output_root())
+    mexc_trades_parser.add_argument("--ops-root", type=Path, default=default_ops_root())
+    mexc_trades_parser.add_argument("--worker-name", default="mexc-trades-worker")
+    mexc_trades_parser.add_argument("--heartbeat-interval-seconds", type=float, default=30.0)
+    mexc_trades_parser.add_argument("--max-delay-ms", type=int, default=60_000)
+    mexc_trades_parser.add_argument("--max-future-skew-ms", type=int, default=5_000)
+    mexc_trades_parser.add_argument("--max-clock-skew-ms", type=float, default=60_000.0)
+    mexc_trades_parser.add_argument(
+        "--source-suffix",
+        default="",
+        help="Optional per-instrument lane suffix. When non-empty, runs go to "
+        "<output_root>/mexc_trades_<suffix>/<timestamp>/ instead of mexc_trades/.",
+    )
+    mexc_trades_parser.add_argument(
+        "--rotate-at-midnight",
+        action="store_true",
+        help="Rotate the run directory at midnight UTC instead of after --segment-count "
+        "messages. See the depth worker's help text for the same flag.",
+    )
+
+    mexc_depth_parser = subparsers.add_parser(
+        "mexc-depth-worker",
+        help="Run segmented MEXC spot limit (partial-book) depth collection (protobuf, non-sequence feed)",
+    )
+    mexc_depth_parser.add_argument(
+        "--symbol",
+        default="BTCUSDT",
+        help="MEXC spot symbol, e.g. BTCUSDT / ETHUSDT (no separator).",
+    )
+    mexc_depth_parser.add_argument(
+        "--channel",
+        default=MEXC_LIMIT_DEPTH_CHANNEL,
+        help="MEXC limit (partial-book) depth protobuf channel prefix. The symbol and "
+        "depth are appended to form the topic '<channel>@<SYMBOL>@<depth>' (e.g. "
+        "spot@public.limit.depth.v3.api.pb@BTCUSDT@20). Each frame is a full top-N "
+        "book, emitted as a 'snapshot' anchor; the per-frame 'version' is preserved in "
+        "metadata as gap-detection metadata but NOT used to prove gaplessness (the "
+        "frames are independent full books, not a delta chain), so this lane is curated "
+        "as a non-sequence ('none_native') feed -- structurally clean only (STANDARDS "
+        "4.3). Frames are Protocol Buffers (decoded via the vendored bindings; requires "
+        "the 'protobuf' runtime).",
+    )
+    mexc_depth_parser.add_argument(
+        "--depth",
+        type=int,
+        default=20,
+        choices=[5, 10, 20],
+        help="Number of book levels per side in the limit-depth stream.",
+    )
+    mexc_depth_parser.add_argument("--segment-count", type=int, default=5000)
+    mexc_depth_parser.add_argument("--max-segments", type=int)
+    mexc_depth_parser.add_argument("--cooldown-seconds", type=float, default=1.0)
+    mexc_depth_parser.add_argument("--output-root", type=Path, default=default_output_root())
+    mexc_depth_parser.add_argument("--ops-root", type=Path, default=default_ops_root())
+    mexc_depth_parser.add_argument("--worker-name", default="mexc-depth-worker")
+    mexc_depth_parser.add_argument("--heartbeat-interval-seconds", type=float, default=30.0)
+    mexc_depth_parser.add_argument(
+        "--source-suffix",
+        default="",
+        help="Optional per-instrument lane suffix. When non-empty, runs go to "
+        "<output_root>/mexc_depth_<suffix>/<timestamp>/ instead of mexc_depth/.",
+    )
+    mexc_depth_parser.add_argument(
+        "--rotate-at-midnight",
+        action="store_true",
+        help="Rotate the run directory at midnight UTC instead of after --segment-count "
         "messages. See the depth worker's help text for the same flag.",
     )
 
@@ -885,6 +996,32 @@ async def collect_bybit_trades_segment(args: argparse.Namespace) -> dict[str, ob
     )
 
 
+async def collect_mexc_trades_segment(args: argparse.Namespace) -> dict[str, object]:
+    # MEXC's public market data is protobuf-encoded (JSON endpoint retired
+    # 2025-08-04), so the lane supplies decode_mexc_frame as the binary-frame decoder;
+    # text ack/PONG frames stay JSON. The aggregated-deals stream carries no per-trade
+    # id, so curate as a non-sequence ("none_native") feed — structurally clean only,
+    # NOT gap-proof (STANDARDS 4.3), same class as Bybit spot trades.
+    topic = build_deals_topic(
+        channel=args.channel,
+        symbol=str(args.symbol),
+        interval=str(getattr(args, "interval", "100ms")),
+    )
+    return await _collect_trades_segment(
+        args,
+        source="mexc",
+        websocket_url=MEXC_WS_URL,
+        subscription_style="mexc",
+        normalizer=MexcTradeNormalizer(),
+        source_base="mexc_trades",
+        replay_fn=replay_trades_stream_run,
+        ping_message=MEXC_PING_MESSAGE,
+        ping_interval_seconds=MEXC_PING_INTERVAL_SECONDS,
+        message_decoder=decode_mexc_frame,
+        channel_override=topic,
+    )
+
+
 async def _collect_trades_segment(
     args: argparse.Namespace,
     *,
@@ -896,6 +1033,8 @@ async def _collect_trades_segment(
     replay_fn=replay_trades_run,
     ping_message: dict | None = None,
     ping_interval_seconds: float = 0.0,
+    message_decoder=None,
+    channel_override: str | None = None,
 ) -> dict[str, object]:
     """Venue-agnostic trades segment. The trades pipeline (generic WS collector +
     normalizer + quality gate + trades replay) is identical across venues; only the
@@ -910,7 +1049,7 @@ async def _collect_trades_segment(
         source=source,
         output_root=args.output_root,
         product=args.symbol,
-        channel=args.channel,
+        channel=channel_override or args.channel,
         websocket_url=websocket_url,
         subscription_style=subscription_style,
         max_delay_ms=args.max_delay_ms,
@@ -918,6 +1057,7 @@ async def _collect_trades_segment(
         ping_message=ping_message,
         ping_interval_seconds=ping_interval_seconds,
         idle_timeout_seconds=float(getattr(args, "idle_timeout_seconds", 0.0) or 0.0),
+        message_decoder=message_decoder,
     )
     collector = GenericWebsocketCollector(config=config)
     source_name = _build_source_name(source_base, getattr(args, "source_suffix", ""))
@@ -1056,6 +1196,32 @@ async def collect_kraken_depth_segment(args: argparse.Namespace) -> dict[str, ob
     )
 
 
+async def collect_mexc_depth_segment(args: argparse.Namespace) -> dict[str, object]:
+    # MEXC limit (partial-book) depth pushes a full top-N book every frame (decoded
+    # from protobuf), emitted as a snapshot anchor; replay_depth_stream_run validates
+    # each as a structurally-clean book. No sequence_metadata_key / checksum is passed,
+    # so the lane stays none_native: the per-frame `version` is preserved in metadata
+    # for forensics but isn't used to prove gaplessness (independent full books, not a
+    # delta chain). Same class as Coinbase depth (STANDARDS 4.3).
+    topic = build_limit_depth_topic(
+        channel=args.channel,
+        symbol=str(args.symbol),
+        depth=int(getattr(args, "depth", 20)),
+    )
+    return await _collect_depth_stream_segment(
+        args,
+        source="mexc",
+        websocket_url=MEXC_WS_URL,
+        subscription_style="mexc",
+        normalizer=MexcDepthNormalizer(),
+        source_base="mexc_depth",
+        ping_message=MEXC_PING_MESSAGE,
+        ping_interval_seconds=MEXC_PING_INTERVAL_SECONDS,
+        message_decoder=decode_mexc_frame,
+        channel_override=topic,
+    )
+
+
 async def _collect_depth_stream_segment(
     args: argparse.Namespace,
     *,
@@ -1071,6 +1237,8 @@ async def _collect_depth_stream_segment(
     checksum_price_precision: int | None = None,
     checksum_qty_precision: int | None = None,
     book_depth: int | None = None,
+    message_decoder=None,
+    channel_override: str | None = None,
 ) -> dict[str, object]:
     """Venue-agnostic in-stream-snapshot depth segment.
 
@@ -1088,12 +1256,13 @@ async def _collect_depth_stream_segment(
         source=source,
         output_root=args.output_root,
         product=args.symbol,
-        channel=args.channel,
+        channel=channel_override or args.channel,
         websocket_url=websocket_url,
         subscription_style=subscription_style,
         ping_message=ping_message,
         ping_interval_seconds=ping_interval_seconds,
         idle_timeout_seconds=float(getattr(args, "idle_timeout_seconds", 0.0) or 0.0),
+        message_decoder=message_decoder,
     )
     collector = GenericWebsocketCollector(config=config)
     source_name = _build_source_name(source_base, getattr(args, "source_suffix", ""))
@@ -1346,6 +1515,57 @@ def run_kraken_depth_worker(args: argparse.Namespace) -> None:
     )
 
 
+def run_mexc_trades_worker(args: argparse.Namespace) -> None:
+    _run_segmented_worker(
+        args=args,
+        default_worker_name="mexc-trades-worker",
+        worker_type="mexc-trades-worker",
+        venue="mexc",
+        build_segment_args=lambda source_args: SimpleNamespace(
+            symbol=source_args.symbol,
+            channel=source_args.channel,
+            interval=getattr(source_args, "interval", "100ms"),
+            count=source_args.segment_count,
+            output_root=source_args.output_root,
+            max_delay_ms=source_args.max_delay_ms,
+            max_future_skew_ms=getattr(source_args, "max_future_skew_ms", 5_000),
+            max_clock_skew_ms=getattr(source_args, "max_clock_skew_ms", 60_000.0),
+            source_suffix=getattr(source_args, "source_suffix", ""),
+            deadline_utc=None,  # _run_segmented_worker overrides this when rotate_at_midnight is set
+        ),
+        collect_segment=collect_mexc_trades_segment,
+        progress_message=lambda segment_index, summary: (
+            "mexc trades segment finished: "
+            f"segment={segment_index} clean_events={summary['clean_events']} "
+            f"replayable={summary.get('replayable')} run_path={summary['run_path']}"
+        ),
+    )
+
+
+def run_mexc_depth_worker(args: argparse.Namespace) -> None:
+    _run_segmented_worker(
+        args=args,
+        default_worker_name="mexc-depth-worker",
+        worker_type="mexc-depth-worker",
+        venue="mexc",
+        build_segment_args=lambda source_args: SimpleNamespace(
+            symbol=source_args.symbol,
+            channel=source_args.channel,
+            depth=getattr(source_args, "depth", 20),
+            count=source_args.segment_count,
+            output_root=source_args.output_root,
+            source_suffix=getattr(source_args, "source_suffix", ""),
+            deadline_utc=None,  # _run_segmented_worker overrides this when rotate_at_midnight is set
+        ),
+        collect_segment=collect_mexc_depth_segment,
+        progress_message=lambda segment_index, summary: (
+            "mexc depth segment finished: "
+            f"segment={segment_index} clean_events={summary['clean_events']} "
+            f"replayable={summary.get('replayable')} run_path={summary['run_path']}"
+        ),
+    )
+
+
 def _run_segmented_worker(
     *,
     args: argparse.Namespace,
@@ -1483,6 +1703,12 @@ def _execute_ops_job(job: JobSpec) -> JobExecutionResult | str | None:
     if job.job_type == "kraken-depth-worker":
         run_kraken_depth_worker(args)
         return "kraken depth worker completed"
+    if job.job_type == "mexc-trades-worker":
+        run_mexc_trades_worker(args)
+        return "mexc trades worker completed"
+    if job.job_type == "mexc-depth-worker":
+        run_mexc_depth_worker(args)
+        return "mexc depth worker completed"
     if job.job_type == "book-sync-health":
         run_book_sync_health(args)
         return "book sync health completed"
@@ -1676,6 +1902,47 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             # Per-lane data-arrival watchdog (0.0 = off; see
             # CollectorConfig.idle_timeout_seconds). Honored by the generic-WS lanes;
             # the Binance depth lane runs its own socket loop and ignores it.
+            idle_timeout_seconds=raw_args.get("idle_timeout_seconds", 0.0),
+        )
+    if job.job_type == "mexc-trades-worker":
+        return SimpleNamespace(
+            symbol=raw_args.get("symbol", "BTCUSDT"),
+            # Full protobuf channel prefix; the interval + symbol are appended to the topic.
+            channel=raw_args.get("channel", MEXC_DEALS_CHANNEL),
+            interval=raw_args.get("interval", "100ms"),
+            segment_count=raw_args.get("segment_count", 5000),
+            max_segments=raw_args.get("max_segments"),
+            cooldown_seconds=raw_args.get("cooldown_seconds", 1.0),
+            output_root=raw_args.get("output_root", default_output_root()),
+            ops_root=Path(raw_args.get("ops_root", default_ops_root())),
+            worker_name=raw_args.get("worker_name", "mexc-trades-worker"),
+            heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
+            max_delay_ms=raw_args.get("max_delay_ms", 60_000),
+            max_future_skew_ms=raw_args.get("max_future_skew_ms", 5_000),
+            max_clock_skew_ms=raw_args.get("max_clock_skew_ms", 60_000.0),
+            source_suffix=raw_args.get("source_suffix", ""),
+            rotate_at_midnight=raw_args.get("rotate_at_midnight", False),
+            # Per-lane data-arrival watchdog (0.0 = off; see
+            # CollectorConfig.idle_timeout_seconds). Honored by the generic-WS lanes.
+            idle_timeout_seconds=raw_args.get("idle_timeout_seconds", 0.0),
+        )
+    if job.job_type == "mexc-depth-worker":
+        return SimpleNamespace(
+            symbol=raw_args.get("symbol", "BTCUSDT"),
+            # Full protobuf channel prefix; the symbol + depth are appended to the topic.
+            channel=raw_args.get("channel", MEXC_LIMIT_DEPTH_CHANNEL),
+            depth=raw_args.get("depth", 20),
+            segment_count=raw_args.get("segment_count", 5000),
+            max_segments=raw_args.get("max_segments"),
+            cooldown_seconds=raw_args.get("cooldown_seconds", 1.0),
+            output_root=raw_args.get("output_root", default_output_root()),
+            ops_root=Path(raw_args.get("ops_root", default_ops_root())),
+            worker_name=raw_args.get("worker_name", "mexc-depth-worker"),
+            heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
+            source_suffix=raw_args.get("source_suffix", ""),
+            rotate_at_midnight=raw_args.get("rotate_at_midnight", False),
+            # Per-lane data-arrival watchdog (0.0 = off; see
+            # CollectorConfig.idle_timeout_seconds). Honored by the generic-WS lanes.
             idle_timeout_seconds=raw_args.get("idle_timeout_seconds", 0.0),
         )
     if job.job_type in {"book-sync-health", "backfill-replay"}:
@@ -2252,6 +2519,10 @@ def main() -> None:
         run_bybit_depth_worker(args)
     elif args.command == "kraken-depth-worker":
         run_kraken_depth_worker(args)
+    elif args.command == "mexc-trades-worker":
+        run_mexc_trades_worker(args)
+    elif args.command == "mexc-depth-worker":
+        run_mexc_depth_worker(args)
     elif args.command == "ops-runner":
         run_ops_runner(args)
     elif args.command == "health":

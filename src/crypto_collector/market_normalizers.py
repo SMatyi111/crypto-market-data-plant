@@ -433,6 +433,187 @@ class KrakenDepthNormalizer:
         )
 
 
+class MexcTradeNormalizer:
+    """Normalize MEXC spot v3 `publicAggreDeals` frames (decoded from protobuf).
+
+    The collector decodes MEXC's binary `PushDataV3ApiWrapper` into a plain dict
+    (`collectors/mexc.py`); this normalizer consumes that dict, so it is wire-format
+    agnostic. One frame batches several trades in `publicAggreDeals.deals`, so this
+    exposes `normalize_many` and the pipeline fans them out.
+
+    Like Bybit spot, MEXC's aggregated-deals stream carries **no per-trade id** —
+    each item is just `price`/`quantity`/`tradeType`/`time` — so `sequence` is left
+    `None` and the run is curated by `replay_trades_stream_run` as a non-sequence
+    (`none_native`) feed: structurally clean, **not** gap-proof (STANDARDS 4.3).
+
+    `tradeType` is the **taker (aggressor) side** directly (`1` = buy, `2` = sell),
+    so no flip is needed; `buyer_is_maker` is derived for the cross-venue convention
+    (taker sold => the buyer was the maker). int64 `time` arrives as a decimal string
+    (proto3 JSON) in epoch milliseconds.
+    """
+
+    def normalize_many(self, raw: RawMessage) -> list[NormalizedL3Event]:
+        body = raw.payload.get("publicAggreDeals")
+        if not isinstance(body, dict):
+            return []
+        deals = body.get("deals")
+        if not isinstance(deals, list):
+            return []
+        return [self._normalize_one(item, raw) for item in deals]
+
+    def _normalize_one(self, item: Any, raw: RawMessage) -> NormalizedL3Event:
+        item = item if isinstance(item, dict) else {}
+        parse_errors: list[str] = []
+        product = str(raw.payload.get("symbol") or "UNKNOWN")
+        trade_time = _parse_timestamp_ms(item.get("time"), parse_errors)
+        taker_side = _mexc_taker_side(item.get("tradeType"), parse_errors)
+        price = _optional_float(item.get("price"), "price", parse_errors)
+        size = _optional_float(item.get("quantity"), "size", parse_errors)
+        instrument = resolve_spot_instrument(
+            _strip_symbol_separators(product), venue=raw.source
+        )
+
+        metadata: dict[str, Any] = {
+            "instrument_id": instrument.instrument_id if instrument is not None else None,
+            "canonical_symbol": instrument.canonical_symbol if instrument is not None else None,
+            "buyer_is_maker": (taker_side == "sell") if taker_side is not None else None,
+            # Forensics: the MEXC topic and the raw protobuf frame hash (full frame
+            # bytes are preserved in raw/messages.jsonl under _mexc_decode).
+            "mexc_channel": _optional_str(raw.payload.get("channel")),
+            "mexc_frame_sha256": _mexc_frame_sha256(raw.payload),
+        }
+        if parse_errors:
+            metadata["parse_errors"] = parse_errors
+
+        return NormalizedL3Event(
+            source=raw.source,
+            product=product,
+            channel="trades",
+            event_type="trade",
+            exchange_time=trade_time,
+            received_at=raw.received_at,
+            side=taker_side,
+            price=price,
+            size=size,
+            # No per-trade id in the aggregated-deals stream -> no sequence-gap detection.
+            trade_id=None,
+            sequence=None,
+            raw_type="trade",
+            metadata={key: value for key, value in metadata.items() if value is not None},
+        )
+
+
+class MexcDepthNormalizer:
+    """Normalize MEXC spot v3 `publicLimitDepths` frames (decoded from protobuf).
+
+    MEXC's limit-depth stream pushes the **full top-N book on every update** (each
+    frame is a complete partial-book snapshot of `asks`/`bids`, levels as
+    `{"price","quantity"}`), plus a per-frame `version`. There is no separate REST
+    snapshot and no incremental-diff frame, so every frame is emitted with
+    `event_type="snapshot"`: the depth replay (`replay_depth_stream_run`) treats each
+    as a re-anchor and validates the run as structurally clean.
+
+    This is a **non-sequence** (`none_native`) feed under STANDARDS 4.3. MEXC's
+    `version` is preserved in metadata (`mexc_version`) as explicit gap-detection
+    metadata, but it is NOT used to prove gaplessness: limit-depth frames are
+    independent full books (not a delta chain), and the `version` is not a
+    verified dense +1 counter. So `first_update_id`/`final_update_id` stay None and
+    `replayable` means structurally-clean-only (a future pass could upgrade this to
+    a provable `sequence` guarantee if a dense per-symbol diff id is verified live —
+    the same path Bybit depth took).
+    """
+
+    def normalize(self, raw: RawMessage) -> NormalizedDepthUpdate:
+        payload = raw.payload
+        parse_errors: list[str] = []
+        body = payload.get("publicLimitDepths")
+        body = body if isinstance(body, dict) else {}
+        product = str(payload.get("symbol") or "UNKNOWN")
+        # The wrapper send time (matching-engine push time) is the per-frame clock;
+        # fall back to createTime. Both are epoch-ms decimal strings (proto3 JSON).
+        event_time = _parse_timestamp_ms(
+            payload.get("sendTime") if payload.get("sendTime") is not None else payload.get("createTime"),
+            parse_errors,
+        )
+        bids = _parse_mexc_book_levels(body.get("bids"), "bids", parse_errors)
+        asks = _parse_mexc_book_levels(body.get("asks"), "asks", parse_errors)
+        instrument = resolve_spot_instrument(
+            _strip_symbol_separators(product), venue=raw.source
+        )
+        metadata: dict[str, Any] = {
+            # Preserved as explicit gap-detection metadata (STANDARDS 4.3); NOT used
+            # as a dense gap-proof sequence (see class docstring).
+            "mexc_version": _optional_int(body.get("version"), "version", parse_errors),
+            "mexc_channel": _optional_str(payload.get("channel")),
+            "mexc_frame_sha256": _mexc_frame_sha256(payload),
+        }
+        if parse_errors:
+            metadata["parse_errors"] = parse_errors
+        return NormalizedDepthUpdate(
+            source=raw.source,
+            product=product,
+            channel="depth",
+            # Every limit-depth frame is a full top-N book -> a snapshot anchor.
+            event_type="snapshot",
+            event_time=event_time,
+            received_at=raw.received_at,
+            first_update_id=None,
+            final_update_id=None,
+            instrument=instrument,
+            bids=bids,
+            asks=asks,
+            metadata={key: value for key, value in metadata.items() if value is not None},
+        )
+
+
+def _mexc_taker_side(value: Any, errors: list[str]) -> str | None:
+    # MEXC `tradeType` is the taker (aggressor) side: 1 = buy, 2 = sell. A missing
+    # value (proto3 omits the int32 default 0) means unknown, not an error.
+    if value in (None, "", 0):
+        return None
+    if value == 1:
+        return "buy"
+    if value == 2:
+        return "sell"
+    errors.append("invalid_side")
+    return None
+
+
+def _mexc_frame_sha256(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    provenance = payload.get("_mexc_decode")
+    if isinstance(provenance, dict):
+        return _optional_str(provenance.get("frame_sha256"))
+    return None
+
+
+def _parse_mexc_book_levels(
+    values: Any,
+    field_name: str,
+    errors: list[str],
+) -> list[list[float]]:
+    """Parse MEXC depth levels (`[{"price":.., "quantity":..}, ...]`) into the
+    `[[price, size]]` shape `_apply_levels` expects. A `quantity` of `0` removes the
+    level (consistent with the other depth feeds), though MEXC limit-depth frames are
+    full books rather than diffs."""
+    if values in (None, ""):
+        return []
+    if not isinstance(values, list):
+        errors.append(f"invalid_{field_name}")
+        return []
+    levels: list[list[float]] = []
+    for item in values:
+        try:
+            price = float(item["price"])
+            size = float(item["quantity"])
+        except (TypeError, ValueError, KeyError):
+            errors.append(f"invalid_{field_name}")
+            continue
+        levels.append([price, size])
+    return levels
+
+
 def _bybit_taker_side(value: Any, errors: list[str]) -> str | None:
     # Bybit `S` is the taker (aggressor) side, capitalized.
     if value == "Buy":
@@ -520,6 +701,12 @@ def _optional_float(value: Any, field_name: str, errors: list[str]) -> float | N
     except (TypeError, ValueError):
         errors.append(f"invalid_{field_name}")
         return None
+
+
+def _optional_str(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    return str(value)
 
 
 def _trade_side(buyer_is_maker: bool | None) -> str | None:

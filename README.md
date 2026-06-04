@@ -30,10 +30,23 @@ unaffected. Enable them per lane when you want them:
 | Coinbase | ✅      | ✅      | trades = sequence; depth = `none_native` |
 | Kraken   | ✅      | ✅      | trades = sequence; depth = `checksum` (CRC32) |
 | Bybit    | ✅      | ✅      | trades = `none_native`; depth = sequence (`data.u` +1) |
+| MEXC     | ✅      | ✅      | trades = `none_native`; depth = `none_native` (protobuf) |
 
 `none_native` lanes are curated as *structurally clean*, **not** gap-proof — see
 [`STANDARDS.md`](STANDARDS.md) §4.3. The mock feed exists only for local smoke
 tests.
+
+**MEXC** is implemented and tested but ships **disabled and unverified-against-live**.
+MEXC retired its JSON websocket on 2025-08-04, so its public market data is now
+**Protocol Buffers** on `wss://wbs-api.mexc.com/ws` — the only binary-transport venue
+here. Frames are decoded through vendored, generated protobuf bindings (the MEXC lane
+needs the `protobuf` runtime: `pip install -e ".[mexc]"`); the JSON ack/PING frames are
+unchanged. Both MEXC lanes are `none_native`: the aggregated-deals stream has no
+per-trade id, and limit-depth pushes independent full top-N books (each a snapshot)
+whose `version` is kept as metadata but not used to prove gaplessness. The vendored
+schema was built from MEXC's published proto + docs, **not** a live capture — verify
+against real frames before enabling (see
+[`src/crypto_collector/proto/mexc/README.md`](src/crypto_collector/proto/mexc/README.md)).
 
 ## Data Contract
 
@@ -104,8 +117,9 @@ D:\market_archive
 
 Raw/quarantine lane directories are `<venue>_<dataset>[_<suffix>]` —
 `binance_depth`, `binance_trades`, `coinbase_trades`, `coinbase_depth`,
-`kraken_trades`, `kraken_depth`, `bybit_trades`, `bybit_depth`, plus an optional
-per-instrument suffix (`binance_trades_ethusdt`). Depth lanes promote into
+`kraken_trades`, `kraken_depth`, `bybit_trades`, `bybit_depth`, `mexc_trades`,
+`mexc_depth`, plus an optional per-instrument suffix (`binance_trades_ethusdt`).
+Depth lanes promote into
 `market_replayable`; trades lanes promote into `trades_replayable`. Since the
 `schema_version=v2` cutover, normalized and curated Parquet carry an
 `instrument=<canonical>` partition (the sanitized canonical symbol, e.g.
@@ -128,6 +142,10 @@ python -m venv .venv
 .\.venv\Scripts\activate
 pip install -e ".[dev]"
 ```
+
+`[dev]` includes the `protobuf` runtime, so the MEXC tests run out of the box. To run
+a live MEXC worker without the dev extras, install the `[mexc]` extra instead
+(`pip install -e ".[mexc]"`).
 
 Check the installation:
 
@@ -162,6 +180,15 @@ market-data-plant kraken-trades-worker   --symbol BTC/USD --channel trade --max-
 market-data-plant kraken-depth-worker    --symbol BTC/USD --channel book --max-segments 1
 market-data-plant bybit-trades-worker    --symbol BTCUSDT --channel publicTrade --max-segments 1
 market-data-plant bybit-depth-worker     --symbol BTCUSDT --channel orderbook.50 --max-segments 1
+```
+
+MEXC is protobuf-only (`pip install -e ".[mexc]"` for the `protobuf` runtime). The
+worker builds the full topic from the channel prefix plus `--interval` (trades) or
+`--depth` (depth):
+
+```powershell
+market-data-plant mexc-trades-worker --symbol BTCUSDT --interval 100ms --max-segments 1
+market-data-plant mexc-depth-worker  --symbol BTCUSDT --depth 20 --max-segments 1
 ```
 
 Two cross-cutting lane flags (both default to legacy behavior, so the live BTC

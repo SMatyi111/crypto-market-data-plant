@@ -208,6 +208,35 @@ layout, or an external venue, so none should be started silently.
    restart the ops-runner (so the live collector loads this code — briefly interrupts the
    Binance lane) and run `backfill-stream-depth --apply` for the existing backlog.
 
+8. **MEXC spot adapter (protobuf transport)** — IMPLEMENTED, ships DISABLED, pending
+   live-frame verification. MEXC retired its JSON websocket on 2025-08-04, so its public
+   market data is **Protocol Buffers** on `wss://wbs-api.mexc.com/ws` — the first
+   binary-transport venue. Added: vendored `.proto` (`src/crypto_collector/proto/mexc`) +
+   committed generated bindings (`collectors/mexc_pb`) + a decode seam
+   (`collectors/mexc.py`, `decode_mexc_frame`) wired in via an opt-in
+   `CollectorConfig.message_decoder` (binary frames → payload dict; JSON ack/PING
+   unchanged, every other lane byte-for-byte identical); `MexcTradeNormalizer` +
+   `MexcDepthNormalizer`; `mexc-trades-worker` / `mexc-depth-worker` CLI + ops job types;
+   disabled lanes + quarantine/promote + cleanup retention in `ops.live.example.json`.
+   **Classification — both `none_native`** (STANDARDS 4.3): the aggregated-deals stream
+   (`spot@public.aggre.deals.v3.api.pb`) has no per-trade id; limit-depth
+   (`spot@public.limit.depth.v3.api.pb`) pushes independent full top-N books (each a
+   snapshot) whose `version` is kept as `metadata.mexc_version` but not used to prove
+   gaplessness. Trades → `trades_replayable`, depth → `market_replayable`. Raw frames
+   carry a `_mexc_decode` provenance block (schema/sha256/base64) so raw stays a rebuild
+   source. `protobuf` is an optional `[mexc]` extra (also in `[dev]` for tests); runtime
+   needs only the runtime, never `protoc`. No `STANDARDS_VERSION` bump — reuses the
+   existing `none_native` class with no schema/partition/replayable-definition change.
+   **Verification gate:** the vendored schema + classification were built from MEXC's
+   published proto + docs, **not** a live capture (offline/dry-run constraint), so the
+   lanes are disabled until verified against real frames (see
+   `src/crypto_collector/proto/mexc/README.md`). A future pass could upgrade depth to a
+   provable `sequence` guarantee if a dense per-symbol diff id is verified live (the
+   `version` is already captured), the same path Bybit depth took (#4). **Note:** the
+   editable `crypto_collector` install resolves to `…\Crypto_L3 collection\src`, a
+   different tree than this repo — reinstall from this repo (`pip install -e ".[mexc]"`)
+   so the lane is importable before any rollout.
+
 Also still parked: the **L3 collection project** re-enable (see bottom of this
 file) and making **day-bounded rotation the default** run model (currently
 opt-in via `--rotate-at-midnight`).

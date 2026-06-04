@@ -12,6 +12,19 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+    # The MEXC lane's protobuf bindings + the offline binary-fixture tests need the
+    # protobuf runtime; keep it in dev so `pytest` exercises the MEXC decode path.
+    "protobuf>=6.33.5,<8",
+]
+# MEXC spot market data is protobuf-encoded (the JSON websocket was retired
+# 2025-08-04). Only the MEXC lane needs this; the core install (and the live Binance
+# deployment) stays protobuf-free. Enable with `pip install -e ".[mexc]"`. The
+# generated bindings are committed (crypto_collector/collectors/mexc_pb), so runtime
+# needs only this `protobuf` runtime, never `protoc`. Range floored at the version the
+# committed gencode targets and capped below the next major (gencode major N runs on
+# runtime major N..N+1); both 6.33.x and 7.x were validated.
+mexc = [
+    "protobuf>=6.33.5,<8",
 ]
 
 [project.scripts]

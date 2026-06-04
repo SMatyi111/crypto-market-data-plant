@@ -47,7 +47,9 @@ Two normalized datasets, each collected per (venue, instrument) lane:
 | `trades` | trade prints     | `BinanceTradeNormalizer`, `CoinbaseTradeNormalizer`, `KrakenTradeNormalizer`, `BybitTradeNormalizer` | `trades_replayable` |
 
 Venues live today: **Binance** (depth + trades), **Coinbase** (trades + depth),
-**Kraken** (trades + depth), **Bybit** (trades + depth). See Roadmap for the rest.
+**Kraken** (trades + depth), **Bybit** (trades + depth). **MEXC** (trades + depth) is
+implemented and tested but ships **disabled**, pending live-frame schema verification
+— it is the only **protobuf-transport** venue (see §4.3). See Roadmap for the rest.
 
 > **Gap-detection class differs by feed, not just by venue.** Three classes, tagged
 > per lane as `gap_detection` in the manifest (§6):
@@ -59,8 +61,10 @@ Venues live today: **Binance** (depth + trades), **Coinbase** (trades + depth),
 > - **`checksum`** — a per-frame CRC32 over the reconstructed book proves integrity,
 >   so a dropped/corrupted update is caught (§4.3): **Kraken `book` depth**.
 > - **`none_native`** — no usable integrity signal, so `replayable` means
->   *structurally clean*, **not** gap-proof: Coinbase depth (`level2_50`) and **Bybit
->   spot trades** (`publicTrade`, whose trade id is a UUID).
+>   *structurally clean*, **not** gap-proof: Coinbase depth (`level2_50`), **Bybit
+>   spot trades** (`publicTrade`, whose trade id is a UUID), and **both MEXC lanes**
+>   (aggregated-deals trades carry no per-trade id; limit-depth pushes independent full
+>   books whose `version` is metadata-only — see §4.3).
 >
 > `sequence` and `checksum` are both **provable** (consumers can rely on
 > completeness); `none_native` is best-effort. Two lanes of the same dataset can
@@ -87,7 +91,8 @@ A collector "run" is one segment directory:
 `<source>` is the lane directory:
 
 - `binance_depth`, `binance_trades`, `coinbase_trades`, `coinbase_depth`,
-  `kraken_trades`, `bybit_trades`, `bybit_depth`, `kraken_depth`
+  `kraken_trades`, `bybit_trades`, `bybit_depth`, `kraken_depth`, `mexc_trades`,
+  `mexc_depth`
 - Per-instrument lanes append a sanitized suffix: `binance_trades_ethusdt`, etc.
   (`--source-suffix`; empty preserves the legacy single-symbol layout).
 
@@ -400,6 +405,51 @@ consumer that needs provable completeness MUST gate on the lane's
 `gap_detection == "sequence"` (Kraken/Binance/Coinbase trades), not just on the
 `trades` dataset.
 
+**Transport note — MEXC is protobuf, not JSON.** MEXC retired its JSON websocket
+(`wss://wbs.mexc.com/ws`) on 2025-08-04; public market data is now **Protocol
+Buffers** on `wss://wbs-api.mexc.com/ws` (the subscription ack and PING/PONG control
+frames stay JSON text). It is the only binary-transport venue: the collector decodes a
+binary `PushDataV3ApiWrapper` frame into the same payload dict every JSON venue
+produces, via vendored generated bindings + the `protobuf` runtime
+(`crypto_collector/collectors/mexc.py`, `…/mexc_pb/`; regenerate with
+`scripts/generate_mexc_protobuf.py`). The decoded dict — including a `_mexc_decode`
+provenance block (schema, proto source, decoder version, frame byte length, SHA-256,
+and base64 of the original frame) — is what lands in `raw/messages.jsonl`, so raw stays
+a true rebuild source even though the wire bytes were protobuf. **The vendored schema
+and the classifications below were built from MEXC's published proto + docs, not a live
+capture, so both MEXC lanes ship disabled pending live-frame verification**
+(see `src/crypto_collector/proto/mexc/README.md`).
+
+**Live adapter — MEXC spot `trades` (`aggre.deals`).** Channel
+`spot@public.aggre.deals.v3.api.pb@<interval>@<SYMBOL>`. One frame batches several
+deals (`publicAggreDeals.deals`), fanned out via `normalize_many`. Each deal carries
+only `price`/`quantity`/`tradeType`/`time` — **no per-trade id** — so `sequence` is left
+`None` and the whole-run verdict (`replay_trades_stream_run`) sets
+`gap_detection: "none_native"`, `mode: "trade_stream_none_native"`. `tradeType` is the
+**taker (aggressor) side** directly (`1` = buy, `2` = sell), so no flip is needed;
+`buyer_is_maker` is derived. Same `replayable` bar as Bybit spot trades: `event_count >
+0`, monotonic exchange timestamps, finite-positive `price`/`size`, clock skew within
+`--max-clock-skew-ms`. Findings: `no_events`, `non_monotonic_event_time`,
+`invalid_prices`, `invalid_sizes`, `excessive_clock_skew`. Promotes to
+`trades_replayable`.
+
+**Live adapter — MEXC spot `depth` (`limit.depth`).** Channel
+`spot@public.limit.depth.v3.api.pb@<SYMBOL>@<depth>` (depth 5/10/20). MEXC's
+limit-depth stream pushes the **full top-N book on every update** (`publicLimitDepths`
+with `asks`/`bids` as `{"price","quantity"}`), so each frame is a complete partial-book
+snapshot and is emitted with `event_type="snapshot"`. The whole-run verdict
+(`replay_depth_stream_run`, default mode) treats every frame as a re-anchor and sets
+`gap_detection: "none_native"`, `mode: "stream_snapshot"`. The per-frame `version` is
+preserved in `metadata.mexc_version` as explicit gap-detection metadata but is **not**
+used to prove gaplessness: limit-depth frames are independent full books (not a delta
+chain), and the `version` is not a verified dense +1 counter — so unlike Bybit
+`orderbook` (which IS `sequence`), this stays `none_native`. `replayable` iff
+`event_count > 0`, the run starts with a snapshot anchor (always true — every frame is a
+snapshot), and event timestamps (the wrapper `sendTime`) are monotonic non-decreasing.
+Promotes to `market_replayable`. A future pass could upgrade this lane to a provable
+`sequence` guarantee if a dense per-symbol diff id is verified live (the same path Bybit
+depth took); the `version` is already captured for that.
+
 > **Bybit keepalive.** Bybit drops idle public connections after ~10 min and
 > expects a `{"op":"ping"}` roughly every 20 s. Both Bybit lanes opt into the
 > collector's app-level keepalive (`CollectorConfig.ping_message` +
@@ -407,9 +457,11 @@ consumer that needs provable completeness MUST gate on the lane's
 > interval, concurrently with the receive loop, so a low-volume symbol no longer
 > ends its segment early on the idle drop. The pong reply carries no `topic`, so
 > the data path drops it (`_should_emit`) and it can't be mistaken for the
-> subscription ack. Every other venue leaves the keepalive off and relies on the
-> `websockets` library's protocol-level ping/pong — the live Binance collector is
-> unchanged.
+> subscription ack. MEXC opts into the same keepalive with its own control frame
+> (`{"method":"PING"}` every 20 s; the `{"msg":"PONG"}` reply has no `channel`, so
+> `_should_emit` drops it) because MEXC closes a subscribed-but-silent connection after
+> ~60 s. Every other venue leaves the keepalive off and relies on the `websockets`
+> library's protocol-level ping/pong — the live Binance collector is unchanged.
 
 > **Data-arrival watchdog.** A feed can ack the subscription and then go
 > *silent-but-connected* — keepalive/ping still flowing, but zero data frames (exactly

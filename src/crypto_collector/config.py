@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 import os
 import warnings
 from pathlib import Path
+from typing import Any
 
 
 DEFAULT_ARCHIVE_ROOT = Path(r"D:\market_archive")
@@ -81,6 +83,13 @@ class CollectorConfig:
     # 0.0 = OFF, preserving the exact `async for message in websocket` behavior for every
     # existing lane (incl. the live Binance collector); enable per-lane via the ops config.
     idle_timeout_seconds: float = 0.0
+    # Optional binary-frame decoder. Default None = the legacy `json.loads(text)` path,
+    # which every JSON venue (Binance/Coinbase/Kraken/Bybit) uses unchanged. When set
+    # (MEXC only), a *binary* WS frame is handed to this callable to produce the payload
+    # dict instead of being JSON-parsed; text frames (subscription ack, PONG) still go
+    # through json.loads so the control-frame handling is shared. MEXC's public market
+    # data is protobuf-encoded, so its lane supplies `decode_mexc_frame` here.
+    message_decoder: Callable[[bytes], dict[str, Any]] | None = None
 
 
 @dataclass(slots=True)

@@ -320,6 +320,92 @@
       }
     },
     {
+      "// protobuf non-sequence trades lane": "MEXC retired its JSON websocket on 2025-08-04; public market data is now Protocol Buffers on wss://wbs-api.mexc.com/ws. The lane decodes frames via vendored bindings (needs the 'protobuf' runtime: pip install -e .[mexc]). The aggregated-deals stream carries no per-trade id, so this is a none_native feed (STANDARDS 4.3): 'replayable' means structurally clean (monotonic timestamps, valid price/size, bounded clock skew) -- NOT gap-proof. Promoted rows go to trades_replayable. DISABLED pending live-frame schema verification (see proto/mexc/README.md). channel is the protobuf channel prefix; interval+symbol are appended to the topic.",
+      "name": "mexc-btc-trades",
+      "job_type": "mexc-trades-worker",
+      "enabled": false,
+      "interval_seconds": 3600,
+      "args": {
+        "symbol": "BTCUSDT",
+        "channel": "spot@public.aggre.deals.v3.api.pb",
+        "interval": "100ms",
+        "segment_count": 5000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "worker_name": "mexc-trades-worker",
+        "output_root": "D:\\market_archive\\raw\\market",
+        "ops_root": "D:\\market_archive\\ops"
+      }
+    },
+    {
+      "name": "quarantine-mexc-trades",
+      "job_type": "quarantine-runs",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "D:\\market_archive\\raw\\market\\mexc_trades",
+        "quarantine_root": "D:\\market_archive\\quarantine\\market\\mexc_trades",
+        "limit": 20,
+        "max_age_hours": 6
+      }
+    },
+    {
+      "name": "promote-mexc-trades",
+      "job_type": "promote-replayable",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "D:\\market_archive\\raw\\market\\mexc_trades",
+        "target_root": "D:\\market_archive\\curated\\research\\trades_replayable",
+        "quarantine_index": "D:\\market_archive\\quarantine\\market\\mexc_trades\\_quarantine_index.jsonl",
+        "limit": 20,
+        "max_age_hours": 6
+      }
+    },
+    {
+      "// protobuf non-sequence depth lane": "MEXC limit (partial-book) depth pushes the full top-N book every frame (decoded from protobuf), emitted as a snapshot anchor; replay_depth_stream_run validates each as a structurally-clean book. none_native (STANDARDS 4.3): the per-frame 'version' is preserved in metadata as gap-detection metadata but NOT used to prove gaplessness (independent full books, not a delta chain). Promoted rows go to market_replayable like the other depth lanes. DISABLED pending live-frame schema verification. channel is the protobuf channel prefix; symbol+depth are appended to the topic.",
+      "name": "mexc-btc-depth",
+      "job_type": "mexc-depth-worker",
+      "enabled": false,
+      "interval_seconds": 3600,
+      "args": {
+        "symbol": "BTCUSDT",
+        "channel": "spot@public.limit.depth.v3.api.pb",
+        "depth": 20,
+        "segment_count": 5000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "worker_name": "mexc-depth-worker",
+        "output_root": "D:\\market_archive\\raw\\market",
+        "ops_root": "D:\\market_archive\\ops"
+      }
+    },
+    {
+      "name": "quarantine-mexc-depth",
+      "job_type": "quarantine-runs",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "D:\\market_archive\\raw\\market\\mexc_depth",
+        "quarantine_root": "D:\\market_archive\\quarantine\\market\\mexc_depth",
+        "limit": 20,
+        "max_age_hours": 6
+      }
+    },
+    {
+      "name": "promote-mexc-depth",
+      "job_type": "promote-replayable",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "D:\\market_archive\\raw\\market\\mexc_depth",
+        "target_root": "D:\\market_archive\\curated\\research\\market_replayable",
+        "quarantine_index": "D:\\market_archive\\quarantine\\market\\mexc_depth\\_quarantine_index.jsonl",
+        "limit": 20,
+        "max_age_hours": 6
+      }
+    },
+    {
       "name": "book-sync-health",
       "job_type": "book-sync-health",
       "interval_seconds": 300,
@@ -398,7 +484,9 @@
           "market/kraken_trades=14",
           "market/bybit_trades=14",
           "market/bybit_depth=14",
-          "market/kraken_depth=14"
+          "market/kraken_depth=14",
+          "market/mexc_trades=14",
+          "market/mexc_depth=14"
         ],
         "apply": false
       }
