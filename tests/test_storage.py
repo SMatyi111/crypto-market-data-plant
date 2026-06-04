@@ -4,7 +4,10 @@ from pathlib import Path
 
 import pyarrow.dataset as ds
 
+from crypto_collector.pipeline import CollectorPipeline
+from crypto_collector.quality import QualityGate
 from crypto_collector.storage import JsonlSink, ParquetDatasetSink, RotatingJsonlSink
+from crypto_collector.storage import RunPaths
 
 
 def test_rotating_jsonl_sink_rolls_files_at_byte_threshold(tmp_path: Path) -> None:
@@ -37,6 +40,42 @@ def test_jsonl_sink_flushes_each_write_so_partial_lines_dont_accumulate(tmp_path
     # Read without closing any other handle — every write must be durably on disk already.
     lines = (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()
     assert lines == ['{"a": 1}', '{"a": 2}']
+
+
+def test_jsonl_sink_non_fsync_buffers_and_flushes_on_close(tmp_path: Path) -> None:
+    sink = JsonlSink(tmp_path, "events.jsonl", fsync=False, flush_every=100)
+    sink.write({"a": 1})
+    sink.write({"a": 2})
+
+    sink.close()
+
+    lines = (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    assert lines == ['{"a": 1}', '{"a": 2}']
+
+
+def test_pipeline_can_disable_data_jsonl_fsync_without_touching_metrics(tmp_path: Path) -> None:
+    paths = RunPaths(
+        base=tmp_path,
+        raw=tmp_path / "raw",
+        clean=tmp_path / "clean",
+        quarantine=tmp_path / "quarantine",
+        metrics=tmp_path / "metrics",
+    )
+    for path in (paths.raw, paths.clean, paths.quarantine, paths.metrics):
+        path.mkdir()
+
+    pipeline = CollectorPipeline(
+        collector=object(),
+        normalizer=object(),
+        quality_gate=QualityGate(),
+        run_paths=paths,
+        jsonl_fsync=False,
+    )
+
+    assert pipeline.raw_sink._fsync is False
+    assert pipeline.clean_sink._fsync is False
+    assert pipeline.quarantine_sink._fsync is False
+    assert pipeline.metrics_sink._fsync is True
 
 
 def test_parquet_dataset_sink_writes_partitioned_dataset(tmp_path: Path) -> None:

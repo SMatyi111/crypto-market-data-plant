@@ -131,7 +131,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     trades_parser = subparsers.add_parser("binance-trades-worker", help="Run segmented Binance trade collection")
     trades_parser.add_argument("--symbol", default="btcusdt")
-    trades_parser.add_argument("--channel", choices=["trade", "aggTrade"], default="aggTrade")
+    trades_parser.add_argument("--channel", choices=["trade", "aggTrade"], default="trade")
     trades_parser.add_argument("--segment-count", type=int, default=5000)
     trades_parser.add_argument("--max-segments", type=int)
     trades_parser.add_argument("--cooldown-seconds", type=float, default=1.0)
@@ -154,6 +154,22 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Rotate the run directory at midnight UTC instead of at --segment-count "
         "messages. See the depth worker's help text for the same flag.",
+    )
+    trades_parser.add_argument(
+        "--no-jsonl-fsync",
+        action="store_false",
+        dest="jsonl_fsync",
+        default=True,
+        help="Disable per-row fsync for raw/clean/quarantine JSONL writes. Use only "
+        "for high-rate lanes where replay continuity is the promotion gate.",
+    )
+    trades_parser.add_argument(
+        "--no-normalized-parquet",
+        action="store_false",
+        dest="normalized_parquet",
+        default=True,
+        help="Skip hot-path normalized Parquet writes. Raw/clean JSONL and replay "
+        "summaries are still written; use for high-rate lanes that curate via replay.",
     )
 
     cb_trades_parser = subparsers.add_parser(
@@ -1071,7 +1087,12 @@ async def _collect_trades_segment(
             session_id=run_paths.base.name,
         ),
         run_paths=run_paths,
-        normalized_root=default_normalized_root("trades"),
+        normalized_root=(
+            default_normalized_root("trades")
+            if bool(getattr(args, "normalized_parquet", True))
+            else None
+        ),
+        jsonl_fsync=bool(getattr(args, "jsonl_fsync", True)),
     )
     pipeline_summary = await pipeline.run(
         limit=args.count,
@@ -1782,6 +1803,8 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             # CollectorConfig.idle_timeout_seconds). Honored by the generic-WS lanes;
             # the Binance depth lane runs its own socket loop and ignores it.
             idle_timeout_seconds=raw_args.get("idle_timeout_seconds", 0.0),
+            jsonl_fsync=raw_args.get("jsonl_fsync", True),
+            normalized_parquet=raw_args.get("normalized_parquet", True),
         )
     if job.job_type == "coinbase-trades-worker":
         return SimpleNamespace(

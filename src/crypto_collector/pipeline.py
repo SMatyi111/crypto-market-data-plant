@@ -38,6 +38,7 @@ class CollectorPipeline:
         normalized_root: Path | None = None,
         raw_rotate_bytes: int = 512 * 1024 * 1024,
         metrics_flush_every: int = 1000,
+        jsonl_fsync: bool = True,
     ) -> None:
         self.metrics_flush_every = max(0, int(metrics_flush_every))
         self.collector = collector
@@ -45,9 +46,14 @@ class CollectorPipeline:
         self.quality_gate = quality_gate
         # Raw traffic is the fastest-growing file; rotate it so a long-running
         # collector doesn't produce a single multi-GB messages.jsonl.
-        self.raw_sink = RotatingJsonlSink(run_paths.raw, "messages.jsonl", max_bytes=raw_rotate_bytes)
-        self.clean_sink = JsonlSink(run_paths.clean, "events.jsonl")
-        self.quarantine_sink = JsonlSink(run_paths.quarantine, "events.jsonl")
+        self.raw_sink = RotatingJsonlSink(
+            run_paths.raw,
+            "messages.jsonl",
+            max_bytes=raw_rotate_bytes,
+            fsync=jsonl_fsync,
+        )
+        self.clean_sink = JsonlSink(run_paths.clean, "events.jsonl", fsync=jsonl_fsync)
+        self.quarantine_sink = JsonlSink(run_paths.quarantine, "events.jsonl", fsync=jsonl_fsync)
         self.metrics_sink = JsonlSink(run_paths.metrics, "summary.jsonl")
         self.parquet_sink = ParquetDatasetSink(normalized_root) if normalized_root else None
 
@@ -122,6 +128,10 @@ class CollectorPipeline:
             )
             if self.parquet_sink is not None:
                 self.parquet_sink.flush()
+            for sink in (self.raw_sink, self.clean_sink, self.quarantine_sink):
+                close = getattr(sink, "close", None)
+                if callable(close):
+                    close()
         return summary
 
 

@@ -34,18 +34,46 @@ def prepare_run_paths(output_root: Path, source: str, started_at: datetime | Non
 
 
 class JsonlSink:
-    def __init__(self, root: Path, filename: str, *, fsync: bool = True) -> None:
+    def __init__(
+        self,
+        root: Path,
+        filename: str,
+        *,
+        fsync: bool = True,
+        flush_every: int = 100,
+    ) -> None:
         self.path = root / filename
         self._fsync = fsync
+        self._flush_every = max(1, int(flush_every))
+        self._pending_writes = 0
+        self._handle = None
 
     def write(self, row: dict[str, Any]) -> None:
-        with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(row, sort_keys=True))
-            handle.write("\n")
-            handle.flush()
-            if self._fsync:
+        if self._fsync:
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(row, sort_keys=True))
+                handle.write("\n")
+                handle.flush()
                 # fsync prevents a torn last line if the process dies before the OS flushes.
                 os.fsync(handle.fileno())
+            return
+
+        if self._handle is None:
+            self._handle = self.path.open("a", encoding="utf-8")
+        handle = self._handle
+        handle.write(json.dumps(row, sort_keys=True))
+        handle.write("\n")
+        self._pending_writes += 1
+        if self._pending_writes >= self._flush_every:
+            handle.flush()
+            self._pending_writes = 0
+
+    def close(self) -> None:
+        if self._handle is not None:
+            self._handle.flush()
+            self._handle.close()
+            self._handle = None
+            self._pending_writes = 0
 
 
 class RotatingJsonlSink:
@@ -65,12 +93,16 @@ class RotatingJsonlSink:
         *,
         max_bytes: int = 512 * 1024 * 1024,
         fsync: bool = True,
+        flush_every: int = 100,
     ) -> None:
         self.root = root
         self.filename = filename
         self.max_bytes = max(1, int(max_bytes))
         self._fsync = fsync
+        self._flush_every = max(1, int(flush_every))
+        self._pending_writes = 0
         self._active_path = root / filename
+        self._handle = None
         self._part_index = self._discover_next_part_index()
         self._current_bytes = (
             self._active_path.stat().st_size if self._active_path.exists() else 0
@@ -84,14 +116,24 @@ class RotatingJsonlSink:
         encoded = (json.dumps(row, sort_keys=True) + "\n").encode("utf-8")
         if self._current_bytes > 0 and self._current_bytes + len(encoded) > self.max_bytes:
             self._rotate()
-        with self._active_path.open("ab") as handle:
-            handle.write(encoded)
-            handle.flush()
-            if self._fsync:
+        if self._fsync:
+            with self._active_path.open("ab") as handle:
+                handle.write(encoded)
+                handle.flush()
                 os.fsync(handle.fileno())
+        else:
+            if self._handle is None:
+                self._handle = self._active_path.open("ab")
+            handle = self._handle
+            handle.write(encoded)
+            self._pending_writes += 1
+            if self._pending_writes >= self._flush_every:
+                handle.flush()
+                self._pending_writes = 0
         self._current_bytes += len(encoded)
 
     def _rotate(self) -> None:
+        self.close()
         stem, dot, ext = self.filename.rpartition(".")
         if dot:
             new_name = f"{stem}.{self._part_index}.{ext}"
@@ -101,6 +143,13 @@ class RotatingJsonlSink:
         os.replace(self._active_path, rotated_path)
         self._part_index += 1
         self._current_bytes = 0
+
+    def close(self) -> None:
+        if self._handle is not None:
+            self._handle.flush()
+            self._handle.close()
+            self._handle = None
+            self._pending_writes = 0
 
     def _discover_next_part_index(self) -> int:
         stem, dot, ext = self.filename.rpartition(".")

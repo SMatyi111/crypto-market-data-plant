@@ -902,6 +902,8 @@ def test_job_args_threads_lane_and_rotation_flags_for_trades() -> None:
             "source_suffix": "ethusdt",
             "rotate_at_midnight": True,
             "max_clock_skew_ms": 30_000.0,
+            "jsonl_fsync": False,
+            "normalized_parquet": False,
             "worker_name": "binance-trades-worker-ethusdt",
         },
     )
@@ -911,6 +913,8 @@ def test_job_args_threads_lane_and_rotation_flags_for_trades() -> None:
     assert args.source_suffix == "ethusdt"
     assert args.rotate_at_midnight is True
     assert args.max_clock_skew_ms == 30_000.0
+    assert args.jsonl_fsync is False
+    assert args.normalized_parquet is False
     assert args.worker_name == "binance-trades-worker-ethusdt"
 
 
