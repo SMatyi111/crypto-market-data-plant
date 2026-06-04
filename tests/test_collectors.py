@@ -97,9 +97,15 @@ def test_retryable_binance_connect_error_detects_handshake_timeout() -> None:
     assert _is_retryable_connect_error(RuntimeError("validation bug")) is False
 
 
-def test_cli_binance_trades_worker_defaults_to_trade_channel() -> None:
+def test_cli_binance_trades_worker_defaults_to_agg_trade_channel() -> None:
     parser = build_parser()
     args = parser.parse_args(["binance-trades-worker"])
+    assert args.channel == "aggTrade"
+
+
+def test_cli_binance_trades_worker_still_accepts_raw_trade_channel() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["binance-trades-worker", "--channel", "trade"])
     assert args.channel == "trade"
 
 

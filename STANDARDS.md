@@ -55,7 +55,8 @@ implemented and tested but ships **disabled**, pending live-frame schema verific
 > per lane as `gap_detection` in the manifest (§6):
 >
 > - **`sequence`** — a dense per-message counter proves gaplessness (§4.1/§4.2):
->   Binance depth/trades, Coinbase trades, **Kraken trades** (`trade_id` is a dense
+>   Binance depth/trades (live trades use `aggTrade` aggregate-trade IDs),
+>   Coinbase trades, **Kraken trades** (`trade_id` is a dense
 >   per-pair counter), and **Bybit spot `orderbook` depth** (`data.u` increments by
 >   exactly 1 per message).
 > - **`checksum`** — a per-frame CRC32 over the reconstructed book proves integrity,

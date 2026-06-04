@@ -131,7 +131,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     trades_parser = subparsers.add_parser("binance-trades-worker", help="Run segmented Binance trade collection")
     trades_parser.add_argument("--symbol", default="btcusdt")
-    trades_parser.add_argument("--channel", choices=["trade", "aggTrade"], default="trade")
+    trades_parser.add_argument("--channel", choices=["trade", "aggTrade"], default="aggTrade")
     trades_parser.add_argument("--segment-count", type=int, default=5000)
     trades_parser.add_argument("--max-segments", type=int)
     trades_parser.add_argument("--cooldown-seconds", type=float, default=1.0)

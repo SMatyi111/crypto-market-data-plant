@@ -18,7 +18,7 @@ This repo is a data plant, not a trading bot. It runs public collectors, writes 
 Enabled in the live deployment today:
 
 - Binance `BTCUSDT` public depth stream
-- Binance `BTCUSDT` public trade stream
+- Binance `BTCUSDT` public aggregate-trade stream
 
 Additional venue adapters are **implemented and tested** but ship **disabled**
 (`enabled: false` in `ops.live.example.json`) so the live Binance collector is
@@ -166,7 +166,7 @@ market-data-plant binance-depth-worker --symbol btcusdt --speed 100ms --segment-
 Run one Binance trade segment:
 
 ```powershell
-market-data-plant binance-trades-worker --symbol btcusdt --channel trade --segment-count 5000 --max-segments 1
+market-data-plant binance-trades-worker --symbol btcusdt --channel aggTrade --segment-count 5000 --max-segments 1
 ```
 
 Other venue workers (same `--segment-count` / `--max-segments` / `--cooldown-seconds`
