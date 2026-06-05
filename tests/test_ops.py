@@ -582,6 +582,168 @@ def _write_summary_jsonl(run_path: Path, rows: list[dict]) -> None:
     )
 
 
+def _write_trade_replay_summary(
+    run_path: Path,
+    *,
+    replayable: bool = True,
+    findings: list[str] | None = None,
+    gap_missing: int = 0,
+) -> None:
+    (run_path / "metrics").mkdir(parents=True, exist_ok=True)
+    (run_path / "metrics" / "replay_summary.json").write_text(
+        json.dumps(
+            {
+                "replay_type": "trades",
+                "source": "binance",
+                "replayable": replayable,
+                "findings": findings or [],
+                "trade_id_gap_count": 1 if gap_missing else 0,
+                "trade_id_gap_total_missing": gap_missing,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_binance_trade_run(
+    archive_root: Path,
+    run_name: str,
+    *,
+    raw: int = 300,
+    clean: int = 300,
+    quarantined: int = 0,
+    replayable: bool = True,
+    findings: list[str] | None = None,
+    promoted_rows: int = 0,
+) -> Path:
+    run_path = archive_root / "raw" / "market" / "binance_trades" / run_name
+    run_path.mkdir(parents=True)
+    _write_summary_jsonl(
+        run_path,
+        [
+            {
+                "raw_messages": raw,
+                "clean_events": clean,
+                "quarantined_events": quarantined,
+                "partial": False,
+            }
+        ],
+    )
+    _write_trade_replay_summary(
+        run_path,
+        replayable=replayable,
+        findings=findings,
+        gap_missing=10 if findings and "trade_id_gaps" in findings else 0,
+    )
+    if promoted_rows:
+        target_root = archive_root / "curated" / "research" / "trades_replayable"
+        target_root.mkdir(parents=True, exist_ok=True)
+        with (target_root / "_promotion_index.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps({"run_path": str(run_path), "promoted_rows": promoted_rows})
+                + "\n"
+            )
+    return run_path
+
+
+def _run_name_at(dt: datetime) -> str:
+    return dt.strftime("%Y%m%d_%H%M%S")
+
+
+def test_health_reports_healthy_recent_binance_trades_quality(tmp_path: Path) -> None:
+    archive_root = tmp_path
+    ops_root = archive_root / "ops"
+    ops_root.mkdir()
+    now = datetime.now(tz=UTC)
+    (ops_root / "heartbeat.json").write_text(
+        json.dumps({"status": "running", "last_seen": now.isoformat(), "job_counters": {}}),
+        encoding="utf-8",
+    )
+    _write_binance_trade_run(
+        archive_root,
+        _run_name_at(now - timedelta(minutes=1)),
+        clean=300,
+        quarantined=0,
+        promoted_rows=300,
+    )
+
+    report = build_health_report(ops_root=ops_root, jobs=None, stale_after_seconds=300)
+
+    assert "binance_trades_no_replayable_30m" not in report.findings
+    assert "binance_trades_latest_unreplayable" not in report.findings
+    assert report.binance_trades is not None
+    assert report.binance_trades["checked_run_count"] == 1
+    assert report.binance_trades["replayable_run_count"] == 1
+    assert report.binance_trades["total_promoted_rows"] == 300
+
+
+def test_health_flags_latest_unreplayable_binance_trade_run(tmp_path: Path) -> None:
+    archive_root = tmp_path
+    ops_root = archive_root / "ops"
+    ops_root.mkdir()
+    now = datetime.now(tz=UTC)
+    (ops_root / "heartbeat.json").write_text(
+        json.dumps({"status": "running", "last_seen": now.isoformat(), "job_counters": {}}),
+        encoding="utf-8",
+    )
+    _write_binance_trade_run(archive_root, _run_name_at(now - timedelta(minutes=2)))
+    _write_binance_trade_run(
+        archive_root,
+        _run_name_at(now - timedelta(minutes=1)),
+        clean=200,
+        quarantined=100,
+        replayable=False,
+        findings=["trade_id_gaps"],
+    )
+
+    report = build_health_report(ops_root=ops_root, jobs=None, stale_after_seconds=300)
+
+    assert "binance_trades_latest_unreplayable" in report.findings
+    assert "binance_trades_no_replayable_30m" not in report.findings
+    assert report.status == "warn"
+    assert report.binance_trades["latest_run_replayable"] is False
+
+
+def test_health_flags_no_recent_replayable_binance_trades(tmp_path: Path) -> None:
+    archive_root = tmp_path
+    ops_root = archive_root / "ops"
+    ops_root.mkdir()
+    now = datetime.now(tz=UTC)
+    (ops_root / "heartbeat.json").write_text(
+        json.dumps({"status": "running", "last_seen": now.isoformat(), "job_counters": {}}),
+        encoding="utf-8",
+    )
+    _write_binance_trade_run(archive_root, _run_name_at(now - timedelta(hours=1)))
+
+    report = build_health_report(ops_root=ops_root, jobs=None, stale_after_seconds=300)
+
+    assert "binance_trades_no_replayable_30m" in report.findings
+    assert report.status == "warn"
+
+
+def test_health_flags_three_low_clean_ratio_binance_trade_runs(tmp_path: Path) -> None:
+    archive_root = tmp_path
+    ops_root = archive_root / "ops"
+    ops_root.mkdir()
+    now = datetime.now(tz=UTC)
+    (ops_root / "heartbeat.json").write_text(
+        json.dumps({"status": "running", "last_seen": now.isoformat(), "job_counters": {}}),
+        encoding="utf-8",
+    )
+    for minutes_ago in (3, 2, 1):
+        _write_binance_trade_run(
+            archive_root,
+            _run_name_at(now - timedelta(minutes=minutes_ago)),
+            clean=20,
+            quarantined=280,
+        )
+
+    report = build_health_report(ops_root=ops_root, jobs=None, stale_after_seconds=300)
+
+    assert "binance_trades_low_clean_ratio" in report.findings
+    assert report.status == "warn"
+
+
 def test_health_surfaces_partial_metrics_from_active_run(tmp_path: Path) -> None:
     """Per FOLLOW_UPS #4: an operator should see the in-flight reject ratio without
     waiting for the run to finish. build_health_report should read the latest

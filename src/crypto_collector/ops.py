@@ -98,6 +98,7 @@ class HealthReport:
     findings: list[str]
     jobs: list[dict[str, Any]]
     standalone_workers: list[dict[str, Any]]
+    binance_trades: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -109,6 +110,7 @@ class HealthReport:
             "findings": self.findings,
             "jobs": self.jobs,
             "standalone_workers": self.standalone_workers,
+            "binance_trades": self.binance_trades,
         }
 
 
@@ -900,6 +902,11 @@ def build_health_report(
         quarantine_ratio_threshold=quarantine_ratio_threshold,
     )
     findings.extend(standalone_findings)
+    binance_trades, binance_trade_findings = _binance_trades_quality(
+        ops_root=ops_root,
+        checked_at=checked_at,
+    )
+    findings.extend(binance_trade_findings)
 
     disk_free_gb: float | None = None
     disk_free_pct: float | None = None
@@ -940,6 +947,7 @@ def build_health_report(
         findings=sorted(set(findings)),
         jobs=job_rows,
         standalone_workers=standalone_workers,
+        binance_trades=binance_trades,
     )
 
 
@@ -1259,6 +1267,180 @@ def _standalone_worker_rows(
             }
         )
     return rows, findings
+
+
+def _binance_trades_quality(
+    *,
+    ops_root: Path,
+    checked_at: datetime,
+    recent_run_limit: int = 10,
+    no_replayable_after_seconds: float = 30 * 60,
+    low_clean_ratio_threshold: float = 0.25,
+    low_clean_ratio_consecutive_runs: int = 3,
+) -> tuple[dict[str, Any], list[str]]:
+    source_root = ops_root.parent / "raw" / "market" / "binance_trades"
+    promotion_index_path = (
+        ops_root.parent
+        / "curated"
+        / "research"
+        / "trades_replayable"
+        / "_promotion_index.jsonl"
+    )
+    promoted_rows_by_run = _promoted_rows_by_run(promotion_index_path)
+    run_rows: list[dict[str, Any]] = []
+    findings: list[str] = []
+    latest_replayable_started_at: datetime | None = None
+    latest_replayable_run: str | None = None
+
+    if source_root.exists():
+        for run_dir in sorted(
+            (path for path in source_root.iterdir() if path.is_dir()),
+            key=lambda path: path.name,
+            reverse=True,
+        )[:recent_run_limit]:
+            metrics = _read_latest_summary_row(run_dir)
+            replay = _read_json_file(run_dir / "metrics" / "replay_summary.json")
+            started_at = _parse_run_dir_started_at(run_dir.name)
+            replayable = replay.get("replayable") if isinstance(replay, dict) else None
+            raw_messages = _number_or_none(metrics.get("raw_messages")) if metrics else None
+            clean_events = _number_or_none(metrics.get("clean_events")) if metrics else None
+            quarantined_events = (
+                _number_or_none(metrics.get("quarantined_events")) if metrics else None
+            )
+            clean_ratio: float | None = None
+            if raw_messages and raw_messages > 0 and clean_events is not None:
+                clean_ratio = float(clean_events) / float(raw_messages)
+            elif (
+                clean_events is not None
+                and quarantined_events is not None
+                and (clean_events + quarantined_events) > 0
+            ):
+                clean_ratio = float(clean_events) / float(clean_events + quarantined_events)
+
+            if replayable is True and started_at is not None:
+                if latest_replayable_started_at is None or started_at > latest_replayable_started_at:
+                    latest_replayable_started_at = started_at
+                    latest_replayable_run = run_dir.name
+
+            run_rows.append(
+                {
+                    "run": run_dir.name,
+                    "started_at": started_at.isoformat() if started_at is not None else None,
+                    "raw_messages": raw_messages,
+                    "clean_events": clean_events,
+                    "quarantined_events": quarantined_events,
+                    "clean_ratio": clean_ratio,
+                    "replayable": replayable,
+                    "findings": (
+                        [str(item) for item in replay.get("findings", [])]
+                        if isinstance(replay, dict)
+                        else None
+                    ),
+                    "trade_id_gap_count": (
+                        _number_or_none(replay.get("trade_id_gap_count"))
+                        if isinstance(replay, dict)
+                        else None
+                    ),
+                    "trade_id_gap_total_missing": (
+                        _number_or_none(replay.get("trade_id_gap_total_missing"))
+                        if isinstance(replay, dict)
+                        else None
+                    ),
+                    "promoted_rows": promoted_rows_by_run.get(str(run_dir), 0),
+                }
+            )
+
+    if run_rows and run_rows[0]["replayable"] is False:
+        findings.append("binance_trades_latest_unreplayable")
+
+    latest_replayable_age_seconds: float | None = None
+    if run_rows and latest_replayable_started_at is None:
+        findings.append("binance_trades_no_replayable_30m")
+    elif latest_replayable_started_at is not None:
+        latest_replayable_age_seconds = max(
+            0.0, (checked_at - latest_replayable_started_at).total_seconds()
+        )
+        if latest_replayable_age_seconds > no_replayable_after_seconds:
+            findings.append("binance_trades_no_replayable_30m")
+
+    ratio_candidates = [
+        row
+        for row in run_rows
+        if row.get("clean_ratio") is not None and row.get("replayable") is not None
+    ][:low_clean_ratio_consecutive_runs]
+    if (
+        len(ratio_candidates) == low_clean_ratio_consecutive_runs
+        and all(
+            float(row["clean_ratio"]) < low_clean_ratio_threshold
+            for row in ratio_candidates
+        )
+    ):
+        findings.append("binance_trades_low_clean_ratio")
+
+    return (
+        {
+            "source_root": str(source_root),
+            "recent_run_limit": recent_run_limit,
+            "checked_run_count": len(run_rows),
+            "replayable_run_count": sum(1 for row in run_rows if row["replayable"] is True),
+            "latest_run": run_rows[0]["run"] if run_rows else None,
+            "latest_run_replayable": run_rows[0]["replayable"] if run_rows else None,
+            "latest_replayable_run": latest_replayable_run,
+            "latest_replayable_age_seconds": latest_replayable_age_seconds,
+            "total_clean_events": int(sum(row.get("clean_events") or 0 for row in run_rows)),
+            "total_quarantined_events": int(
+                sum(row.get("quarantined_events") or 0 for row in run_rows)
+            ),
+            "total_promoted_rows": int(sum(row.get("promoted_rows") or 0 for row in run_rows)),
+            "low_clean_ratio_threshold": low_clean_ratio_threshold,
+            "runs": run_rows,
+        },
+        findings,
+    )
+
+
+def _promoted_rows_by_run(index_path: Path) -> dict[str, int]:
+    rows: dict[str, int] = {}
+    if not index_path.exists():
+        return rows
+    try:
+        raw = index_path.read_text(encoding="utf-8")
+    except OSError:
+        return rows
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        run_path = payload.get("run_path")
+        promoted_rows = _number_or_none(payload.get("promoted_rows"))
+        if (
+            isinstance(run_path, str)
+            and "binance_trades" in Path(run_path).parts
+            and promoted_rows
+        ):
+            rows[run_path] = rows.get(run_path, 0) + int(promoted_rows)
+    return rows
+
+
+def _parse_run_dir_started_at(name: str) -> datetime | None:
+    try:
+        return datetime.strptime(name, "%Y%m%d_%H%M%S").replace(tzinfo=UTC)
+    except ValueError:
+        return None
+
+
+def _number_or_none(value: Any) -> int | float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    return None
 
 
 def _read_latest_summary_row(run_path: Path) -> dict[str, Any] | None:
