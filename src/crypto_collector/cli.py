@@ -17,6 +17,20 @@ from .collectors.generic_ws import (
     _backoff_delay,
     _is_retryable_connect_error,
 )
+from .collectors.kalshi import (
+    DEFAULT_KALSHI_CATEGORY,
+    DEFAULT_KALSHI_DURATION_SECONDS,
+    DEFAULT_KALSHI_MARKETS_PER_SERIES,
+    DEFAULT_KALSHI_POLL_INTERVAL_SECONDS,
+    DEFAULT_KALSHI_STALE_AFTER_SECONDS,
+    DEFAULT_KALSHI_TARGET_ASSETS,
+    DEFAULT_KALSHI_TARGET_FREQUENCIES,
+    collect_kalshi_crypto_quotes,
+    default_kalshi_normalized_root,
+    default_kalshi_output_root,
+    discover_kalshi_crypto_markets,
+    summarize_kalshi_quote_rows,
+)
 from .collectors.mexc import (
     MEXC_DEALS_CHANNEL,
     MEXC_LIMIT_DEPTH_CHANNEL,
@@ -505,6 +519,59 @@ def build_parser() -> argparse.ArgumentParser:
         help="Rotate the run directory at midnight UTC instead of after --segment-count "
         "messages. See the depth worker's help text for the same flag.",
     )
+
+    kalshi_discover_parser = subparsers.add_parser(
+        "kalshi-discover-crypto",
+        help="Discover public Kalshi BTC/ETH crypto binary series and open markets",
+    )
+    kalshi_discover_parser.add_argument("--category", default=DEFAULT_KALSHI_CATEGORY)
+    kalshi_discover_parser.add_argument("--target-assets", nargs="+", default=DEFAULT_KALSHI_TARGET_ASSETS)
+    kalshi_discover_parser.add_argument(
+        "--target-frequencies",
+        nargs="+",
+        default=DEFAULT_KALSHI_TARGET_FREQUENCIES,
+        help="Series frequencies to keep, e.g. fifteen_min hourly.",
+    )
+    kalshi_discover_parser.add_argument("--markets-per-series", type=int, default=DEFAULT_KALSHI_MARKETS_PER_SERIES)
+    kalshi_discover_parser.add_argument("--output-root", type=Path, default=default_curated_root("kalshi_crypto_binary_options"))
+    kalshi_discover_parser.add_argument("--format", choices=["json", "text"], default="text")
+
+    kalshi_collect_parser = subparsers.add_parser(
+        "kalshi-collect-crypto-quotes",
+        help="Collect public Kalshi BTC/ETH binary quote snapshots into raw and normalized storage",
+    )
+    kalshi_collect_parser.add_argument("--category", default=DEFAULT_KALSHI_CATEGORY)
+    kalshi_collect_parser.add_argument("--target-assets", nargs="+", default=DEFAULT_KALSHI_TARGET_ASSETS)
+    kalshi_collect_parser.add_argument("--target-frequencies", nargs="+", default=DEFAULT_KALSHI_TARGET_FREQUENCIES)
+    kalshi_collect_parser.add_argument("--markets-per-series", type=int, default=DEFAULT_KALSHI_MARKETS_PER_SERIES)
+    kalshi_collect_parser.add_argument("--duration-seconds", type=float, default=DEFAULT_KALSHI_DURATION_SECONDS)
+    kalshi_collect_parser.add_argument("--sample-count", type=int)
+    kalshi_collect_parser.add_argument("--poll-interval-seconds", type=float, default=DEFAULT_KALSHI_POLL_INTERVAL_SECONDS)
+    kalshi_collect_parser.add_argument("--stale-after-seconds", type=float, default=DEFAULT_KALSHI_STALE_AFTER_SECONDS)
+    kalshi_collect_parser.add_argument("--output-root", type=Path, default=default_kalshi_output_root())
+    kalshi_collect_parser.add_argument("--normalized-root", type=Path, default=default_kalshi_normalized_root())
+    kalshi_collect_parser.add_argument(
+        "--no-jsonl-fsync",
+        action="store_false",
+        dest="jsonl_fsync",
+        default=True,
+        help="Disable per-row fsync for raw/clean/quarantine JSONL writes.",
+    )
+    kalshi_collect_parser.add_argument(
+        "--no-normalized-parquet",
+        action="store_false",
+        dest="normalized_parquet",
+        default=True,
+        help="Skip normalized Parquet writes; raw and clean JSONL are still written.",
+    )
+    kalshi_collect_parser.add_argument("--format", choices=["json", "text"], default="text")
+
+    kalshi_summary_parser = subparsers.add_parser(
+        "kalshi-summarize-crypto-quotes",
+        help="Summarize a Kalshi quote run or events.jsonl with per-symbol quote transitions",
+    )
+    kalshi_summary_parser.add_argument("--input-path", type=Path, required=True)
+    kalshi_summary_parser.add_argument("--format", choices=["json", "text"], default="text")
 
     ops_parser = subparsers.add_parser("ops-runner", help="Run collection and curation jobs from a manifest")
     ops_parser.add_argument("--config", type=Path, required=True)
@@ -1730,6 +1797,15 @@ def _execute_ops_job(job: JobSpec) -> JobExecutionResult | str | None:
     if job.job_type == "mexc-depth-worker":
         run_mexc_depth_worker(args)
         return "mexc depth worker completed"
+    if job.job_type == "kalshi-discover-crypto":
+        run_kalshi_discover_crypto(args)
+        return "kalshi crypto discovery completed"
+    if job.job_type == "kalshi-collect-crypto-quotes":
+        run_kalshi_collect_crypto_quotes(args)
+        return "kalshi crypto quote collection completed"
+    if job.job_type == "kalshi-summarize-crypto-quotes":
+        run_kalshi_summarize_crypto_quotes(args)
+        return "kalshi crypto quote summary completed"
     if job.job_type == "book-sync-health":
         run_book_sync_health(args)
         return "book sync health completed"
@@ -1755,6 +1831,10 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
     raw_args = dict(job.args)
     if "output_root" in raw_args:
         raw_args["output_root"] = Path(raw_args["output_root"])
+    if "normalized_root" in raw_args:
+        raw_args["normalized_root"] = Path(raw_args["normalized_root"])
+    if "input_path" in raw_args:
+        raw_args["input_path"] = Path(raw_args["input_path"])
     if job.job_type == "mock":
         return SimpleNamespace(count=raw_args.get("count", 25), output_root=raw_args.get("output_root", default_output_root()), product=raw_args.get("product", "BTC-USD"))
     if job.job_type == "binance-depth-worker":
@@ -1967,6 +2047,36 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             # Per-lane data-arrival watchdog (0.0 = off; see
             # CollectorConfig.idle_timeout_seconds). Honored by the generic-WS lanes.
             idle_timeout_seconds=raw_args.get("idle_timeout_seconds", 0.0),
+        )
+    if job.job_type == "kalshi-discover-crypto":
+        return SimpleNamespace(
+            category=raw_args.get("category", DEFAULT_KALSHI_CATEGORY),
+            target_assets=raw_args.get("target_assets", DEFAULT_KALSHI_TARGET_ASSETS),
+            target_frequencies=raw_args.get("target_frequencies", DEFAULT_KALSHI_TARGET_FREQUENCIES),
+            markets_per_series=raw_args.get("markets_per_series", DEFAULT_KALSHI_MARKETS_PER_SERIES),
+            output_root=raw_args.get("output_root", default_curated_root("kalshi_crypto_binary_options")),
+            format=raw_args.get("format", "text"),
+        )
+    if job.job_type == "kalshi-collect-crypto-quotes":
+        return SimpleNamespace(
+            category=raw_args.get("category", DEFAULT_KALSHI_CATEGORY),
+            target_assets=raw_args.get("target_assets", DEFAULT_KALSHI_TARGET_ASSETS),
+            target_frequencies=raw_args.get("target_frequencies", DEFAULT_KALSHI_TARGET_FREQUENCIES),
+            markets_per_series=raw_args.get("markets_per_series", DEFAULT_KALSHI_MARKETS_PER_SERIES),
+            duration_seconds=raw_args.get("duration_seconds", DEFAULT_KALSHI_DURATION_SECONDS),
+            sample_count=raw_args.get("sample_count"),
+            poll_interval_seconds=raw_args.get("poll_interval_seconds", DEFAULT_KALSHI_POLL_INTERVAL_SECONDS),
+            stale_after_seconds=raw_args.get("stale_after_seconds", DEFAULT_KALSHI_STALE_AFTER_SECONDS),
+            output_root=raw_args.get("output_root", default_kalshi_output_root()),
+            normalized_root=raw_args.get("normalized_root", default_kalshi_normalized_root()),
+            jsonl_fsync=raw_args.get("jsonl_fsync", True),
+            normalized_parquet=raw_args.get("normalized_parquet", True),
+            format=raw_args.get("format", "text"),
+        )
+    if job.job_type == "kalshi-summarize-crypto-quotes":
+        return SimpleNamespace(
+            input_path=raw_args.get("input_path", default_output_root() / "kalshi_crypto_quotes"),
+            format=raw_args.get("format", "text"),
         )
     if job.job_type in {"book-sync-health", "backfill-replay"}:
         return SimpleNamespace(
@@ -2273,6 +2383,71 @@ def run_research_manifest(args: argparse.Namespace) -> None:
     print(f"latest_markdown={outputs['latest_markdown']}")
 
 
+def run_kalshi_discover_crypto(args: argparse.Namespace) -> None:
+    report = discover_kalshi_crypto_markets(
+        output_root=args.output_root,
+        category=args.category,
+        target_assets=args.target_assets,
+        target_frequencies=args.target_frequencies,
+        markets_per_series=args.markets_per_series,
+    )
+    if args.format == "json":
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+        return
+    print(f"status={report.status}")
+    print(f"series_count={report.series_count}")
+    print(f"selected_series_count={report.selected_series_count}")
+    print(f"active_market_count={report.active_market_count}")
+    print(f"shortest_frequency={report.shortest_frequency or ''}")
+    print(f"shortest_frequency_seconds={report.shortest_frequency_seconds or ''}")
+    print(f"findings={','.join(report.findings) if report.findings else 'none'}")
+    print(f"output_root={args.output_root}")
+
+
+def run_kalshi_collect_crypto_quotes(args: argparse.Namespace) -> None:
+    summary = collect_kalshi_crypto_quotes(
+        output_root=args.output_root,
+        normalized_root=args.normalized_root,
+        category=args.category,
+        target_assets=args.target_assets,
+        target_frequencies=args.target_frequencies,
+        duration_seconds=args.duration_seconds,
+        sample_count=args.sample_count,
+        poll_interval_seconds=args.poll_interval_seconds,
+        stale_after_seconds=args.stale_after_seconds,
+        markets_per_series=args.markets_per_series,
+        jsonl_fsync=args.jsonl_fsync,
+        normalized_parquet=args.normalized_parquet,
+    )
+    if args.format == "json":
+        print(json.dumps(summary.to_dict(), indent=2, sort_keys=True))
+        return
+    print(f"status={summary.status}")
+    print(f"run_path={summary.run_path}")
+    print(f"sample_count={summary.sample_count}")
+    print(f"quote_count={summary.quote_count}")
+    print(f"side_symbol_count={summary.side_symbol_count}")
+    print(f"first_observed_quote_count={summary.first_observed_quote_count}")
+    print(f"quote_update_count={summary.quote_update_count}")
+    print(f"repeated_quote_count={summary.repeated_quote_count}")
+    print(f"stale_quote_count={summary.stale_quote_count}")
+    print(f"findings={','.join(summary.findings) if summary.findings else 'none'}")
+
+
+def run_kalshi_summarize_crypto_quotes(args: argparse.Namespace) -> None:
+    summary = summarize_kalshi_quote_rows(args.input_path)
+    if args.format == "json":
+        print(json.dumps(summary, indent=2, sort_keys=True))
+        return
+    print(f"input_path={summary['input_path']}")
+    print(f"quote_count={summary['quote_count']}")
+    print(f"side_symbol_count={summary['side_symbol_count']}")
+    print(f"first_observed_quote_count={summary['first_observed_quote_count']}")
+    print(f"quote_update_count={summary['quote_update_count']}")
+    print(f"repeated_quote_count={summary['repeated_quote_count']}")
+    print(f"stale_quote_count={summary['stale_quote_count']}")
+
+
 def run_state() -> None:
     archive_root = default_archive_root()
     output_root = default_output_root()
@@ -2546,6 +2721,12 @@ def main() -> None:
         run_mexc_trades_worker(args)
     elif args.command == "mexc-depth-worker":
         run_mexc_depth_worker(args)
+    elif args.command == "kalshi-discover-crypto":
+        run_kalshi_discover_crypto(args)
+    elif args.command == "kalshi-collect-crypto-quotes":
+        run_kalshi_collect_crypto_quotes(args)
+    elif args.command == "kalshi-summarize-crypto-quotes":
+        run_kalshi_summarize_crypto_quotes(args)
     elif args.command == "ops-runner":
         run_ops_runner(args)
     elif args.command == "health":

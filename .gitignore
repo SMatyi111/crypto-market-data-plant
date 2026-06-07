@@ -10,6 +10,7 @@ curated/
 quarantine/
 ops/
 reports/
+artifacts/
 *.log
 *.pyc
 __pycache__/

@@ -95,7 +95,10 @@ D:\market_archive\ops\worker_events.jsonl
 
 ```powershell
 Get-ScheduledTask -TaskName CryptoMarketDataPlant
-market-data-plant health --config .\ops.live.local.json
+market-data-plant health --ops-root D:\market_archive\ops --format text
+Get-ChildItem D:\market_archive\curated\research\manifests |
+  Sort-Object LastWriteTime -Descending |
+  Select-Object -First 5 Name,LastWriteTime,Length
 ```
 
 Point `health` at the **same** config the runner uses. On the maintainer
@@ -103,6 +106,13 @@ deployment that is `ops.live.local.json` (it takes precedence when present);
 fall back to `ops.live.example.json` only if no local config exists. Checking the
 example config when the runner is actually using the local one will report on the
 wrong job set.
+
+For the maintainer deployment, `--ops-root D:\market_archive\ops` is the shortest
+reliable live check because it reads the runner heartbeat and worker state
+directly. The live research manifests are under
+`D:\market_archive\curated\research\manifests`; the older
+`D:\market_archive\manifests` folder is not the live-readiness location unless a
+custom config points there.
 
 ## Deploying code changes (restart the runner)
 
@@ -113,7 +123,7 @@ effect until the runner is restarted**. To deploy:
 ```powershell
 Stop-ScheduledTask  -TaskName CryptoMarketDataPlant   # stops the running runner
 Start-ScheduledTask -TaskName CryptoMarketDataPlant   # relaunches with new code/config
-market-data-plant health --config .\ops.live.local.json
+market-data-plant health --ops-root D:\market_archive\ops --format text
 ```
 
 > ⚠️ The restart briefly interrupts **every** lane, including the live Binance

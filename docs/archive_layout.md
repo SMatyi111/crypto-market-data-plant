@@ -53,6 +53,7 @@ Curated datasets contain only quality-gated research inputs:
 ```text
 D:\market_archive\curated\research\market_replayable    # depth
 D:\market_archive\curated\research\trades_replayable     # trades
+D:\market_archive\curated\research\manifests             # readiness manifests
 ```
 
 A run is promoted only when its `metrics/replay_summary.json` marks it
@@ -60,6 +61,12 @@ A run is promoted only when its `metrics/replay_summary.json` marks it
 "replayable" guarantees depends on the feed's `gap_detection` class**
 (`sequence` = provable gaplessness; `none_native` = structurally clean only) —
 see [`../STANDARDS.md`](../STANDARDS.md) §4 for the per-class definition.
+
+The live ops config writes `research_manifest_latest.json`,
+`research_manifest_latest.md`, and timestamped manifest snapshots to
+`D:\market_archive\curated\research\manifests`. Treat
+`D:\market_archive\manifests` as legacy/manual output unless the active config
+explicitly uses it.
 
 ## Ops State
 

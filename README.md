@@ -32,6 +32,13 @@ unaffected. Enable them per lane when you want them:
 | Bybit    | ✅      | ✅      | trades = `none_native`; depth = sequence (`data.u` +1) |
 | MEXC     | ✅      | ✅      | trades = `none_native`; depth = `none_native` (protobuf) |
 
+Kalshi public crypto binary-option quote snapshots are also implemented as a REST
+collector (`kalshi_crypto_quotes`). This lane is not an order book or trade feed:
+it samples public `/series` and `/markets` responses, writes raw API payloads, and
+normalizes side-specific `YES`/`NO` quote telemetry. No orders are placed and no
+credentials are required. See
+[`docs/kalshi_crypto_binary_options.md`](docs/kalshi_crypto_binary_options.md).
+
 `none_native` lanes are curated as *structurally clean*, **not** gap-proof — see
 [`STANDARDS.md`](STANDARDS.md) §4.3. The mock feed exists only for local smoke
 tests.
@@ -73,6 +80,11 @@ Local archive status is reported by:
 market-data-plant research-manifest --archive-root D:\market_archive --output-root D:\market_archive\curated\research\manifests
 ```
 
+In the live deployment, manifests are written under
+`D:\market_archive\curated\research\manifests`. Do not use
+`D:\market_archive\manifests` as the live-readiness location unless a local ops
+config explicitly points there; that path is from older/manual runs.
+
 Generated manifest files are local operational artifacts and are intentionally
 not tracked in git.
 
@@ -100,11 +112,13 @@ D:\market_archive
   normalized\                         # all runs, pre-curation Parquet
     market\schema_version=v2\source=<venue>\instrument=<canonical>\event_date=YYYY-MM-DD\   # depth
     trades\schema_version=v2\source=<venue>\instrument=<canonical>\event_date=YYYY-MM-DD\
+    binary_options\schema_version=v2\source=kalshi\instrument=<market_ticker_side>\event_date=YYYY-MM-DD\
   curated\
     research\
       market_replayable\schema_version=v2\source=<venue>\instrument=<canonical>\event_date=YYYY-MM-DD\   # depth
       trades_replayable\schema_version=v2\source=<venue>\instrument=<canonical>\event_date=YYYY-MM-DD\
-      manifests\
+      kalshi_crypto_binary_options\  # discovery reports
+      manifests\                    # research_manifest_latest.* and snapshots
   quarantine\
     market\<lane>\
   ops\
@@ -190,6 +204,22 @@ worker builds the full topic from the channel prefix plus `--interval` (trades) 
 market-data-plant mexc-trades-worker --symbol BTCUSDT --interval 100ms --max-segments 1
 market-data-plant mexc-depth-worker  --symbol BTCUSDT --depth 20 --max-segments 1
 ```
+
+Kalshi crypto binary market discovery and quote snapshots:
+
+```powershell
+market-data-plant kalshi-discover-crypto --target-assets BTC ETH --target-frequencies fifteen_min hourly
+market-data-plant kalshi-collect-crypto-quotes --sample-count 120 --poll-interval-seconds 5 --stale-after-seconds 3
+market-data-plant kalshi-summarize-crypto-quotes --input-path D:\market_archive\raw\market\kalshi_crypto_quotes\<run_id>
+```
+
+Kalshi collection writes raw REST envelopes to
+`raw\market\kalshi_crypto_quotes\<run_id>\raw\messages.jsonl`, normalized
+side-specific rows to `clean\events.jsonl`, and Parquet to
+`normalized\binary_options\schema_version=v2\source=kalshi\...`. Quote updates are
+counted per `symbol` by subsequent `quote_id` transitions; the first observed state
+is not counted as an update, and repeated snapshots are labeled as repeated/stale
+instead of inferred as live changes.
 
 Two cross-cutting lane flags (both default to legacy behavior, so the live BTC
 collector is unaffected):
