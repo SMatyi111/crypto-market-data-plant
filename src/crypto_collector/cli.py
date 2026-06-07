@@ -126,6 +126,14 @@ def build_parser() -> argparse.ArgumentParser:
     depth_parser.add_argument("--connect-retries", type=int, default=3)
     depth_parser.add_argument("--retry-backoff-seconds", type=float, default=2.0)
     depth_parser.add_argument("--max-backoff-seconds", type=float, default=60.0)
+    depth_parser.add_argument(
+        "--snapshot-anchor-timeout-seconds",
+        type=float,
+        default=10.0,
+        help="Max seconds to keep buffering deltas while anchoring the REST snapshot "
+        "before giving up. The diff stream emits every ~100ms, so the default is a wide "
+        "safety net; lower only for tests.",
+    )
     depth_parser.add_argument("--snapshot-base-url", default="https://api.binance.com/api/v3/depth")
     depth_parser.add_argument(
         "--source-suffix",
@@ -750,6 +758,7 @@ async def collect_binance_depth_segment(args: argparse.Namespace) -> dict[str, o
         snapshot_base_url=args.snapshot_base_url,
         connect_retries=max_attempts,
         retry_backoff_seconds=retry_backoff_seconds,
+        snapshot_anchor_timeout_seconds=float(getattr(args, "snapshot_anchor_timeout_seconds", 10.0)),
     )
     snapshot_last_update_id = int(snapshot.get("lastUpdateId", 0))
     write_snapshot_file(
@@ -1852,6 +1861,7 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             connect_retries=raw_args.get("connect_retries", 3),
             retry_backoff_seconds=raw_args.get("retry_backoff_seconds", 2.0),
             max_backoff_seconds=raw_args.get("max_backoff_seconds", 60.0),
+            snapshot_anchor_timeout_seconds=raw_args.get("snapshot_anchor_timeout_seconds", 10.0),
             snapshot_base_url=raw_args.get("snapshot_base_url", "https://api.binance.com/api/v3/depth"),
             # Phase 2 lane/rotation flags must flow through the ops-runner too — without
             # these the ETH lane example would silently collide with the BTC lane in
@@ -2469,36 +2479,108 @@ def run_state() -> None:
         print(f"archive_disk_free_tb={usage.free / (1024 ** 4):.2f}")
 
 
+def _binance_buffer_bridges_snapshot(
+    buffered: list[RawMessage], snapshot_last_update_id: int
+) -> bool | None:
+    """Classify a depth buffer against a snapshot's lastUpdateId (L) for bootstrap anchoring.
+
+    Binance's diff-depth recipe requires a buffered delta whose ``[U, u]`` straddles
+    ``L + 1``. Returns:
+      ``True``  — a kept delta bridges the snapshot (the first delta with ``u > L`` has
+                  ``U <= L + 1``); the run can anchor on this snapshot with no gap.
+      ``None``  — every buffered delta predates the snapshot (all ``u <= L``), so ``L`` is
+                  ahead of the buffer: keep reading until the stream catches up.
+      ``False`` — the earliest kept delta starts past ``L + 1`` (``U > L + 1``): the buffer
+                  has run ahead of the snapshot, so a NEWER snapshot is needed to close
+                  the gap (matches replay's ``snapshot_anchor_gap`` condition).
+    """
+    aligned = _align_binance_buffered_events(buffered, snapshot_last_update_id)
+    if not aligned:
+        return None
+    first_window = _binance_update_window(aligned[0].payload)
+    if first_window is None:
+        return None
+    return first_window[0] <= snapshot_last_update_id + 1
+
+
 async def _capture_binance_snapshot_and_buffer(
     websocket: object,
     *,
     product: str,
     snapshot_limit: int,
     snapshot_base_url: str,
+    snapshot_anchor_timeout_seconds: float = 10.0,
+    max_snapshot_fetches: int = 6,
 ) -> tuple[dict[str, object], list[RawMessage]]:
-    snapshot_task = asyncio.create_task(
-        asyncio.to_thread(fetch_binance_order_book_snapshot, symbol=product, limit=snapshot_limit, base_url=snapshot_base_url)
-    )
+    """Fetch a REST snapshot and buffer the surrounding deltas so the run anchors with NO
+    gap between ``snapshot.lastUpdateId`` and the first kept delta.
+
+    The diff-depth stream only emits every ~100ms while the REST snapshot can return
+    faster, so we must NEVER stop buffering on snapshot arrival. (The original bug: a fast
+    snapshot left an empty buffer, the bridging delta was missed, and replay flagged a
+    ``snapshot_anchor_gap`` with the book crossed on nearly every event.) We keep reading
+    until a buffered delta bridges the snapshot, refetching a newer snapshot — in the
+    background, so buffering never pauses — whenever the buffer has already advanced past
+    the current one. If we cannot anchor within ``snapshot_anchor_timeout_seconds`` we
+    return what we have and let replay flag it, as before.
+    """
     buffered: list[RawMessage] = []
-    while not snapshot_task.done():
+
+    def _fetch() -> asyncio.Task:
+        return asyncio.create_task(
+            asyncio.to_thread(
+                fetch_binance_order_book_snapshot,
+                symbol=product,
+                limit=snapshot_limit,
+                base_url=snapshot_base_url,
+            )
+        )
+
+    async def _read_into_buffer() -> None:
         try:
             message = await asyncio.wait_for(websocket.recv(), timeout=0.05)
         except asyncio.TimeoutError:
-            continue
+            return
         payload = json.loads(message)
         if _is_binance_depth_payload(payload):
             buffered.append(RawMessage(source="binance", received_at=utc_now(), payload=payload))
+
+    # Buffer deltas while the initial snapshot is in flight so a fast REST response can't
+    # leave us with an empty buffer.
+    snapshot_task = _fetch()
+    while not snapshot_task.done():
+        await _read_into_buffer()
     snapshot = await snapshot_task
     snapshot_last_update_id = int(snapshot.get("lastUpdateId", 0))
-    while buffered:
-        first_window = _binance_update_window(buffered[0].payload)
-        if first_window is None:
-            buffered.pop(0)
-            continue
-        if snapshot_last_update_id >= first_window[0]:
+    fetches = 1
+
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + max(0.0, snapshot_anchor_timeout_seconds)
+    refetch_task: asyncio.Task | None = None
+    while loop.time() < deadline:
+        # Adopt a completed background refetch before re-classifying the buffer.
+        if refetch_task is not None and refetch_task.done():
+            snapshot = refetch_task.result()
+            snapshot_last_update_id = int(snapshot.get("lastUpdateId", 0))
+            refetch_task = None
+
+        bridges = _binance_buffer_bridges_snapshot(buffered, snapshot_last_update_id)
+        if bridges is True:
             break
-        snapshot = await asyncio.to_thread(fetch_binance_order_book_snapshot, symbol=product, limit=snapshot_limit, base_url=snapshot_base_url)
-        snapshot_last_update_id = int(snapshot.get("lastUpdateId", 0))
+        if bridges is False and refetch_task is None and fetches < max_snapshot_fetches:
+            # Buffer ran ahead of the snapshot — fetch a newer one WITHOUT pausing
+            # buffering, so the bridging delta can't slip past us during the HTTP call.
+            refetch_task = _fetch()
+            fetches += 1
+        await _read_into_buffer()
+
+    if refetch_task is not None:
+        refetch_task.cancel()
+        try:
+            await refetch_task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001 — best-effort cleanup
+            pass
+
     return snapshot, _align_binance_buffered_events(buffered, snapshot_last_update_id)
 
 
@@ -2512,6 +2594,7 @@ async def _open_binance_depth_connection(
     snapshot_base_url: str,
     connect_retries: int,
     retry_backoff_seconds: float,
+    snapshot_anchor_timeout_seconds: float = 10.0,
 ) -> tuple[object, object, dict[str, object], list[RawMessage], int]:
     last_error: Exception | None = None
     for attempt in range(1, connect_retries + 1):
@@ -2525,6 +2608,7 @@ async def _open_binance_depth_connection(
                 product=product,
                 snapshot_limit=snapshot_limit,
                 snapshot_base_url=snapshot_base_url,
+                snapshot_anchor_timeout_seconds=snapshot_anchor_timeout_seconds,
             )
             return connection, websocket, snapshot, pending_raws, attempt
         except Exception as exc:  # noqa: BLE001

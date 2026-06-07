@@ -8,8 +8,10 @@ from types import SimpleNamespace
 
 from crypto_collector.cli import (
     _align_binance_buffered_events,
+    _binance_buffer_bridges_snapshot,
     _binance_update_window,
     _build_source_name,
+    _capture_binance_snapshot_and_buffer,
     _next_utc_midnight,
     _post_reconnect_alignment_holds,
     _reopen_binance_depth_connection,
@@ -613,6 +615,93 @@ def test_reopen_binance_depth_connection_buffers_frames_no_snapshot_fetch(monkey
     assert ws.sent and "SUBSCRIBE" in ws.sent[0]
 
 
+def test_binance_buffer_bridges_snapshot_classifies_three_states() -> None:
+    """The bootstrap anchor classifier mirrors replay's snapshot-gap rule exactly."""
+    def _raw(first: int, final: int):
+        return RawMessage(source="binance", received_at=utc_now(), payload=_depth_payload(first=first, final=final))
+
+    # Bridges: first kept delta (u>L) has U <= L+1.
+    assert _binance_buffer_bridges_snapshot([_raw(99, 101)], 100) is True
+    # Snapshot ahead of the buffer (all u <= L) -> need more deltas.
+    assert _binance_buffer_bridges_snapshot([_raw(90, 95)], 100) is None
+    # Buffer ran ahead (earliest kept U > L+1) -> a newer snapshot is needed.
+    assert _binance_buffer_bridges_snapshot([_raw(150, 151)], 100) is False
+    # Empty buffer -> need more.
+    assert _binance_buffer_bridges_snapshot([], 100) is None
+
+
+def test_capture_keeps_buffering_until_delta_bridges_snapshot(monkeypatch) -> None:
+    """Regression for the snapshot_anchor_gap bug: a fast REST snapshot must NOT end
+    buffering early. The bridging delta can arrive after the snapshot returns, and we
+    must keep reading until it does — otherwise it is dropped and replay flags a gap."""
+    import crypto_collector.cli as cli_mod
+
+    monkeypatch.setattr(
+        cli_mod,
+        "fetch_binance_order_book_snapshot",
+        lambda **k: {"lastUpdateId": 100, "bids": [], "asks": []},
+    )
+    ws = _ScriptedDepthWebsocket(
+        frames=[
+            {"result": None, "id": 1},             # ack
+            _depth_payload(first=99, final=101),   # bridges 100 (U=99 <= 101)
+            _depth_payload(first=102, final=104),
+        ]
+    )
+
+    snapshot, pending = asyncio.run(
+        _capture_binance_snapshot_and_buffer(
+            ws,
+            product="btcusdt",
+            snapshot_limit=10,
+            snapshot_base_url="https://example.test/depth",
+            snapshot_anchor_timeout_seconds=1.0,
+        )
+    )
+
+    assert snapshot["lastUpdateId"] == 100
+    assert pending, "bridging delta must be buffered, not dropped"
+    assert pending[0].payload["U"] == 99
+    assert _binance_buffer_bridges_snapshot(pending, 100) is True
+
+
+def test_capture_refetches_newer_snapshot_when_buffer_ran_ahead(monkeypatch) -> None:
+    """When the buffer has already advanced past the snapshot (U > L+1), the bootstrap
+    must refetch a NEWER snapshot — while still buffering — until one bridges."""
+    import crypto_collector.cli as cli_mod
+
+    calls: list[dict] = []
+    seq = [100, 149]  # first snapshot is stale vs U=150 buffer; the refetch bridges it
+
+    def _fake(**kwargs):
+        calls.append(kwargs)
+        return {"lastUpdateId": seq[min(len(calls) - 1, len(seq) - 1)], "bids": [], "asks": []}
+
+    monkeypatch.setattr(cli_mod, "fetch_binance_order_book_snapshot", _fake)
+    ws = _ScriptedDepthWebsocket(
+        frames=[
+            {"result": None, "id": 1},
+            _depth_payload(first=150, final=151),  # U=150 > 100+1 -> snapshot too old
+            _depth_payload(first=152, final=153),
+        ]
+    )
+
+    snapshot, pending = asyncio.run(
+        _capture_binance_snapshot_and_buffer(
+            ws,
+            product="btcusdt",
+            snapshot_limit=10,
+            snapshot_base_url="https://example.test/depth",
+            snapshot_anchor_timeout_seconds=1.0,
+        )
+    )
+
+    assert len(calls) == 2, "expected exactly one refetch to resolve the stale snapshot"
+    assert snapshot["lastUpdateId"] == 149
+    assert pending and pending[0].payload["U"] == 150
+    assert _binance_buffer_bridges_snapshot(pending, 149) is True
+
+
 def _install_fake_depth_runtime(monkeypatch, websockets_list, *, snapshot_last_update_id):
     """Wire up `crypto_collector.cli` to use a scripted websockets module + a fake REST
     snapshot. Returns (snapshot_calls, fake_ws_mod) so tests can assert against them."""
@@ -682,6 +771,9 @@ def test_collect_depth_segment_reconnects_in_place_when_alignment_holds(tmp_path
         retry_backoff_seconds=0.0,
         max_backoff_seconds=0.0,
         resubscribe_buffer_seconds=0.2,
+        # Initial buffer is all-stale by design (forces reconnect-in-place), so cap the
+        # snapshot-anchor wait small instead of letting it spin the full default.
+        snapshot_anchor_timeout_seconds=0.2,
     )
 
     result = asyncio.run(collect_binance_depth_segment(args))
@@ -726,6 +818,7 @@ def test_collect_depth_segment_ends_segment_when_alignment_broken(tmp_path, monk
         retry_backoff_seconds=0.0,
         max_backoff_seconds=0.0,
         resubscribe_buffer_seconds=0.2,
+        snapshot_anchor_timeout_seconds=0.2,
     )
 
     result = asyncio.run(collect_binance_depth_segment(args))
