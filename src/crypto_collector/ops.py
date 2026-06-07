@@ -88,6 +88,14 @@ def load_ops_config(path: Path) -> list[JobSpec]:
     return [job for job in jobs if job.enabled]
 
 
+# Collector lanes that poll a REST/HTTP API on an interval instead of holding a
+# websocket. Unlike the WS lanes (the *-worker job types tracked in
+# standalone_workers), these never appear in the standalone-worker table, so the
+# health report surfaces their freshness separately under poll_lanes. Extend this
+# set as new poll-based collectors are added.
+POLL_LANE_JOB_TYPES = frozenset({"kalshi-collect-crypto-quotes", "kalshi-discover-crypto"})
+
+
 @dataclass(slots=True)
 class HealthReport:
     status: str
@@ -99,6 +107,7 @@ class HealthReport:
     jobs: list[dict[str, Any]]
     standalone_workers: list[dict[str, Any]]
     binance_trades: dict[str, Any] | None = None
+    poll_lanes: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -111,6 +120,7 @@ class HealthReport:
             "jobs": self.jobs,
             "standalone_workers": self.standalone_workers,
             "binance_trades": self.binance_trades,
+            "poll_lanes": self.poll_lanes,
         }
 
 
@@ -772,6 +782,7 @@ def build_health_report(
         if heartbeat.get("status") == "error":
             findings.append("runner_error_state")
     job_counters = heartbeat.get("job_counters", {}) if isinstance(heartbeat, dict) else {}
+    next_run_at_map = heartbeat.get("next_run_at", {}) if isinstance(heartbeat, dict) else {}
     runner_status = str(heartbeat.get("status") or "") if isinstance(heartbeat, dict) else ""
     # Active jobs: prefer the current_jobs list written by the parallel runner; fall
     # back to the legacy single current_job for older heartbeats. A job that appears
@@ -815,6 +826,7 @@ def build_health_report(
         findings.append("repeated_binance_failures")
 
     job_rows: list[dict[str, Any]] = []
+    poll_lanes: list[dict[str, Any]] = []
     if jobs:
         latest_by_job: dict[str, dict[str, Any]] = {}
         for row in run_rows:
@@ -893,6 +905,26 @@ def build_health_report(
                 }
             )
 
+            # Poll-based collector lanes (e.g. Kalshi) run as interval jobs, not WS
+            # workers, so they never show up in standalone_workers. Surface their
+            # freshness explicitly so they aren't a monitoring blind spot.
+            if job.job_type in POLL_LANE_JOB_TYPES:
+                poll_lanes.append(
+                    {
+                        "name": job.name,
+                        "job_type": job.job_type,
+                        "interval_seconds": job.interval_seconds,
+                        "last_finished_at": finished_at.isoformat() if finished_at else None,
+                        "age_seconds": age_seconds,
+                        "stale": is_stale,
+                        "in_progress": in_progress,
+                        "status": latest.get("status") if latest else "missing",
+                        "next_run_at": next_run_at_map.get(job.name) if isinstance(next_run_at_map, dict) else None,
+                        "success_count": counters.get("success_count", 0),
+                        "error_count": counters.get("error_count", 0),
+                    }
+                )
+
     managed_worker_names = _managed_worker_names(jobs) if jobs is not None else None
     standalone_workers, standalone_findings = _standalone_worker_rows(
         ops_root=ops_root,
@@ -948,6 +980,7 @@ def build_health_report(
         jobs=job_rows,
         standalone_workers=standalone_workers,
         binance_trades=binance_trades,
+        poll_lanes=poll_lanes,
     )
 
 

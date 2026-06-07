@@ -504,6 +504,91 @@ def test_health_with_config_does_not_error_on_unmanaged_stale_workers(
     assert worker["blocking"] is False
 
 
+def test_health_reports_poll_lane_freshness_for_kalshi(tmp_path: Path) -> None:
+    """Poll-based collectors (Kalshi) run as interval jobs, not WS workers, so they
+    never appear in standalone_workers. They must surface under poll_lanes with
+    freshness so they aren't a monitoring blind spot."""
+    ops_root = tmp_path / "ops"
+    (ops_root / "standalone_workers").mkdir(parents=True)
+    now = datetime.now(tz=UTC)
+    (ops_root / "heartbeat.json").write_text(
+        json.dumps(
+            {
+                "status": "running",
+                "last_seen": now.isoformat(),
+                "job_counters": {"kalshi-crypto-quotes": {"success_count": 67, "error_count": 0}},
+                "next_run_at": {"kalshi-crypto-quotes": (now + timedelta(seconds=30)).isoformat()},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (ops_root / "job_runs.jsonl").write_text(
+        json.dumps(
+            {
+                "job_name": "kalshi-crypto-quotes",
+                "job_type": "kalshi-collect-crypto-quotes",
+                "status": "success",
+                "started_at": (now - timedelta(seconds=40)).isoformat(),
+                "finished_at": (now - timedelta(seconds=20)).isoformat(),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    jobs = [
+        JobSpec(name="kalshi-crypto-quotes", job_type="kalshi-collect-crypto-quotes", interval_seconds=60)
+    ]
+    report = build_health_report(
+        ops_root=ops_root, jobs=jobs, stale_after_seconds=120, job_stale_multiplier=2.5
+    )
+
+    lane = next((row for row in report.poll_lanes if row["name"] == "kalshi-crypto-quotes"), None)
+    assert lane is not None, report.poll_lanes
+    assert lane["job_type"] == "kalshi-collect-crypto-quotes"
+    assert lane["interval_seconds"] == 60
+    assert lane["stale"] is False
+    assert lane["status"] == "success"
+    assert lane["age_seconds"] is not None and lane["age_seconds"] < 150
+    assert lane["next_run_at"] is not None
+    assert lane["success_count"] == 67
+    assert "stale_job:kalshi-crypto-quotes" not in report.findings
+
+
+def test_health_flags_stale_poll_lane(tmp_path: Path) -> None:
+    """A Kalshi lane that hasn't finished within interval*multiplier is marked stale
+    in poll_lanes and flagged, so a stalled poll collector is caught."""
+    ops_root = tmp_path / "ops"
+    (ops_root / "standalone_workers").mkdir(parents=True)
+    now = datetime.now(tz=UTC)
+    (ops_root / "heartbeat.json").write_text(
+        json.dumps({"status": "running", "last_seen": now.isoformat(), "job_counters": {}}),
+        encoding="utf-8",
+    )
+    (ops_root / "job_runs.jsonl").write_text(
+        json.dumps(
+            {
+                "job_name": "kalshi-crypto-quotes",
+                "job_type": "kalshi-collect-crypto-quotes",
+                "status": "success",
+                "started_at": (now - timedelta(seconds=2000)).isoformat(),
+                "finished_at": (now - timedelta(seconds=1800)).isoformat(),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    jobs = [
+        JobSpec(name="kalshi-crypto-quotes", job_type="kalshi-collect-crypto-quotes", interval_seconds=60)
+    ]
+    report = build_health_report(
+        ops_root=ops_root, jobs=jobs, stale_after_seconds=120, job_stale_multiplier=2.5
+    )
+
+    lane = next(row for row in report.poll_lanes if row["name"] == "kalshi-crypto-quotes")
+    assert lane["stale"] is True
+    assert "stale_job:kalshi-crypto-quotes" in report.findings
+
+
 def test_health_without_config_keeps_legacy_all_worker_blocking_behavior(tmp_path: Path) -> None:
     ops_root = tmp_path / "ops"
     workers_root = ops_root / "standalone_workers"

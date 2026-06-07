@@ -2131,8 +2131,24 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
     raise ValueError(f"Unsupported job_type: {job.job_type}")
 
 
+def _default_ops_config_path() -> Path | None:
+    """Locate the runner's ops config relative to this repo so `health` reports on the
+    same jobs the runner runs even when --config is omitted. Mirrors run_ops_runner.ps1:
+    prefer ops.live.local.json, fall back to ops.live.example.json."""
+    repo_root = Path(__file__).resolve().parents[2]
+    for name in ("ops.live.local.json", "ops.live.example.json"):
+        candidate = repo_root / name
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def run_health(args: argparse.Namespace) -> None:
-    jobs = load_ops_config(args.config) if args.config and args.config.exists() else None
+    # Without an explicit --config the report was blind to interval jobs (poll-based
+    # lanes like Kalshi never appear in standalone_workers), so auto-discover the
+    # runner's config and report on the same job set the runner runs.
+    config_path = args.config or _default_ops_config_path()
+    jobs = load_ops_config(config_path) if config_path and config_path.exists() else None
     report = build_health_report(
         ops_root=args.ops_root,
         jobs=jobs,
@@ -2149,6 +2165,20 @@ def run_health(args: argparse.Namespace) -> None:
     print(f"heartbeat_age_seconds={report.heartbeat_age_seconds}")
     print(f"disk_free_gb={report.disk_free_gb:.2f}" if report.disk_free_gb is not None else "disk_free_gb=None")
     print(f"findings={','.join(report.findings) if report.findings else 'none'}")
+    if report.poll_lanes:
+        print("poll_lanes:")
+        for lane in report.poll_lanes:
+            age = lane.get("age_seconds")
+            age_str = f"{age:.0f}s" if isinstance(age, (int, float)) else "n/a"
+            print(
+                f"  {lane.get('name')}: age={age_str}"
+                f" interval={lane.get('interval_seconds')}s"
+                f" status={lane.get('status')}"
+                f" stale={lane.get('stale')}"
+                f" next_run_at={lane.get('next_run_at') or '?'}"
+            )
+    else:
+        print("poll_lanes=none")
 
 
 def run_cleanup_command(args: argparse.Namespace) -> None:
