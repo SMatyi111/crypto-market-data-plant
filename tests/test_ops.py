@@ -589,6 +589,23 @@ def test_health_flags_stale_poll_lane(tmp_path: Path) -> None:
     assert "stale_job:kalshi-crypto-quotes" in report.findings
 
 
+@pytest.mark.parametrize(
+    "job_type",
+    ["coinbase-trades-worker", "kraken-trades-worker", "bybit-trades-worker", "mexc-trades-worker"],
+)
+def test_job_args_trades_default_to_buffered_jsonl(job_type: str) -> None:
+    """High-volume trade lanes must default to buffered JSONL (jsonl_fsync=False).
+    Per-event fsync throttled the consumer below the feed rate, growing the backlog
+    past the 60s freshness gate so valid trades were quarantined as stale."""
+    args = _job_args(JobSpec(name="x", job_type=job_type, interval_seconds=3600, args={}))
+    assert args.jsonl_fsync is False
+    # Config can still force fsync back on per lane.
+    args_on = _job_args(
+        JobSpec(name="x", job_type=job_type, interval_seconds=3600, args={"jsonl_fsync": True})
+    )
+    assert args_on.jsonl_fsync is True
+
+
 def test_health_without_config_keeps_legacy_all_worker_blocking_behavior(tmp_path: Path) -> None:
     ops_root = tmp_path / "ops"
     workers_root = ops_root / "standalone_workers"

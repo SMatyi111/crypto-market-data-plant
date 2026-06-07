@@ -1906,6 +1906,11 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             output_root=raw_args.get("output_root", default_output_root()),
             ops_root=Path(raw_args.get("ops_root", default_ops_root())),
             worker_name=raw_args.get("worker_name", "coinbase-trades-worker"),
+            # Buffered JSONL (no per-event fsync) by default: per-event fsync throttles the
+            # consumer below high-volume feeds, so the backlog grows past the 60s freshness
+            # gate and valid trades get quarantined as stale (binance-trades already opted
+            # out). raw JSONL flushes every 100 rows instead.
+            jsonl_fsync=raw_args.get("jsonl_fsync", False),
             heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
             max_delay_ms=raw_args.get("max_delay_ms", 60_000),
             max_future_skew_ms=raw_args.get("max_future_skew_ms", 5_000),
@@ -1948,6 +1953,8 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             output_root=raw_args.get("output_root", default_output_root()),
             ops_root=Path(raw_args.get("ops_root", default_ops_root())),
             worker_name=raw_args.get("worker_name", "kraken-trades-worker"),
+            # Buffered JSONL (no per-event fsync) by default — see coinbase-trades-worker.
+            jsonl_fsync=raw_args.get("jsonl_fsync", False),
             heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
             max_delay_ms=raw_args.get("max_delay_ms", 60_000),
             max_future_skew_ms=raw_args.get("max_future_skew_ms", 5_000),
@@ -1969,6 +1976,8 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             output_root=raw_args.get("output_root", default_output_root()),
             ops_root=Path(raw_args.get("ops_root", default_ops_root())),
             worker_name=raw_args.get("worker_name", "bybit-trades-worker"),
+            # Buffered JSONL (no per-event fsync) by default — see coinbase-trades-worker.
+            jsonl_fsync=raw_args.get("jsonl_fsync", False),
             heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
             max_delay_ms=raw_args.get("max_delay_ms", 60_000),
             max_future_skew_ms=raw_args.get("max_future_skew_ms", 5_000),
@@ -2029,6 +2038,8 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             output_root=raw_args.get("output_root", default_output_root()),
             ops_root=Path(raw_args.get("ops_root", default_ops_root())),
             worker_name=raw_args.get("worker_name", "mexc-trades-worker"),
+            # Buffered JSONL (no per-event fsync) by default — see coinbase-trades-worker.
+            jsonl_fsync=raw_args.get("jsonl_fsync", False),
             heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
             max_delay_ms=raw_args.get("max_delay_ms", 60_000),
             max_future_skew_ms=raw_args.get("max_future_skew_ms", 5_000),
