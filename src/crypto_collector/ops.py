@@ -210,11 +210,18 @@ class OpsRunnerLock:
             except FileExistsError:
                 owner = _read_json_file(self.lock_path)
                 owner_pid = _read_pid(owner)
-                if owner_pid is not None and _pid_exists(owner_pid):
+                if owner_pid is not None and _pid_exists(owner_pid) and self._heartbeat_is_fresh():
                     raise RuntimeError(
                         f"ops runner already active for {self.ops_root} "
                         f"(pid={owner_pid}, runner={owner.get('runner_name', 'unknown')})"
                     )
+                # Stale lock: the recorded pid is gone, OR it was recycled to an unrelated
+                # process (Windows OpenProcess -> access-denied makes _pid_exists report
+                # "alive") while the heartbeat has gone stale. A live runner writes
+                # heartbeat.json every ~30s, so a stale/absent heartbeat means the previous
+                # runner is dead — reclaim the lock instead of refusing to start. Without
+                # this, a crash or Stop+Start strands collection on a phantom lock until a
+                # manual unlink.
                 self.lock_path.unlink(missing_ok=True)
                 continue
             payload = {
@@ -226,6 +233,18 @@ class OpsRunnerLock:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 json.dump(payload, handle, indent=2, sort_keys=True)
             return
+
+    def _heartbeat_is_fresh(self, *, max_age_seconds: float = 180.0) -> bool:
+        """A live ops-runner writes heartbeat.json every ~30s. Used to tell a genuinely
+        active runner apart from a stale lock whose pid was recycled to another process.
+        Missing / unparseable / older-than-max_age heartbeat -> not fresh (runner is dead)."""
+        heartbeat = _read_json_file(self.ops_root / "heartbeat.json")
+        if not isinstance(heartbeat, dict):
+            return False
+        last_seen = _parse_dt(heartbeat.get("last_seen"))
+        if last_seen is None:
+            return False
+        return (datetime.now(tz=UTC) - last_seen).total_seconds() <= max_age_seconds
 
     def release(self) -> None:
         self.lock_path.unlink(missing_ok=True)

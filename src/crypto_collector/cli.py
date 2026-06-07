@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -67,6 +68,7 @@ from .market_snapshots import fetch_binance_order_book_snapshot, write_snapshot_
 from .models import RawMessage, utc_now
 from .normalizer import GenericL3Normalizer
 from .ops import (
+    COLLECTOR_JOB_TYPES,
     JobExecutionResult,
     JobSpec,
     OpsRunner,
@@ -596,6 +598,12 @@ def build_parser() -> argparse.ArgumentParser:
             "Maintenance jobs stay serialized regardless. Defaults to 1 (serial)."
         ),
     )
+
+    run_job_parser = subparsers.add_parser(
+        "run-job",
+        help="Run a single ops job in this process (child entrypoint for process-isolated collectors)",
+    )
+    run_job_parser.add_argument("--job-json", required=True, help="JSON: {name, job_type, interval_seconds, args}")
 
     health_parser = subparsers.add_parser("health", help="Inspect runner and archive health")
     health_parser.add_argument("--ops-root", type=Path, default=default_ops_root())
@@ -1771,7 +1779,68 @@ def run_ops_runner(args: argparse.Namespace) -> None:
     print(f"ops runner finished: {executed} job runs -> {args.ops_root}")
 
 
+# Collector lanes run in their OWN OS process for true parallelism: the runner's pool is
+# thread-based, and the GIL otherwise serializes the per-event work of concurrent
+# high-volume collectors, which backs up their feeds and quarantines valid-but-late trades
+# (coinbase hit ~0.39 in-thread vs ~0.0 isolated). The supervising pool thread just waits
+# on the subprocess. Maintenance jobs (quarantine/promote/manifest/health/...) stay
+# in-process — they're light and already serialized by the runner.
+_COLLECTOR_SUBPROCESS_TIMEOUT_SECONDS = 7200.0
+
+
 def _execute_ops_job(job: JobSpec) -> JobExecutionResult | str | None:
+    if job.job_type in COLLECTOR_JOB_TYPES:
+        return _run_collector_in_subprocess(job)
+    return _execute_ops_job_inprocess(job)
+
+
+def _run_collector_in_subprocess(job: JobSpec) -> str:
+    """Run one collector segment in a fresh `crypto_collector.cli run-job` process so
+    concurrent collectors don't contend on the GIL. Raises on non-zero exit / timeout so
+    the runner records an error result (JobExecutionResult carries no status field)."""
+    payload = json.dumps(
+        {
+            "name": job.name,
+            "job_type": job.job_type,
+            "interval_seconds": job.interval_seconds,
+            "args": job.args,
+        }
+    )
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "crypto_collector.cli", "run-job", "--job-json", payload],
+            capture_output=True,
+            text=True,
+            timeout=_COLLECTOR_SUBPROCESS_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"collector subprocess for {job.name} timed out after "
+            f"{_COLLECTOR_SUBPROCESS_TIMEOUT_SECONDS:.0f}s"
+        ) from exc
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "").strip()[-800:]
+        raise RuntimeError(
+            f"collector subprocess for {job.name} ({job.job_type}) exited "
+            f"{proc.returncode}: {tail}"
+        )
+    return f"{job.job_type} completed (process-isolated)"
+
+
+def run_single_job(args: argparse.Namespace) -> None:
+    """Child entrypoint for process-isolated collection: reconstruct one JobSpec from JSON
+    and run it in THIS process. Non-zero exit on failure (the worker raises)."""
+    payload = json.loads(args.job_json)
+    job = JobSpec(
+        name=str(payload.get("name", "job")),
+        job_type=str(payload["job_type"]),
+        interval_seconds=int(payload.get("interval_seconds", 0)),
+        args=dict(payload.get("args", {})),
+    )
+    _execute_ops_job_inprocess(job)
+
+
+def _execute_ops_job_inprocess(job: JobSpec) -> JobExecutionResult | str | None:
     args = _job_args(job)
     if job.job_type == "mock":
         asyncio.run(run_mock(args))
@@ -2854,6 +2923,8 @@ def main() -> None:
         run_kalshi_summarize_crypto_quotes(args)
     elif args.command == "ops-runner":
         run_ops_runner(args)
+    elif args.command == "run-job":
+        run_single_job(args)
     elif args.command == "health":
         run_health(args)
     elif args.command == "cleanup":

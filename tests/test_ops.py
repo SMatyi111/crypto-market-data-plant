@@ -10,10 +10,13 @@ import time
 import pytest
 
 from crypto_collector.cli import (
+    _execute_ops_job,
+    _execute_ops_job_inprocess,
     _job_args,
     build_parser,
     run_binance_depth_worker,
     run_ops_runner,
+    run_single_job,
 )
 from crypto_collector.models import utc_now
 from crypto_collector.ops import (
@@ -160,6 +163,12 @@ def test_run_ops_runner_rejects_duplicate_lock(tmp_path: Path) -> None:
         json.dumps({"pid": os.getpid(), "runner_name": "collector-ops"}),
         encoding="utf-8",
     )
+    # A genuinely-active runner = alive pid AND a fresh heartbeat. Both are required to
+    # reject a duplicate (the heartbeat distinguishes a live runner from a recycled pid).
+    (ops_root / "heartbeat.json").write_text(
+        json.dumps({"status": "running", "last_seen": datetime.now(tz=UTC).isoformat()}),
+        encoding="utf-8",
+    )
 
     with pytest.raises(RuntimeError, match="ops runner already active"):
         run_ops_runner(
@@ -167,6 +176,36 @@ def test_run_ops_runner_rejects_duplicate_lock(tmp_path: Path) -> None:
                 ["ops-runner", "--config", str(config_path), "--ops-root", str(ops_root)]
             )
         )
+
+
+def test_run_ops_runner_reclaims_lock_when_pid_alive_but_heartbeat_stale(tmp_path: Path) -> None:
+    """Regression: a recycled pid (Windows OpenProcess -> access-denied -> _pid_exists
+    reports 'alive') must NOT strand the runner on a phantom lock. If the heartbeat is
+    stale, the previous runner is dead and the lock is reclaimed. Uses os.getpid() (a real,
+    live pid) plus a stale heartbeat to simulate the recycled-pid case."""
+    config_path = tmp_path / "ops.json"
+    config_path.write_text(
+        json.dumps({"jobs": [{"name": "mock-a", "job_type": "mock", "interval_seconds": 60, "args": {"count": 1}}]}),
+        encoding="utf-8",
+    )
+    ops_root = tmp_path / "ops"
+    ops_root.mkdir()
+    (ops_root / "ops-runner.lock").write_text(
+        json.dumps({"pid": os.getpid(), "runner_name": "collector-ops"}),
+        encoding="utf-8",
+    )
+    (ops_root / "heartbeat.json").write_text(
+        json.dumps({"status": "running", "last_seen": (datetime.now(tz=UTC) - timedelta(seconds=600)).isoformat()}),
+        encoding="utf-8",
+    )
+
+    # Should NOT raise — stale heartbeat means the prior runner is dead; the lock is reclaimed.
+    run_ops_runner(
+        build_parser().parse_args(
+            ["ops-runner", "--config", str(config_path), "--ops-root", str(ops_root), "--max-runs", "1"]
+        )
+    )
+    assert not (ops_root / "ops-runner.lock").exists()
 
 
 def test_run_ops_runner_clears_stale_lock(tmp_path: Path) -> None:
@@ -587,6 +626,81 @@ def test_health_flags_stale_poll_lane(tmp_path: Path) -> None:
     lane = next(row for row in report.poll_lanes if row["name"] == "kalshi-crypto-quotes")
     assert lane["stale"] is True
     assert "stale_job:kalshi-crypto-quotes" in report.findings
+
+
+def test_execute_ops_job_runs_collector_in_subprocess(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Collector jobs must run in a separate OS process (GIL isolation), passing the job
+    as JSON to the `run-job` child entrypoint."""
+    import crypto_collector.cli as cli_mod
+
+    captured: dict = {}
+
+    class _Proc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(cli_mod.subprocess, "run", lambda argv, **kw: (captured.update(argv=argv), _Proc())[1])
+    job = JobSpec(name="coinbase-btc-trades", job_type="coinbase-trades-worker", interval_seconds=3600, args={"symbol": "BTC-USD"})
+
+    res = _execute_ops_job(job)
+    assert "process-isolated" in str(res)
+    argv = captured["argv"]
+    assert argv[0].endswith("python") or argv[0].endswith("python.exe") or "python" in argv[0]
+    assert argv[1:4] == ["-m", "crypto_collector.cli", "run-job"]
+    payload = json.loads(argv[argv.index("--job-json") + 1])
+    assert payload["job_type"] == "coinbase-trades-worker"
+    assert payload["args"]["symbol"] == "BTC-USD"
+
+
+def test_execute_ops_job_subprocess_failure_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-zero collector subprocess exit must raise so the runner records an error."""
+    import crypto_collector.cli as cli_mod
+
+    class _Proc:
+        returncode = 2
+        stdout = ""
+        stderr = "kaboom"
+
+    monkeypatch.setattr(cli_mod.subprocess, "run", lambda *a, **k: _Proc())
+    job = JobSpec(name="x", job_type="bybit-trades-worker", interval_seconds=3600, args={})
+    with pytest.raises(RuntimeError, match="exited 2"):
+        _execute_ops_job(job)
+
+
+def test_execute_ops_job_runs_maintenance_in_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Maintenance jobs stay in-process — no subprocess spawned."""
+    import crypto_collector.cli as cli_mod
+
+    def _no_subprocess(*a, **k):
+        raise AssertionError("maintenance jobs must not spawn a subprocess")
+
+    monkeypatch.setattr(cli_mod.subprocess, "run", _no_subprocess)
+    seen: dict = {}
+
+    def _fake_inproc(job):
+        seen["job"] = job
+        return "ok"
+
+    monkeypatch.setattr(cli_mod, "_execute_ops_job_inprocess", _fake_inproc)
+    job = JobSpec(name="quarantine-market", job_type="quarantine-runs", interval_seconds=300, args={})
+
+    assert _execute_ops_job(job) == "ok"
+    assert seen["job"].job_type == "quarantine-runs"
+
+
+def test_run_single_job_reconstructs_and_dispatches_in_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The run-job child reconstructs the JobSpec from JSON and runs the in-process path."""
+    import crypto_collector.cli as cli_mod
+
+    seen: dict = {}
+    monkeypatch.setattr(cli_mod, "_execute_ops_job_inprocess", lambda job: seen.setdefault("job", job))
+    payload = json.dumps({"name": "c", "job_type": "coinbase-trades-worker", "interval_seconds": 3600, "args": {"symbol": "BTC-USD"}})
+    args = build_parser().parse_args(["run-job", "--job-json", payload])
+
+    run_single_job(args)
+    assert seen["job"].job_type == "coinbase-trades-worker"
+    assert seen["job"].args["symbol"] == "BTC-USD"
 
 
 @pytest.mark.parametrize(
