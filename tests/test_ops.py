@@ -720,6 +720,27 @@ def test_job_args_trades_default_to_buffered_jsonl(job_type: str) -> None:
     assert args_on.jsonl_fsync is True
 
 
+@pytest.mark.parametrize(
+    "job_type",
+    [
+        "binance-trades-worker",
+        "coinbase-trades-worker",
+        "kraken-trades-worker",
+        "bybit-trades-worker",
+        "mexc-trades-worker",
+    ],
+)
+def test_job_args_trades_widen_stale_window(job_type: str) -> None:
+    """Trades keep a wide stale gate (15 min) so late-but-valid trades aren't quarantined
+    under disk-I/O backlog, while the clock-skew (future) bound stays tight at 5s. Config
+    can still override per lane."""
+    args = _job_args(JobSpec(name="x", job_type=job_type, interval_seconds=300, args={}))
+    assert args.max_delay_ms == 900_000
+    assert args.max_future_skew_ms == 5_000
+    overridden = _job_args(JobSpec(name="x", job_type=job_type, interval_seconds=300, args={"max_delay_ms": 60_000}))
+    assert overridden.max_delay_ms == 60_000
+
+
 def test_health_without_config_keeps_legacy_all_worker_blocking_behavior(tmp_path: Path) -> None:
     ops_root = tmp_path / "ops"
     workers_root = ops_root / "standalone_workers"

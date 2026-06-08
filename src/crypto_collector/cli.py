@@ -1905,6 +1905,16 @@ def _execute_ops_job_inprocess(job: JobSpec) -> JobExecutionResult | str | None:
     raise ValueError(f"Unsupported job_type: {job.job_type}")
 
 
+# Trades freshness (stale) gate. This archive is replayed by exchange_time, so a
+# late-but-valid trade is GOOD data, not garbage. Under disk-I/O backlog (concurrent
+# collectors writing D:\market_archive), delivery lateness reaches ~500s on the
+# high-volume lanes, so quarantining at 60s discards thousands of valid trades. Widen
+# the stale bound to 15 min to KEEP them; the tight 5s future-skew bound (separate) still
+# catches genuine clock skew. Tighten back toward 60s once on faster storage (NVMe), which
+# removes the backlog at the source. Config can still override per lane via max_delay_ms.
+_TRADES_STALE_WINDOW_MS = 900_000
+
+
 def _job_args(job: JobSpec) -> SimpleNamespace:
     raw_args = dict(job.args)
     if "output_root" in raw_args:
@@ -1953,7 +1963,7 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             ops_root=Path(raw_args.get("ops_root", default_ops_root())),
             worker_name=raw_args.get("worker_name", "binance-trades-worker"),
             heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
-            max_delay_ms=raw_args.get("max_delay_ms", 60_000),
+            max_delay_ms=raw_args.get("max_delay_ms", _TRADES_STALE_WINDOW_MS),
             max_future_skew_ms=raw_args.get("max_future_skew_ms", 5_000),
             max_clock_skew_ms=raw_args.get("max_clock_skew_ms", 60_000.0),
             source_suffix=raw_args.get("source_suffix", ""),
@@ -1981,7 +1991,7 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             # out). raw JSONL flushes every 100 rows instead.
             jsonl_fsync=raw_args.get("jsonl_fsync", False),
             heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
-            max_delay_ms=raw_args.get("max_delay_ms", 60_000),
+            max_delay_ms=raw_args.get("max_delay_ms", _TRADES_STALE_WINDOW_MS),
             max_future_skew_ms=raw_args.get("max_future_skew_ms", 5_000),
             max_clock_skew_ms=raw_args.get("max_clock_skew_ms", 60_000.0),
             source_suffix=raw_args.get("source_suffix", ""),
@@ -2025,7 +2035,7 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             # Buffered JSONL (no per-event fsync) by default — see coinbase-trades-worker.
             jsonl_fsync=raw_args.get("jsonl_fsync", False),
             heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
-            max_delay_ms=raw_args.get("max_delay_ms", 60_000),
+            max_delay_ms=raw_args.get("max_delay_ms", _TRADES_STALE_WINDOW_MS),
             max_future_skew_ms=raw_args.get("max_future_skew_ms", 5_000),
             max_clock_skew_ms=raw_args.get("max_clock_skew_ms", 60_000.0),
             source_suffix=raw_args.get("source_suffix", ""),
@@ -2048,7 +2058,7 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             # Buffered JSONL (no per-event fsync) by default — see coinbase-trades-worker.
             jsonl_fsync=raw_args.get("jsonl_fsync", False),
             heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
-            max_delay_ms=raw_args.get("max_delay_ms", 60_000),
+            max_delay_ms=raw_args.get("max_delay_ms", _TRADES_STALE_WINDOW_MS),
             max_future_skew_ms=raw_args.get("max_future_skew_ms", 5_000),
             max_clock_skew_ms=raw_args.get("max_clock_skew_ms", 60_000.0),
             source_suffix=raw_args.get("source_suffix", ""),
@@ -2110,7 +2120,7 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             # Buffered JSONL (no per-event fsync) by default — see coinbase-trades-worker.
             jsonl_fsync=raw_args.get("jsonl_fsync", False),
             heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
-            max_delay_ms=raw_args.get("max_delay_ms", 60_000),
+            max_delay_ms=raw_args.get("max_delay_ms", _TRADES_STALE_WINDOW_MS),
             max_future_skew_ms=raw_args.get("max_future_skew_ms", 5_000),
             max_clock_skew_ms=raw_args.get("max_clock_skew_ms", 60_000.0),
             source_suffix=raw_args.get("source_suffix", ""),
