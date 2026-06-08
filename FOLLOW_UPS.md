@@ -9,6 +9,28 @@ Ordered roughly by risk × ease.
 
 ---
 
+## 2026-06-08 — Live collection migrated D: → G: (NVMe)
+
+Cut live collection from `D:\market_archive` to `G:\market_archive` (NVMe). **Why:** the
+D: disk couldn't keep up with concurrent collection — high-volume trade lanes backlogged
+past the 60s freshness gate and quarantined valid, merely-late trades (coinbase ~0.55,
+bybit ~1.0). Software fixes shipped first — Binance depth snapshot-anchor (`206beb5`),
+trades buffered JSONL / no per-event fsync (`9e6e50b`), 900s trades stale gate
+(`a4bfd9d`), and collector process isolation (`a7b9544`) — but the real bottleneck was
+disk I/O, so the NVMe cut-over is what removed it. On G:, **all five trade lanes run at
+0% quarantine** (verified directly from in-progress run dirs: 0 quarantined events).
+
+`ops.live.local.json`, `run_ops_runner.ps1` (`--ops-root` default), the runbook, and the
+scheduled task now all point at G:.
+
+**Open task:** `D:\market_archive` is kept read-only as history. Decide retention and
+backfill/merge the D: history into the G: dataset (preview scripts:
+`_preview_trades_backfill.ps1`, `_preview_trades_score.py`). Also: kraken's
+`segment_count=5000` is coarse for its low trade volume (~2.5h/segment) — consider
+shrinking it for freshness (does not affect normalization/curation, which are per-event).
+
+---
+
 ## North-star goal — multi-pair, multi-venue, day-bounded, pull-ready
 
 What "done" looks like, eventually:

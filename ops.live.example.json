@@ -12,8 +12,8 @@
         "cooldown_seconds": 1.0,
         "connect_retries": 3,
         "retry_backoff_seconds": 2.0,
-        "output_root": "D:\\market_archive\\raw\\market",
-        "ops_root": "D:\\market_archive\\ops"
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops"
       }
     },
     {
@@ -28,8 +28,8 @@
         "segment_count": 300,
         "max_segments": 1,
         "cooldown_seconds": 1.0,
-        "output_root": "D:\\market_archive\\raw\\market",
-        "ops_root": "D:\\market_archive\\ops"
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops"
       }
     },
     {
@@ -48,8 +48,8 @@
         "retry_backoff_seconds": 2.0,
         "source_suffix": "ethusdt",
         "worker_name": "binance-depth-worker-ethusdt",
-        "output_root": "D:\\market_archive\\raw\\market",
-        "ops_root": "D:\\market_archive\\ops"
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops"
       }
     },
     {
@@ -67,8 +67,8 @@
         "cooldown_seconds": 1.0,
         "source_suffix": "ethusdt",
         "worker_name": "binance-trades-worker-ethusdt",
-        "output_root": "D:\\market_archive\\raw\\market",
-        "ops_root": "D:\\market_archive\\ops"
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops"
       }
     },
     {
@@ -84,8 +84,8 @@
         "max_segments": 1,
         "cooldown_seconds": 1.0,
         "worker_name": "coinbase-trades-worker",
-        "output_root": "D:\\market_archive\\raw\\market",
-        "ops_root": "D:\\market_archive\\ops"
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops"
       }
     },
     {
@@ -94,8 +94,8 @@
       "enabled": false,
       "interval_seconds": 300,
       "args": {
-        "source_root": "D:\\market_archive\\raw\\market\\coinbase_trades",
-        "quarantine_root": "D:\\market_archive\\quarantine\\market\\coinbase_trades",
+        "source_root": "G:\\market_archive\\raw\\market\\coinbase_trades",
+        "quarantine_root": "G:\\market_archive\\quarantine\\market\\coinbase_trades",
         "limit": 20,
         "max_age_hours": 6
       }
@@ -106,15 +106,15 @@
       "enabled": false,
       "interval_seconds": 300,
       "args": {
-        "source_root": "D:\\market_archive\\raw\\market\\coinbase_trades",
-        "target_root": "D:\\market_archive\\curated\\research\\trades_replayable",
-        "quarantine_index": "D:\\market_archive\\quarantine\\market\\coinbase_trades\\_quarantine_index.jsonl",
+        "source_root": "G:\\market_archive\\raw\\market\\coinbase_trades",
+        "target_root": "G:\\market_archive\\curated\\research\\trades_replayable",
+        "quarantine_index": "G:\\market_archive\\quarantine\\market\\coinbase_trades\\_quarantine_index.jsonl",
         "limit": 20,
         "max_age_hours": 6
       }
     },
     {
-      "// non-sequence depth lane": "Coinbase level2 depth is a none_native feed (STANDARDS 4.3): the snapshot arrives in-stream and diffs carry no sequence, so 'replayable' means structurally clean (single snapshot anchor, parse-clean, monotonic timestamps) — NOT gap-proof. Promoted rows go to market_replayable just like Binance depth, but consumers must treat gap_detection=='none_native' data as best-effort. channel level2_50 is the unauthenticated public feed (verified live 2026-05-31); plain level2/level2_batch now need Coinbase auth. The level2_50 snapshot is the full book (~1.4 MiB) so the collector raises the WS max frame size.",
+      "// non-sequence depth lane": "Coinbase level2 depth is a none_native feed (STANDARDS 4.3): the snapshot arrives in-stream and diffs carry no sequence, so 'replayable' means structurally clean (single snapshot anchor, parse-clean, monotonic timestamps) \u2014 NOT gap-proof. Promoted rows go to market_replayable just like Binance depth, but consumers must treat gap_detection=='none_native' data as best-effort. channel level2_50 is the unauthenticated public feed (verified live 2026-05-31); plain level2/level2_batch now need Coinbase auth. The level2_50 snapshot is the full book (~1.4 MiB) so the collector raises the WS max frame size.",
       "name": "coinbase-btc-depth",
       "job_type": "coinbase-depth-worker",
       "enabled": false,
@@ -126,8 +126,8 @@
         "max_segments": 1,
         "cooldown_seconds": 1.0,
         "worker_name": "coinbase-depth-worker",
-        "output_root": "D:\\market_archive\\raw\\market",
-        "ops_root": "D:\\market_archive\\ops"
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops"
       }
     },
     {
@@ -136,8 +136,8 @@
       "enabled": false,
       "interval_seconds": 300,
       "args": {
-        "source_root": "D:\\market_archive\\raw\\market\\coinbase_depth",
-        "quarantine_root": "D:\\market_archive\\quarantine\\market\\coinbase_depth",
+        "source_root": "G:\\market_archive\\raw\\market\\coinbase_depth",
+        "quarantine_root": "G:\\market_archive\\quarantine\\market\\coinbase_depth",
         "limit": 20,
         "max_age_hours": 6
       }
@@ -148,9 +148,9 @@
       "enabled": false,
       "interval_seconds": 300,
       "args": {
-        "source_root": "D:\\market_archive\\raw\\market\\coinbase_depth",
-        "target_root": "D:\\market_archive\\curated\\research\\market_replayable",
-        "quarantine_index": "D:\\market_archive\\quarantine\\market\\coinbase_depth\\_quarantine_index.jsonl",
+        "source_root": "G:\\market_archive\\raw\\market\\coinbase_depth",
+        "target_root": "G:\\market_archive\\curated\\research\\market_replayable",
+        "quarantine_index": "G:\\market_archive\\quarantine\\market\\coinbase_depth\\_quarantine_index.jsonl",
         "limit": 20,
         "max_age_hours": 6
       }
@@ -168,8 +168,8 @@
         "max_segments": 1,
         "cooldown_seconds": 1.0,
         "worker_name": "kraken-trades-worker",
-        "output_root": "D:\\market_archive\\raw\\market",
-        "ops_root": "D:\\market_archive\\ops"
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops"
       }
     },
     {
@@ -178,8 +178,8 @@
       "enabled": false,
       "interval_seconds": 300,
       "args": {
-        "source_root": "D:\\market_archive\\raw\\market\\kraken_trades",
-        "quarantine_root": "D:\\market_archive\\quarantine\\market\\kraken_trades",
+        "source_root": "G:\\market_archive\\raw\\market\\kraken_trades",
+        "quarantine_root": "G:\\market_archive\\quarantine\\market\\kraken_trades",
         "limit": 20,
         "max_age_hours": 6
       }
@@ -190,15 +190,15 @@
       "enabled": false,
       "interval_seconds": 300,
       "args": {
-        "source_root": "D:\\market_archive\\raw\\market\\kraken_trades",
-        "target_root": "D:\\market_archive\\curated\\research\\trades_replayable",
-        "quarantine_index": "D:\\market_archive\\quarantine\\market\\kraken_trades\\_quarantine_index.jsonl",
+        "source_root": "G:\\market_archive\\raw\\market\\kraken_trades",
+        "target_root": "G:\\market_archive\\curated\\research\\trades_replayable",
+        "quarantine_index": "G:\\market_archive\\quarantine\\market\\kraken_trades\\_quarantine_index.jsonl",
         "limit": 20,
         "max_age_hours": 6
       }
     },
     {
-      "// non-sequence trades lane": "Bybit v5 spot publicTrade id is a UUID (not a dense counter), so this is a none_native feed (STANDARDS 4.3): 'replayable' means structurally clean (event_count>0, monotonic timestamps, valid price/size, bounded clock skew) — NOT gap-proof. Promoted rows still go to trades_replayable, but consumers must treat gap_detection=='none_native' trades as best-effort. One WS frame batches several trades; the pipeline fans them out via normalize_many. NOTE: Bybit drops idle connections after ~10min and wants a {op:ping} ~20s; active trade streams stay alive via continuous traffic, so bounded segments complete fine, but a low-volume symbol could see the segment end on a clean close + reconnect.",
+      "// non-sequence trades lane": "Bybit v5 spot publicTrade id is a UUID (not a dense counter), so this is a none_native feed (STANDARDS 4.3): 'replayable' means structurally clean (event_count>0, monotonic timestamps, valid price/size, bounded clock skew) \u2014 NOT gap-proof. Promoted rows still go to trades_replayable, but consumers must treat gap_detection=='none_native' trades as best-effort. One WS frame batches several trades; the pipeline fans them out via normalize_many. NOTE: Bybit drops idle connections after ~10min and wants a {op:ping} ~20s; active trade streams stay alive via continuous traffic, so bounded segments complete fine, but a low-volume symbol could see the segment end on a clean close + reconnect.",
       "name": "bybit-btc-trades",
       "job_type": "bybit-trades-worker",
       "enabled": false,
@@ -210,8 +210,8 @@
         "max_segments": 1,
         "cooldown_seconds": 1.0,
         "worker_name": "bybit-trades-worker",
-        "output_root": "D:\\market_archive\\raw\\market",
-        "ops_root": "D:\\market_archive\\ops"
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops"
       }
     },
     {
@@ -220,8 +220,8 @@
       "enabled": false,
       "interval_seconds": 300,
       "args": {
-        "source_root": "D:\\market_archive\\raw\\market\\bybit_trades",
-        "quarantine_root": "D:\\market_archive\\quarantine\\market\\bybit_trades",
+        "source_root": "G:\\market_archive\\raw\\market\\bybit_trades",
+        "quarantine_root": "G:\\market_archive\\quarantine\\market\\bybit_trades",
         "limit": 20,
         "max_age_hours": 6
       }
@@ -232,9 +232,9 @@
       "enabled": false,
       "interval_seconds": 300,
       "args": {
-        "source_root": "D:\\market_archive\\raw\\market\\bybit_trades",
-        "target_root": "D:\\market_archive\\curated\\research\\trades_replayable",
-        "quarantine_index": "D:\\market_archive\\quarantine\\market\\bybit_trades\\_quarantine_index.jsonl",
+        "source_root": "G:\\market_archive\\raw\\market\\bybit_trades",
+        "target_root": "G:\\market_archive\\curated\\research\\trades_replayable",
+        "quarantine_index": "G:\\market_archive\\quarantine\\market\\bybit_trades\\_quarantine_index.jsonl",
         "limit": 20,
         "max_age_hours": 6
       }
@@ -252,8 +252,8 @@
         "max_segments": 1,
         "cooldown_seconds": 1.0,
         "worker_name": "bybit-depth-worker",
-        "output_root": "D:\\market_archive\\raw\\market",
-        "ops_root": "D:\\market_archive\\ops"
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops"
       }
     },
     {
@@ -262,8 +262,8 @@
       "enabled": false,
       "interval_seconds": 300,
       "args": {
-        "source_root": "D:\\market_archive\\raw\\market\\bybit_depth",
-        "quarantine_root": "D:\\market_archive\\quarantine\\market\\bybit_depth",
+        "source_root": "G:\\market_archive\\raw\\market\\bybit_depth",
+        "quarantine_root": "G:\\market_archive\\quarantine\\market\\bybit_depth",
         "limit": 20,
         "max_age_hours": 6
       }
@@ -274,15 +274,15 @@
       "enabled": false,
       "interval_seconds": 300,
       "args": {
-        "source_root": "D:\\market_archive\\raw\\market\\bybit_depth",
-        "target_root": "D:\\market_archive\\curated\\research\\market_replayable",
-        "quarantine_index": "D:\\market_archive\\quarantine\\market\\bybit_depth\\_quarantine_index.jsonl",
+        "source_root": "G:\\market_archive\\raw\\market\\bybit_depth",
+        "target_root": "G:\\market_archive\\curated\\research\\market_replayable",
+        "quarantine_index": "G:\\market_archive\\quarantine\\market\\bybit_depth\\_quarantine_index.jsonl",
         "limit": 20,
         "max_age_hours": 6
       }
     },
     {
-      "// checksum depth lane": "Kraken v2 book: the snapshot arrives in-stream, and every frame carries a CRC32 checksum over the top-10 book that the collector now VALIDATES at replay time for known-precision pairs (BTC/USD = price 1dp, qty 8dp). So this lane is curated 'checksum' (STANDARDS 4.3): provable integrity — a dropped/corrupted update diverges the book and is caught, blocking promotion. Promoted rows go to market_replayable like Binance/Coinbase depth, and gap_detection=='checksum' means consumers can rely on completeness. Other Kraken pairs fall back to none_native until their precision is added. One WS frame's data list fans out via normalize_many. Symbol is the slash pair (BTC/USD); channel 'book' uses Kraken's default depth (10).",
+      "// checksum depth lane": "Kraken v2 book: the snapshot arrives in-stream, and every frame carries a CRC32 checksum over the top-10 book that the collector now VALIDATES at replay time for known-precision pairs (BTC/USD = price 1dp, qty 8dp). So this lane is curated 'checksum' (STANDARDS 4.3): provable integrity \u2014 a dropped/corrupted update diverges the book and is caught, blocking promotion. Promoted rows go to market_replayable like Binance/Coinbase depth, and gap_detection=='checksum' means consumers can rely on completeness. Other Kraken pairs fall back to none_native until their precision is added. One WS frame's data list fans out via normalize_many. Symbol is the slash pair (BTC/USD); channel 'book' uses Kraken's default depth (10).",
       "name": "kraken-btc-depth",
       "job_type": "kraken-depth-worker",
       "enabled": false,
@@ -294,8 +294,8 @@
         "max_segments": 1,
         "cooldown_seconds": 1.0,
         "worker_name": "kraken-depth-worker",
-        "output_root": "D:\\market_archive\\raw\\market",
-        "ops_root": "D:\\market_archive\\ops"
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops"
       }
     },
     {
@@ -304,8 +304,8 @@
       "enabled": false,
       "interval_seconds": 300,
       "args": {
-        "source_root": "D:\\market_archive\\raw\\market\\kraken_depth",
-        "quarantine_root": "D:\\market_archive\\quarantine\\market\\kraken_depth",
+        "source_root": "G:\\market_archive\\raw\\market\\kraken_depth",
+        "quarantine_root": "G:\\market_archive\\quarantine\\market\\kraken_depth",
         "limit": 20,
         "max_age_hours": 6
       }
@@ -316,9 +316,9 @@
       "enabled": false,
       "interval_seconds": 300,
       "args": {
-        "source_root": "D:\\market_archive\\raw\\market\\kraken_depth",
-        "target_root": "D:\\market_archive\\curated\\research\\market_replayable",
-        "quarantine_index": "D:\\market_archive\\quarantine\\market\\kraken_depth\\_quarantine_index.jsonl",
+        "source_root": "G:\\market_archive\\raw\\market\\kraken_depth",
+        "target_root": "G:\\market_archive\\curated\\research\\market_replayable",
+        "quarantine_index": "G:\\market_archive\\quarantine\\market\\kraken_depth\\_quarantine_index.jsonl",
         "limit": 20,
         "max_age_hours": 6
       }
@@ -337,8 +337,8 @@
         "max_segments": 1,
         "cooldown_seconds": 1.0,
         "worker_name": "mexc-trades-worker",
-        "output_root": "D:\\market_archive\\raw\\market",
-        "ops_root": "D:\\market_archive\\ops"
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops"
       }
     },
     {
@@ -347,8 +347,8 @@
       "enabled": false,
       "interval_seconds": 300,
       "args": {
-        "source_root": "D:\\market_archive\\raw\\market\\mexc_trades",
-        "quarantine_root": "D:\\market_archive\\quarantine\\market\\mexc_trades",
+        "source_root": "G:\\market_archive\\raw\\market\\mexc_trades",
+        "quarantine_root": "G:\\market_archive\\quarantine\\market\\mexc_trades",
         "limit": 20,
         "max_age_hours": 6
       }
@@ -359,9 +359,9 @@
       "enabled": false,
       "interval_seconds": 300,
       "args": {
-        "source_root": "D:\\market_archive\\raw\\market\\mexc_trades",
-        "target_root": "D:\\market_archive\\curated\\research\\trades_replayable",
-        "quarantine_index": "D:\\market_archive\\quarantine\\market\\mexc_trades\\_quarantine_index.jsonl",
+        "source_root": "G:\\market_archive\\raw\\market\\mexc_trades",
+        "target_root": "G:\\market_archive\\curated\\research\\trades_replayable",
+        "quarantine_index": "G:\\market_archive\\quarantine\\market\\mexc_trades\\_quarantine_index.jsonl",
         "limit": 20,
         "max_age_hours": 6
       }
@@ -380,8 +380,8 @@
         "max_segments": 1,
         "cooldown_seconds": 1.0,
         "worker_name": "mexc-depth-worker",
-        "output_root": "D:\\market_archive\\raw\\market",
-        "ops_root": "D:\\market_archive\\ops"
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops"
       }
     },
     {
@@ -390,8 +390,8 @@
       "enabled": false,
       "interval_seconds": 300,
       "args": {
-        "source_root": "D:\\market_archive\\raw\\market\\mexc_depth",
-        "quarantine_root": "D:\\market_archive\\quarantine\\market\\mexc_depth",
+        "source_root": "G:\\market_archive\\raw\\market\\mexc_depth",
+        "quarantine_root": "G:\\market_archive\\quarantine\\market\\mexc_depth",
         "limit": 20,
         "max_age_hours": 6
       }
@@ -402,9 +402,9 @@
       "enabled": false,
       "interval_seconds": 300,
       "args": {
-        "source_root": "D:\\market_archive\\raw\\market\\mexc_depth",
-        "target_root": "D:\\market_archive\\curated\\research\\market_replayable",
-        "quarantine_index": "D:\\market_archive\\quarantine\\market\\mexc_depth\\_quarantine_index.jsonl",
+        "source_root": "G:\\market_archive\\raw\\market\\mexc_depth",
+        "target_root": "G:\\market_archive\\curated\\research\\market_replayable",
+        "quarantine_index": "G:\\market_archive\\quarantine\\market\\mexc_depth\\_quarantine_index.jsonl",
         "limit": 20,
         "max_age_hours": 6
       }
@@ -414,7 +414,7 @@
       "job_type": "book-sync-health",
       "interval_seconds": 300,
       "args": {
-        "source_root": "D:\\market_archive\\raw\\market\\binance_depth",
+        "source_root": "G:\\market_archive\\raw\\market\\binance_depth",
         "limit": 20,
         "max_age_hours": 6
       }
@@ -424,8 +424,8 @@
       "job_type": "quarantine-runs",
       "interval_seconds": 300,
       "args": {
-        "source_root": "D:\\market_archive\\raw\\market\\binance_depth",
-        "quarantine_root": "D:\\market_archive\\quarantine\\market\\binance_depth",
+        "source_root": "G:\\market_archive\\raw\\market\\binance_depth",
+        "quarantine_root": "G:\\market_archive\\quarantine\\market\\binance_depth",
         "limit": 20,
         "max_age_hours": 6
       }
@@ -435,8 +435,8 @@
       "job_type": "promote-replayable",
       "interval_seconds": 300,
       "args": {
-        "source_root": "D:\\market_archive\\raw\\market\\binance_depth",
-        "target_root": "D:\\market_archive\\curated\\research\\market_replayable",
+        "source_root": "G:\\market_archive\\raw\\market\\binance_depth",
+        "target_root": "G:\\market_archive\\curated\\research\\market_replayable",
         "limit": 20,
         "max_age_hours": 6
       }
@@ -446,8 +446,8 @@
       "job_type": "quarantine-runs",
       "interval_seconds": 300,
       "args": {
-        "source_root": "D:\\market_archive\\raw\\market\\binance_trades",
-        "quarantine_root": "D:\\market_archive\\quarantine\\market\\binance_trades",
+        "source_root": "G:\\market_archive\\raw\\market\\binance_trades",
+        "quarantine_root": "G:\\market_archive\\quarantine\\market\\binance_trades",
         "limit": 20,
         "max_age_hours": 6
       }
@@ -457,9 +457,9 @@
       "job_type": "promote-replayable",
       "interval_seconds": 300,
       "args": {
-        "source_root": "D:\\market_archive\\raw\\market\\binance_trades",
-        "target_root": "D:\\market_archive\\curated\\research\\trades_replayable",
-        "quarantine_index": "D:\\market_archive\\quarantine\\market\\binance_trades\\_quarantine_index.jsonl",
+        "source_root": "G:\\market_archive\\raw\\market\\binance_trades",
+        "target_root": "G:\\market_archive\\curated\\research\\trades_replayable",
+        "quarantine_index": "G:\\market_archive\\quarantine\\market\\binance_trades\\_quarantine_index.jsonl",
         "limit": 20,
         "max_age_hours": 6
       }
@@ -469,8 +469,8 @@
       "job_type": "research-manifest",
       "interval_seconds": 900,
       "args": {
-        "archive_root": "D:\\market_archive",
-        "output_root": "D:\\market_archive\\curated\\research\\manifests"
+        "archive_root": "G:\\market_archive",
+        "output_root": "G:\\market_archive\\curated\\research\\manifests"
       }
     },
     {
@@ -478,7 +478,7 @@
       "job_type": "cleanup",
       "interval_seconds": 3600,
       "args": {
-        "archive_root": "D:\\market_archive",
+        "archive_root": "G:\\market_archive",
         "raw_days": 14,
         "raw_policy": [
           "market/binance_depth=14",

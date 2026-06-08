@@ -1,6 +1,6 @@
 param(
     [string]$ConfigPath,
-    [string]$OpsRoot = "D:\market_archive\ops",
+    [string]$OpsRoot = "G:\market_archive\ops",
     [string]$LogPath,
     # Live default: run up to 4 collector jobs concurrently. Maintenance jobs
     # (quarantine/promote/manifest/cleanup/health) stay serialized in the runner.

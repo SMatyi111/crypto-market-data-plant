@@ -2,6 +2,13 @@
 
 This repo uses Windows Task Scheduler, not a custom Windows service.
 
+> **Live data root: `G:\market_archive` (NVMe), since 2026-06-08.** Collection was cut
+> over from `D:\market_archive` because the D: disk couldn't keep up with concurrent
+> collection — the high-volume trade lanes backlogged past the 60s freshness gate and
+> quarantined valid (merely-late) trades. `D:\market_archive` is retained **read-only as
+> historical data** pending a separate backfill/merge (see `FOLLOW_UPS.md`). All paths
+> below use G:; point `--ops-root` at `G:\market_archive\ops`.
+
 ## Install
 
 Run from an elevated PowerShell:
@@ -80,23 +87,23 @@ task that "ran" but produced nothing:
 Default runner log:
 
 ```text
-D:\market_archive\ops\runner.log
+G:\market_archive\ops\runner.log
 ```
 
 Operational state:
 
 ```text
-D:\market_archive\ops\heartbeat.json
-D:\market_archive\ops\job_runs.jsonl
-D:\market_archive\ops\worker_events.jsonl
+G:\market_archive\ops\heartbeat.json
+G:\market_archive\ops\job_runs.jsonl
+G:\market_archive\ops\worker_events.jsonl
 ```
 
 ## Check
 
 ```powershell
 Get-ScheduledTask -TaskName CryptoMarketDataPlant
-market-data-plant health --ops-root D:\market_archive\ops --format text
-Get-ChildItem D:\market_archive\curated\research\manifests |
+market-data-plant health --ops-root G:\market_archive\ops --format text
+Get-ChildItem G:\market_archive\curated\research\manifests |
   Sort-Object LastWriteTime -Descending |
   Select-Object -First 5 Name,LastWriteTime,Length
 ```
@@ -107,11 +114,11 @@ fall back to `ops.live.example.json` only if no local config exists. Checking th
 example config when the runner is actually using the local one will report on the
 wrong job set.
 
-For the maintainer deployment, `--ops-root D:\market_archive\ops` is the shortest
+For the maintainer deployment, `--ops-root G:\market_archive\ops` is the shortest
 reliable live check because it reads the runner heartbeat and worker state
 directly. The live research manifests are under
-`D:\market_archive\curated\research\manifests`; the older
-`D:\market_archive\manifests` folder is not the live-readiness location unless a
+`G:\market_archive\curated\research\manifests`; the older
+`G:\market_archive\manifests` folder is not the live-readiness location unless a
 custom config points there.
 
 ## Deploying code changes (restart the runner)
@@ -123,7 +130,7 @@ effect until the runner is restarted**. To deploy:
 ```powershell
 Stop-ScheduledTask  -TaskName CryptoMarketDataPlant   # stops the running runner
 Start-ScheduledTask -TaskName CryptoMarketDataPlant   # relaunches with new code/config
-market-data-plant health --ops-root D:\market_archive\ops --format text
+market-data-plant health --ops-root G:\market_archive\ops --format text
 ```
 
 > ⚠️ The restart briefly interrupts **every** lane, including the live Binance
@@ -140,10 +147,10 @@ qualifies:
 
 ```powershell
 # Dry run first — read-only, regenerates nothing, just reports counts:
-market-data-plant backfill-stream-depth --raw-root D:\market_archive\raw\market
+market-data-plant backfill-stream-depth --raw-root G:\market_archive\raw\market
 
 # Apply — regenerate each run's replay_summary.json AND promote the replayable ones:
-market-data-plant backfill-stream-depth --raw-root D:\market_archive\raw\market --apply
+market-data-plant backfill-stream-depth --raw-root G:\market_archive\raw\market --apply
 ```
 
 Defaults cover `coinbase_depth`, `bybit_depth`, `kraken_depth` (override with
