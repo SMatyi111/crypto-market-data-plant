@@ -741,6 +741,38 @@ def test_job_args_trades_widen_stale_window(job_type: str) -> None:
     assert overridden.max_delay_ms == 60_000
 
 
+def test_health_running_worker_reports_in_progress_quarantine_ratio(tmp_path: Path) -> None:
+    """A running worker exposes no run path mid-segment, so quarantine_ratio used to be
+    None (blind spot). Health should fall back to the latest run dir's clean/quarantine
+    event counts (derived from ops_root + worker_type) and report a real ratio."""
+    ops_root = tmp_path / "ops"
+    (ops_root / "standalone_workers").mkdir(parents=True)
+    now = datetime.now(tz=UTC)
+    (ops_root / "standalone_workers" / "coinbase-trades-worker.json").write_text(
+        json.dumps(
+            {
+                "worker_name": "coinbase-trades-worker",
+                "worker_type": "coinbase-trades-worker",
+                "status": "running",
+                "pid": os.getpid(),
+                "last_seen": now.isoformat(),
+                "last_run_path": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    run = tmp_path / "raw" / "market" / "coinbase_trades" / "20260608_120000"
+    (run / "clean").mkdir(parents=True)
+    (run / "quarantine").mkdir(parents=True)
+    (run / "clean" / "events.jsonl").write_text("".join('{"e":1}\n' for _ in range(98)), encoding="utf-8")
+    (run / "quarantine" / "events.jsonl").write_text("".join('{"e":1}\n' for _ in range(2)), encoding="utf-8")
+
+    report = build_health_report(ops_root=ops_root, jobs=None, stale_after_seconds=300)
+    w = next(r for r in report.standalone_workers if r["name"] == "coinbase-trades-worker")
+    assert w["quarantine_ratio"] == 0.02  # 2 / (98+2)
+    assert (w["partial_metrics"] or {}).get("source") == "in_progress_run_dir"
+
+
 def test_health_without_config_keeps_legacy_all_worker_blocking_behavior(tmp_path: Path) -> None:
     ops_root = tmp_path / "ops"
     workers_root = ops_root / "standalone_workers"

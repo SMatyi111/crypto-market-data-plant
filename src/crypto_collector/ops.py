@@ -1290,6 +1290,49 @@ def _standalone_worker_rows(
                         f"{'idle_timeout' if managed else 'unmanaged_idle_timeout'}:{name}"
                     )
 
+        # Fallback for actively-running workers: mid-segment a worker exposes no run path
+        # (current_run_path and last_run_path are both None) and writes no summary.jsonl
+        # until the segment finalizes, so the read above yields quarantine_ratio=None — a
+        # monitoring blind spot (you can't tell a clean running lane from a bad one, and
+        # low-volume lanes whose segment exceeds their interval may *never* report). Derive
+        # the lane's raw source dir from ops_root + worker_type and read the latest run's
+        # clean/quarantine event counts directly so health reports a real in-progress ratio.
+        if quarantine_ratio is None:
+            worker_type = str(payload.get("worker_type") or "")
+            if worker_type.endswith("-worker"):
+                source = worker_type[: -len("-worker")].replace("-", "_")
+                raw_root = ops_root.parent / "raw" / "market" / source
+                run_dirs = (
+                    sorted((p for p in raw_root.glob("[0-9]*_*") if p.is_dir()), reverse=True)
+                    if raw_root.exists()
+                    else []
+                )
+                if run_dirs:
+                    latest_run = run_dirs[0]
+                    counts: dict[str, int] = {}
+                    for rel in ("clean/events.jsonl", "quarantine/events.jsonl"):
+                        f = latest_run / rel
+                        counts[rel] = (
+                            sum(1 for line in f.open(encoding="utf-8") if line.strip())
+                            if f.exists()
+                            else 0
+                        )
+                    clean_n = counts["clean/events.jsonl"]
+                    quar_n = counts["quarantine/events.jsonl"]
+                    if clean_n + quar_n > 0:
+                        quarantine_ratio = float(quar_n) / float(clean_n + quar_n)
+                        partial_metrics = {
+                            "clean_events": clean_n,
+                            "quarantined_events": quar_n,
+                            "run_path": str(latest_run),
+                            "source": "in_progress_run_dir",
+                        }
+                        if quarantine_ratio > quarantine_ratio_threshold and active:
+                            row_findings.append("high_quarantine_ratio")
+                            findings.append(
+                                f"{'high_quarantine_ratio' if managed else 'unmanaged_high_quarantine_ratio'}:{name}"
+                            )
+
         rows.append(
             {
                 "name": name,
