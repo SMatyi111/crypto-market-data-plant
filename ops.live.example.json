@@ -3,33 +3,35 @@
     {
       "name": "binance-btc-depth",
       "job_type": "binance-depth-worker",
-      "interval_seconds": 3600,
+      "interval_seconds": 5,
       "args": {
         "symbol": "btcusdt",
         "speed": "100ms",
-        "segment_count": 5000,
+        "segment_count": 100000,
         "max_segments": 1,
         "cooldown_seconds": 1.0,
         "connect_retries": 3,
         "retry_backoff_seconds": 2.0,
         "output_root": "G:\\market_archive\\raw\\market",
-        "ops_root": "G:\\market_archive\\ops"
+        "ops_root": "G:\\market_archive\\ops",
+        "max_segment_seconds": 1800
       }
     },
     {
       "name": "binance-btc-trades",
       "job_type": "binance-trades-worker",
-      "interval_seconds": 300,
+      "interval_seconds": 5,
       "args": {
         "symbol": "btcusdt",
         "channel": "trade",
         "jsonl_fsync": false,
         "normalized_parquet": false,
-        "segment_count": 300,
+        "segment_count": 100000,
         "max_segments": 1,
         "cooldown_seconds": 1.0,
         "output_root": "G:\\market_archive\\raw\\market",
-        "ops_root": "G:\\market_archive\\ops"
+        "ops_root": "G:\\market_archive\\ops",
+        "max_segment_seconds": 1800
       }
     },
     {
@@ -37,11 +39,11 @@
       "name": "binance-eth-depth",
       "job_type": "binance-depth-worker",
       "enabled": false,
-      "interval_seconds": 3600,
+      "interval_seconds": 5,
       "args": {
         "symbol": "ethusdt",
         "speed": "100ms",
-        "segment_count": 5000,
+        "segment_count": 100000,
         "max_segments": 1,
         "cooldown_seconds": 1.0,
         "connect_retries": 3,
@@ -49,26 +51,28 @@
         "source_suffix": "ethusdt",
         "worker_name": "binance-depth-worker-ethusdt",
         "output_root": "G:\\market_archive\\raw\\market",
-        "ops_root": "G:\\market_archive\\ops"
+        "ops_root": "G:\\market_archive\\ops",
+        "max_segment_seconds": 1800
       }
     },
     {
       "name": "binance-eth-trades",
       "job_type": "binance-trades-worker",
       "enabled": false,
-      "interval_seconds": 300,
+      "interval_seconds": 5,
       "args": {
         "symbol": "ethusdt",
         "channel": "trade",
         "jsonl_fsync": false,
         "normalized_parquet": false,
-        "segment_count": 300,
+        "segment_count": 100000,
         "max_segments": 1,
         "cooldown_seconds": 1.0,
         "source_suffix": "ethusdt",
         "worker_name": "binance-trades-worker-ethusdt",
         "output_root": "G:\\market_archive\\raw\\market",
-        "ops_root": "G:\\market_archive\\ops"
+        "ops_root": "G:\\market_archive\\ops",
+        "max_segment_seconds": 1800
       }
     },
     {
@@ -76,16 +80,17 @@
       "name": "coinbase-btc-trades",
       "job_type": "coinbase-trades-worker",
       "enabled": false,
-      "interval_seconds": 3600,
+      "interval_seconds": 5,
       "args": {
         "symbol": "BTC-USD",
         "channel": "matches",
-        "segment_count": 5000,
+        "segment_count": 100000,
         "max_segments": 1,
         "cooldown_seconds": 1.0,
         "worker_name": "coinbase-trades-worker",
         "output_root": "G:\\market_archive\\raw\\market",
-        "ops_root": "G:\\market_archive\\ops"
+        "ops_root": "G:\\market_archive\\ops",
+        "max_segment_seconds": 1800
       }
     },
     {
@@ -118,16 +123,17 @@
       "name": "coinbase-btc-depth",
       "job_type": "coinbase-depth-worker",
       "enabled": false,
-      "interval_seconds": 3600,
+      "interval_seconds": 5,
       "args": {
         "symbol": "BTC-USD",
         "channel": "level2_50",
-        "segment_count": 5000,
+        "segment_count": 100000,
         "max_segments": 1,
         "cooldown_seconds": 1.0,
         "worker_name": "coinbase-depth-worker",
         "output_root": "G:\\market_archive\\raw\\market",
-        "ops_root": "G:\\market_archive\\ops"
+        "ops_root": "G:\\market_archive\\ops",
+        "max_segment_seconds": 1800
       }
     },
     {
@@ -160,16 +166,17 @@
       "name": "kraken-btc-trades",
       "job_type": "kraken-trades-worker",
       "enabled": false,
-      "interval_seconds": 3600,
+      "interval_seconds": 5,
       "args": {
         "symbol": "BTC/USD",
         "channel": "trade",
-        "segment_count": 5000,
+        "segment_count": 100000,
         "max_segments": 1,
         "cooldown_seconds": 1.0,
         "worker_name": "kraken-trades-worker",
         "output_root": "G:\\market_archive\\raw\\market",
-        "ops_root": "G:\\market_archive\\ops"
+        "ops_root": "G:\\market_archive\\ops",
+        "max_segment_seconds": 1800
       }
     },
     {
@@ -202,16 +209,17 @@
       "name": "bybit-btc-trades",
       "job_type": "bybit-trades-worker",
       "enabled": false,
-      "interval_seconds": 3600,
+      "interval_seconds": 5,
       "args": {
         "symbol": "BTCUSDT",
         "channel": "publicTrade",
-        "segment_count": 5000,
+        "segment_count": 100000,
         "max_segments": 1,
         "cooldown_seconds": 1.0,
         "worker_name": "bybit-trades-worker",
         "output_root": "G:\\market_archive\\raw\\market",
-        "ops_root": "G:\\market_archive\\ops"
+        "ops_root": "G:\\market_archive\\ops",
+        "max_segment_seconds": 1800
       }
     },
     {
@@ -244,16 +252,17 @@
       "name": "bybit-btc-depth",
       "job_type": "bybit-depth-worker",
       "enabled": false,
-      "interval_seconds": 3600,
+      "interval_seconds": 5,
       "args": {
         "symbol": "BTCUSDT",
         "channel": "orderbook.50",
-        "segment_count": 5000,
+        "segment_count": 100000,
         "max_segments": 1,
         "cooldown_seconds": 1.0,
         "worker_name": "bybit-depth-worker",
         "output_root": "G:\\market_archive\\raw\\market",
-        "ops_root": "G:\\market_archive\\ops"
+        "ops_root": "G:\\market_archive\\ops",
+        "max_segment_seconds": 1800
       }
     },
     {
@@ -286,16 +295,17 @@
       "name": "kraken-btc-depth",
       "job_type": "kraken-depth-worker",
       "enabled": false,
-      "interval_seconds": 3600,
+      "interval_seconds": 5,
       "args": {
         "symbol": "BTC/USD",
         "channel": "book",
-        "segment_count": 5000,
+        "segment_count": 100000,
         "max_segments": 1,
         "cooldown_seconds": 1.0,
         "worker_name": "kraken-depth-worker",
         "output_root": "G:\\market_archive\\raw\\market",
-        "ops_root": "G:\\market_archive\\ops"
+        "ops_root": "G:\\market_archive\\ops",
+        "max_segment_seconds": 1800
       }
     },
     {
@@ -328,17 +338,18 @@
       "name": "mexc-btc-trades",
       "job_type": "mexc-trades-worker",
       "enabled": false,
-      "interval_seconds": 3600,
+      "interval_seconds": 5,
       "args": {
         "symbol": "BTCUSDT",
         "channel": "spot@public.aggre.deals.v3.api.pb",
         "interval": "100ms",
-        "segment_count": 5000,
+        "segment_count": 100000,
         "max_segments": 1,
         "cooldown_seconds": 1.0,
         "worker_name": "mexc-trades-worker",
         "output_root": "G:\\market_archive\\raw\\market",
-        "ops_root": "G:\\market_archive\\ops"
+        "ops_root": "G:\\market_archive\\ops",
+        "max_segment_seconds": 1800
       }
     },
     {
@@ -371,17 +382,18 @@
       "name": "mexc-btc-depth",
       "job_type": "mexc-depth-worker",
       "enabled": false,
-      "interval_seconds": 3600,
+      "interval_seconds": 5,
       "args": {
         "symbol": "BTCUSDT",
         "channel": "spot@public.limit.depth.v3.api.pb",
         "depth": 20,
-        "segment_count": 5000,
+        "segment_count": 100000,
         "max_segments": 1,
         "cooldown_seconds": 1.0,
         "worker_name": "mexc-depth-worker",
         "output_root": "G:\\market_archive\\raw\\market",
-        "ops_root": "G:\\market_archive\\ops"
+        "ops_root": "G:\\market_archive\\ops",
+        "max_segment_seconds": 1800
       }
     },
     {

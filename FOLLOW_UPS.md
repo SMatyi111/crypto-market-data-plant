@@ -9,6 +9,46 @@ Ordered roughly by risk × ease.
 
 ---
 
+## 2026-06-08 — Continuous capture: time-based segment rotation + full concurrency
+
+**Problem:** every collector lane (trades AND depth, all venues) was only recording
+~one short segment per hour then idling. Root cause: each lane is `max_segments=1` and
+the runner re-dispatches it at `finish + interval_seconds` (interval was 3600s), so the
+idle gap after each segment ≈ the interval. Measured coverage was brutal — coinbase
+trades ~13% (5000 msgs filled in ~7 min, then ~50 min idle), binance trades ~17%,
+kraken/mexc ~15–40%, coinbase_depth ~8%, kraken_depth ~2%. Quality was fine (replayable,
+0 quarantine); *continuity* was broken, which undermines the replayable-book goal. Also
+only `collector_concurrency=4` of 10 lanes could run at once.
+
+**Fix (continuous capture):**
+- New `max_segment_seconds` knob → segments rotate on a fixed wall-clock cadence
+  regardless of volume (generalizes the existing `rotate_at_midnight` deadline path;
+  `_segment_deadline_utc` helper in [cli.py], injected onto worker args in
+  `_execute_ops_job_inprocess`). Set to **1800s (30-min segments)** for all lanes.
+- All collector lanes: `interval_seconds` 3600/300 → **5** (re-dispatch ~immediately
+  after each segment finalizes), `segment_count` → **100000** (safety cap; the 30-min
+  time bound normally fires first), `max_segments=1` kept (one finalized segment per
+  dispatch, well under the 7200s subprocess timeout).
+- `collector_concurrency` **4 → 12** in `run_ops_runner.ps1` so all 10 lanes stream
+  simultaneously. (Maintenance jobs run in the scheduler thread, not the pool, so they
+  don't need slots.)
+
+Net: each lane records continuously, rotating a finalized 30-min segment with only a
+~5–8s reconnect/respawn gap (~0.3–0.4% per segment). Verified end-to-end with an 8s
+time-bounded smoke segment (`deadline_reached=true`, clean finalize). 271 tests pass.
+**DEPLOY:** restart the runner (SYSTEM `CryptoMarketDataPlant` task) to load the new
+config + concurrency. **Watch after deploy:** 10 concurrent WS collectors is a real
+step-up in CPU/RAM/NVMe load — if the box strains, dial `CollectorConcurrency` back or
+shorten `max_segment_seconds`. Confirm no quarantine regression on the now-longer
+segments (the 900s gate + isolation + NVMe should keep them clean).
+
+**Possible next step (true zero-gap):** the residual ~5–8s/segment gap is the WS
+reconnect between segments. Eliminating it needs the collector to keep one WS connection
+alive across segment-file rotation (separate connection lifecycle from file lifecycle) —
+a real refactor of the collector core, deferred unless the 0.3% loss matters.
+
+---
+
 ## 2026-06-08 — Live collection migrated D: → G: (NVMe)
 
 Cut live collection from `D:\market_archive` to `G:\market_archive` (NVMe). **Why:** the

@@ -2,9 +2,12 @@ param(
     [string]$ConfigPath,
     [string]$OpsRoot = "G:\market_archive\ops",
     [string]$LogPath,
-    # Live default: run up to 4 collector jobs concurrently. Maintenance jobs
-    # (quarantine/promote/manifest/cleanup/health) stay serialized in the runner.
-    [int]$CollectorConcurrency = 4
+    # Live default: run every collector lane concurrently so each records CONTINUOUSLY
+    # (10 BTC lanes today + headroom). With fewer slots than lanes, lanes round-robin
+    # through the pool and each idles a large fraction of the time -> coverage gaps.
+    # Maintenance jobs (quarantine/promote/manifest/cleanup/health) run in the runner's
+    # scheduler thread, NOT the pool, so they don't consume collector slots.
+    [int]$CollectorConcurrency = 12
 )
 
 $ErrorActionPreference = "Stop"

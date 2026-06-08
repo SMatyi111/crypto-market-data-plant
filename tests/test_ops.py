@@ -14,6 +14,7 @@ from crypto_collector.cli import (
     _execute_ops_job_inprocess,
     _job_args,
     _ops_root_from_jobs,
+    _segment_deadline_utc,
     build_parser,
     run_binance_depth_worker,
     run_health,
@@ -593,6 +594,42 @@ def test_health_reports_poll_lane_freshness_for_kalshi(tmp_path: Path) -> None:
     assert lane["next_run_at"] is not None
     assert lane["success_count"] == 67
     assert "stale_job:kalshi-crypto-quotes" not in report.findings
+
+
+def test_segment_deadline_utc_time_bounded() -> None:
+    """Continuous capture relies on TIME-based segment rotation: a positive
+    max_segment_seconds bounds each segment regardless of message volume, while a
+    zero/None bound (and no midnight rotation) means no deadline. rotate_at_midnight
+    takes precedence so day-bounded files keep working."""
+    start = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)
+    # Fixed-cadence time bound -> deadline at start + window.
+    assert _segment_deadline_utc(
+        start, rotate_at_midnight=False, max_segment_seconds=1800
+    ) == start + timedelta(seconds=1800)
+    # Disabled -> no deadline (segment ends only on segment_count).
+    assert _segment_deadline_utc(start, rotate_at_midnight=False, max_segment_seconds=0.0) is None
+    assert _segment_deadline_utc(start, rotate_at_midnight=False, max_segment_seconds=0) is None
+    # Midnight rotation wins even if a time bound is also set.
+    assert _segment_deadline_utc(
+        start, rotate_at_midnight=True, max_segment_seconds=1800
+    ) == datetime(2026, 6, 9, 0, 0, 0, tzinfo=UTC)
+
+
+def test_execute_ops_job_inprocess_injects_max_segment_seconds(monkeypatch) -> None:
+    """The runner must thread max_segment_seconds from the job config onto the worker
+    args for every collector lane, so time-based rotation actually reaches the worker."""
+    import crypto_collector.cli as cli_mod
+
+    captured = {}
+    monkeypatch.setattr(cli_mod, "run_kraken_trades_worker", lambda args: captured.update(args=args))
+    job = JobSpec(
+        name="kraken-btc-trades",
+        job_type="kraken-trades-worker",
+        interval_seconds=5,
+        args={"symbol": "BTC/USD", "max_segment_seconds": 1800, "ops_root": r"G:\x\ops"},
+    )
+    _execute_ops_job_inprocess(job)
+    assert captured["args"].max_segment_seconds == 1800
 
 
 def test_ops_root_from_jobs_prefers_config_root() -> None:

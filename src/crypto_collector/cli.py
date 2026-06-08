@@ -1677,6 +1677,26 @@ def run_mexc_depth_worker(args: argparse.Namespace) -> None:
     )
 
 
+def _segment_deadline_utc(
+    started_at: datetime,
+    *,
+    rotate_at_midnight: bool,
+    max_segment_seconds: float,
+) -> datetime | None:
+    """Wall-clock deadline at which the current segment rotates cleanly (the stream
+    loop checks this and finalizes — flush/replay-summary/metrics all still run).
+    `rotate_at_midnight` (day-bounded files) takes precedence; otherwise a positive
+    `max_segment_seconds` bounds each segment by TIME so a lane rotates on a fixed
+    cadence regardless of message volume — this is what lets every lane record
+    continuously (one finalized segment per window, no per-hour idle gap). A
+    zero/None `max_segment_seconds` with no midnight rotation = no time bound."""
+    if rotate_at_midnight:
+        return _next_utc_midnight(started_at)
+    if max_segment_seconds and max_segment_seconds > 0:
+        return started_at + timedelta(seconds=max_segment_seconds)
+    return None
+
+
 def _run_segmented_worker(
     *,
     args: argparse.Namespace,
@@ -1713,12 +1733,16 @@ def _run_segmented_worker(
             while args.max_segments is None or completed_segments < args.max_segments:
                 segment_index = completed_segments + 1
                 segment_started_at = utc_now()
-                # When the worker is in day-bounded mode, each segment runs until
-                # midnight UTC instead of until --segment-count. The segment
-                # function checks the deadline in its inner stream loop and exits
-                # cleanly when it's crossed, so the parquet flush / replay summary
-                # / metrics write all still run.
-                segment_deadline_utc = _next_utc_midnight(segment_started_at) if rotate_at_midnight else None
+                # A segment may rotate on a wall-clock deadline instead of (or before)
+                # --segment-count: day-bounded (midnight) or a fixed max_segment_seconds
+                # cadence for continuous capture. The segment function checks the deadline
+                # in its inner stream loop and exits cleanly when crossed, so the parquet
+                # flush / replay summary / metrics write all still run.
+                segment_deadline_utc = _segment_deadline_utc(
+                    segment_started_at,
+                    rotate_at_midnight=rotate_at_midnight,
+                    max_segment_seconds=float(getattr(args, "max_segment_seconds", 0.0) or 0.0),
+                )
                 stop_event, heartbeat_thread = runtime.start_segment_heartbeat(
                     segment_index=segment_index,
                     started_at=segment_started_at,
@@ -1848,6 +1872,11 @@ def run_single_job(args: argparse.Namespace) -> None:
 
 def _execute_ops_job_inprocess(job: JobSpec) -> JobExecutionResult | str | None:
     args = _job_args(job)
+    # Time-based segment rotation knob for continuous-capture collectors. Injected here
+    # (rather than in each of the 10 _job_args builders) so every collector lane picks it
+    # up uniformly; _run_segmented_worker reads it via getattr and ignores it when
+    # unset/zero, and non-collector jobs simply never look at it.
+    args.max_segment_seconds = job.args.get("max_segment_seconds")
     if job.job_type == "mock":
         asyncio.run(run_mock(args))
         return "mock completed"

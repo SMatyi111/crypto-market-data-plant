@@ -67,15 +67,23 @@ task that "ran" but produced nothing:
   guarantees only one runner is active. A second invocation logs
   "ops runner already active, exiting" and exits 0 — so a boot trigger firing
   while a logon-triggered runner is already up is harmless.
-- **Parallel collection**: the script passes `-CollectorConcurrency 4` (override
-  with the param), so up to 4 collector jobs (the `*-worker` types) run at once
-  in a thread pool. Maintenance jobs (quarantine, promote, manifest, cleanup,
-  health) stay serialized in the scheduler loop — at most one runs at a time, and
-  it may run alongside active collectors but never alongside another maintenance
-  job. A given job is never launched a second time while its previous run is still
-  in flight. Default concurrency is `1` (fully serial) when the flag is omitted, so
-  nothing changes for callers that do not pass it. The live BTC Binance lanes are
-  unaffected by the change in dispatch order.
+- **Parallel collection (continuous capture)**: the script passes
+  `-CollectorConcurrency 12` (override with the param), enough slots for every
+  collector lane (`*-worker` types) to run **simultaneously and continuously**. This
+  is deliberate: with fewer slots than lanes, lanes round-robin through the pool and
+  each idles a large fraction of the time, leaving coverage gaps. Maintenance jobs
+  (quarantine, promote, manifest, cleanup, health) run in the scheduler thread, NOT
+  the pool, so they never consume collector slots. A given job is never launched a
+  second time while its previous run is still in flight. Default concurrency is `1`
+  (fully serial) when the flag is omitted.
+- **Continuous segments**: each collector lane sets `interval_seconds: 5` and
+  `args.max_segment_seconds: 1800`, so it re-dispatches ~immediately after a segment
+  finalizes and rotates a fresh 30-minute segment by wall-clock time (volume-
+  independent). `segment_count: 100000` is just a safety ceiling — the time bound
+  normally fires first. The only gap is a ~5–8s WS reconnect/respawn per segment
+  (~0.3% of wall-clock). Tuning: raise `max_segment_seconds` for fewer reconnects,
+  or lower `CollectorConcurrency` / `max_segment_seconds` if the box strains under
+  ~10 concurrent collectors.
 - **Heartbeat active set**: `heartbeat.json` reports `current_jobs` — the full list
   of in-flight jobs (`name`, `job_type`, `started_at`) — and keeps `current_job`
   pointing at the oldest active job (or `null` when idle) for older readers. Health
