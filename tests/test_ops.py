@@ -13,8 +13,10 @@ from crypto_collector.cli import (
     _execute_ops_job,
     _execute_ops_job_inprocess,
     _job_args,
+    _ops_root_from_jobs,
     build_parser,
     run_binance_depth_worker,
+    run_health,
     run_ops_runner,
     run_single_job,
 )
@@ -591,6 +593,94 @@ def test_health_reports_poll_lane_freshness_for_kalshi(tmp_path: Path) -> None:
     assert lane["next_run_at"] is not None
     assert lane["success_count"] == 67
     assert "stale_job:kalshi-crypto-quotes" not in report.findings
+
+
+def test_ops_root_from_jobs_prefers_config_root() -> None:
+    """The health CLI derives its ops root from the discovered config's job args so a
+    bare `health` follows the live collection root rather than the env/default fallback.
+    Jobs without an ops_root arg (maintenance jobs) are ignored; the most common root
+    across collector jobs wins."""
+    jobs = [
+        JobSpec(name="cb", job_type="coinbase-trades-worker", interval_seconds=60, args={"ops_root": r"G:\live\ops"}),
+        JobSpec(name="bn", job_type="binance-depth-worker", interval_seconds=60, args={"ops_root": r"G:\live\ops"}),
+        JobSpec(name="promote", job_type="promote-market", interval_seconds=60),
+    ]
+    assert _ops_root_from_jobs(jobs) == Path(r"G:\live\ops")
+    assert _ops_root_from_jobs([]) is None
+    assert _ops_root_from_jobs(None) is None
+
+
+def test_health_without_ops_root_follows_config_root(tmp_path, monkeypatch, capsys) -> None:
+    """Regression: after the D:->G: migration, a bare `health` (no --ops-root) read the
+    stale env/default root via default_ops_root() and falsely reported errors. With a
+    config discovered, it must inspect the ops root that config writes to instead."""
+    import crypto_collector.cli as cli_mod
+
+    live_ops = tmp_path / "live" / "ops"
+    (live_ops / "standalone_workers").mkdir(parents=True)
+    now = datetime.now(tz=UTC)
+    (live_ops / "heartbeat.json").write_text(
+        json.dumps(
+            {
+                "status": "running",
+                "last_seen": now.isoformat(),
+                "job_counters": {"kalshi-crypto-quotes": {"success_count": 5, "error_count": 0}},
+                "next_run_at": {"kalshi-crypto-quotes": (now + timedelta(seconds=30)).isoformat()},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (live_ops / "job_runs.jsonl").write_text(
+        json.dumps(
+            {
+                "job_name": "kalshi-crypto-quotes",
+                "job_type": "kalshi-collect-crypto-quotes",
+                "status": "success",
+                "started_at": (now - timedelta(seconds=40)).isoformat(),
+                "finished_at": (now - timedelta(seconds=20)).isoformat(),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "ops.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "jobs": [
+                    {
+                        "name": "kalshi-crypto-quotes",
+                        "job_type": "kalshi-collect-crypto-quotes",
+                        "interval_seconds": 60,
+                        "args": {"ops_root": str(live_ops)},
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # A bogus default proves the CLI does NOT fall back to it when a config is present.
+    bogus_root = tmp_path / "stale" / "ops"
+    monkeypatch.setattr(cli_mod, "default_ops_root", lambda: bogus_root)
+
+    captured: dict[str, Path] = {}
+    real_build = cli_mod.build_health_report
+
+    def spy(*spy_args, **spy_kwargs):
+        captured["ops_root"] = spy_kwargs.get("ops_root")
+        return real_build(*spy_args, **spy_kwargs)
+
+    monkeypatch.setattr(cli_mod, "build_health_report", spy)
+
+    args = build_parser().parse_args(["health", "--config", str(config_path)])
+    run_health(args)
+
+    assert captured["ops_root"] == live_ops
+    assert captured["ops_root"] != bogus_root
+    # End-to-end: the poll lane from the live heartbeat is rendered.
+    out = capsys.readouterr().out
+    assert "kalshi-crypto-quotes" in out
 
 
 def test_health_flags_stale_poll_lane(tmp_path: Path) -> None:

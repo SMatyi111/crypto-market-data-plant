@@ -606,7 +606,13 @@ def build_parser() -> argparse.ArgumentParser:
     run_job_parser.add_argument("--job-json", required=True, help="JSON: {name, job_type, interval_seconds, args}")
 
     health_parser = subparsers.add_parser("health", help="Inspect runner and archive health")
-    health_parser.add_argument("--ops-root", type=Path, default=default_ops_root())
+    health_parser.add_argument(
+        "--ops-root",
+        type=Path,
+        default=None,
+        help="Ops root to inspect. Default: derive from the discovered ops config so the "
+        "report follows the live collection root, falling back to the env/default root.",
+    )
     health_parser.add_argument("--config", type=Path)
     health_parser.add_argument("--stale-after-seconds", type=float, default=120.0)
     health_parser.add_argument("--job-stale-multiplier", type=float, default=3.0)
@@ -2233,14 +2239,37 @@ def _default_ops_config_path() -> Path | None:
     return None
 
 
+def _ops_root_from_jobs(jobs: list | None) -> Path | None:
+    """Derive the ops root the runner actually writes to from the discovered config's
+    job args. Without this, a bare `health` (no --ops-root, no env var) reads the stale
+    pre-migration root via default_ops_root() and falsely reports status=error; the
+    config is the source of truth for the live collection root. Returns the most common
+    ops_root across jobs, or None if the config carries none."""
+    if not jobs:
+        return None
+    counts: dict[str, int] = {}
+    for job in jobs:
+        root = getattr(job, "args", {}).get("ops_root")
+        if root:
+            key = str(root)
+            counts[key] = counts.get(key, 0) + 1
+    if not counts:
+        return None
+    return Path(max(counts.items(), key=lambda kv: kv[1])[0])
+
+
 def run_health(args: argparse.Namespace) -> None:
     # Without an explicit --config the report was blind to interval jobs (poll-based
     # lanes like Kalshi never appear in standalone_workers), so auto-discover the
     # runner's config and report on the same job set the runner runs.
     config_path = args.config or _default_ops_config_path()
     jobs = load_ops_config(config_path) if config_path and config_path.exists() else None
+    # When --ops-root is omitted, follow the discovered config's live root instead of the
+    # env/default fallback, so a bare `health` reports on the running collection rather
+    # than a stale pre-migration root.
+    ops_root = args.ops_root or _ops_root_from_jobs(jobs) or default_ops_root()
     report = build_health_report(
-        ops_root=args.ops_root,
+        ops_root=ops_root,
         jobs=jobs,
         stale_after_seconds=args.stale_after_seconds,
         job_stale_multiplier=args.job_stale_multiplier,
