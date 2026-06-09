@@ -340,13 +340,14 @@ layout, or an external venue, so none should be started silently.
    `src/crypto_collector/proto/mexc/README.md`). A future pass could upgrade depth to a
    provable `sequence` guarantee if a dense per-symbol diff id is verified live (the
    `version` is already captured), the same path Bybit depth took (#4). **Note:** the
-   editable `crypto_collector` install resolves to `…\Crypto_L3 collection\src`, a
-   different tree than this repo — reinstall from this repo (`pip install -e ".[mexc]"`)
-   so the lane is importable before any rollout.
+   editable `crypto_collector` install historically resolved to the now-retired
+   `Crypto_L3 collection` tree (archived to `G:\04-archive`), a different tree than this
+   repo — install/reinstall from this repo (`pip install -e ".[mexc]"`, or run with
+   `PYTHONPATH=src`) so the lane is importable before any rollout.
 
-Also still parked: the **L3 collection project** re-enable (see bottom of this
-file) and making **day-bounded rotation the default** run model (currently
-opt-in via `--rotate-at-midnight`).
+Also still parked: making **day-bounded rotation the default** run model (currently
+opt-in via `--rotate-at-midnight`). (The L3 collection project is **retired**, not
+parked — see bottom of this file.)
 
 ---
 
@@ -431,20 +432,10 @@ durable via per-write fsync) at the cost of more, smaller part-files.
 
 ---
 
-## L3 — explicitly deferred
+## L3 — RETIRED (2026-06-09)
 
-The `Crypto_L3 collection` project at `G:\01-active\trading\Crypto_L3 collection\`
-has `CryptoL3Collector` + `CryptoL3MarketSupervisor` scheduled tasks, both
-**disabled**. Its unique jobs (Deribit perps via `book_summary`, CoinDesk RSS,
-maker-queue-measure, promote-deribit-options/perps) are not running.
-
-Re-enabling needs:
-
-- A separate `--ops-root` so it doesn't fight `CryptoMarketDataPlant` for the
-  `OpsRunnerLock` on `D:\market_archive\ops`.
-- Disable the three duplicate jobs in L3's config: `quarantine-market`,
-  `promote-market`, `research-manifest` (the plant already runs them).
-- Verify L3's deribit jobs don't conflict with `BinanceIV Collect Deribit`
-  (different output paths today, so likely fine).
-
-Out of scope for current session.
+The `Crypto_L3 collection` project is **retired**: its `CryptoL3Collector` +
+`CryptoL3MarketSupervisor` scheduled tasks were removed and the tree was archived to
+`G:\04-archive\Crypto_L3 collection`. It is no longer a re-enable candidate. Any of its
+unique feeds still wanted (e.g. Deribit perps) should be added as native lanes to this
+plant rather than reviving L3.
