@@ -9,6 +9,39 @@ Ordered roughly by risk × ease.
 
 ---
 
+## 2026-06-09 — Open: binance has no snapshot row in curated `market_replayable`
+
+coinbase/bybit/kraken/mexc receive their book snapshot **in-stream** (the WS sends a
+`type:snapshot` frame, normalized to a clean event with `event_type="snapshot"`), so
+each run's curated data is self-contained for replay. **Binance is the exception:** its
+diff-depth WS sends no snapshot frame — the seed is fetched via REST and written only to
+the sidecar `…/snapshots/book_snapshot.json` (`collect_binance_depth_segment`, cli.py).
+So binance clean/curated rows are pure `depthUpdate` deltas with **no snapshot row**, and
+the curated `market_replayable` dataset cannot be replayed for binance without the raw
+sidecar. (The arbitrage probe in `crypto-modelling` works around this by seeding binance
+from the raw `book_snapshot.json` — but that couples it to the raw tree.)
+
+**Fix (ready to implement, ~low risk but VALIDATE first):** after the REST snapshot is
+captured, synthesize a `RawMessage` in binance depth format with `e="snapshot"`,
+`U=u=lastUpdateId`, `b`/`a` = snapshot levels, run it through the existing
+`BinanceDepthNormalizer` (gives a correct `event_type="snapshot"` clean row), and write it
+to `clean_sink` + `parquet_sink` as the FIRST clean event (bypass the quality gate — the
+REST snapshot is authoritative). **MUST VALIDATE:** binance `replay_depth_run` /
+`book-sync-health` were built assuming binance clean events are all deltas (seed from the
+sidecar). Confirm a leading snapshot clean event doesn't double-seed or misapply before
+shipping — don't regress the green book-sync-health state. Only affects new collection;
+existing curated binance data would need re-promotion.
+
+## 2026-06-09 — Minor: bare `health` checks the wrong normalized root (D: fallback)
+
+`_latest_partition_write` (ops.py) uses env-based `default_normalized_root`, so a bare
+`health` with no env set checks the abandoned `D:\market_archive\normalized` and emits a
+false `stale_partition:binance-*`. Same class as the ops-root fix (2d3a415) — derive the
+normalized root from the discovered config instead of the env fallback. Monitoring-only
+artifact in ad-hoc runs; the runner (correct env) is unaffected.
+
+---
+
 ## 2026-06-08 — Continuous capture: time-based segment rotation + full concurrency
 
 **Problem:** every collector lane (trades AND depth, all venues) was only recording
