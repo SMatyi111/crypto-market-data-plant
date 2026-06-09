@@ -9,28 +9,40 @@ Ordered roughly by risk × ease.
 
 ---
 
-## 2026-06-09 — Open: binance has no snapshot row in curated `market_replayable`
+## 2026-06-09 — DONE: self-heal cut-off segments via score-only catch-up jobs
+
+A segment cut off mid-finalize (clean events written to disk, but no inline
+`metrics/replay_summary.json`) was invisible to curation: `promote_replayable_runs`
+skips any run without a summary (`skipped_missing_replay`), so those rows never reached
+the curated dataset. Fixed by making the trades + non-binance-depth scorers dispatchable
+as **ops job types** (`backfill-trades-replay`, `backfill-stream-depth` — previously
+CLI-only) and adding hourly per-lane `score-*` catch-up jobs that (re)write each run's
+`replay_summary.json`. The depth scorer runs in a new `--score-only` mode that writes
+summaries but does **not** promote, so the quarantine-aware `promote-replayable` jobs
+stay the *single* promoter into the curated parquet — two concurrent promoters would
+duplicate curated rows (the promotion index can't dedup a run it hasn't recorded yet).
+8 tests incl. an end-to-end self-heal + no-duplicate-rows acceptance test. Activates on
+the next runner restart (the ops config is read once at startup).
+
+## 2026-06-09 — DONE (084f8c9): binance emits its REST snapshot as a clean event
 
 coinbase/bybit/kraken/mexc receive their book snapshot **in-stream** (the WS sends a
 `type:snapshot` frame, normalized to a clean event with `event_type="snapshot"`), so
-each run's curated data is self-contained for replay. **Binance is the exception:** its
-diff-depth WS sends no snapshot frame — the seed is fetched via REST and written only to
-the sidecar `…/snapshots/book_snapshot.json` (`collect_binance_depth_segment`, cli.py).
-So binance clean/curated rows are pure `depthUpdate` deltas with **no snapshot row**, and
-the curated `market_replayable` dataset cannot be replayed for binance without the raw
-sidecar. (The arbitrage probe in `crypto-modelling` works around this by seeding binance
-from the raw `book_snapshot.json` — but that couples it to the raw tree.)
+each run's curated data is self-contained for replay. **Binance was the exception:** its
+diff-depth WS sends no snapshot frame — the seed is fetched via REST and was written only
+to the sidecar `…/snapshots/book_snapshot.json` (`collect_binance_depth_segment`, cli.py),
+so binance clean/curated rows were pure `depthUpdate` deltas with **no snapshot row**, and
+the curated `market_replayable` dataset could not be replayed for binance without the raw
+sidecar.
 
-**Fix (ready to implement, ~low risk but VALIDATE first):** after the REST snapshot is
-captured, synthesize a `RawMessage` in binance depth format with `e="snapshot"`,
-`U=u=lastUpdateId`, `b`/`a` = snapshot levels, run it through the existing
-`BinanceDepthNormalizer` (gives a correct `event_type="snapshot"` clean row), and write it
-to `clean_sink` + `parquet_sink` as the FIRST clean event (bypass the quality gate — the
-REST snapshot is authoritative). **MUST VALIDATE:** binance `replay_depth_run` /
-`book-sync-health` were built assuming binance clean events are all deltas (seed from the
-sidecar). Confirm a leading snapshot clean event doesn't double-seed or misapply before
-shipping — don't regress the green book-sync-health state. Only affects new collection;
-existing curated binance data would need re-promotion.
+**Resolved (084f8c9):** after the REST snapshot is captured, the collector synthesizes a
+binance-format snapshot `RawMessage` (`e="snapshot"`, `U=u=lastUpdateId`, `b`/`a` =
+snapshot levels), runs it through `BinanceDepthNormalizer` (correct `event_type="snapshot"`
+clean row), and writes it to `clean_sink` + `parquet_sink` as the FIRST clean event
+(bypassing the quality gate — the REST snapshot is authoritative). Shipped with collector +
+replay tests (`test_collectors.py`, `test_replay.py`) covering the leading-snapshot clean
+event so it doesn't double-seed. **Residual (operational, not code):** only affects new
+collection — existing curated binance data would need re-promotion to gain the snapshot row.
 
 ## 2026-06-09 — Minor: bare `health` checks the wrong normalized root (D: fallback)
 
