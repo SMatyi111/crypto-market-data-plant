@@ -48,13 +48,18 @@ self-contained. **Residual (optional):** only NEW collection self-heals — bina
 partitions collected *before* the fix still lack a snapshot row and would need
 re-promotion if self-contained replay of those historical dates is wanted.
 
-## 2026-06-09 — Minor: bare `health` checks the wrong normalized root (D: fallback)
+## 2026-06-09 — DONE: bare `health` now follows the config's normalized root
 
-`_latest_partition_write` (ops.py) uses env-based `default_normalized_root`, so a bare
-`health` with no env set checks the abandoned `D:\market_archive\normalized` and emits a
-false `stale_partition:binance-*`. Same class as the ops-root fix (2d3a415) — derive the
-normalized root from the discovered config instead of the env fallback. Monitoring-only
-artifact in ad-hoc runs; the runner (correct env) is unaffected.
+Was: `_latest_partition_write` (ops.py) used env-based `default_normalized_root`, so a
+bare `health` with no env set checked the abandoned `D:\market_archive\normalized` and
+emitted a false `stale_partition:binance-*` (monitoring-only artifact in ad-hoc runs; the
+runner with the correct env was unaffected). **Fixed** the same way as the ops-root fix
+(`2d3a415`): `_normalized_root_from_jobs()` derives the live normalized root from the
+discovered config (the jobs' `ops_root` sits at `archive/ops`, normalized data beside it
+at `archive/normalized`), threaded through `build_health_report → _latest_partition_write`
+via an optional `normalized_root`. When unset the env/default fallback is preserved, so
+the live runner and other callers are untouched. Regression test:
+`test_health_follows_config_normalized_root_not_env_fallback`.
 
 ---
 
