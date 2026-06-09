@@ -1685,6 +1685,54 @@ def test_job_args_threads_binance_trades_market_through_inprocess_path() -> None
     assert futures.market == "futures"
 
 
+def test_workers_thread_market_through_build_segment_args(tmp_path, monkeypatch) -> None:
+    """Regression: the per-worker build_segment_args lambda must copy `market` onto the
+    segment namespace. It previously dropped it, so a perp worker silently ran as spot
+    (wrong endpoint + lane + instrument). Drive each worker once with a stubbed segment
+    fn and assert the market it actually receives."""
+    import crypto_collector.cli as cli
+
+    captured: dict[str, str] = {}
+
+    def make_fake(key):
+        async def fake(segment_args):
+            captured[key] = getattr(segment_args, "market", "MISSING")
+            return {"run_path": str(tmp_path / key), "clean_events": 0, "replayable": True}
+        return fake
+
+    monkeypatch.setattr(cli, "collect_bybit_trades_segment", make_fake("bybit_trades"))
+    monkeypatch.setattr(cli, "collect_bybit_depth_segment", make_fake("bybit_depth"))
+    monkeypatch.setattr(cli, "collect_binance_trades_segment", make_fake("binance_trades"))
+
+    def drive(job_type, runner, market):
+        args = _job_args(
+            SimpleNamespace(
+                job_type=job_type,
+                args={
+                    "symbol": "BTCUSDT",
+                    "market": market,
+                    "max_segments": 1,
+                    "cooldown_seconds": 0.0,
+                    "heartbeat_interval_seconds": 0.1,
+                    "worker_name": f"{job_type}-mkttest",
+                    "output_root": str(tmp_path),
+                    "ops_root": str(tmp_path),
+                },
+            )
+        )
+        runner(args)
+
+    drive("bybit-trades-worker", cli.run_bybit_trades_worker, "linear")
+    drive("bybit-depth-worker", cli.run_bybit_depth_worker, "linear")
+    drive("binance-trades-worker", cli.run_binance_trades_worker, "futures")
+
+    assert captured == {
+        "bybit_trades": "linear",
+        "bybit_depth": "linear",
+        "binance_trades": "futures",
+    }
+
+
 def test_collect_bybit_trades_segment_writes_none_native_replay_summary(
     tmp_path, monkeypatch
 ) -> None:

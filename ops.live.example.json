@@ -555,7 +555,6 @@
         "raw_root": "G:\\market_archive\\raw\\market",
         "source": [
           "coinbase_depth",
-          "coinbase_depth_usdc",
           "bybit_depth",
           "bybit_perp_depth",
           "kraken_depth",
@@ -686,105 +685,6 @@
       "interval_seconds": 3600,
       "args": {
         "source_root": "G:\\market_archive\\raw\\market\\binance_trades_usdc",
-        "limit": 1000,
-        "max_age_hours": 168
-      }
-    },
-    {
-      "name": "coinbase-btcusdc-trades",
-      "job_type": "coinbase-trades-worker",
-      "enabled": false,
-      "interval_seconds": 5,
-      "args": {
-        "symbol": "BTC-USDC",
-        "channel": "matches",
-        "segment_count": 100000,
-        "max_segments": 1,
-        "cooldown_seconds": 1.0,
-        "source_suffix": "usdc",
-        "worker_name": "coinbase-trades-worker-usdc",
-        "idle_timeout_seconds": 120,
-        "output_root": "G:\\market_archive\\raw\\market",
-        "ops_root": "G:\\market_archive\\ops",
-        "max_segment_seconds": 1800
-      }
-    },
-    {
-      "name": "quarantine-coinbase-trades-usdc",
-      "job_type": "quarantine-runs",
-      "enabled": false,
-      "interval_seconds": 300,
-      "args": {
-        "source_root": "G:\\market_archive\\raw\\market\\coinbase_trades_usdc",
-        "quarantine_root": "G:\\market_archive\\quarantine\\market\\coinbase_trades_usdc",
-        "limit": 1000,
-        "max_age_hours": 168
-      }
-    },
-    {
-      "name": "promote-coinbase-trades-usdc",
-      "job_type": "promote-replayable",
-      "enabled": false,
-      "interval_seconds": 300,
-      "args": {
-        "source_root": "G:\\market_archive\\raw\\market\\coinbase_trades_usdc",
-        "target_root": "G:\\market_archive\\curated\\research\\trades_replayable",
-        "quarantine_index": "G:\\market_archive\\quarantine\\market\\coinbase_trades_usdc\\_quarantine_index.jsonl",
-        "limit": 1000,
-        "max_age_hours": 168
-      }
-    },
-    {
-      "name": "score-coinbase-trades-usdc",
-      "job_type": "backfill-trades-replay",
-      "enabled": false,
-      "interval_seconds": 3600,
-      "args": {
-        "source_root": "G:\\market_archive\\raw\\market\\coinbase_trades_usdc",
-        "limit": 1000,
-        "max_age_hours": 168
-      }
-    },
-    {
-      "name": "coinbase-btcusdc-depth",
-      "job_type": "coinbase-depth-worker",
-      "enabled": false,
-      "interval_seconds": 5,
-      "args": {
-        "symbol": "BTC-USDC",
-        "channel": "level2_50",
-        "segment_count": 100000,
-        "max_segments": 1,
-        "cooldown_seconds": 1.0,
-        "source_suffix": "usdc",
-        "worker_name": "coinbase-depth-worker-usdc",
-        "idle_timeout_seconds": 120,
-        "output_root": "G:\\market_archive\\raw\\market",
-        "ops_root": "G:\\market_archive\\ops",
-        "max_segment_seconds": 1800
-      }
-    },
-    {
-      "name": "quarantine-coinbase-depth-usdc",
-      "job_type": "quarantine-runs",
-      "enabled": false,
-      "interval_seconds": 300,
-      "args": {
-        "source_root": "G:\\market_archive\\raw\\market\\coinbase_depth_usdc",
-        "quarantine_root": "G:\\market_archive\\quarantine\\market\\coinbase_depth_usdc",
-        "limit": 1000,
-        "max_age_hours": 168
-      }
-    },
-    {
-      "name": "promote-coinbase-depth-usdc",
-      "job_type": "promote-replayable",
-      "enabled": false,
-      "interval_seconds": 300,
-      "args": {
-        "source_root": "G:\\market_archive\\raw\\market\\coinbase_depth_usdc",
-        "target_root": "G:\\market_archive\\curated\\research\\market_replayable",
-        "quarantine_index": "G:\\market_archive\\quarantine\\market\\coinbase_depth_usdc\\_quarantine_index.jsonl",
         "limit": 1000,
         "max_age_hours": 168
       }
@@ -967,8 +867,6 @@
           "market/mexc_depth=14",
           "market/binance_depth_usdc=14",
           "market/binance_trades_usdc=14",
-          "market/coinbase_trades_usdc=14",
-          "market/coinbase_depth_usdc=14",
           "market/bybit_perp_trades=14",
           "market/bybit_perp_depth=14",
           "market/binance_perp_trades=14"
