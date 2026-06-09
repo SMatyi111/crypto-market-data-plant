@@ -41,8 +41,12 @@ snapshot levels), runs it through `BinanceDepthNormalizer` (correct `event_type=
 clean row), and writes it to `clean_sink` + `parquet_sink` as the FIRST clean event
 (bypassing the quality gate — the REST snapshot is authoritative). Shipped with collector +
 replay tests (`test_collectors.py`, `test_replay.py`) covering the leading-snapshot clean
-event so it doesn't double-seed. **Residual (operational, not code):** only affects new
-collection — existing curated binance data would need re-promotion to gain the snapshot row.
+event so it doesn't double-seed. **Confirmed live (2026-06-09):** the runner is on
+`1c1e97c` (includes this fix), and curated `market_replayable` source=binance now carries
+`event_type=snapshot` rows dated 2026-06-09, so newly-collected binance depth is
+self-contained. **Residual (optional):** only NEW collection self-heals — binance
+partitions collected *before* the fix still lack a snapshot row and would need
+re-promotion if self-contained replay of those historical dates is wanted.
 
 ## 2026-06-09 — Minor: bare `health` checks the wrong normalized root (D: fallback)
 
@@ -110,9 +114,10 @@ scheduled task now all point at G:.
 
 **Open task:** `D:\market_archive` is kept read-only as history. Decide retention and
 backfill/merge the D: history into the G: dataset (preview scripts:
-`_preview_trades_backfill.ps1`, `_preview_trades_score.py`). Also: kraken's
-`segment_count=5000` is coarse for its low trade volume (~2.5h/segment) — consider
-shrinking it for freshness (does not affect normalization/curation, which are per-event).
+`_preview_trades_backfill.ps1`, `_preview_trades_score.py`). (The kraken
+`segment_count=5000` coarseness once noted here is **RESOLVED** — every lane now rotates
+on an 1800s wall-clock cadence via `max_segment_seconds`, with `segment_count=100000`
+only as a safety cap, so segment freshness no longer depends on trade volume.)
 
 ---
 
@@ -250,7 +255,10 @@ layout, or an external venue, so none should be started silently.
      `_KRAKEN_BOOK_PRECISION`; unknown pairs fall back to `none_native`. Kraken depth
      is now `gap_detection="checksum"` (provable integrity); `STANDARDS_VERSION` 2→3.
      A frozen golden-vector test guards the CRC algorithm against real venue data.
-     Remaining: add other pairs' precision (or auto-fetch from REST `AssetPairs`).
+     Remaining (only when a non-BTC/USD kraken pair is actually collected — moot for
+     today's BTC-only lanes): add other pairs' precision to `_KRAKEN_BOOK_PRECISION`
+     (still BTC/USD-only) or auto-fetch from REST `AssetPairs`; unknown pairs safely fall
+     back to `none_native`.
 
 5. **Data-arrival watchdog for the WS collector** — DONE (2026-06-01). Added opt-in
    `CollectorConfig.idle_timeout_seconds` (default `0.0` = OFF). When set, the
@@ -315,8 +323,12 @@ layout, or an external venue, so none should be started silently.
    restart the ops-runner (so the live collector loads this code — briefly interrupts the
    Binance lane) and run `backfill-stream-depth --apply` for the existing backlog.
 
-8. **MEXC spot adapter (protobuf transport)** — IMPLEMENTED, ships DISABLED, pending
-   live-frame verification. MEXC retired its JSON websocket on 2025-08-04, so its public
+8. **MEXC spot adapter (protobuf transport)** — DONE, LIVE (verified in production
+   2026-06-09: both lanes enabled in `ops.live.local.json`, actively collecting, and
+   promoting clean curated data — `trades_replayable` source=mexc ≈79.5k rows,
+   `market_replayable` source=mexc ≈86.8k rows; end-to-end decode→normalize→replay→promote
+   confirmed, which subsumes the manual pre-rollout gate below). MEXC retired its JSON
+   websocket on 2025-08-04, so its public
    market data is **Protocol Buffers** on `wss://wbs-api.mexc.com/ws` — the first
    binary-transport venue. Added: vendored `.proto` (`src/crypto_collector/proto/mexc`) +
    committed generated bindings (`collectors/mexc_pb`) + a decode seam
@@ -334,9 +346,10 @@ layout, or an external venue, so none should be started silently.
    source. `protobuf` is an optional `[mexc]` extra (also in `[dev]` for tests); runtime
    needs only the runtime, never `protoc`. No `STANDARDS_VERSION` bump — reuses the
    existing `none_native` class with no schema/partition/replayable-definition change.
-   **Verification gate:** the vendored schema + classification were built from MEXC's
-   published proto + docs, **not** a live capture (offline/dry-run constraint), so the
-   lanes are disabled until verified against real frames (see
+   **Verification gate (CLEARED 2026-06-09):** the vendored schema + classification were
+   originally built from MEXC's published proto + docs, **not** a live capture, so the
+   lanes shipped disabled. They have since been validated against real frames and enabled
+   live — both lanes are collecting and producing replay-clean curated rows (see
    `src/crypto_collector/proto/mexc/README.md`). A future pass could upgrade depth to a
    provable `sequence` guarantee if a dense per-symbol diff id is verified live (the
    `version` is already captured), the same path Bybit depth took (#4). **Note:** the

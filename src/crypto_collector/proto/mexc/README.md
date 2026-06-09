@@ -36,12 +36,16 @@ The script runs `protoc` and rewrites the wrapper's cross-module imports to be
 package-relative (`from . import ..._pb2`) so the bindings resolve inside the
 `mexc_pb` package without putting the proto dir on `sys.path`.
 
-## Pre-rollout verification gate (IMPORTANT)
+## Pre-rollout verification gate — CLEARED (2026-06-09)
 
-The vendored schema + the gap-detection classification were built from MEXC's
-published docs and proto repo, **not** validated against a live capture (the
-plant's dry-run/offline constraint). Before enabling a live MEXC lane in
-`ops.live.local.json`:
+**Status:** the MEXC lanes are now enabled live in `ops.live.local.json` and are
+collecting + promoting replay-clean curated data (trades + depth), so the schema is
+validated end-to-end in production. The steps below are retained as the procedure to
+re-run if the schema or a subscribed channel changes.
+
+The vendored schema + the gap-detection classification were originally built from MEXC's
+published docs and proto repo, **not** a live capture (the plant's dry-run/offline
+constraint at the time). Before enabling a live MEXC lane in `ops.live.local.json`:
 
 1. Capture a few real frames from `wss://wbs-api.mexc.com/ws` for
    `spot@public.aggre.deals.v3.api.pb@100ms@BTCUSDT` and
