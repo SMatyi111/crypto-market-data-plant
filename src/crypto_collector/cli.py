@@ -156,6 +156,15 @@ def build_parser() -> argparse.ArgumentParser:
     trades_parser = subparsers.add_parser("binance-trades-worker", help="Run segmented Binance trade collection")
     trades_parser.add_argument("--symbol", default="btcusdt")
     trades_parser.add_argument("--channel", choices=["trade", "aggTrade"], default="trade")
+    trades_parser.add_argument(
+        "--market",
+        choices=list(_BINANCE_TRADES_MARKETS),
+        default="spot",
+        help="Binance product type. 'spot' (default) keeps the legacy lane "
+        "(binance_trades/, spot:binance:* instrument). 'futures' = USDT-M perpetual "
+        "futures on fstream.binance.com: streams aggregate trades (channel forced to "
+        "aggTrade), runs land in binance_perp_trades/ tagged perp:binance-futures:*.",
+    )
     trades_parser.add_argument("--segment-count", type=int, default=5000)
     trades_parser.add_argument("--max-segments", type=int)
     trades_parser.add_argument("--cooldown-seconds", type=float, default=1.0)
@@ -1143,11 +1152,42 @@ def _finalize_depth_segment(
     }
 
 
+# Binance trades run against spot or USDT-M futures (perp). Both speak the same WS
+# subscription protocol and BinanceTradeNormalizer already reads the aggTrade `a` id, so
+# futures is a URL + endpoint + instrument-tagging switch. Futures streams only aggregate
+# trades (no raw @trade), so the futures lane forces channel=aggTrade, routes to
+# binance_perp_trades/, and tags perp:binance-futures:* (the explicit instrument-master
+# record) instead of spot:binance:*. aggTrade's `a` is a dense per-symbol counter, so the
+# lane stays a provable sequence feed (replay_trades_run, gap-proof) just like spot.
+_BINANCE_SPOT_TRADES_WS = "wss://stream.binance.com:9443/ws"
+_BINANCE_FUTURES_WS = "wss://fstream.binance.com/ws"
+_BINANCE_TRADES_MARKETS = ("spot", "futures")
+
+
+def _binance_trades_market(args: argparse.Namespace) -> str:
+    market = str(getattr(args, "market", "spot") or "spot").lower()
+    if market not in _BINANCE_TRADES_MARKETS:
+        raise SystemExit(
+            f"--market must be one of {', '.join(_BINANCE_TRADES_MARKETS)} (got {market!r})"
+        )
+    return market
+
+
 async def collect_binance_trades_segment(args: argparse.Namespace) -> dict[str, object]:
+    if _binance_trades_market(args) == "futures":
+        return await _collect_trades_segment(
+            args,
+            source="binance-futures",
+            websocket_url=_BINANCE_FUTURES_WS,
+            subscription_style="binance",
+            normalizer=BinanceTradeNormalizer(instrument_type="perp"),
+            source_base="binance_perp_trades",
+            channel_override="aggTrade",
+        )
     return await _collect_trades_segment(
         args,
         source="binance",
-        websocket_url="wss://stream.binance.com:9443/ws",
+        websocket_url=_BINANCE_SPOT_TRADES_WS,
         subscription_style="binance",
         normalizer=BinanceTradeNormalizer(),
         source_base="binance_trades",
@@ -2130,6 +2170,7 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
         return SimpleNamespace(
             symbol=raw_args.get("symbol", "btcusdt"),
             channel=raw_args.get("channel", "trade"),
+            market=raw_args.get("market", "spot"),
             segment_count=raw_args.get("segment_count", 5000),
             max_segments=raw_args.get("max_segments"),
             cooldown_seconds=raw_args.get("cooldown_seconds", 1.0),

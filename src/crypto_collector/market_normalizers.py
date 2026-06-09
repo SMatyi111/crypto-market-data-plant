@@ -33,6 +33,20 @@ class BinanceDepthNormalizer:
 
 
 class BinanceTradeNormalizer:
+    """Normalize Binance `trade` (spot) / `aggTrade` (spot or USDT-M futures) frames.
+
+    The frame shape is identical across spot and futures — both carry a dense per-symbol
+    id (`t` for raw trades, `a` for aggregate trades), `m` (buyer-is-maker), `p`/`q` — so
+    the only market-dependent behavior is instrument identity: `instrument_type="perp"`
+    resolves `perp:binance-futures:SYM` (canonical `BTC/USDT-PERP`) instead of
+    `spot:binance:SYM`. (Futures streams only aggregate trades, so its lane uses `a`.)
+    """
+
+    def __init__(self, *, instrument_type: str = "spot") -> None:
+        self._resolve_instrument = (
+            resolve_perp_instrument if instrument_type == "perp" else resolve_spot_instrument
+        )
+
     def normalize(self, raw: RawMessage) -> NormalizedL3Event:
         payload = raw.payload.get("data", raw.payload)
         parse_errors: list[str] = []
@@ -44,7 +58,7 @@ class BinanceTradeNormalizer:
         buyer_is_maker = _optional_bool(payload.get("m"), "buyer_is_maker", parse_errors)
         price = _optional_float(payload.get("p"), "price", parse_errors)
         size = _optional_float(payload.get("q"), "size", parse_errors)
-        instrument = resolve_spot_instrument(product, venue=raw.source)
+        instrument = self._resolve_instrument(product, venue=raw.source)
 
         metadata: dict[str, Any] = {
             "instrument_id": instrument.instrument_id if instrument is not None else None,

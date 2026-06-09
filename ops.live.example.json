@@ -891,6 +891,63 @@
       }
     },
     {
+      "// Binance USDT-M perp trades": "Set market='futures' on the Binance trades worker to collect USDT-M perpetual aggregate trades from fstream.binance.com. The frame shape matches spot (BinanceTradeNormalizer already reads the aggTrade `a` id), so this is a URL + endpoint + instrument-tagging switch: channel is forced to aggTrade, runs land in binance_perp_trades/ tagged perp:binance-futures:* (the explicit instrument-master record), and `a` is a dense counter so the lane stays a provable sequence feed. NOTE: this is Phase-3 TRADES ONLY. Binance futures DEPTH is intentionally absent — futures depth chains via the `pu` (previous-final-update-id) field, NOT the spot snapshot-anchor rule the binance-depth-worker book-sync is built on, so a futures depth lane needs its own sync variant + book-sync-health before it can be added (it would false-green otherwise). Enable to activate trades.",
+      "name": "binance-perp-trades",
+      "job_type": "binance-trades-worker",
+      "enabled": false,
+      "interval_seconds": 5,
+      "args": {
+        "symbol": "btcusdt",
+        "channel": "aggTrade",
+        "market": "futures",
+        "jsonl_fsync": false,
+        "normalized_parquet": false,
+        "segment_count": 100000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "worker_name": "binance-trades-worker-perp",
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops",
+        "max_segment_seconds": 1800
+      }
+    },
+    {
+      "name": "quarantine-binance-perp-trades",
+      "job_type": "quarantine-runs",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\binance_perp_trades",
+        "quarantine_root": "G:\\market_archive\\quarantine\\market\\binance_perp_trades",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "promote-binance-perp-trades",
+      "job_type": "promote-replayable",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\binance_perp_trades",
+        "target_root": "G:\\market_archive\\curated\\research\\trades_replayable",
+        "quarantine_index": "G:\\market_archive\\quarantine\\market\\binance_perp_trades\\_quarantine_index.jsonl",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "score-binance-perp-trades",
+      "job_type": "backfill-trades-replay",
+      "enabled": false,
+      "interval_seconds": 3600,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\binance_perp_trades",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
       "name": "cleanup-dry-run",
       "job_type": "cleanup",
       "interval_seconds": 3600,
@@ -913,7 +970,8 @@
           "market/coinbase_trades_usdc=14",
           "market/coinbase_depth_usdc=14",
           "market/bybit_perp_trades=14",
-          "market/bybit_perp_depth=14"
+          "market/bybit_perp_depth=14",
+          "market/binance_perp_trades=14"
         ],
         "apply": false
       }
