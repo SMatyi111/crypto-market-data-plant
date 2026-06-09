@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from crypto_collector.cli import (
     _align_binance_buffered_events,
     _binance_buffer_bridges_snapshot,
+    _binance_trades_market,
     _binance_update_window,
     _build_source_name,
     _bybit_instrument_type,
@@ -30,6 +31,7 @@ from crypto_collector.cli import (
     _is_retryable_connect_error,
 )
 from crypto_collector.market_normalizers import (
+    BinanceTradeNormalizer,
     BybitDepthNormalizer,
     BybitTradeNormalizer,
     CoinbaseDepthNormalizer,
@@ -1605,6 +1607,82 @@ def test_job_args_threads_bybit_market_through_inprocess_path() -> None:
         )
     )
     assert depth_linear.market == "linear"
+
+
+def _binance_aggtrade_frame(*, symbol="BTCUSDT", agg_id=12345, price="50000", qty="0.1"):
+    # Binance USDT-M futures streams aggregate trades: `a` (dense agg id), no raw `t`.
+    return {
+        "e": "aggTrade",
+        "s": symbol,
+        "a": agg_id,
+        "p": price,
+        "q": qty,
+        "T": 1_780_000_000_000,
+        "E": 1_780_000_000_001,
+        "m": False,
+    }
+
+
+def test_binance_trades_market_helper_validates() -> None:
+    import pytest
+
+    assert _binance_trades_market(SimpleNamespace()) == "spot"
+    assert _binance_trades_market(SimpleNamespace(market="FUTURES")) == "futures"
+    with pytest.raises(SystemExit):
+        _binance_trades_market(SimpleNamespace(market="coin"))
+
+
+def test_binance_trade_normalizer_perp_tags_binance_futures_instrument() -> None:
+    # Futures frames arrive with source 'binance-futures' so the perp resolver hits the
+    # explicit instrument-master record (perp:binance-futures:BTCUSDT), not the generic
+    # perp:binance:* fallback.
+    raw = RawMessage(
+        source="binance-futures",
+        received_at=utc_now(),
+        payload=_binance_aggtrade_frame(agg_id=987654),
+    )
+    spot_raw = RawMessage(
+        source="binance",
+        received_at=utc_now(),
+        payload=_binance_aggtrade_frame(agg_id=987654),
+    )
+
+    perp_event = BinanceTradeNormalizer(instrument_type="perp").normalize(raw)
+    spot_event = BinanceTradeNormalizer().normalize(spot_raw)
+
+    assert perp_event.metadata["instrument_id"] == "perp:binance-futures:BTCUSDT"
+    assert perp_event.metadata["canonical_symbol"] == "BTC/USDT-PERP"
+    assert spot_event.metadata["instrument_id"] == "spot:binance:BTCUSDT"
+    # aggTrade `a` is a dense per-symbol counter, so the lane stays a sequence feed.
+    assert perp_event.sequence == 987654
+    assert perp_event.event_type == "aggTrade"
+
+
+def test_cli_parser_binance_trades_worker_accepts_market_flag() -> None:
+    import pytest
+
+    parser = build_parser()
+    assert parser.parse_args(["binance-trades-worker"]).market == "spot"
+    assert (
+        parser.parse_args(["binance-trades-worker", "--market", "futures"]).market
+        == "futures"
+    )
+    with pytest.raises(SystemExit):
+        parser.parse_args(["binance-trades-worker", "--market", "coin"])
+
+
+def test_job_args_threads_binance_trades_market_through_inprocess_path() -> None:
+    default = _job_args(
+        SimpleNamespace(job_type="binance-trades-worker", args={"symbol": "btcusdt"})
+    )
+    assert default.market == "spot"
+    futures = _job_args(
+        SimpleNamespace(
+            job_type="binance-trades-worker",
+            args={"symbol": "btcusdt", "market": "futures"},
+        )
+    )
+    assert futures.market == "futures"
 
 
 def test_collect_bybit_trades_segment_writes_none_native_replay_summary(
