@@ -44,9 +44,14 @@ from .collectors.mexc import (
 )
 from .collectors.mock_l3 import MockL3Collector
 from .collectors.binance_futures_rest import (
+    aggtrades_cursor_path,
+    aggtrades_resume_from_id,
     make_aggtrades_poll,
     make_depth_poll,
     make_funding_poll,
+    max_agg_id_in_events,
+    read_aggtrades_cursor,
+    write_aggtrades_cursor,
 )
 from .collectors.rest_poll import RestPollingCollector
 from .config import (
@@ -1672,7 +1677,9 @@ async def collect_binance_futures_rest_segment(args: argparse.Namespace) -> dict
     selected by --stream:
 
       trades  -> gapless aggTrades (fromId paging; `a` is a dense counter so the run is a
-                 provable `sequence` feed via replay_trades_run), perp:binance-futures:*
+                 provable `sequence` feed via replay_trades_run). The pager resumes from the
+                 previous segment's last durably-written `a` (persisted per lane under
+                 _cursors/), so rotations stay gapless and overlap-free. perp:binance-futures:*
       depth   -> per-poll full-book snapshots (none_native, replay_depth_stream_run) — same
                  model as the MEXC limit-depth lane; lower fidelity than a WS L2 delta stream
       funding -> premiumIndex mark/index/funding metric (none_native, replay_funding_run)
@@ -1682,7 +1689,6 @@ async def collect_binance_futures_rest_segment(args: argparse.Namespace) -> dict
     poll_interval = float(getattr(args, "poll_interval_seconds", 1.0) or 1.0)
 
     if stream == "trades":
-        poll = make_aggtrades_poll(symbol, page_limit=int(getattr(args, "page_limit", 1000)))
         normalizer: object = BinanceTradeNormalizer(instrument_type="perp")
         source_base = "binance_perp_trades"
         normalized_dataset = "trades"
@@ -1697,11 +1703,33 @@ async def collect_binance_futures_rest_segment(args: argparse.Namespace) -> dict
         source_base = "binance_perp_funding"
         normalized_dataset = "funding"
 
+    source_name = _build_source_name(source_base, getattr(args, "source_suffix", ""))
+    run_paths = prepare_run_paths(output_root=args.output_root, source=source_name)
+
+    # The aggTrades lane resumes its dense-`a` pager from the previous segment's last
+    # durably-written id, so segment rotations stay gapless and overlap-free (see
+    # binance_futures_rest.aggtrades_resume_from_id). Depth/funding are stateless snapshots
+    # and need no cursor.
+    cursor_path = aggtrades_cursor_path(args.output_root, source_name)
+    cursor_findings: list[str] = []
+    if stream == "trades":
+        initial_from_id, reset_finding = aggtrades_resume_from_id(
+            read_aggtrades_cursor(cursor_path),
+            symbol=symbol,
+            now=datetime.now(tz=UTC),
+            max_resume_gap_seconds=float(getattr(args, "max_resume_gap_seconds", 21_600.0)),
+        )
+        if reset_finding:
+            cursor_findings.append(reset_finding)
+        poll = make_aggtrades_poll(
+            symbol,
+            page_limit=int(getattr(args, "page_limit", 1000)),
+            initial_from_id=initial_from_id,
+        )
+
     collector = RestPollingCollector(
         source="binance-futures", poll=poll, poll_interval_seconds=poll_interval
     )
-    source_name = _build_source_name(source_base, getattr(args, "source_suffix", ""))
-    run_paths = prepare_run_paths(output_root=args.output_root, source=source_name)
     if stream == "trades":
         quality_gate: object = QualityGate(
             max_delay_ms=int(getattr(args, "max_delay_ms", 60_000)),
@@ -1753,6 +1781,16 @@ async def collect_binance_futures_rest_segment(args: argparse.Namespace) -> dict
         replay_findings = ["no_clean_events"]
         replay_summary_path = None
 
+    # Advance the lane cursor only after this segment's clean events are durably on disk,
+    # to the highest id actually written (not the pager's fetched high-water, which can run
+    # ahead of what was persisted when a segment ends mid-batch). This keeps resume
+    # at-least-once: a crash before this point leaves the cursor unchanged, so the next
+    # segment re-fetches — risking a bounded dup, never a gap.
+    if stream == "trades" and events_path.exists():
+        highest_agg_id = max_agg_id_in_events(events_path)
+        if highest_agg_id is not None:
+            write_aggtrades_cursor(cursor_path, symbol=symbol, last_agg_id=highest_agg_id)
+
     return {
         "raw_messages": pipeline_summary.raw_messages,
         "clean_events": pipeline_summary.clean_events,
@@ -1761,6 +1799,7 @@ async def collect_binance_futures_rest_segment(args: argparse.Namespace) -> dict
         "replayable": replayable,
         "replay_findings": replay_findings,
         "replay_summary_path": replay_summary_path,
+        "cursor_findings": cursor_findings,
         "deadline_reached": bool(pipeline_summary.deadline_reached),
         "idle_timeout_count": collector.idle_timeout_count,
     }
@@ -1777,6 +1816,7 @@ def run_binance_futures_rest_worker(args: argparse.Namespace) -> None:
             stream=getattr(source_args, "stream", "trades"),
             poll_interval_seconds=getattr(source_args, "poll_interval_seconds", 1.0),
             page_limit=getattr(source_args, "page_limit", 1000),
+            max_resume_gap_seconds=getattr(source_args, "max_resume_gap_seconds", 21_600.0),
             depth=getattr(source_args, "depth", 1000),
             count=source_args.segment_count,
             output_root=source_args.output_root,

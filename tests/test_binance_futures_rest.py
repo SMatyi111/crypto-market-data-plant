@@ -3,13 +3,19 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import crypto_collector.cli as cli
 from crypto_collector.collectors.binance_futures_rest import (
+    aggtrades_cursor_path,
+    aggtrades_resume_from_id,
     make_aggtrades_poll,
     make_depth_poll,
     make_funding_poll,
+    max_agg_id_in_events,
+    read_aggtrades_cursor,
+    write_aggtrades_cursor,
 )
 from crypto_collector.collectors.rest_poll import RestPollingCollector
 from crypto_collector.market_normalizers import (
@@ -104,6 +110,78 @@ def test_aggtrades_poll_signals_more_pending_when_page_full() -> None:
     poll = make_aggtrades_poll("btcusdt", page_limit=1, max_pages_per_poll=1, fetch=fetch)
     rows, more = _run(poll())
     assert len(rows) == 1 and more is True
+
+
+def test_aggtrades_poll_seeds_from_initial_from_id() -> None:
+    # A seeded pager resumes from the given id on its FIRST request, instead of anchoring
+    # to the most-recent page (which is what reset every rotation and caused gaps/dups).
+    seen_from_ids = []
+
+    def fetch(path, params):
+        seen_from_ids.append(params.get("fromId"))
+        return []  # empty -> stop immediately
+
+    poll = make_aggtrades_poll("btcusdt", page_limit=2, initial_from_id=500, fetch=fetch)
+    _run(poll())
+    assert seen_from_ids == [500]
+
+
+# --- aggTrades cross-segment cursor ------------------------------------------
+
+
+def test_aggtrades_resume_from_id_fresh_cursor_seeds_next_id() -> None:
+    now = datetime(2026, 6, 9, 12, 0, tzinfo=UTC)
+    cursor = {"symbol": "BTCUSDT", "last_agg_id": 12,
+              "updated_at": (now - timedelta(seconds=30)).isoformat()}
+    from_id, finding = aggtrades_resume_from_id(
+        cursor, symbol="BTCUSDT", now=now, max_resume_gap_seconds=3600
+    )
+    assert from_id == 13 and finding is None
+
+
+def test_aggtrades_resume_from_id_no_cursor_anchors_to_live() -> None:
+    now = datetime(2026, 6, 9, 12, 0, tzinfo=UTC)
+    assert aggtrades_resume_from_id(
+        None, symbol="BTCUSDT", now=now, max_resume_gap_seconds=3600
+    ) == (None, None)
+
+
+def test_aggtrades_resume_from_id_stale_cursor_reanchors_with_logged_gap() -> None:
+    now = datetime(2026, 6, 9, 12, 0, tzinfo=UTC)
+    cursor = {"symbol": "BTCUSDT", "last_agg_id": 12,
+              "updated_at": (now - timedelta(hours=9)).isoformat()}
+    from_id, finding = aggtrades_resume_from_id(
+        cursor, symbol="BTCUSDT", now=now, max_resume_gap_seconds=21_600
+    )
+    assert from_id is None and finding == "cursor_reset_stale_gap"
+
+
+def test_aggtrades_resume_from_id_symbol_mismatch_reanchors() -> None:
+    now = datetime(2026, 6, 9, 12, 0, tzinfo=UTC)
+    cursor = {"symbol": "ETHUSDT", "last_agg_id": 5, "updated_at": now.isoformat()}
+    assert aggtrades_resume_from_id(
+        cursor, symbol="BTCUSDT", now=now, max_resume_gap_seconds=3600
+    ) == (None, "cursor_reset_symbol_mismatch")
+
+
+def test_aggtrades_cursor_roundtrip_and_corrupt_is_treated_as_absent(tmp_path) -> None:
+    path = aggtrades_cursor_path(tmp_path, "binance_perp_trades")
+    write_aggtrades_cursor(path, symbol="btcusdt", last_agg_id=99)
+    cursor = read_aggtrades_cursor(path)
+    assert cursor["symbol"] == "BTCUSDT" and cursor["last_agg_id"] == 99
+    # A torn/corrupt cursor must read as None (re-anchor), never raise.
+    path.write_text("{not valid json", encoding="utf-8")
+    assert read_aggtrades_cursor(path) is None
+
+
+def test_max_agg_id_in_events_returns_highest_sequence(tmp_path) -> None:
+    events = tmp_path / "events.jsonl"
+    events.write_text(
+        "\n".join(json.dumps({"sequence": s}) for s in (10, 11, 12)) + "\n",
+        encoding="utf-8",
+    )
+    assert max_agg_id_in_events(events) == 12
+    assert max_agg_id_in_events(tmp_path / "missing.jsonl") is None
 
 
 def test_depth_poll_remaps_snapshot_to_binance_depth_shape() -> None:
@@ -229,6 +307,65 @@ def test_collect_segment_trades_gapless_perp(tmp_path, monkeypatch) -> None:
     rows = [json.loads(l) for l in (next(run.iterdir()) / "clean" / "events.jsonl").read_text().splitlines()]
     assert rows[0]["metadata"]["instrument_id"] == "perp:binance-futures:BTCUSDT"
     assert [r["sequence"] for r in rows] == [10, 11, 12]  # dense -> gap-proof
+
+
+def test_collect_segment_trades_resumes_across_rotations_no_gap_no_dup(tmp_path, monkeypatch) -> None:
+    # Two consecutive segments (= two subprocesses in prod). Segment 1 captures a=10,11,12
+    # and persists a cursor; segment 2 MUST resume from a=13 via that cursor instead of
+    # re-anchoring to "now". Proves rotations are gapless (no missed ids) and overlap-free
+    # (no duplicate ids) — the bug this fix targets.
+    now_ms = int(time.time() * 1000)
+    seeded_from_ids = []
+
+    def factory_for(page):
+        def fake_factory(symbol, **kw):
+            seeded_from_ids.append(kw.get("initial_from_id"))
+
+            async def poll():
+                return list(page), False
+
+            return poll
+
+        return fake_factory
+
+    # Force distinct, ordered run dirs (prepare_run_paths is 1s-resolution; both segments
+    # run within the same wall-clock second in a test).
+    real_prepare = cli.prepare_run_paths
+    ts_clock = {"n": 0}
+
+    def prepare_with_distinct_ts(output_root, source, started_at=None):
+        ts_clock["n"] += 1
+        return real_prepare(
+            output_root, source, started_at=datetime(2026, 6, 9, 12, 0, ts_clock["n"], tzinfo=UTC)
+        )
+
+    monkeypatch.setattr(cli, "prepare_run_paths", prepare_with_distinct_ts)
+
+    seg1 = [{"a": 10 + i, "p": "61000.0", "q": "0.01", "T": now_ms + i, "m": i % 2 == 0,
+             "s": "BTCUSDT", "e": "aggTrade"} for i in range(3)]   # a=10,11,12
+    monkeypatch.setattr(cli, "make_aggtrades_poll", factory_for(seg1))
+    s1 = _run(cli.collect_binance_futures_rest_segment(_segment_args(tmp_path, "trades")))
+    assert s1["clean_events"] == 3
+
+    cursor = read_aggtrades_cursor(aggtrades_cursor_path(tmp_path, "binance_perp_trades"))
+    assert cursor["last_agg_id"] == 12  # highest durably-written id persisted
+
+    seg2 = [{"a": 13 + i, "p": "61000.0", "q": "0.01", "T": now_ms + 100 + i, "m": i % 2 == 0,
+             "s": "BTCUSDT", "e": "aggTrade"} for i in range(2)]   # a=13,14
+    monkeypatch.setattr(cli, "make_aggtrades_poll", factory_for(seg2))
+    s2 = _run(cli.collect_binance_futures_rest_segment(_segment_args(tmp_path, "trades")))
+    assert s2["clean_events"] == 2
+
+    # Segment 1 anchored to live (None); segment 2 resumed strictly from 12+1.
+    assert seeded_from_ids == [None, 13]
+
+    # Union of both runs' clean events is contiguous 10..14 — no gap, no repeat.
+    run_root = tmp_path / "binance_perp_trades"
+    seqs = []
+    for run_dir in sorted(d for d in run_root.iterdir() if d.is_dir()):
+        ev = run_dir / "clean" / "events.jsonl"
+        seqs += [json.loads(l)["sequence"] for l in ev.read_text().splitlines() if l.strip()]
+    assert seqs == [10, 11, 12, 13, 14]
 
 
 def test_collect_segment_depth_snapshot_perp(tmp_path, monkeypatch) -> None:
