@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pyarrow.dataset as ds
@@ -60,6 +61,119 @@ def test_jsonl_sink_flushes_each_write_so_partial_lines_dont_accumulate(tmp_path
     # Read without closing any other handle — every write must be durably on disk already.
     lines = (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()
     assert lines == ['{"a": 1}', '{"a": 2}']
+
+
+def test_jsonl_sink_batched_fsync_flushes_every_line_but_amortizes_fsync(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Batched fsync must (a) flush every line so the OS holds only whole lines — no torn
+    tail on a hard kill — while (b) issuing the disk-blocking fsync only once per
+    fsync_interval_events events, not once per event. The fsync count IS the throughput
+    ceiling, so amortizing it is the fix."""
+    fsync_calls = {"n": 0}
+    real_fsync = os.fsync
+
+    def counting_fsync(fd: int) -> None:
+        fsync_calls["n"] += 1
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", counting_fsync)
+
+    sink = JsonlSink(
+        tmp_path, "events.jsonl", fsync=True, fsync_interval_events=64, fsync_interval_ms=0.0
+    )
+    for i in range(200):
+        sink.write({"sequence": i})
+
+    # Every line is on disk before any close, even though the handle is still open.
+    mid_lines = (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(mid_lines) == 200, "batched fsync must still flush every line"
+    # fsync fired at 64/128/192 events — 3 times, not 200.
+    assert fsync_calls["n"] == 200 // 64 == 3
+
+    sink.close()
+    # The clean close forces the final (un-fsynced) batch to disk: one more fsync.
+    assert fsync_calls["n"] == 4
+    seqs = [int(line.split('"sequence":')[1].rstrip(" }")) for line in mid_lines]
+    assert seqs == list(range(200)), "sequences must stay contiguous (gap-proof)"
+
+
+def test_jsonl_sink_batched_fsync_fires_on_time_bound_when_event_count_not_reached(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """When events trickle in below the event-count threshold, the time bound
+    (fsync_interval_ms) must still force an fsync so a quiet lane never holds an
+    unbounded un-fsynced window."""
+    fsync_calls = {"n": 0}
+    monkeypatch.setattr(os, "fsync", lambda fd: fsync_calls.__setitem__("n", fsync_calls["n"] + 1))
+
+    clock = {"t": 0.0}  # seconds
+    sink = JsonlSink(
+        tmp_path,
+        "events.jsonl",
+        fsync=True,
+        fsync_interval_events=1_000_000,  # never reached
+        fsync_interval_ms=200.0,
+        time_fn=lambda: clock["t"],
+    )
+
+    sink.write({"i": 0})  # opens handle, resets the fsync clock; 0 ms elapsed -> no fsync
+    assert fsync_calls["n"] == 0
+    clock["t"] = 0.1  # 100 ms < 200 ms
+    sink.write({"i": 1})
+    assert fsync_calls["n"] == 0
+    clock["t"] = 0.25  # 250 ms >= 200 ms -> time bound trips
+    sink.write({"i": 2})
+    assert fsync_calls["n"] == 1
+
+
+def test_high_rate_stream_stays_under_skew_gate_with_batched_fsync(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The regression that motivated this change: on the hottest BTC lanes, per-event
+    fsync latency capped the consumer below the feed rate, so received_at fell ever
+    further behind exchange_time and tripped the 60s clock-skew gate (segments stopped
+    promoting). Model a hot lane where each fsync blocks the consumer for 15 ms while
+    events arrive every 1 ms: per-event fsync runs a runaway backlog past the 60s gate,
+    but batched fsync keeps the lane's processing lag negligible."""
+    FSYNC_COST_MS = 15.0
+    ARRIVAL_MS = 1.0
+    N = 5000
+    SKEW_GATE_MS = 60_000.0
+
+    clock = {"t": 0.0}  # ms — shared by the fake fsync cost and the sink's time bound
+
+    def fake_fsync(fd: int) -> None:
+        clock["t"] += FSYNC_COST_MS  # fsync blocks the single consumer thread
+
+    monkeypatch.setattr(os, "fsync", fake_fsync)
+
+    def max_processing_lag(*, fsync_interval_events: int, fsync_interval_ms: float) -> float:
+        clock["t"] = 0.0
+        sink = JsonlSink(
+            tmp_path,
+            f"e_{fsync_interval_events}_{fsync_interval_ms:g}.jsonl",
+            fsync=True,
+            fsync_interval_events=fsync_interval_events,
+            fsync_interval_ms=fsync_interval_ms,
+            time_fn=lambda: clock["t"] / 1000.0,  # the sink reasons in seconds
+        )
+        worst = 0.0
+        for i in range(N):
+            arrival = i * ARRIVAL_MS
+            clock["t"] = max(clock["t"], arrival)  # can't process before the event arrives
+            sink.write({"sequence": i})  # an fsync here advances the clock
+            worst = max(worst, clock["t"] - arrival)
+        sink.close()
+        return worst
+
+    per_event = max_processing_lag(fsync_interval_events=1, fsync_interval_ms=0.0)
+    batched = max_processing_lag(fsync_interval_events=64, fsync_interval_ms=200.0)
+
+    assert per_event > SKEW_GATE_MS, (
+        f"per-event fsync should run past the skew gate (lag={per_event:.0f}ms)"
+    )
+    assert batched < 1_000.0, f"batched fsync should stay far under the gate (lag={batched:.0f}ms)"
 
 
 def test_jsonl_sink_non_fsync_buffers_and_flushes_on_close(tmp_path: Path) -> None:

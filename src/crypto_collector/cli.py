@@ -92,7 +92,11 @@ from .ops import (
     prune_stale_worker_artifacts,
     run_cleanup,
 )
-from .pipeline import CollectorPipeline
+from .pipeline import (
+    DEFAULT_FSYNC_INTERVAL_EVENTS,
+    DEFAULT_FSYNC_INTERVAL_MS,
+    CollectorPipeline,
+)
 from .promotion import promote_replayable_runs
 from .quality import MetadataQualityGate, QualityGate
 from .quarantine import quarantine_bad_runs
@@ -109,6 +113,41 @@ from .research_manifest import DEFAULT_MANIFEST_ROOT, generate_research_manifest
 from .storage import JsonlSink, ParquetDatasetSink, prepare_run_paths
 
 logger = logging.getLogger(__name__)
+
+
+def _add_fsync_batching_args(parser: argparse.ArgumentParser) -> None:
+    """Expose the batched-fsync cadence on a worker subparser. With fsync enabled the
+    raw/clean/quarantine JSONL is flushed every line (no torn tail on a hard kill) but
+    fsynced only every N events OR every M ms, whichever comes first — so a high-tick
+    lane isn't throttled below the feed rate by per-line fsync latency. Defaults are the
+    pipeline's safe batching; lower them toward 1 / 0 for stricter durability."""
+    parser.add_argument(
+        "--fsync-interval-events",
+        type=int,
+        default=DEFAULT_FSYNC_INTERVAL_EVENTS,
+        help="Flush+fsync the data JSONL at least this often (in events). Default "
+        f"{DEFAULT_FSYNC_INTERVAL_EVENTS}; 1 = fsync every event.",
+    )
+    parser.add_argument(
+        "--fsync-interval-ms",
+        type=float,
+        default=DEFAULT_FSYNC_INTERVAL_MS,
+        help="Also flush+fsync the data JSONL at least this often (in milliseconds). "
+        f"Default {DEFAULT_FSYNC_INTERVAL_MS:g}; 0 = disable the time bound.",
+    )
+
+
+def _fsync_intervals(args: argparse.Namespace) -> tuple[int, float]:
+    """Resolve the (events, ms) batched-fsync cadence from a namespace, mapping a missing
+    or None value (e.g. an ops job that didn't set the knob) to the safe default. Keeping
+    the resolution in one place means every CollectorPipeline construction site batches
+    identically without each call repeating the None handling."""
+    events = getattr(args, "fsync_interval_events", None)
+    ms = getattr(args, "fsync_interval_ms", None)
+    return (
+        DEFAULT_FSYNC_INTERVAL_EVENTS if events is None else int(events),
+        DEFAULT_FSYNC_INTERVAL_MS if ms is None else float(ms),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -217,6 +256,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip hot-path normalized Parquet writes. Raw/clean JSONL and replay "
         "summaries are still written; use for high-rate lanes that curate via replay.",
     )
+    _add_fsync_batching_args(trades_parser)
 
     bfr_parser = subparsers.add_parser(
         "binance-futures-rest-worker",
@@ -264,6 +304,7 @@ def build_parser() -> argparse.ArgumentParser:
     bfr_parser.add_argument(
         "--no-normalized-parquet", action="store_false", dest="normalized_parquet", default=True
     )
+    _add_fsync_batching_args(bfr_parser)
 
     cb_trades_parser = subparsers.add_parser(
         "coinbase-trades-worker", help="Run segmented Coinbase trade collection"
@@ -661,6 +702,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Skip normalized Parquet writes; raw and clean JSONL are still written.",
     )
+    _add_fsync_batching_args(kalshi_collect_parser)
     kalshi_collect_parser.add_argument("--format", choices=["json", "text"], default="text")
 
     kalshi_summary_parser = subparsers.add_parser(
@@ -1398,6 +1440,7 @@ async def _collect_trades_segment(
     collector = GenericWebsocketCollector(config=config)
     source_name = _build_source_name(source_base, getattr(args, "source_suffix", ""))
     run_paths = prepare_run_paths(output_root=config.output_root, source=source_name)
+    fsync_events, fsync_ms = _fsync_intervals(args)
     pipeline = CollectorPipeline(
         collector=collector,
         normalizer=normalizer,
@@ -1413,6 +1456,8 @@ async def _collect_trades_segment(
             else None
         ),
         jsonl_fsync=bool(getattr(args, "jsonl_fsync", True)),
+        fsync_interval_events=fsync_events,
+        fsync_interval_ms=fsync_ms,
     )
     pipeline_summary = await pipeline.run(
         limit=args.count,
@@ -1611,6 +1656,7 @@ async def _collect_depth_stream_segment(
     collector = GenericWebsocketCollector(config=config)
     source_name = _build_source_name(source_base, getattr(args, "source_suffix", ""))
     run_paths = prepare_run_paths(output_root=config.output_root, source=source_name)
+    fsync_events, fsync_ms = _fsync_intervals(args)
     pipeline = CollectorPipeline(
         collector=collector,
         normalizer=normalizer,
@@ -1620,6 +1666,9 @@ async def _collect_depth_stream_segment(
         quality_gate=MetadataQualityGate(),
         run_paths=run_paths,
         normalized_root=default_normalized_root("market"),
+        jsonl_fsync=bool(getattr(args, "jsonl_fsync", True)),
+        fsync_interval_events=fsync_events,
+        fsync_interval_ms=fsync_ms,
     )
     pipeline_summary = await pipeline.run(
         limit=args.count,
@@ -2174,6 +2223,15 @@ def _run_segmented_worker(
                     segment_args.idle_timeout_seconds = float(
                         getattr(args, "idle_timeout_seconds", 0.0) or 0.0
                     )
+                    # Thread the JSONL durability posture onto every segment centrally —
+                    # like idle_timeout_seconds — so no per-worker build_segment_args
+                    # lambda can silently drop it (the same enumeration trap that dropped
+                    # `market`). fsync defaults on and BATCHED, so a hot lane gets
+                    # crash-durable writes without per-event fsync capping its throughput.
+                    segment_args.jsonl_fsync = bool(getattr(args, "jsonl_fsync", True))
+                    fsync_events, fsync_ms = _fsync_intervals(args)
+                    segment_args.fsync_interval_events = fsync_events
+                    segment_args.fsync_interval_ms = fsync_ms
                     summary = asyncio.run(collect_segment(segment_args))
                 except Exception as exc:
                     runtime.record_event("segment_error", details={"segment_index": segment_index, "error": str(exc)})
@@ -2292,6 +2350,12 @@ def _execute_ops_job_inprocess(job: JobSpec) -> JobExecutionResult | str | None:
     # up uniformly; _run_segmented_worker reads it via getattr and ignores it when
     # unset/zero, and non-collector jobs simply never look at it.
     args.max_segment_seconds = job.args.get("max_segment_seconds")
+    # Batched-fsync cadence knobs, injected here (rather than in each of the _job_args
+    # builders) so every collector lane picks them up uniformly; unset -> None, which the
+    # worker / pipeline resolves to the safe pipeline default. Non-collector jobs ignore
+    # them.
+    args.fsync_interval_events = job.args.get("fsync_interval_events")
+    args.fsync_interval_ms = job.args.get("fsync_interval_ms")
     if job.job_type == "mock":
         asyncio.run(run_mock(args))
         return "mock completed"
@@ -2467,11 +2531,13 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             output_root=raw_args.get("output_root", default_output_root()),
             ops_root=Path(raw_args.get("ops_root", default_ops_root())),
             worker_name=raw_args.get("worker_name", "coinbase-trades-worker"),
-            # Buffered JSONL (no per-event fsync) by default: per-event fsync throttles the
-            # consumer below high-volume feeds, so the backlog grows past the 60s freshness
-            # gate and valid trades get quarantined as stale (binance-trades already opted
-            # out). raw JSONL flushes every 100 rows instead.
-            jsonl_fsync=raw_args.get("jsonl_fsync", False),
+            # Durable batched JSONL by default: fsync is now BATCHED in the pipeline (every
+            # line is flushed, but the disk-blocking fsync is amortized over
+            # fsync_interval_events / fsync_interval_ms), so a high-volume lane gets
+            # crash-durable writes without the per-event-fsync throughput ceiling that used
+            # to grow the backlog past the 60s freshness gate and quarantine valid trades as
+            # stale. Opt all the way out to buffered, never-fsynced JSONL with jsonl_fsync:false.
+            jsonl_fsync=raw_args.get("jsonl_fsync", True),
             heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
             max_delay_ms=raw_args.get("max_delay_ms", _TRADES_STALE_WINDOW_MS),
             max_future_skew_ms=raw_args.get("max_future_skew_ms", 5_000),
@@ -2514,8 +2580,8 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             output_root=raw_args.get("output_root", default_output_root()),
             ops_root=Path(raw_args.get("ops_root", default_ops_root())),
             worker_name=raw_args.get("worker_name", "kraken-trades-worker"),
-            # Buffered JSONL (no per-event fsync) by default — see coinbase-trades-worker.
-            jsonl_fsync=raw_args.get("jsonl_fsync", False),
+            # Durable batched JSONL by default — see coinbase-trades-worker.
+            jsonl_fsync=raw_args.get("jsonl_fsync", True),
             heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
             max_delay_ms=raw_args.get("max_delay_ms", _TRADES_STALE_WINDOW_MS),
             max_future_skew_ms=raw_args.get("max_future_skew_ms", 5_000),
@@ -2538,8 +2604,8 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             output_root=raw_args.get("output_root", default_output_root()),
             ops_root=Path(raw_args.get("ops_root", default_ops_root())),
             worker_name=raw_args.get("worker_name", "bybit-trades-worker"),
-            # Buffered JSONL (no per-event fsync) by default — see coinbase-trades-worker.
-            jsonl_fsync=raw_args.get("jsonl_fsync", False),
+            # Durable batched JSONL by default — see coinbase-trades-worker.
+            jsonl_fsync=raw_args.get("jsonl_fsync", True),
             heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
             max_delay_ms=raw_args.get("max_delay_ms", _TRADES_STALE_WINDOW_MS),
             max_future_skew_ms=raw_args.get("max_future_skew_ms", 5_000),
@@ -2601,8 +2667,8 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             output_root=raw_args.get("output_root", default_output_root()),
             ops_root=Path(raw_args.get("ops_root", default_ops_root())),
             worker_name=raw_args.get("worker_name", "mexc-trades-worker"),
-            # Buffered JSONL (no per-event fsync) by default — see coinbase-trades-worker.
-            jsonl_fsync=raw_args.get("jsonl_fsync", False),
+            # Durable batched JSONL by default — see coinbase-trades-worker.
+            jsonl_fsync=raw_args.get("jsonl_fsync", True),
             heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
             max_delay_ms=raw_args.get("max_delay_ms", _TRADES_STALE_WINDOW_MS),
             max_future_skew_ms=raw_args.get("max_future_skew_ms", 5_000),

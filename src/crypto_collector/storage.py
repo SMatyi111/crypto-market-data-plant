@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -34,6 +36,23 @@ def prepare_run_paths(output_root: Path, source: str, started_at: datetime | Non
 
 
 class JsonlSink:
+    """Append-only JSONL writer with three durability postures, chosen by `fsync` and
+    the `fsync_interval_*` knobs:
+
+    * Per-event fsync (`fsync=True`, intervals at their 1-event / 0-ms defaults): every
+      line is reopened-written-flushed-fsynced-closed. Maximally durable, no open handle
+      to leak, readable mid-run — but the per-line fsync is disk-latency-bound, which is
+      what caps a hot lane's sustainable events/sec.
+    * Batched fsync (`fsync=True`, a >1 event interval and/or a >0 ms interval): one
+      handle stays open and EVERY line is flushed (so the OS always holds whole lines and
+      a hard kill can't leave a torn tail), while the disk-blocking fsync is amortized to
+      once per `fsync_interval_events` events OR `fsync_interval_ms` milliseconds,
+      whichever comes first. Raises the throughput ceiling; a clean close still fsyncs
+      (no loss on shutdown) and a hard kill loses at most one un-fsynced batch.
+    * Buffered, no fsync (`fsync=False`): one handle, flushed every `flush_every` rows,
+      never fsynced. Fastest, least durable.
+    """
+
     def __init__(
         self,
         root: Path,
@@ -41,18 +60,32 @@ class JsonlSink:
         *,
         fsync: bool = True,
         flush_every: int = 100,
+        fsync_interval_events: int = 1,
+        fsync_interval_ms: float = 0.0,
+        time_fn: Callable[[], float] = time.monotonic,
     ) -> None:
         self.path = root / filename
         self._fsync = fsync
         self._flush_every = max(1, int(flush_every))
+        self._fsync_interval_events = max(1, int(fsync_interval_events))
+        self._fsync_interval_ms = max(0.0, float(fsync_interval_ms))
+        self._time_fn = time_fn
+        # Per-event fsync only when fsync is on AND batching is effectively disabled, so a
+        # bare JsonlSink(...) keeps the exact reopen-per-line behavior the durability
+        # test and the metrics sink rely on.
+        self._per_event_fsync = (
+            fsync and self._fsync_interval_events <= 1 and self._fsync_interval_ms <= 0.0
+        )
         self._pending_writes = 0
+        self._fsync_pending = 0
+        self._last_fsync = 0.0
         self._handle = None
 
     def write(self, row: dict[str, Any]) -> None:
-        if self._fsync:
+        line = json.dumps(row, sort_keys=True) + "\n"
+        if self._per_event_fsync:
             with self.path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(row, sort_keys=True))
-                handle.write("\n")
+                handle.write(line)
                 handle.flush()
                 # fsync prevents a torn last line if the process dies before the OS flushes.
                 os.fsync(handle.fileno())
@@ -60,20 +93,45 @@ class JsonlSink:
 
         if self._handle is None:
             self._handle = self.path.open("a", encoding="utf-8")
+            self._last_fsync = self._time_fn()
         handle = self._handle
-        handle.write(json.dumps(row, sort_keys=True))
-        handle.write("\n")
-        self._pending_writes += 1
-        if self._pending_writes >= self._flush_every:
+        handle.write(line)
+        if self._fsync:
+            # Flush every line so the OS holds only whole lines (no torn tail on a hard
+            # kill); fsync — the disk-latency-bound call and the real throughput ceiling —
+            # is batched per fsync_interval_events / fsync_interval_ms.
             handle.flush()
-            self._pending_writes = 0
+            self._fsync_pending += 1
+            if self._should_fsync():
+                os.fsync(handle.fileno())
+                self._fsync_pending = 0
+                self._last_fsync = self._time_fn()
+        else:
+            self._pending_writes += 1
+            if self._pending_writes >= self._flush_every:
+                handle.flush()
+                self._pending_writes = 0
+
+    def _should_fsync(self) -> bool:
+        if self._fsync_pending >= self._fsync_interval_events:
+            return True
+        if (
+            self._fsync_interval_ms > 0.0
+            and (self._time_fn() - self._last_fsync) * 1000.0 >= self._fsync_interval_ms
+        ):
+            return True
+        return False
 
     def close(self) -> None:
         if self._handle is not None:
             self._handle.flush()
+            if self._fsync:
+                # A clean shutdown must lose nothing, so force the final batch to disk.
+                os.fsync(self._handle.fileno())
             self._handle.close()
             self._handle = None
             self._pending_writes = 0
+            self._fsync_pending = 0
 
 
 class RotatingJsonlSink:
@@ -94,13 +152,27 @@ class RotatingJsonlSink:
         max_bytes: int = 512 * 1024 * 1024,
         fsync: bool = True,
         flush_every: int = 100,
+        fsync_interval_events: int = 1,
+        fsync_interval_ms: float = 0.0,
+        time_fn: Callable[[], float] = time.monotonic,
     ) -> None:
         self.root = root
         self.filename = filename
         self.max_bytes = max(1, int(max_bytes))
         self._fsync = fsync
         self._flush_every = max(1, int(flush_every))
+        self._fsync_interval_events = max(1, int(fsync_interval_events))
+        self._fsync_interval_ms = max(0.0, float(fsync_interval_ms))
+        self._time_fn = time_fn
+        # See JsonlSink: per-event fsync (reopen per line) only when batching is off; a
+        # batched/buffered handle stays open and is flushed per line so rotation and a
+        # hard kill never leave a torn record.
+        self._per_event_fsync = (
+            fsync and self._fsync_interval_events <= 1 and self._fsync_interval_ms <= 0.0
+        )
         self._pending_writes = 0
+        self._fsync_pending = 0
+        self._last_fsync = 0.0
         self._active_path = root / filename
         self._handle = None
         self._part_index = self._discover_next_part_index()
@@ -116,7 +188,7 @@ class RotatingJsonlSink:
         encoded = (json.dumps(row, sort_keys=True) + "\n").encode("utf-8")
         if self._current_bytes > 0 and self._current_bytes + len(encoded) > self.max_bytes:
             self._rotate()
-        if self._fsync:
+        if self._per_event_fsync:
             with self._active_path.open("ab") as handle:
                 handle.write(encoded)
                 handle.flush()
@@ -124,13 +196,32 @@ class RotatingJsonlSink:
         else:
             if self._handle is None:
                 self._handle = self._active_path.open("ab")
+                self._last_fsync = self._time_fn()
             handle = self._handle
             handle.write(encoded)
-            self._pending_writes += 1
-            if self._pending_writes >= self._flush_every:
+            if self._fsync:
                 handle.flush()
-                self._pending_writes = 0
+                self._fsync_pending += 1
+                if self._should_fsync():
+                    os.fsync(handle.fileno())
+                    self._fsync_pending = 0
+                    self._last_fsync = self._time_fn()
+            else:
+                self._pending_writes += 1
+                if self._pending_writes >= self._flush_every:
+                    handle.flush()
+                    self._pending_writes = 0
         self._current_bytes += len(encoded)
+
+    def _should_fsync(self) -> bool:
+        if self._fsync_pending >= self._fsync_interval_events:
+            return True
+        if (
+            self._fsync_interval_ms > 0.0
+            and (self._time_fn() - self._last_fsync) * 1000.0 >= self._fsync_interval_ms
+        ):
+            return True
+        return False
 
     def _rotate(self) -> None:
         self.close()
@@ -147,9 +238,14 @@ class RotatingJsonlSink:
     def close(self) -> None:
         if self._handle is not None:
             self._handle.flush()
+            if self._fsync:
+                # A clean shutdown (and the close that precedes a rotation) must lose
+                # nothing, so force the final batch to disk.
+                os.fsync(self._handle.fileno())
             self._handle.close()
             self._handle = None
             self._pending_writes = 0
+            self._fsync_pending = 0
 
     def _discover_next_part_index(self) -> int:
         stem, dot, ext = self.filename.rpartition(".")

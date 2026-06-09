@@ -30,6 +30,10 @@ from crypto_collector.cli import (
     collect_kraken_trades_segment,
     _is_retryable_connect_error,
 )
+from crypto_collector.pipeline import (
+    DEFAULT_FSYNC_INTERVAL_EVENTS,
+    DEFAULT_FSYNC_INTERVAL_MS,
+)
 from crypto_collector.market_normalizers import (
     BinanceTradeNormalizer,
     BybitDepthNormalizer,
@@ -1730,6 +1734,71 @@ def test_workers_thread_market_through_build_segment_args(tmp_path, monkeypatch)
         "bybit_trades": "linear",
         "bybit_depth": "linear",
         "binance_trades": "futures",
+    }
+
+
+def test_workers_thread_fsync_batching_through_build_segment_args(tmp_path, monkeypatch) -> None:
+    """Regression: the JSONL durability posture (jsonl_fsync + the batched-fsync cadence)
+    must reach every segment. The per-worker build_segment_args lambdas don't enumerate
+    these — they're threaded centrally in _run_segmented_worker, the same way `market`
+    was fixed — so a config value can't be silently dropped before it reaches the sink."""
+    import crypto_collector.cli as cli
+
+    captured: dict[str, dict[str, object]] = {}
+
+    def make_fake(key):
+        async def fake(segment_args):
+            captured[key] = {
+                "jsonl_fsync": getattr(segment_args, "jsonl_fsync", "MISSING"),
+                "fsync_interval_events": getattr(segment_args, "fsync_interval_events", "MISSING"),
+                "fsync_interval_ms": getattr(segment_args, "fsync_interval_ms", "MISSING"),
+            }
+            return {"run_path": str(tmp_path / key), "clean_events": 0, "replayable": True}
+
+        return fake
+
+    monkeypatch.setattr(cli, "collect_binance_trades_segment", make_fake("binance_trades"))
+    monkeypatch.setattr(cli, "collect_bybit_trades_segment", make_fake("bybit_trades"))
+
+    def drive(job_type, runner, extra_args):
+        args = _job_args(
+            SimpleNamespace(
+                job_type=job_type,
+                args={
+                    "symbol": "BTCUSDT",
+                    "max_segments": 1,
+                    "cooldown_seconds": 0.0,
+                    "heartbeat_interval_seconds": 0.1,
+                    "worker_name": f"{job_type}-fsynctest",
+                    "output_root": str(tmp_path),
+                    "ops_root": str(tmp_path),
+                    **extra_args,
+                },
+            )
+        )
+        # The ops dispatcher injects the cadence knobs onto the worker args; mirror that.
+        args.fsync_interval_events = extra_args.get("fsync_interval_events")
+        args.fsync_interval_ms = extra_args.get("fsync_interval_ms")
+        runner(args)
+
+    # binance trades carries explicit batched-cadence args (config-set).
+    drive(
+        "binance-trades-worker",
+        cli.run_binance_trades_worker,
+        {"fsync_interval_events": 128, "fsync_interval_ms": 250.0},
+    )
+    # bybit perp sets nothing -> defaults to fsync ON with the safe pipeline cadence.
+    drive("bybit-trades-worker", cli.run_bybit_trades_worker, {})
+
+    assert captured["binance_trades"] == {
+        "jsonl_fsync": True,
+        "fsync_interval_events": 128,
+        "fsync_interval_ms": 250.0,
+    }
+    assert captured["bybit_trades"] == {
+        "jsonl_fsync": True,
+        "fsync_interval_events": DEFAULT_FSYNC_INTERVAL_EVENTS,
+        "fsync_interval_ms": DEFAULT_FSYNC_INTERVAL_MS,
     }
 
 

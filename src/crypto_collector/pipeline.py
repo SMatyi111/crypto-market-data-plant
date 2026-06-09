@@ -11,6 +11,17 @@ from .quality import QualityGate
 from .storage import JsonlSink, ParquetDatasetSink, RotatingJsonlSink, RunPaths
 
 
+# Batched-fsync defaults for the raw/clean/quarantine JSONL sinks. Per-event fsync is
+# disk-latency-bound and caps a hot lane's sustainable events/sec below the feed rate,
+# so the backlog grows past the 60s clock-skew gate and valid events stop promoting.
+# Flushing every line (so the OS holds only whole lines — no torn tail on a hard kill)
+# while fsyncing only every N events OR every ~200 ms raises that ceiling, and a clean
+# shutdown still fsyncs the final batch (no loss on a normal stop). Tune per lane via the
+# fsync_interval_events / fsync_interval_ms knobs in the ops config.
+DEFAULT_FSYNC_INTERVAL_EVENTS = 64
+DEFAULT_FSYNC_INTERVAL_MS = 200.0
+
+
 @dataclass(slots=True)
 class RunSummary:
     raw_messages: int = 0
@@ -39,11 +50,21 @@ class CollectorPipeline:
         raw_rotate_bytes: int = 512 * 1024 * 1024,
         metrics_flush_every: int = 1000,
         jsonl_fsync: bool = True,
+        fsync_interval_events: int = DEFAULT_FSYNC_INTERVAL_EVENTS,
+        fsync_interval_ms: float = DEFAULT_FSYNC_INTERVAL_MS,
     ) -> None:
         self.metrics_flush_every = max(0, int(metrics_flush_every))
         self.collector = collector
         self.normalizer = normalizer
         self.quality_gate = quality_gate
+        # The three data sinks share the lane's fsync posture. When fsync is on it is
+        # BATCHED (every line flushed; fsync amortized over fsync_interval_events /
+        # fsync_interval_ms) so a high-tick lane's throughput isn't capped by per-line
+        # fsync latency. See DEFAULT_FSYNC_INTERVAL_* above.
+        fsync_kwargs = {
+            "fsync_interval_events": fsync_interval_events,
+            "fsync_interval_ms": fsync_interval_ms,
+        }
         # Raw traffic is the fastest-growing file; rotate it so a long-running
         # collector doesn't produce a single multi-GB messages.jsonl.
         self.raw_sink = RotatingJsonlSink(
@@ -51,9 +72,15 @@ class CollectorPipeline:
             "messages.jsonl",
             max_bytes=raw_rotate_bytes,
             fsync=jsonl_fsync,
+            **fsync_kwargs,
         )
-        self.clean_sink = JsonlSink(run_paths.clean, "events.jsonl", fsync=jsonl_fsync)
-        self.quarantine_sink = JsonlSink(run_paths.quarantine, "events.jsonl", fsync=jsonl_fsync)
+        self.clean_sink = JsonlSink(run_paths.clean, "events.jsonl", fsync=jsonl_fsync, **fsync_kwargs)
+        self.quarantine_sink = JsonlSink(
+            run_paths.quarantine, "events.jsonl", fsync=jsonl_fsync, **fsync_kwargs
+        )
+        # Metrics are written ~once per metrics_flush_every frames (and once at close), so
+        # the fsync cost is negligible — keep them on the per-event durable default so the
+        # latest replay/health summary is always on disk for external monitors.
         self.metrics_sink = JsonlSink(run_paths.metrics, "summary.jsonl")
         self.parquet_sink = ParquetDatasetSink(normalized_root) if normalized_root else None
 
