@@ -15,6 +15,7 @@ from crypto_collector.cli import (
     _execute_ops_job,
     _execute_ops_job_inprocess,
     _job_args,
+    _normalized_root_from_jobs,
     _ops_root_from_jobs,
     _segment_deadline_utc,
     build_parser,
@@ -76,8 +77,12 @@ def test_live_config_job_types_are_all_dispatchable(config_name: str) -> None:
     for job in jobs:
         by_type.setdefault(job.job_type, []).append(job.name)
     assert "backfill-replay" in by_type  # binance_depth scorer
-    assert len(by_type.get("backfill-trades-replay", [])) == 5  # 5 trades lanes
-    assert "backfill-stream-depth" in by_type  # 4 non-binance depth lanes (one job)
+    # At least the 5 base trades lanes (binance/coinbase/kraken/bybit/mexc) must be wired
+    # in; a live config legitimately adds more as instruments are added (e.g. USDC), so
+    # this is a floor, not an exact count — the per-job _job_args loop above is the real
+    # dispatchability guard.
+    assert len(by_type.get("backfill-trades-replay", [])) >= 5
+    assert "backfill-stream-depth" in by_type  # non-binance depth lanes (one job)
 
 
 def test_load_ops_config_filters_disabled_jobs(tmp_path: Path) -> None:
@@ -615,6 +620,58 @@ def test_health_with_config_does_not_error_on_unmanaged_stale_workers(
     worker = next(row for row in report.standalone_workers if row["name"] == "binance-depth-worker-btcfdusd")
     assert worker["managed"] is False
     assert worker["blocking"] is False
+
+
+def test_health_follows_config_normalized_root_not_env_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FOLLOW_UPS #3: a bare `health` (no MARKET_DATA_NORMALIZED_ROOT) must check the
+    partition tree of the live collection root discovered from the config, not the stale
+    env/default (pre-migration D:) root. _latest_partition_write used to always resolve
+    via default_normalized_root(); run_health now derives the normalized root from the
+    config jobs (mirroring the ops_root logic) and threads it through."""
+    # env points at a stale, EMPTY normalized root — stands in for the abandoned D: tree.
+    stale_root = tmp_path / "stale_normalized"
+    monkeypatch.setenv("MARKET_DATA_NORMALIZED_ROOT", str(stale_root))
+
+    archive = tmp_path / "archive"
+    ops_root = archive / "ops"
+    (ops_root / "standalone_workers").mkdir(parents=True)
+    now = datetime.now(tz=UTC)
+    (ops_root / "heartbeat.json").write_text(
+        json.dumps({"status": "running", "last_seen": now.isoformat(), "job_counters": {}}),
+        encoding="utf-8",
+    )
+    # A fresh live partition under the CONFIG's archive root (archive/normalized/...).
+    partition = archive / "normalized" / "market" / "schema_version=v2" / "source=binance"
+    partition.mkdir(parents=True)
+    (partition / "part-0.parquet").write_bytes(b"")
+
+    jobs = [
+        JobSpec(
+            name="binance-btc-depth",
+            job_type="binance-depth-worker",
+            interval_seconds=3600,
+            args={"ops_root": str(ops_root)},
+        )
+    ]
+    # The derived normalized root sits beside ops_root under the archive root.
+    assert _normalized_root_from_jobs(jobs) == archive / "normalized"
+
+    # With the config-derived root the fresh partition is found -> no partition finding.
+    report = build_health_report(
+        ops_root=ops_root,
+        jobs=jobs,
+        stale_after_seconds=300,
+        normalized_root=_normalized_root_from_jobs(jobs),
+    )
+    assert "missing_partition:binance-btc-depth" not in report.findings
+    assert "stale_partition:binance-btc-depth" not in report.findings
+
+    # Regression guard: the old behavior (no normalized_root) reads the empty env/stale
+    # root and falsely flags the partition missing.
+    bare = build_health_report(ops_root=ops_root, jobs=jobs, stale_after_seconds=300)
+    assert "missing_partition:binance-btc-depth" in bare.findings
 
 
 def test_health_reports_poll_lane_freshness_for_kalshi(tmp_path: Path) -> None:
