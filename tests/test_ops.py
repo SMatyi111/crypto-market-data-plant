@@ -1947,6 +1947,53 @@ def test_health_does_not_flag_running_collector_as_stale(tmp_path: Path) -> None
     assert "stale_job:coinbase-btc-trades" not in report.findings
 
 
+def test_health_does_not_flag_long_continuous_segment_as_long_running(tmp_path: Path) -> None:
+    """Continuous-capture lanes rotate a finalized segment every max_segment_seconds with a
+    tiny re-dispatch interval. A 20-min segment must read healthy, not long_running — the
+    threshold follows the segment cadence (1.5x), not the interval. Without this, deploying
+    continuous capture would flag every collector permanently."""
+    ops_root = tmp_path / "ops"
+    ops_root.mkdir(parents=True)
+    now = datetime.now(tz=UTC)
+    started = now - timedelta(seconds=1200)  # 20 min into a 30-min segment
+    heartbeat = {
+        "runner_name": "market-data-plant",
+        "status": "running",
+        "last_seen": now.isoformat(),
+        "job_counters": {},
+        "current_jobs": [
+            {"name": "coinbase-btc-trades", "job_type": "coinbase-trades-worker", "started_at": started.isoformat()}
+        ],
+        "current_job": {"name": "coinbase-btc-trades", "job_type": "coinbase-trades-worker", "started_at": started.isoformat()},
+    }
+    (ops_root / "heartbeat.json").write_text(json.dumps(heartbeat), encoding="utf-8")
+
+    continuous = JobSpec(
+        name="coinbase-btc-trades",
+        job_type="coinbase-trades-worker",
+        interval_seconds=5,
+        args={"max_segment_seconds": 1800},
+    )
+    report = build_health_report(
+        ops_root=ops_root, jobs=[continuous], stale_after_seconds=300, job_stale_multiplier=3.0
+    )
+    row = next(r for r in report.jobs if r["name"] == "coinbase-btc-trades")
+    assert row["in_progress"] is True
+    assert row["long_running"] is False
+    assert row["long_running_threshold_seconds"] == 2700.0  # 1800 * 1.5, not 5 * 3
+    assert "long_running_job:coinbase-btc-trades" not in report.findings
+
+    # Regression guard: with no segment cadence (legacy short-run config) the SAME 20-min
+    # run IS long_running, so the relaxation is scoped to segmented continuous lanes only.
+    legacy = JobSpec(name="coinbase-btc-trades", job_type="coinbase-trades-worker", interval_seconds=5)
+    legacy_report = build_health_report(
+        ops_root=ops_root, jobs=[legacy], stale_after_seconds=300, job_stale_multiplier=3.0
+    )
+    legacy_row = next(r for r in legacy_report.jobs if r["name"] == "coinbase-btc-trades")
+    assert legacy_row["long_running"] is True
+    assert "long_running_job:coinbase-btc-trades" in legacy_report.findings
+
+
 def test_ops_runner_collector_concurrency_defaults_to_one(tmp_path: Path) -> None:
     parser = build_parser()
     config = str(tmp_path / "ops.json")

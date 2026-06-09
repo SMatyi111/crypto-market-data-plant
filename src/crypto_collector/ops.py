@@ -856,7 +856,24 @@ def build_health_report(
             counters = job_counters.get(job.name, {}) if isinstance(job_counters, dict) else {}
             finished_at = _parse_dt(latest.get("finished_at")) if latest else None
             age_seconds = (checked_at - finished_at).total_seconds() if finished_at else None
-            stale_threshold = job.interval_seconds * job_stale_multiplier
+            # Continuous-capture collectors rotate a finalized segment every
+            # max_segment_seconds, which is far longer than their tiny re-dispatch
+            # interval (e.g. 1800s segments, 5s interval). Interval-based staleness
+            # would then flag every healthy lane, so the expected completion cadence is
+            # the segment length when set. Jobs without it (poll/maintenance lanes, the
+            # legacy hourly config) keep pure interval-based thresholds.
+            segment_seconds = 0.0
+            try:
+                segment_seconds = float(job.args.get("max_segment_seconds") or 0.0)
+            except (TypeError, ValueError):
+                segment_seconds = 0.0
+            cadence_seconds = max(float(job.interval_seconds), segment_seconds)
+            stale_threshold = cadence_seconds * job_stale_multiplier
+            # A running segment is "long" only past its own rotation deadline (+ slack
+            # for finalize); for non-segmented jobs this stays the interval-based bound.
+            long_running_threshold = (
+                segment_seconds * 1.5 if segment_seconds > 0 else stale_threshold
+            )
             job_started_at = active_started_by_name.get(job.name)
             in_progress = (
                 runner_status == "running"
@@ -872,7 +889,7 @@ def build_health_report(
             long_running = (
                 in_progress
                 and current_job_age_seconds is not None
-                and current_job_age_seconds > stale_threshold
+                and current_job_age_seconds > long_running_threshold
             )
             is_stale = False if in_progress else age_seconds is None or age_seconds > stale_threshold
             partition_dataset, partition_source = _job_partition_target(job)
@@ -910,7 +927,7 @@ def build_health_report(
                     "current_job_started_at": job_started_at.isoformat() if in_progress and job_started_at is not None else None,
                     "current_job_age_seconds": current_job_age_seconds,
                     "long_running": long_running,
-                    "long_running_threshold_seconds": stale_threshold,
+                    "long_running_threshold_seconds": long_running_threshold,
                     "status": latest.get("status") if latest else "missing",
                     "stale": is_stale,
                     "normalized_dataset": partition_dataset,
