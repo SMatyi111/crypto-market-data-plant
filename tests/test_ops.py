@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -35,6 +37,23 @@ from crypto_collector.ops import (
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.fixture(autouse=True)
+def _ample_free_disk(monkeypatch: pytest.MonkeyPatch) -> None:
+    """build_health_report flags ``low_disk_free_space`` when the drive backing
+    ops_root has less than ``min_disk_free_gb`` (default 100) free, measured against the
+    *real* host disk. On a CI runner with a small system disk that finding fires for
+    every report and forces ``status == "error"`` — so these tests previously passed
+    only on a workstation with >100 GB free. Report a fixed, ample free figure so host
+    disk space can never flip a status assertion. No test exercises the low-disk path,
+    so this changes no intended behavior (a future low-disk test can re-patch)."""
+    gib = 1024 ** 3
+    monkeypatch.setattr(
+        shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(total=2000 * gib, used=1000 * gib, free=1000 * gib),
+    )
 
 
 @pytest.mark.parametrize("config_name", ["ops.live.local.json", "ops.live.example.json"])
@@ -383,10 +402,34 @@ def test_ops_runner_refreshes_heartbeat_during_long_running_job(tmp_path: Path) 
     thread.start()
 
     heartbeat_path = tmp_path / "ops" / "heartbeat.json"
+
+    def _read_heartbeat() -> dict | None:
+        # Writes are atomic (_write_json_atomic), so the file is never half-written; it
+        # just may not exist yet on the first polls.
+        if not heartbeat_path.exists():
+            return None
+        try:
+            return json.loads(heartbeat_path.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            return None
+
+    # The heartbeat is first written as "starting" and only flips to "running" with a
+    # populated current_job once the job is dispatched. Waiting merely for the file to
+    # exist races on a slow/loaded runner (it can catch the "starting" snapshot), so
+    # poll until the running-with-job state the assertions below depend on.
     deadline = time.time() + 5.0
-    while not heartbeat_path.exists():
+    while True:
+        snapshot = _read_heartbeat()
+        if (
+            snapshot is not None
+            and snapshot.get("status") == "running"
+            and snapshot.get("current_job")
+        ):
+            break
         if time.time() >= deadline:
-            raise AssertionError("heartbeat.json was not created")
+            raise AssertionError(
+                f"runner did not reach running-with-job in time (last={snapshot!r})"
+            )
         time.sleep(0.02)
 
     first = json.loads(heartbeat_path.read_text(encoding="utf-8"))
