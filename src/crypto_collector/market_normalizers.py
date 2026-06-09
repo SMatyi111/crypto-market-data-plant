@@ -11,6 +11,16 @@ from .models import NormalizedL3Event, RawMessage
 
 
 class BinanceDepthNormalizer:
+    """Normalize Binance `depthUpdate` (spot/futures WS diff) or remapped REST depth
+    snapshots. `instrument_type="perp"` resolves `perp:binance-futures:SYM` (used by the
+    REST futures depth lane) instead of `spot:binance:SYM`; the level/timestamp parsing is
+    identical (REST snapshots are remapped to the same `s`/`e`/`E`/`u`/`b`/`a` keys)."""
+
+    def __init__(self, *, instrument_type: str = "spot") -> None:
+        self._resolve_instrument = (
+            resolve_perp_instrument if instrument_type == "perp" else resolve_spot_instrument
+        )
+
     def normalize(self, raw: RawMessage) -> NormalizedDepthUpdate:
         payload = raw.payload.get("data", raw.payload)
         parse_errors: list[str] = []
@@ -25,7 +35,7 @@ class BinanceDepthNormalizer:
             received_at=raw.received_at,
             first_update_id=_optional_int(payload.get("U"), "first_update_id", parse_errors),
             final_update_id=_optional_int(payload.get("u"), "final_update_id", parse_errors),
-            instrument=resolve_spot_instrument(product, venue=raw.source),
+            instrument=self._resolve_instrument(product, venue=raw.source),
             bids=_parse_levels(payload.get("b"), "bids", parse_errors),
             asks=_parse_levels(payload.get("a"), "asks", parse_errors),
             metadata={"parse_errors": parse_errors} if parse_errors else {},
@@ -82,6 +92,47 @@ class BinanceTradeNormalizer:
             trade_id=str(trade_id) if trade_id is not None else None,
             sequence=trade_id,
             raw_type=event_type,
+            metadata={key: value for key, value in metadata.items() if value is not None},
+        )
+
+
+class BinanceFuturesFundingNormalizer:
+    """Normalize Binance USDT-M futures `/fapi/v1/premiumIndex` rows into a `funding`
+    event. Mark price is carried as the event `price` (a real price); index price, funding
+    rate, interest rate and next funding time live in metadata. This is a low-rate METRIC
+    lane (not microstructure): `size`/`side`/`trade_id` are absent and it is curated
+    none_native via replay_funding_run. Instrument is tagged perp:binance-futures:*."""
+
+    def normalize(self, raw: RawMessage) -> NormalizedL3Event:
+        payload = raw.payload.get("data", raw.payload)
+        parse_errors: list[str] = []
+        product = str(payload.get("symbol") or "UNKNOWN")
+        event_time = _parse_timestamp_ms(payload.get("time"), parse_errors)
+        mark_price = _optional_float(payload.get("markPrice"), "mark_price", parse_errors)
+        instrument = resolve_perp_instrument(product, venue=raw.source)
+        metadata: dict[str, Any] = {
+            "instrument_id": instrument.instrument_id if instrument is not None else None,
+            "canonical_symbol": instrument.canonical_symbol if instrument is not None else None,
+            "mark_price": mark_price,
+            "index_price": _optional_float(payload.get("indexPrice"), "index_price", parse_errors),
+            "funding_rate": _optional_float(payload.get("lastFundingRate"), "funding_rate", parse_errors),
+            "interest_rate": _optional_float(payload.get("interestRate"), "interest_rate", parse_errors),
+            "estimated_settle_price": _optional_float(
+                payload.get("estimatedSettlePrice"), "estimated_settle_price", parse_errors
+            ),
+            "next_funding_time": _optional_int(payload.get("nextFundingTime"), "next_funding_time", parse_errors),
+        }
+        if parse_errors:
+            metadata["parse_errors"] = parse_errors
+        return NormalizedL3Event(
+            source=raw.source,
+            product=product,
+            channel="funding",
+            event_type="funding",
+            exchange_time=event_time,
+            received_at=raw.received_at,
+            price=mark_price,
+            raw_type="premiumIndex",
             metadata={key: value for key, value in metadata.items() if value is not None},
         )
 

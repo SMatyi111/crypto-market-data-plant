@@ -557,6 +557,7 @@
           "coinbase_depth",
           "bybit_depth",
           "bybit_perp_depth",
+          "binance_perp_depth",
           "kraken_depth",
           "mexc_depth"
         ],
@@ -848,6 +849,117 @@
       }
     },
     {
+      "// Binance USDT-M futures via REST polling": "Use these where the Binance fstream WebSocket is blocked (some jurisdictions withhold futures market-data streams while the fapi REST data API stays up) - the symptom is a WS that connects + acks SUBSCRIBE but streams zero frames. The binance-futures-rest-worker polls REST instead and feeds the same pipeline + curation chain. --stream trades = gapless aggTrades (fromId paging, `a` is a dense counter => gap-proof sequence feed) into binance_perp_trades/ (reuses the binance_perp_trades quarantine/promote/score jobs above); --stream depth = per-poll full-book snapshots into binance_perp_depth/ (none_native, lower fidelity than a WS L2 delta stream); --stream funding = premiumIndex mark/index/funding metric into binance_perp_funding/. All tagged perp:binance-futures:*. Enable to activate. (The binance-trades-worker --market futures lane above is the WS alternative for regions where fstream is NOT blocked.)",
+      "name": "binance-futures-rest-trades",
+      "job_type": "binance-futures-rest-worker",
+      "enabled": false,
+      "interval_seconds": 5,
+      "args": {
+        "symbol": "BTCUSDT",
+        "stream": "trades",
+        "poll_interval_seconds": 1.0,
+        "page_limit": 1000,
+        "jsonl_fsync": false,
+        "normalized_parquet": false,
+        "segment_count": 100000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "worker_name": "binance-futures-rest-trades",
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops",
+        "max_segment_seconds": 1800
+      }
+    },
+    {
+      "name": "binance-futures-rest-depth",
+      "job_type": "binance-futures-rest-worker",
+      "enabled": false,
+      "interval_seconds": 5,
+      "args": {
+        "symbol": "BTCUSDT",
+        "stream": "depth",
+        "poll_interval_seconds": 2.0,
+        "depth": 1000,
+        "normalized_parquet": false,
+        "segment_count": 100000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "worker_name": "binance-futures-rest-depth",
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops",
+        "max_segment_seconds": 1800
+      }
+    },
+    {
+      "name": "quarantine-binance-perp-depth",
+      "job_type": "quarantine-runs",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\binance_perp_depth",
+        "quarantine_root": "G:\\market_archive\\quarantine\\market\\binance_perp_depth",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "promote-binance-perp-depth",
+      "job_type": "promote-replayable",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\binance_perp_depth",
+        "target_root": "G:\\market_archive\\curated\\research\\market_replayable",
+        "quarantine_index": "G:\\market_archive\\quarantine\\market\\binance_perp_depth\\_quarantine_index.jsonl",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "binance-futures-rest-funding",
+      "job_type": "binance-futures-rest-worker",
+      "enabled": false,
+      "interval_seconds": 5,
+      "args": {
+        "symbol": "BTCUSDT",
+        "stream": "funding",
+        "poll_interval_seconds": 5.0,
+        "normalized_parquet": false,
+        "segment_count": 100000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "worker_name": "binance-futures-rest-funding",
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops",
+        "max_segment_seconds": 1800
+      }
+    },
+    {
+      "name": "quarantine-binance-perp-funding",
+      "job_type": "quarantine-runs",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\binance_perp_funding",
+        "quarantine_root": "G:\\market_archive\\quarantine\\market\\binance_perp_funding",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "promote-binance-perp-funding",
+      "job_type": "promote-replayable",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\binance_perp_funding",
+        "target_root": "G:\\market_archive\\curated\\research\\funding",
+        "quarantine_index": "G:\\market_archive\\quarantine\\market\\binance_perp_funding\\_quarantine_index.jsonl",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
       "name": "cleanup-dry-run",
       "job_type": "cleanup",
       "interval_seconds": 3600,
@@ -869,7 +981,9 @@
           "market/binance_trades_usdc=14",
           "market/bybit_perp_trades=14",
           "market/bybit_perp_depth=14",
-          "market/binance_perp_trades=14"
+          "market/binance_perp_trades=14",
+          "market/binance_perp_depth=14",
+          "market/binance_perp_funding=14"
         ],
         "apply": false
       }

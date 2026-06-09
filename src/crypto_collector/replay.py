@@ -1158,6 +1158,119 @@ def replay_trades_stream_run(
     return summary
 
 
+def replay_funding_run(
+    run_path: Path,
+    *,
+    max_clock_skew_ms: float = 60_000.0,
+    write_summary: bool = True,
+) -> TradesReplaySummary:
+    """Replay-validate a funding / mark-price metric run (Binance USDT-M `premiumIndex`).
+
+    Mirrors `replay_trades_stream_run` but there is NO `size` (funding is a metric, not a
+    trade). The structural bar is: `event_count > 0`, monotonic non-decreasing exchange
+    timestamps, a finite-positive mark price (carried as `price`), and exchange->receipt
+    clock skew within `max_clock_skew_ms`. Tagged `gap_detection="none_native"` and writes
+    the same `metrics/replay_summary.json` contract so the quarantine + promote chain
+    curates funding runs unchanged.
+    """
+    resolved_run_path, events_path, summary_path = _resolve_run_paths(run_path)
+    event_count = 0
+    first_event_time: str | None = None
+    last_event_time: str | None = None
+    non_monotonic_time_count = 0
+    invalid_price_count = 0
+    excessive_clock_skew_count = 0
+    max_clock_skew_ms_seen: float | None = None
+    source: str | None = None
+    product: str | None = None
+    instrument_id: str | None = None
+    previous_event_dt: datetime | None = None
+
+    for row in _read_jsonl(events_path):
+        event_count += 1
+        source = source or _optional_str(row.get("source"))
+        product = product or _optional_str(row.get("product"))
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        if instrument_id is None:
+            instrument_id = _optional_str(metadata.get("instrument_id"))
+
+        exchange_time_str = _optional_str(row.get("exchange_time"))
+        if first_event_time is None:
+            first_event_time = exchange_time_str
+        last_event_time = exchange_time_str
+
+        event_dt = _parse_iso_dt(exchange_time_str)
+        if event_dt is not None:
+            if previous_event_dt is not None and event_dt < previous_event_dt:
+                non_monotonic_time_count += 1
+            if previous_event_dt is None or event_dt >= previous_event_dt:
+                previous_event_dt = event_dt
+
+        price = _optional_float(row.get("price"))
+        if price is None or not _is_finite_positive(price):
+            invalid_price_count += 1
+
+        skew_ms = _abs_skew_ms(exchange_time_str, _optional_str(row.get("received_at")))
+        if skew_ms is not None:
+            if max_clock_skew_ms_seen is None or skew_ms > max_clock_skew_ms_seen:
+                max_clock_skew_ms_seen = skew_ms
+            if skew_ms > max_clock_skew_ms:
+                excessive_clock_skew_count += 1
+
+    findings: list[str] = []
+    if event_count == 0:
+        findings.append("no_events")
+    if non_monotonic_time_count:
+        findings.append("non_monotonic_event_time")
+    if invalid_price_count:
+        findings.append("invalid_mark_price")
+    if excessive_clock_skew_count:
+        findings.append("excessive_clock_skew")
+
+    replayable = (
+        event_count > 0
+        and non_monotonic_time_count == 0
+        and invalid_price_count == 0
+        and excessive_clock_skew_count == 0
+    )
+
+    summary = TradesReplaySummary(
+        replay_type="trades",
+        mode="funding_none_native",
+        run_path=str(resolved_run_path),
+        events_path=str(events_path),
+        source=source,
+        product=product,
+        instrument_id=instrument_id,
+        event_count=event_count,
+        first_trade_id=None,
+        last_trade_id=None,
+        first_event_time=first_event_time,
+        last_event_time=last_event_time,
+        non_monotonic_count=non_monotonic_time_count,
+        trade_id_gap_count=0,
+        trade_id_gap_total_missing=0,
+        invalid_price_count=invalid_price_count,
+        invalid_size_count=0,
+        excessive_clock_skew_count=excessive_clock_skew_count,
+        max_clock_skew_ms=max_clock_skew_ms_seen,
+        duplicate_trade_id_count=0,
+        replayable=replayable,
+        findings=findings,
+        gap_detection="none_native",
+        summary_path=str(summary_path) if summary_path is not None else None,
+    )
+
+    if write_summary and summary_path is not None:
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text(
+            json.dumps(summary.to_dict(), indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+    return summary
+
+
 def _is_finite_positive(value: float) -> bool:
     try:
         if value <= 0:
