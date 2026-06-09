@@ -43,6 +43,12 @@ from .collectors.mexc import (
     decode_mexc_frame,
 )
 from .collectors.mock_l3 import MockL3Collector
+from .collectors.binance_futures_rest import (
+    make_aggtrades_poll,
+    make_depth_poll,
+    make_funding_poll,
+)
+from .collectors.rest_poll import RestPollingCollector
 from .config import (
     DEFAULT_ARCHIVE_ROOT,
     CollectorConfig,
@@ -54,6 +60,7 @@ from .config import (
 )
 from .market_normalizers import (
     BinanceDepthNormalizer,
+    BinanceFuturesFundingNormalizer,
     BinanceTradeNormalizer,
     BybitDepthNormalizer,
     BybitTradeNormalizer,
@@ -89,6 +96,7 @@ from .replay import (
     build_book_sync_health_report,
     replay_depth_run,
     replay_depth_stream_run,
+    replay_funding_run,
     replay_trades_run,
     replay_trades_stream_run,
 )
@@ -203,6 +211,53 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Skip hot-path normalized Parquet writes. Raw/clean JSONL and replay "
         "summaries are still written; use for high-rate lanes that curate via replay.",
+    )
+
+    bfr_parser = subparsers.add_parser(
+        "binance-futures-rest-worker",
+        help="Collect Binance USDT-M futures (perp) via REST polling, for hosts where the "
+        "fstream WebSocket is blocked but the fapi REST data API works.",
+    )
+    bfr_parser.add_argument("--symbol", default="BTCUSDT", help="Binance futures symbol, e.g. BTCUSDT.")
+    bfr_parser.add_argument(
+        "--stream",
+        choices=list(_BINANCE_FUTURES_REST_STREAMS),
+        default="trades",
+        help="Which REST data to poll: 'trades' (gapless aggTrades via fromId paging -> "
+        "binance_perp_trades/, perp:binance-futures:*, gap-proof sequence feed), 'depth' "
+        "(per-poll full-book snapshots -> binance_perp_depth/, none_native), or 'funding' "
+        "(premiumIndex mark/index/funding metric -> binance_perp_funding/, none_native).",
+    )
+    bfr_parser.add_argument(
+        "--poll-interval-seconds",
+        type=float,
+        default=1.0,
+        help="Seconds between polls. Trades auto-catch-up (ignore the sleep while a page is "
+        "full); depth/funding poll on this cadence.",
+    )
+    bfr_parser.add_argument("--page-limit", type=int, default=1000, help="aggTrades page size (trades).")
+    bfr_parser.add_argument("--depth", type=int, default=1000, help="Order-book snapshot depth (depth stream).")
+    bfr_parser.add_argument("--segment-count", type=int, default=5000)
+    bfr_parser.add_argument("--max-segments", type=int)
+    bfr_parser.add_argument("--cooldown-seconds", type=float, default=1.0)
+    bfr_parser.add_argument("--output-root", type=Path, default=default_output_root())
+    bfr_parser.add_argument("--ops-root", type=Path, default=default_ops_root())
+    bfr_parser.add_argument("--worker-name", default="binance-futures-rest-worker")
+    bfr_parser.add_argument("--heartbeat-interval-seconds", type=float, default=30.0)
+    bfr_parser.add_argument("--max-delay-ms", type=int, default=60_000)
+    bfr_parser.add_argument("--max-future-skew-ms", type=int, default=5_000)
+    bfr_parser.add_argument("--max-clock-skew-ms", type=float, default=60_000.0)
+    bfr_parser.add_argument(
+        "--source-suffix",
+        default="",
+        help="Optional per-instrument lane suffix (e.g. ethusdt) appended to the lane dir.",
+    )
+    bfr_parser.add_argument("--rotate-at-midnight", action="store_true")
+    bfr_parser.add_argument(
+        "--no-jsonl-fsync", action="store_false", dest="jsonl_fsync", default=True
+    )
+    bfr_parser.add_argument(
+        "--no-normalized-parquet", action="store_false", dest="normalized_parquet", default=True
     )
 
     cb_trades_parser = subparsers.add_parser(
@@ -1598,6 +1653,150 @@ async def _collect_depth_stream_segment(
     }
 
 
+_BINANCE_FUTURES_REST_STREAMS = ("trades", "depth", "funding")
+
+
+def _binance_futures_rest_stream(args: argparse.Namespace) -> str:
+    stream = str(getattr(args, "stream", "trades") or "trades").lower()
+    if stream not in _BINANCE_FUTURES_REST_STREAMS:
+        raise SystemExit(
+            f"--stream must be one of {', '.join(_BINANCE_FUTURES_REST_STREAMS)} (got {stream!r})"
+        )
+    return stream
+
+
+async def collect_binance_futures_rest_segment(args: argparse.Namespace) -> dict[str, object]:
+    """Collect Binance USDT-M futures via REST polling. fstream (WS) market data is blocked
+    in some jurisdictions while the fapi REST data API works, so this lane polls REST and
+    feeds the same pipeline + curation chain as every WS lane. One worker, three streams
+    selected by --stream:
+
+      trades  -> gapless aggTrades (fromId paging; `a` is a dense counter so the run is a
+                 provable `sequence` feed via replay_trades_run), perp:binance-futures:*
+      depth   -> per-poll full-book snapshots (none_native, replay_depth_stream_run) — same
+                 model as the MEXC limit-depth lane; lower fidelity than a WS L2 delta stream
+      funding -> premiumIndex mark/index/funding metric (none_native, replay_funding_run)
+    """
+    stream = _binance_futures_rest_stream(args)
+    symbol = str(args.symbol).upper()
+    poll_interval = float(getattr(args, "poll_interval_seconds", 1.0) or 1.0)
+
+    if stream == "trades":
+        poll = make_aggtrades_poll(symbol, page_limit=int(getattr(args, "page_limit", 1000)))
+        normalizer: object = BinanceTradeNormalizer(instrument_type="perp")
+        source_base = "binance_perp_trades"
+        normalized_dataset = "trades"
+    elif stream == "depth":
+        poll = make_depth_poll(symbol, limit=int(getattr(args, "depth", 1000)))
+        normalizer = BinanceDepthNormalizer(instrument_type="perp")
+        source_base = "binance_perp_depth"
+        normalized_dataset = "market"
+    else:  # funding
+        poll = make_funding_poll(symbol)
+        normalizer = BinanceFuturesFundingNormalizer()
+        source_base = "binance_perp_funding"
+        normalized_dataset = "funding"
+
+    collector = RestPollingCollector(
+        source="binance-futures", poll=poll, poll_interval_seconds=poll_interval
+    )
+    source_name = _build_source_name(source_base, getattr(args, "source_suffix", ""))
+    run_paths = prepare_run_paths(output_root=args.output_root, source=source_name)
+    if stream == "trades":
+        quality_gate: object = QualityGate(
+            max_delay_ms=int(getattr(args, "max_delay_ms", 60_000)),
+            max_future_skew_ms=int(getattr(args, "max_future_skew_ms", 5_000)),
+            session_id=run_paths.base.name,
+        )
+    else:
+        # Depth events carry no top-level price/size; funding has no size. The trades
+        # gate doesn't apply — MetadataQualityGate gates on parse errors, the right bar.
+        quality_gate = MetadataQualityGate()
+
+    pipeline = CollectorPipeline(
+        collector=collector,
+        normalizer=normalizer,
+        quality_gate=quality_gate,
+        run_paths=run_paths,
+        normalized_root=(
+            default_normalized_root(normalized_dataset)
+            if bool(getattr(args, "normalized_parquet", True))
+            else None
+        ),
+        jsonl_fsync=bool(getattr(args, "jsonl_fsync", True)),
+    )
+    pipeline_summary = await pipeline.run(
+        limit=args.count, deadline_utc=getattr(args, "deadline_utc", None)
+    )
+
+    events_path = run_paths.base / "clean" / "events.jsonl"
+    if events_path.exists():
+        if stream == "depth":
+            replay_summary = replay_depth_stream_run(run_paths.base, write_summary=True)
+        elif stream == "funding":
+            replay_summary = replay_funding_run(
+                run_paths.base,
+                max_clock_skew_ms=float(getattr(args, "max_clock_skew_ms", 60_000.0)),
+                write_summary=True,
+            )
+        else:
+            replay_summary = replay_trades_run(
+                run_paths.base,
+                max_clock_skew_ms=float(getattr(args, "max_clock_skew_ms", 60_000.0)),
+                write_summary=True,
+            )
+        replayable = replay_summary.replayable
+        replay_findings = list(replay_summary.findings)
+        replay_summary_path = replay_summary.summary_path
+    else:
+        replayable = False
+        replay_findings = ["no_clean_events"]
+        replay_summary_path = None
+
+    return {
+        "raw_messages": pipeline_summary.raw_messages,
+        "clean_events": pipeline_summary.clean_events,
+        "quarantined_events": pipeline_summary.quarantined_events,
+        "run_path": str(run_paths.base),
+        "replayable": replayable,
+        "replay_findings": replay_findings,
+        "replay_summary_path": replay_summary_path,
+        "deadline_reached": bool(pipeline_summary.deadline_reached),
+        "idle_timeout_count": collector.idle_timeout_count,
+    }
+
+
+def run_binance_futures_rest_worker(args: argparse.Namespace) -> None:
+    _run_segmented_worker(
+        args=args,
+        default_worker_name="binance-futures-rest-worker",
+        worker_type="binance-futures-rest-worker",
+        venue="binance-futures",
+        build_segment_args=lambda source_args: SimpleNamespace(
+            symbol=source_args.symbol,
+            stream=getattr(source_args, "stream", "trades"),
+            poll_interval_seconds=getattr(source_args, "poll_interval_seconds", 1.0),
+            page_limit=getattr(source_args, "page_limit", 1000),
+            depth=getattr(source_args, "depth", 1000),
+            count=source_args.segment_count,
+            output_root=source_args.output_root,
+            max_delay_ms=getattr(source_args, "max_delay_ms", 60_000),
+            max_future_skew_ms=getattr(source_args, "max_future_skew_ms", 5_000),
+            max_clock_skew_ms=getattr(source_args, "max_clock_skew_ms", 60_000.0),
+            jsonl_fsync=getattr(source_args, "jsonl_fsync", True),
+            normalized_parquet=getattr(source_args, "normalized_parquet", True),
+            source_suffix=getattr(source_args, "source_suffix", ""),
+            deadline_utc=None,  # _run_segmented_worker overrides this when rotate_at_midnight is set
+        ),
+        collect_segment=collect_binance_futures_rest_segment,
+        progress_message=lambda segment_index, summary: (
+            "binance futures rest segment finished: "
+            f"segment={segment_index} clean_events={summary['clean_events']} "
+            f"replayable={summary.get('replayable')} run_path={summary['run_path']}"
+        ),
+    )
+
+
 def run_binance_depth_worker(args: argparse.Namespace) -> None:
     _run_segmented_worker(
         args=args,
@@ -2062,6 +2261,9 @@ def _execute_ops_job_inprocess(job: JobSpec) -> JobExecutionResult | str | None:
     if job.job_type == "binance-trades-worker":
         run_binance_trades_worker(args)
         return "binance trades worker completed"
+    if job.job_type == "binance-futures-rest-worker":
+        run_binance_futures_rest_worker(args)
+        return "binance futures rest worker completed"
     if job.job_type == "coinbase-trades-worker":
         run_coinbase_trades_worker(args)
         return "coinbase trades worker completed"
@@ -2190,6 +2392,28 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             # CollectorConfig.idle_timeout_seconds). Honored by the generic-WS lanes;
             # the Binance depth lane runs its own socket loop and ignores it.
             idle_timeout_seconds=raw_args.get("idle_timeout_seconds", 0.0),
+            jsonl_fsync=raw_args.get("jsonl_fsync", True),
+            normalized_parquet=raw_args.get("normalized_parquet", True),
+        )
+    if job.job_type == "binance-futures-rest-worker":
+        return SimpleNamespace(
+            symbol=raw_args.get("symbol", "BTCUSDT"),
+            stream=raw_args.get("stream", "trades"),
+            poll_interval_seconds=raw_args.get("poll_interval_seconds", 1.0),
+            page_limit=raw_args.get("page_limit", 1000),
+            depth=raw_args.get("depth", 1000),
+            segment_count=raw_args.get("segment_count", 5000),
+            max_segments=raw_args.get("max_segments"),
+            cooldown_seconds=raw_args.get("cooldown_seconds", 1.0),
+            output_root=raw_args.get("output_root", default_output_root()),
+            ops_root=Path(raw_args.get("ops_root", default_ops_root())),
+            worker_name=raw_args.get("worker_name", "binance-futures-rest-worker"),
+            heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
+            max_delay_ms=raw_args.get("max_delay_ms", 60_000),
+            max_future_skew_ms=raw_args.get("max_future_skew_ms", 5_000),
+            max_clock_skew_ms=raw_args.get("max_clock_skew_ms", 60_000.0),
+            source_suffix=raw_args.get("source_suffix", ""),
+            rotate_at_midnight=raw_args.get("rotate_at_midnight", False),
             jsonl_fsync=raw_args.get("jsonl_fsync", True),
             normalized_parquet=raw_args.get("normalized_parquet", True),
         )
@@ -3239,6 +3463,8 @@ def main() -> None:
         run_binance_depth_worker(args)
     elif args.command == "binance-trades-worker":
         run_binance_trades_worker(args)
+    elif args.command == "binance-futures-rest-worker":
+        run_binance_futures_rest_worker(args)
     elif args.command == "coinbase-trades-worker":
         run_coinbase_trades_worker(args)
     elif args.command == "coinbase-depth-worker":
