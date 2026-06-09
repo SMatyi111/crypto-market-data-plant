@@ -1635,6 +1635,7 @@ def run_binance_trades_worker(args: argparse.Namespace) -> None:
         build_segment_args=lambda source_args: SimpleNamespace(
             symbol=source_args.symbol,
             channel=source_args.channel,
+            market=getattr(source_args, "market", "spot"),
             count=source_args.segment_count,
             output_root=source_args.output_root,
             max_delay_ms=source_args.max_delay_ms,
@@ -1736,6 +1737,7 @@ def run_bybit_trades_worker(args: argparse.Namespace) -> None:
         build_segment_args=lambda source_args: SimpleNamespace(
             symbol=source_args.symbol,
             channel=source_args.channel,
+            market=getattr(source_args, "market", "spot"),
             count=source_args.segment_count,
             output_root=source_args.output_root,
             max_delay_ms=source_args.max_delay_ms,
@@ -1762,6 +1764,7 @@ def run_bybit_depth_worker(args: argparse.Namespace) -> None:
         build_segment_args=lambda source_args: SimpleNamespace(
             symbol=source_args.symbol,
             channel=source_args.channel,
+            market=getattr(source_args, "market", "spot"),
             count=source_args.segment_count,
             output_root=source_args.output_root,
             source_suffix=getattr(source_args, "source_suffix", ""),
