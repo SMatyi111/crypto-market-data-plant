@@ -555,12 +555,337 @@
         "raw_root": "G:\\market_archive\\raw\\market",
         "source": [
           "coinbase_depth",
+          "coinbase_depth_usdc",
           "bybit_depth",
+          "bybit_perp_depth",
           "kraken_depth",
           "mexc_depth"
         ],
         "target_root": "G:\\market_archive\\curated\\research\\market_replayable",
         "score_only": true,
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "// quote-variant lanes (USD/USDT/USDC basis)": "BTC/USDC alongside the BTC/USDT (Binance/Bybit/MEXC) and BTC/USD (Coinbase/Kraken) lanes completes the stablecoin triangle on one base asset, so cross-quote basis + depeg microstructure is directly observable. This is a different expansion axis from the ETH per-instrument example above (base-asset variant) — same source_suffix + unique worker_name mechanism, different quote. Binance USDC is gap-proof depth like BTC/USDT; Coinbase USDC depth is none_native. Enable to activate; lanes write to *_usdc/ so they never interleave the BTC lanes.",
+      "name": "binance-btcusdc-depth",
+      "job_type": "binance-depth-worker",
+      "enabled": false,
+      "interval_seconds": 5,
+      "args": {
+        "symbol": "btcusdc",
+        "speed": "100ms",
+        "segment_count": 100000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "connect_retries": 3,
+        "retry_backoff_seconds": 2.0,
+        "source_suffix": "usdc",
+        "worker_name": "binance-depth-worker-usdc",
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops",
+        "max_segment_seconds": 1800
+      }
+    },
+    {
+      "name": "book-sync-health-usdc",
+      "job_type": "book-sync-health",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\binance_depth_usdc",
+        "limit": 20,
+        "max_age_hours": 6
+      }
+    },
+    {
+      "name": "quarantine-binance-depth-usdc",
+      "job_type": "quarantine-runs",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\binance_depth_usdc",
+        "quarantine_root": "G:\\market_archive\\quarantine\\market\\binance_depth_usdc",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "promote-binance-depth-usdc",
+      "job_type": "promote-replayable",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\binance_depth_usdc",
+        "target_root": "G:\\market_archive\\curated\\research\\market_replayable",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "score-binance-depth-usdc",
+      "job_type": "backfill-replay",
+      "enabled": false,
+      "interval_seconds": 3600,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\binance_depth_usdc",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "binance-btcusdc-trades",
+      "job_type": "binance-trades-worker",
+      "enabled": false,
+      "interval_seconds": 5,
+      "args": {
+        "symbol": "btcusdc",
+        "channel": "trade",
+        "jsonl_fsync": false,
+        "normalized_parquet": false,
+        "segment_count": 100000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "source_suffix": "usdc",
+        "worker_name": "binance-trades-worker-usdc",
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops",
+        "max_segment_seconds": 1800
+      }
+    },
+    {
+      "name": "quarantine-binance-trades-usdc",
+      "job_type": "quarantine-runs",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\binance_trades_usdc",
+        "quarantine_root": "G:\\market_archive\\quarantine\\market\\binance_trades_usdc",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "promote-binance-trades-usdc",
+      "job_type": "promote-replayable",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\binance_trades_usdc",
+        "target_root": "G:\\market_archive\\curated\\research\\trades_replayable",
+        "quarantine_index": "G:\\market_archive\\quarantine\\market\\binance_trades_usdc\\_quarantine_index.jsonl",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "score-binance-trades-usdc",
+      "job_type": "backfill-trades-replay",
+      "enabled": false,
+      "interval_seconds": 3600,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\binance_trades_usdc",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "coinbase-btcusdc-trades",
+      "job_type": "coinbase-trades-worker",
+      "enabled": false,
+      "interval_seconds": 5,
+      "args": {
+        "symbol": "BTC-USDC",
+        "channel": "matches",
+        "segment_count": 100000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "source_suffix": "usdc",
+        "worker_name": "coinbase-trades-worker-usdc",
+        "idle_timeout_seconds": 120,
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops",
+        "max_segment_seconds": 1800
+      }
+    },
+    {
+      "name": "quarantine-coinbase-trades-usdc",
+      "job_type": "quarantine-runs",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\coinbase_trades_usdc",
+        "quarantine_root": "G:\\market_archive\\quarantine\\market\\coinbase_trades_usdc",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "promote-coinbase-trades-usdc",
+      "job_type": "promote-replayable",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\coinbase_trades_usdc",
+        "target_root": "G:\\market_archive\\curated\\research\\trades_replayable",
+        "quarantine_index": "G:\\market_archive\\quarantine\\market\\coinbase_trades_usdc\\_quarantine_index.jsonl",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "score-coinbase-trades-usdc",
+      "job_type": "backfill-trades-replay",
+      "enabled": false,
+      "interval_seconds": 3600,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\coinbase_trades_usdc",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "coinbase-btcusdc-depth",
+      "job_type": "coinbase-depth-worker",
+      "enabled": false,
+      "interval_seconds": 5,
+      "args": {
+        "symbol": "BTC-USDC",
+        "channel": "level2_50",
+        "segment_count": 100000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "source_suffix": "usdc",
+        "worker_name": "coinbase-depth-worker-usdc",
+        "idle_timeout_seconds": 120,
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops",
+        "max_segment_seconds": 1800
+      }
+    },
+    {
+      "name": "quarantine-coinbase-depth-usdc",
+      "job_type": "quarantine-runs",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\coinbase_depth_usdc",
+        "quarantine_root": "G:\\market_archive\\quarantine\\market\\coinbase_depth_usdc",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "promote-coinbase-depth-usdc",
+      "job_type": "promote-replayable",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\coinbase_depth_usdc",
+        "target_root": "G:\\market_archive\\curated\\research\\market_replayable",
+        "quarantine_index": "G:\\market_archive\\quarantine\\market\\coinbase_depth_usdc\\_quarantine_index.jsonl",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "// perpetual-futures lanes (Bybit USDT-perp)": "Set market='linear' on the Bybit v5 workers to collect USDT-perpetual futures instead of spot. Same publicTrade/orderbook.50 topics, same v5 keepalive, same delta==1 depth sequence guarantee — only the URL path (/v5/public/linear) and the resolved instrument (perp:bybit:* canonical BTC/USDT-PERP) differ. Runs auto-route to bybit_perp_{trades,depth}/ so perp never mixes with the spot lanes; use distinct worker_names. This is the cheapest perp on-ramp (no new collector) and unlocks funding/basis/perp-spot dislocation vs the spot lanes. Enable to activate.",
+      "name": "bybit-perp-trades",
+      "job_type": "bybit-trades-worker",
+      "enabled": false,
+      "interval_seconds": 5,
+      "args": {
+        "symbol": "BTCUSDT",
+        "channel": "publicTrade",
+        "market": "linear",
+        "segment_count": 100000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "worker_name": "bybit-trades-worker-perp",
+        "idle_timeout_seconds": 120,
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops",
+        "max_segment_seconds": 1800
+      }
+    },
+    {
+      "name": "quarantine-bybit-perp-trades",
+      "job_type": "quarantine-runs",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\bybit_perp_trades",
+        "quarantine_root": "G:\\market_archive\\quarantine\\market\\bybit_perp_trades",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "promote-bybit-perp-trades",
+      "job_type": "promote-replayable",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\bybit_perp_trades",
+        "target_root": "G:\\market_archive\\curated\\research\\trades_replayable",
+        "quarantine_index": "G:\\market_archive\\quarantine\\market\\bybit_perp_trades\\_quarantine_index.jsonl",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "score-bybit-perp-trades",
+      "job_type": "backfill-trades-replay",
+      "enabled": false,
+      "interval_seconds": 3600,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\bybit_perp_trades",
+        "stream": true,
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "bybit-perp-depth",
+      "job_type": "bybit-depth-worker",
+      "enabled": false,
+      "interval_seconds": 5,
+      "args": {
+        "symbol": "BTCUSDT",
+        "channel": "orderbook.50",
+        "market": "linear",
+        "segment_count": 100000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "worker_name": "bybit-depth-worker-perp",
+        "idle_timeout_seconds": 120,
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops",
+        "max_segment_seconds": 1800
+      }
+    },
+    {
+      "name": "quarantine-bybit-perp-depth",
+      "job_type": "quarantine-runs",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\bybit_perp_depth",
+        "quarantine_root": "G:\\market_archive\\quarantine\\market\\bybit_perp_depth",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "promote-bybit-perp-depth",
+      "job_type": "promote-replayable",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\bybit_perp_depth",
+        "target_root": "G:\\market_archive\\curated\\research\\market_replayable",
+        "quarantine_index": "G:\\market_archive\\quarantine\\market\\bybit_perp_depth\\_quarantine_index.jsonl",
         "limit": 1000,
         "max_age_hours": 168
       }
@@ -582,7 +907,13 @@
           "market/bybit_depth=14",
           "market/kraken_depth=14",
           "market/mexc_trades=14",
-          "market/mexc_depth=14"
+          "market/mexc_depth=14",
+          "market/binance_depth_usdc=14",
+          "market/binance_trades_usdc=14",
+          "market/coinbase_trades_usdc=14",
+          "market/coinbase_depth_usdc=14",
+          "market/bybit_perp_trades=14",
+          "market/bybit_perp_depth=14"
         ],
         "apply": false
       }

@@ -329,6 +329,15 @@ def build_parser() -> argparse.ArgumentParser:
         "this is curated as a non-sequence ('none_native') feed -- structurally "
         "clean only, NOT gap-proof (STANDARDS 4.3).",
     )
+    bybit_trades_parser.add_argument(
+        "--market",
+        choices=list(_BYBIT_MARKETS),
+        default="spot",
+        help="Bybit v5 product type. 'spot' (default) keeps the legacy lane "
+        "(bybit_trades/, spot:bybit:* instrument). 'linear' = USDT-perpetual futures: "
+        "same publicTrade topic + curation, but the URL path is /v5/public/linear and "
+        "runs land in bybit_perp_trades/ tagged perp:bybit:* so perp never mixes with spot.",
+    )
     bybit_trades_parser.add_argument("--segment-count", type=int, default=5000)
     bybit_trades_parser.add_argument("--max-segments", type=int)
     bybit_trades_parser.add_argument("--cooldown-seconds", type=float, default=1.0)
@@ -371,6 +380,15 @@ def build_parser() -> argparse.ArgumentParser:
         "data.u increments by exactly 1 per message, so this lane is curated as a "
         "provable 'sequence' feed (delta==1, gap-proof) — a dropped message is caught "
         "and blocks promotion (STANDARDS 4.1/4.3).",
+    )
+    bybit_depth_parser.add_argument(
+        "--market",
+        choices=list(_BYBIT_MARKETS),
+        default="spot",
+        help="Bybit v5 product type. 'spot' (default) keeps the legacy lane "
+        "(bybit_depth/, spot:bybit:* instrument). 'linear' = USDT-perpetual futures: "
+        "same orderbook topic + delta==1 sequence guarantee, but the URL path is "
+        "/v5/public/linear and runs land in bybit_perp_depth/ tagged perp:bybit:*.",
     )
     bybit_depth_parser.add_argument("--segment-count", type=int, default=5000)
     bybit_depth_parser.add_argument("--max-segments", type=int)
@@ -1167,18 +1185,47 @@ async def collect_kraken_trades_segment(args: argparse.Namespace) -> dict[str, o
 _BYBIT_PING_MESSAGE = {"op": "ping"}
 _BYBIT_PING_INTERVAL_SECONDS = 20.0
 
+# Bybit v5 public market types we collect. 'spot' is the original lane; 'linear' is
+# USDT-perpetual futures. Both use the identical publicTrade/orderbook.50 topics, the
+# same v5 keepalive, and the same generic WS collector + curation chain — only the URL
+# path differs (…/v5/public/spot vs …/linear) and the resulting instrument is a perp
+# rather than spot. Keeping the market explicit (not inferred from the symbol) avoids
+# silently mixing spot and perp BTCUSDT, which share a venue_symbol.
+_BYBIT_WS_BASE = "wss://stream.bybit.com/v5/public"
+_BYBIT_MARKETS = ("spot", "linear")
+
+
+def _bybit_market(args: argparse.Namespace) -> str:
+    market = str(getattr(args, "market", "spot") or "spot").lower()
+    if market not in _BYBIT_MARKETS:
+        raise SystemExit(
+            f"--market must be one of {', '.join(_BYBIT_MARKETS)} (got {market!r})"
+        )
+    return market
+
+
+def _bybit_ws_url(market: str) -> str:
+    return f"{_BYBIT_WS_BASE}/{market}"
+
+
+def _bybit_instrument_type(market: str) -> str:
+    # linear is a USDT-margined perpetual; spot stays spot.
+    return "perp" if market == "linear" else "spot"
+
 
 async def collect_bybit_trades_segment(args: argparse.Namespace) -> dict[str, object]:
-    # Bybit spot trade id is a UUID (not a dense counter), so gaplessness is
-    # unprovable: curate as a non-sequence ("none_native") feed — structurally clean
-    # only, NOT gap-proof (STANDARDS §4.3).
+    # Bybit trade id is a UUID (not a dense counter), so gaplessness is unprovable:
+    # curate as a non-sequence ("none_native") feed — structurally clean only, NOT
+    # gap-proof (STANDARDS §4.3). spot vs linear only changes the URL path, the lane
+    # directory (bybit_trades vs bybit_perp_trades) and the resolved instrument.
+    market = _bybit_market(args)
     return await _collect_trades_segment(
         args,
         source="bybit",
-        websocket_url="wss://stream.bybit.com/v5/public/spot",
+        websocket_url=_bybit_ws_url(market),
         subscription_style="bybit",
-        normalizer=BybitTradeNormalizer(),
-        source_base="bybit_trades",
+        normalizer=BybitTradeNormalizer(instrument_type=_bybit_instrument_type(market)),
+        source_base="bybit_trades" if market == "spot" else "bybit_perp_trades",
         replay_fn=replay_trades_stream_run,
         ping_message=_BYBIT_PING_MESSAGE,
         ping_interval_seconds=_BYBIT_PING_INTERVAL_SECONDS,
@@ -1319,14 +1366,17 @@ async def collect_bybit_depth_segment(args: argparse.Namespace) -> dict[str, obj
     # update id (data.u) that increments by exactly 1 per message (verified live
     # 2026-06-01). Passing sequence_metadata_key promotes this lane from none_native
     # to a provable `sequence` gap proof (delta==1), so a dropped message is caught
-    # and blocks promotion (STANDARDS 4.1 / 4.3).
+    # and blocks promotion (STANDARDS 4.1 / 4.3). Linear (USDT-perp) orderbook carries
+    # the same in-stream snapshot + delta==1 update id, so the sequence guarantee holds
+    # identically; only the URL path, lane dir and instrument (perp) differ.
+    market = _bybit_market(args)
     return await _collect_depth_stream_segment(
         args,
         source="bybit",
-        websocket_url="wss://stream.bybit.com/v5/public/spot",
+        websocket_url=_bybit_ws_url(market),
         subscription_style="bybit",
-        normalizer=BybitDepthNormalizer(),
-        source_base="bybit_depth",
+        normalizer=BybitDepthNormalizer(instrument_type=_bybit_instrument_type(market)),
+        source_base="bybit_depth" if market == "spot" else "bybit_perp_depth",
         ping_message=_BYBIT_PING_MESSAGE,
         ping_interval_seconds=_BYBIT_PING_INTERVAL_SECONDS,
         **_stream_depth_replay_kwargs("bybit", getattr(args, "symbol", None)),
@@ -2173,6 +2223,7 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
         return SimpleNamespace(
             symbol=raw_args.get("symbol", "BTCUSDT"),
             channel=raw_args.get("channel", "publicTrade"),
+            market=raw_args.get("market", "spot"),
             segment_count=raw_args.get("segment_count", 5000),
             max_segments=raw_args.get("max_segments"),
             cooldown_seconds=raw_args.get("cooldown_seconds", 1.0),
@@ -2197,6 +2248,7 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             symbol=raw_args.get("symbol", "BTCUSDT"),
             # orderbook.<depth>; the symbol is appended to form the full topic.
             channel=raw_args.get("channel", "orderbook.50"),
+            market=raw_args.get("market", "spot"),
             segment_count=raw_args.get("segment_count", 5000),
             max_segments=raw_args.get("max_segments"),
             cooldown_seconds=raw_args.get("cooldown_seconds", 1.0),

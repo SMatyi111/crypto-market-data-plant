@@ -11,7 +11,11 @@ from crypto_collector.cli import (
     _binance_buffer_bridges_snapshot,
     _binance_update_window,
     _build_source_name,
+    _bybit_instrument_type,
+    _bybit_market,
+    _bybit_ws_url,
     _capture_binance_snapshot_and_buffer,
+    _job_args,
     _next_utc_midnight,
     _post_reconnect_alignment_holds,
     _reopen_binance_depth_connection,
@@ -1505,6 +1509,102 @@ def test_cli_parser_bybit_trades_worker_defaults() -> None:
     )
     assert suffixed.symbol == "ETHUSDT"
     assert suffixed.source_suffix == "ethusdt"
+
+
+def test_bybit_market_helpers_select_url_and_instrument_type() -> None:
+    # spot is the legacy lane; linear is the USDT-perp path. Only the URL suffix and the
+    # resolved instrument type differ between them.
+    assert _bybit_ws_url("spot") == "wss://stream.bybit.com/v5/public/spot"
+    assert _bybit_ws_url("linear") == "wss://stream.bybit.com/v5/public/linear"
+    assert _bybit_instrument_type("spot") == "spot"
+    assert _bybit_instrument_type("linear") == "perp"
+    # _bybit_market defaults to spot, is case-insensitive, and rejects unknown markets
+    # (rather than silently collecting an untagged feed).
+    import pytest
+
+    assert _bybit_market(SimpleNamespace()) == "spot"
+    assert _bybit_market(SimpleNamespace(market="LINEAR")) == "linear"
+    with pytest.raises(SystemExit):
+        _bybit_market(SimpleNamespace(market="inverse"))
+
+
+def test_cli_parser_bybit_workers_accept_market_flag() -> None:
+    parser = build_parser()
+    # Default stays spot for both lanes (preserves the live BTC behavior).
+    assert parser.parse_args(["bybit-trades-worker"]).market == "spot"
+    assert parser.parse_args(["bybit-depth-worker"]).market == "spot"
+    # linear is accepted.
+    assert parser.parse_args(["bybit-trades-worker", "--market", "linear"]).market == "linear"
+    assert parser.parse_args(["bybit-depth-worker", "--market", "linear"]).market == "linear"
+    # argparse rejects anything outside the choices.
+    import pytest
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["bybit-depth-worker", "--market", "inverse"])
+
+
+def test_bybit_trade_normalizer_perp_tags_perp_instrument() -> None:
+    raw = RawMessage(
+        source="bybit",
+        received_at=utc_now(),
+        payload=_bybit_publictrade_frame(
+            trades=[
+                _bybit_trade(
+                    trade_id="a1",
+                    price="50000",
+                    size="0.1",
+                    taker_side="Buy",
+                    time_ms=1_780_000_000_000,
+                )
+            ]
+        ),
+    )
+
+    spot_event = BybitTradeNormalizer().normalize_many(raw)[0]
+    perp_event = BybitTradeNormalizer(instrument_type="perp").normalize_many(raw)[0]
+
+    # Same frame, only the instrument identity differs by market.
+    assert spot_event.metadata["instrument_id"] == "spot:bybit:BTCUSDT"
+    assert spot_event.metadata["canonical_symbol"] == "BTC/USDT"
+    assert perp_event.metadata["instrument_id"] == "perp:bybit:BTCUSDT"
+    assert perp_event.metadata["canonical_symbol"] == "BTC/USDT-PERP"
+
+
+def test_bybit_depth_normalizer_perp_tags_perp_instrument() -> None:
+    raw = RawMessage(
+        source="bybit",
+        received_at=utc_now(),
+        payload=_bybit_orderbook_frame(
+            bids=[["50000.0", "1.0"]],
+            asks=[["50001.0", "0.5"]],
+            update_id=18521288,
+            cts_ms=1_780_000_000_000,
+        ),
+    )
+
+    spot_event = BybitDepthNormalizer().normalize(raw)
+    perp_event = BybitDepthNormalizer(instrument_type="perp").normalize(raw)
+
+    assert spot_event.instrument.instrument_id == "spot:bybit:BTCUSDT"
+    assert perp_event.instrument.instrument_id == "perp:bybit:BTCUSDT"
+    assert perp_event.instrument.canonical_symbol == "BTC/USDT-PERP"
+
+
+def test_job_args_threads_bybit_market_through_inprocess_path() -> None:
+    # The ops-runner in-process path builds args from the job dict (not argparse), so
+    # `market` must be carried there too; default spot when unset.
+    trades_default = _job_args(
+        SimpleNamespace(job_type="bybit-trades-worker", args={"symbol": "BTCUSDT"})
+    )
+    assert trades_default.market == "spot"
+
+    depth_linear = _job_args(
+        SimpleNamespace(
+            job_type="bybit-depth-worker",
+            args={"symbol": "BTCUSDT", "market": "linear"},
+        )
+    )
+    assert depth_linear.market == "linear"
 
 
 def test_collect_bybit_trades_segment_writes_none_native_replay_summary(
