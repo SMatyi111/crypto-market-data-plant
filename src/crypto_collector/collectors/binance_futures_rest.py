@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -31,13 +34,22 @@ def make_aggtrades_poll(
     *,
     page_limit: int = 1000,
     max_pages_per_poll: int = 5,
+    initial_from_id: int | None = None,
     fetch: FetchFn = _get_json,
 ):
     """Build a gapless aggregate-trades poll. Binance's `a` (aggregate trade id) is a dense
     per-symbol counter, so paging by `fromId = last_a + 1` yields a CONTIGUOUS id stream
     with no gaps — curated as a provable `sequence` feed (replay_trades_run, gap-proof),
-    same class as the spot trades lane. The first poll (fromId unset) grabs the most recent
-    page and anchors `from_id`; each later poll advances from there.
+    same class as the spot trades lane.
+
+    Continuity is dense WITHIN a poll and, crucially, ACROSS segment rotations: each
+    collector segment is its own subprocess, so without a seed the pager would reset to
+    "now" every rotation and silently miss (or, on a liquid market, re-fetch and duplicate)
+    every trade in the rotation window. The caller therefore passes `initial_from_id` — the
+    last durably-written `a` + 1 from the previous segment (see `aggtrades_resume_from_id`)
+    — so the stream stays gapless and overlap-free across rotations. Only the first-ever
+    poll for a lane (no prior cursor) leaves `initial_from_id` unset, anchoring to the most
+    recent page.
 
     REST aggTrade rows carry no `s`/`e`, so we inject them to match the shape
     `BinanceTradeNormalizer` reads (`s`=symbol, `e`="aggTrade", `a`/`p`/`q`/`T`/`m`).
@@ -45,7 +57,7 @@ def make_aggtrades_poll(
     (still catching up) so the collector should re-poll without sleeping.
     """
     sym = symbol.upper()
-    state: dict[str, int | None] = {"from_id": None}
+    state: dict[str, int | None] = {"from_id": initial_from_id}
 
     async def poll() -> tuple[list[dict], bool]:
         rows: list[dict] = []
@@ -110,3 +122,126 @@ def make_funding_poll(symbol: str, *, fetch: FetchFn = _get_json):
         return [row], False
 
     return poll
+
+
+# --- aggTrades cross-segment continuity --------------------------------------
+# Each collector segment is its own subprocess, so the aggTrades pager's `from_id`
+# would reset every ~30-min rotation and re-anchor to the most-recent page. On an
+# illiquid market that silently DROPS every trade in the rotation window; on a
+# liquid market the most-recent page reaches back past the prior segment's tail, so
+# the overlap is RE-FETCHED into a fresh run and (promotion has no cross-run dedup)
+# emitted as duplicate `a` ids. Because `a` is a dense per-symbol counter we instead
+# persist the highest DURABLY-WRITTEN `a` and seed the next segment from there:
+# strictly forward, no gap and no overlap — the one continuity guarantee a dense-id
+# REST feed can make that a WS reconnect cannot. The cursor advances only after a
+# segment's clean events are on disk (at-least-once), so a crash risks a small
+# bounded re-fetch (dup), never a gap.
+
+CURSOR_DIR_NAME = "_cursors"
+
+
+def aggtrades_cursor_path(output_root: Path | str, source_name: str) -> Path:
+    """Per-lane cursor file, kept in a `_cursors/` sibling dir OUTSIDE the run-dir tree
+    so promotion/quarantine/replay/manifest run-dir scans (all `is_dir()`-filtered and
+    timestamp-named) never mistake it for a run."""
+    return Path(output_root) / CURSOR_DIR_NAME / f"{source_name}.json"
+
+
+def read_aggtrades_cursor(path: Path | str) -> dict | None:
+    """Return the persisted cursor, or None if absent/unreadable. Never raises: a torn or
+    corrupt cursor is treated as 'no cursor' (re-anchor to live) rather than bricking the
+    lane on every restart."""
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def write_aggtrades_cursor(
+    path: Path | str, *, symbol: str, last_agg_id: int, now: datetime | None = None
+) -> None:
+    """Atomically persist the highest durably-written aggregate-trade id for this lane."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "symbol": symbol.upper(),
+        "last_agg_id": int(last_agg_id),
+        "updated_at": (now or datetime.now(tz=UTC)).isoformat(),
+    }
+    tmp = target.with_name(f"{target.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    tmp.replace(target)
+
+
+def aggtrades_resume_from_id(
+    cursor: dict | None,
+    *,
+    symbol: str,
+    now: datetime,
+    max_resume_gap_seconds: float,
+) -> tuple[int | None, str | None]:
+    """Decide the next segment's starting `fromId` from the persisted cursor.
+
+    Returns (initial_from_id, reset_finding). `initial_from_id=None` means "anchor to the
+    most-recent page" (first-ever poll, or a deliberate reset). `reset_finding` is a
+    non-None tag when a usable cursor was intentionally discarded, so the segment can
+    surface a logged gap.
+    """
+    if not cursor:
+        return None, None
+    if str(cursor.get("symbol", "")).upper() != symbol.upper():
+        return None, "cursor_reset_symbol_mismatch"
+    last = cursor.get("last_agg_id")
+    if not isinstance(last, int) or isinstance(last, bool):
+        return None, "cursor_reset_invalid"
+    updated_at = _parse_iso(cursor.get("updated_at"))
+    if updated_at is None:
+        return None, "cursor_reset_invalid"
+    if (now - updated_at).total_seconds() > max_resume_gap_seconds:
+        # Extended downtime: paging forward from a very old id would backfill an unbounded
+        # number of trades (and blow the fapi weight budget), so accept a single logged
+        # gap and re-anchor to live instead.
+        return None, "cursor_reset_stale_gap"
+    return last + 1, None
+
+
+def max_agg_id_in_events(events_path: Path | str) -> int | None:
+    """Highest normalized `sequence` (= aggregate-trade `a`) durably written to a run's
+    clean events. None when the run wrote no sequenced trades. Streams the file so memory
+    stays flat for a full-segment run."""
+    highest: int | None = None
+    try:
+        handle = Path(events_path).open("r", encoding="utf-8")
+    except OSError:
+        return None
+    with handle:
+        for line in handle:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                row = json.loads(stripped)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            seq = row.get("sequence") if isinstance(row, dict) else None
+            if isinstance(seq, int) and not isinstance(seq, bool):
+                if highest is None or seq > highest:
+                    highest = seq
+    return highest
+
+
+def _parse_iso(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
