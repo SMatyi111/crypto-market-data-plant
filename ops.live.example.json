@@ -101,8 +101,8 @@
       "args": {
         "source_root": "G:\\market_archive\\raw\\market\\coinbase_trades",
         "quarantine_root": "G:\\market_archive\\quarantine\\market\\coinbase_trades",
-        "limit": 20,
-        "max_age_hours": 6
+        "limit": 1000,
+        "max_age_hours": 168
       }
     },
     {
@@ -114,8 +114,8 @@
         "source_root": "G:\\market_archive\\raw\\market\\coinbase_trades",
         "target_root": "G:\\market_archive\\curated\\research\\trades_replayable",
         "quarantine_index": "G:\\market_archive\\quarantine\\market\\coinbase_trades\\_quarantine_index.jsonl",
-        "limit": 20,
-        "max_age_hours": 6
+        "limit": 1000,
+        "max_age_hours": 168
       }
     },
     {
@@ -144,8 +144,8 @@
       "args": {
         "source_root": "G:\\market_archive\\raw\\market\\coinbase_depth",
         "quarantine_root": "G:\\market_archive\\quarantine\\market\\coinbase_depth",
-        "limit": 20,
-        "max_age_hours": 6
+        "limit": 1000,
+        "max_age_hours": 168
       }
     },
     {
@@ -157,8 +157,8 @@
         "source_root": "G:\\market_archive\\raw\\market\\coinbase_depth",
         "target_root": "G:\\market_archive\\curated\\research\\market_replayable",
         "quarantine_index": "G:\\market_archive\\quarantine\\market\\coinbase_depth\\_quarantine_index.jsonl",
-        "limit": 20,
-        "max_age_hours": 6
+        "limit": 1000,
+        "max_age_hours": 168
       }
     },
     {
@@ -187,8 +187,8 @@
       "args": {
         "source_root": "G:\\market_archive\\raw\\market\\kraken_trades",
         "quarantine_root": "G:\\market_archive\\quarantine\\market\\kraken_trades",
-        "limit": 20,
-        "max_age_hours": 6
+        "limit": 1000,
+        "max_age_hours": 168
       }
     },
     {
@@ -200,8 +200,8 @@
         "source_root": "G:\\market_archive\\raw\\market\\kraken_trades",
         "target_root": "G:\\market_archive\\curated\\research\\trades_replayable",
         "quarantine_index": "G:\\market_archive\\quarantine\\market\\kraken_trades\\_quarantine_index.jsonl",
-        "limit": 20,
-        "max_age_hours": 6
+        "limit": 1000,
+        "max_age_hours": 168
       }
     },
     {
@@ -230,8 +230,8 @@
       "args": {
         "source_root": "G:\\market_archive\\raw\\market\\bybit_trades",
         "quarantine_root": "G:\\market_archive\\quarantine\\market\\bybit_trades",
-        "limit": 20,
-        "max_age_hours": 6
+        "limit": 1000,
+        "max_age_hours": 168
       }
     },
     {
@@ -243,8 +243,8 @@
         "source_root": "G:\\market_archive\\raw\\market\\bybit_trades",
         "target_root": "G:\\market_archive\\curated\\research\\trades_replayable",
         "quarantine_index": "G:\\market_archive\\quarantine\\market\\bybit_trades\\_quarantine_index.jsonl",
-        "limit": 20,
-        "max_age_hours": 6
+        "limit": 1000,
+        "max_age_hours": 168
       }
     },
     {
@@ -273,8 +273,8 @@
       "args": {
         "source_root": "G:\\market_archive\\raw\\market\\bybit_depth",
         "quarantine_root": "G:\\market_archive\\quarantine\\market\\bybit_depth",
-        "limit": 20,
-        "max_age_hours": 6
+        "limit": 1000,
+        "max_age_hours": 168
       }
     },
     {
@@ -286,8 +286,8 @@
         "source_root": "G:\\market_archive\\raw\\market\\bybit_depth",
         "target_root": "G:\\market_archive\\curated\\research\\market_replayable",
         "quarantine_index": "G:\\market_archive\\quarantine\\market\\bybit_depth\\_quarantine_index.jsonl",
-        "limit": 20,
-        "max_age_hours": 6
+        "limit": 1000,
+        "max_age_hours": 168
       }
     },
     {
@@ -316,8 +316,8 @@
       "args": {
         "source_root": "G:\\market_archive\\raw\\market\\kraken_depth",
         "quarantine_root": "G:\\market_archive\\quarantine\\market\\kraken_depth",
-        "limit": 20,
-        "max_age_hours": 6
+        "limit": 1000,
+        "max_age_hours": 168
       }
     },
     {
@@ -329,8 +329,8 @@
         "source_root": "G:\\market_archive\\raw\\market\\kraken_depth",
         "target_root": "G:\\market_archive\\curated\\research\\market_replayable",
         "quarantine_index": "G:\\market_archive\\quarantine\\market\\kraken_depth\\_quarantine_index.jsonl",
-        "limit": 20,
-        "max_age_hours": 6
+        "limit": 1000,
+        "max_age_hours": 168
       }
     },
     {
@@ -360,8 +360,8 @@
       "args": {
         "source_root": "G:\\market_archive\\raw\\market\\mexc_trades",
         "quarantine_root": "G:\\market_archive\\quarantine\\market\\mexc_trades",
-        "limit": 20,
-        "max_age_hours": 6
+        "limit": 1000,
+        "max_age_hours": 168
       }
     },
     {
@@ -373,8 +373,8 @@
         "source_root": "G:\\market_archive\\raw\\market\\mexc_trades",
         "target_root": "G:\\market_archive\\curated\\research\\trades_replayable",
         "quarantine_index": "G:\\market_archive\\quarantine\\market\\mexc_trades\\_quarantine_index.jsonl",
-        "limit": 20,
-        "max_age_hours": 6
+        "limit": 1000,
+        "max_age_hours": 168
       }
     },
     {
@@ -404,8 +404,8 @@
       "args": {
         "source_root": "G:\\market_archive\\raw\\market\\mexc_depth",
         "quarantine_root": "G:\\market_archive\\quarantine\\market\\mexc_depth",
-        "limit": 20,
-        "max_age_hours": 6
+        "limit": 1000,
+        "max_age_hours": 168
       }
     },
     {
@@ -417,8 +417,8 @@
         "source_root": "G:\\market_archive\\raw\\market\\mexc_depth",
         "target_root": "G:\\market_archive\\curated\\research\\market_replayable",
         "quarantine_index": "G:\\market_archive\\quarantine\\market\\mexc_depth\\_quarantine_index.jsonl",
-        "limit": 20,
-        "max_age_hours": 6
+        "limit": 1000,
+        "max_age_hours": 168
       }
     },
     {
@@ -438,8 +438,8 @@
       "args": {
         "source_root": "G:\\market_archive\\raw\\market\\binance_depth",
         "quarantine_root": "G:\\market_archive\\quarantine\\market\\binance_depth",
-        "limit": 20,
-        "max_age_hours": 6
+        "limit": 1000,
+        "max_age_hours": 168
       }
     },
     {
@@ -449,8 +449,8 @@
       "args": {
         "source_root": "G:\\market_archive\\raw\\market\\binance_depth",
         "target_root": "G:\\market_archive\\curated\\research\\market_replayable",
-        "limit": 20,
-        "max_age_hours": 6
+        "limit": 1000,
+        "max_age_hours": 168
       }
     },
     {
@@ -460,8 +460,8 @@
       "args": {
         "source_root": "G:\\market_archive\\raw\\market\\binance_trades",
         "quarantine_root": "G:\\market_archive\\quarantine\\market\\binance_trades",
-        "limit": 20,
-        "max_age_hours": 6
+        "limit": 1000,
+        "max_age_hours": 168
       }
     },
     {
@@ -472,8 +472,8 @@
         "source_root": "G:\\market_archive\\raw\\market\\binance_trades",
         "target_root": "G:\\market_archive\\curated\\research\\trades_replayable",
         "quarantine_index": "G:\\market_archive\\quarantine\\market\\binance_trades\\_quarantine_index.jsonl",
-        "limit": 20,
-        "max_age_hours": 6
+        "limit": 1000,
+        "max_age_hours": 168
       }
     },
     {
