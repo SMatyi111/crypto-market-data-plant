@@ -337,6 +337,57 @@ def test_backfill_replay_summaries_skips_existing_without_overwrite(tmp_path: Pa
     assert report.runs[0].action == "skipped_existing"
 
 
+def test_backfill_replay_summaries_scores_trades_lane_with_trades_fn(tmp_path: Path) -> None:
+    # A trades lane has no order-book snapshot; backfilling it with the default depth
+    # scorer would mis-score it. Passing replay_trades_run writes a trades summary that
+    # quarantine/promote consume unchanged.
+    source_root = tmp_path / "raw" / "market" / "binance_trades"
+    run_path = source_root / "20990101_000012"
+    clean_path = run_path / "clean"
+    clean_path.mkdir(parents=True)
+    rows = [
+        {
+            "source": "binance",
+            "product": "BTCUSDT",
+            "exchange_time": "2026-04-06T00:00:00.000000+00:00",
+            "received_at": "2026-04-06T00:00:00.050000+00:00",
+            "sequence": 100,
+            "price": 100.0,
+            "size": 1.0,
+            "metadata": {"instrument_id": "spot:binance:BTCUSDT"},
+        },
+        {
+            "source": "binance",
+            "product": "BTCUSDT",
+            "exchange_time": "2026-04-06T00:00:00.100000+00:00",
+            "received_at": "2026-04-06T00:00:00.150000+00:00",
+            "sequence": 101,
+            "price": 100.5,
+            "size": 2.0,
+            "metadata": {"instrument_id": "spot:binance:BTCUSDT"},
+        },
+    ]
+    (clean_path / "events.jsonl").write_text(
+        "".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8"
+    )
+
+    report = backfill_replay_summaries(
+        source_root,
+        limit=10,
+        max_age_hours=24 * 365 * 100,
+        replay_fn=replay_trades_run,
+    )
+
+    assert report.status == "ok"
+    assert report.created_count == 1
+    assert report.runs[0].action == "created"
+    assert report.runs[0].replayable is True
+    summary = json.loads((run_path / "metrics" / "replay_summary.json").read_text(encoding="utf-8"))
+    assert summary["replay_type"] == "trades"
+    assert summary["replayable"] is True
+    assert summary["trade_id_gap_count"] == 0
+
+
 def _write_trades_run(
     run_path: Path,
     rows: list[dict],

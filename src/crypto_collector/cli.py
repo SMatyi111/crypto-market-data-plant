@@ -653,12 +653,32 @@ def build_parser() -> argparse.ArgumentParser:
     book_sync_parser.add_argument("--max-age-hours", type=float, default=24.0)
     book_sync_parser.add_argument("--format", choices=["json", "text"], default="text")
 
-    backfill_parser = subparsers.add_parser("backfill-replay", help="Backfill missing replay summaries")
+    backfill_parser = subparsers.add_parser("backfill-replay", help="Backfill missing depth replay summaries")
     backfill_parser.add_argument("--source-root", type=Path, default=default_archive_root() / "raw" / "market" / "binance_depth")
     backfill_parser.add_argument("--limit", type=int, default=50)
     backfill_parser.add_argument("--max-age-hours", type=float, default=24.0)
     backfill_parser.add_argument("--overwrite", action="store_true")
     backfill_parser.add_argument("--format", choices=["json", "text"], default="text")
+
+    backfill_trades_parser = subparsers.add_parser(
+        "backfill-trades-replay",
+        help="Backfill missing replay summaries for a TRADES lane using the trades "
+        "scorer (not the depth scorer). Defaults to binance_trades.",
+    )
+    backfill_trades_parser.add_argument(
+        "--source-root", type=Path, default=default_archive_root() / "raw" / "market" / "binance_trades"
+    )
+    backfill_trades_parser.add_argument("--limit", type=int, default=50)
+    backfill_trades_parser.add_argument("--max-age-hours", type=float, default=24.0)
+    backfill_trades_parser.add_argument("--overwrite", action="store_true")
+    backfill_trades_parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="Score with the none_native stream-trades replay (Bybit/MEXC, whose "
+        "trade ids are UUIDs) instead of the dense sequence-bearing scorer "
+        "(Binance/Coinbase/Kraken).",
+    )
+    backfill_trades_parser.add_argument("--format", choices=["json", "text"], default="text")
 
     quarantine_parser = subparsers.add_parser("quarantine-runs", help="Quarantine unreplayable depth runs")
     quarantine_parser.add_argument("--source-root", type=Path, default=default_archive_root() / "raw" / "market" / "binance_depth")
@@ -2406,6 +2426,26 @@ def run_backfill_replay(args: argparse.Namespace) -> None:
     print(f"findings={','.join(report.findings) if report.findings else 'none'}")
 
 
+def run_backfill_trades_replay(args: argparse.Namespace) -> None:
+    replay_fn = replay_trades_stream_run if getattr(args, "stream", False) else replay_trades_run
+    report = backfill_replay_summaries(
+        args.source_root,
+        limit=args.limit,
+        max_age_hours=args.max_age_hours,
+        overwrite=args.overwrite,
+        replay_fn=replay_fn,
+    )
+    if args.format == "json":
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+        return
+    print(f"status={report.status}")
+    print(f"created_count={report.created_count}")
+    print(f"updated_count={report.updated_count}")
+    print(f"skipped_count={report.skipped_count}")
+    print(f"failed_count={report.failed_count}")
+    print(f"findings={','.join(report.findings) if report.findings else 'none'}")
+
+
 def _backfill_first_event_product(run_dir: Path) -> str | None:
     """Read the venue product (e.g. 'BTC/USD') from a run's first clean event so the
     backfill can select the right per-venue replay kwargs (Kraken precision)."""
@@ -3005,6 +3045,8 @@ def main() -> None:
         run_book_sync_health(args)
     elif args.command == "backfill-replay":
         run_backfill_replay(args)
+    elif args.command == "backfill-trades-replay":
+        run_backfill_trades_replay(args)
     elif args.command == "backfill-stream-depth":
         run_backfill_stream_depth(args)
     elif args.command == "quarantine-runs":

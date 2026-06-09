@@ -59,6 +59,7 @@ def promote_replayable_runs(
     limit: int = 50,
     max_age_hours: float = 24.0,
     quarantine_index_path: Path | None = None,
+    parquet_batch_size: int = 50_000,
 ) -> PromotionReport:
     checked_at = datetime.now(tz=UTC)
     cutoff = checked_at - timedelta(hours=max_age_hours)
@@ -67,7 +68,14 @@ def promote_replayable_runs(
     promoted_runs = _read_promoted_runs(index_path)
     quarantined_runs = _read_quarantined_runs(quarantine_index_path)
     index_sink = JsonlSink(target_root, "_promotion_index.jsonl")
-    parquet_sink = ParquetDatasetSink(target_root)
+    # Promotion writes whole runs and flushes per-run (see the explicit flush before
+    # each index write below), so the buffer only needs to hold one run's rows. The
+    # sink's default batch_size (100) would auto-flush mid-run — for a 5k-row run that
+    # is ~50 tiny part-files PER run, which both fragments the dataset and slows
+    # write_to_dataset as the partition dir fills (a backfill of thousands of runs can
+    # stall on it). Sizing the buffer past a run's row count means exactly one flush
+    # (≈one part-file) per run, with the same per-run durability guarantee.
+    parquet_sink = ParquetDatasetSink(target_root, batch_size=parquet_batch_size)
 
     runs: list[PromotionRunStatus] = []
     promoted_run_count = 0

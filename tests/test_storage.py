@@ -10,6 +10,26 @@ from crypto_collector.storage import JsonlSink, ParquetDatasetSink, RotatingJson
 from crypto_collector.storage import RunPaths
 
 
+def test_parquet_dataset_sink_keeps_column_whose_first_value_is_null(tmp_path: Path) -> None:
+    # Regression: a numeric column that is None in the FIRST row but populated later
+    # must NOT be dropped. pa.Table.from_pylist infers a column's type from its leading
+    # value and types an early-None column as `null`, silently dropping it on write —
+    # which made trade_aggressor_imbalance_* / trade_vwap disappear on days whose
+    # opening buckets had no trades. The sink must scan all values per column.
+    sink = ParquetDatasetSink(tmp_path / "feat", schema_version="v1", batch_size=100)
+    base = {"source": "research_features", "event_time": "2026-06-05T00:00:00+00:00"}
+    sink.write({**base, "imbalance": None, "always": 0.0})
+    sink.write({**base, "imbalance": None, "always": 0.0})
+    sink.write({**base, "imbalance": -0.5, "always": 1.0})
+    sink.flush()
+
+    dataset = ds.dataset(tmp_path / "feat", format="parquet", partitioning="hive")
+    names = dataset.schema.names
+    assert "imbalance" in names, f"early-None column dropped; got {names}"
+    nonnull = [v for v in dataset.to_table().to_pylist() if v["imbalance"] is not None]
+    assert [r["imbalance"] for r in nonnull] == [-0.5]
+
+
 def test_rotating_jsonl_sink_rolls_files_at_byte_threshold(tmp_path: Path) -> None:
     sink = RotatingJsonlSink(tmp_path, "messages.jsonl", max_bytes=50)
     # Each row encodes to about 30 bytes including the newline.

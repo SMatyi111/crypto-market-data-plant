@@ -5,7 +5,7 @@ import zlib
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 @dataclass(slots=True)
@@ -741,7 +741,15 @@ def backfill_replay_summaries(
     limit: int = 50,
     max_age_hours: float = 24.0,
     overwrite: bool = False,
+    replay_fn: Callable[..., Any] = replay_depth_run,
 ) -> ReplayBackfillReport:
+    """Re-score archived runs missing a `metrics/replay_summary.json`.
+
+    `replay_fn` is the scorer applied per run; it must accept
+    `(run_dir, write_summary=True)` and return an object exposing `.replayable`,
+    `.findings`, and `.summary_path`. Defaults to `replay_depth_run` (Binance depth);
+    pass `replay_trades_run` / `replay_trades_stream_run` to backfill a trades lane.
+    """
     checked_at = datetime.now(tz=UTC)
     cutoff = checked_at - timedelta(hours=max_age_hours)
     runs: list[ReplayBackfillRun] = []
@@ -783,7 +791,7 @@ def backfill_replay_summaries(
             continue
         existed_before = replay_summary_path.exists()
         try:
-            summary = replay_depth_run(run_dir, write_summary=True)
+            summary = replay_fn(run_dir, write_summary=True)
         except Exception as exc:  # noqa: BLE001
             failed_count += 1
             runs.append(

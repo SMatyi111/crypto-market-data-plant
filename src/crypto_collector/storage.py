@@ -223,7 +223,23 @@ class ParquetDatasetSink:
         except ImportError as exc:
             raise RuntimeError("Install the 'pyarrow' package to write normalized Parquet datasets.") from exc
 
-        table = pa.Table.from_pylist(self._rows)
+        # Build each column with pa.array (which scans ALL values for type inference)
+        # rather than pa.Table.from_pylist, which infers a column's type from its
+        # LEADING value. Under from_pylist a column whose first row is None is typed
+        # `null` and silently dropped on write — so features that are None until the
+        # first trade of the day (e.g. trade_aggressor_imbalance_60s, trade_vwap)
+        # vanished entirely on days whose opening buckets had no trades, while
+        # always-numeric columns survived. Union keys in first-seen order so
+        # heterogeneous rows still contribute every column.
+        column_names: list[str] = []
+        seen: set[str] = set()
+        for row in self._rows:
+            for key in row:
+                if key not in seen:
+                    seen.add(key)
+                    column_names.append(key)
+        arrays = [pa.array([row.get(name) for row in self._rows]) for name in column_names]
+        table = pa.Table.from_arrays(arrays, names=column_names)
         pq.write_to_dataset(
             table,
             root_path=str(self.root),
