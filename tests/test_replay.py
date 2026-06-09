@@ -1397,3 +1397,109 @@ def test_backfill_stream_depth_apply_regenerates_summary_and_promotes(
     promotion = out["sources"][0]["promotion"]
     assert promotion is not None
     assert promotion["promoted_run_count"] == 1
+
+
+def test_backfill_stream_depth_score_only_writes_summary_without_promoting(
+    tmp_path: Path, capsys
+) -> None:
+    """--score-only writes each run's replay_summary.json (so the quarantine-aware
+    promote-replayable jobs can later promote it) but does NOT promote here. This is the
+    mode the live ops catch-up job uses; promoting from two places would risk duplicate
+    curated rows."""
+    from types import SimpleNamespace
+
+    from crypto_collector.cli import run_backfill_stream_depth
+
+    raw_root = tmp_path / "raw"
+    target_root = tmp_path / "curated"
+    run_path = raw_root / "bybit_depth" / "20260406_000002"
+    _write_stream_depth_run(
+        run_path,
+        [
+            _bybit_stream_row(event_type="snapshot", update_id=100, bids=[[100.0, 1.0]], asks=[[101.0, 2.0]]),
+            _bybit_stream_row(event_type="delta", update_id=101, asks=[[101.0, 1.5]], event_time="2026-04-06T00:00:01+00:00"),
+        ],
+    )
+    args = SimpleNamespace(
+        raw_root=raw_root,
+        source=["bybit_depth"],
+        target_root=target_root,
+        limit=200,
+        max_age_hours=1_000_000.0,
+        apply=False,
+        score_only=True,
+        format="json",
+    )
+
+    run_backfill_stream_depth(args)
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["mode"] == "score_only"
+    # The replay summary is written so promote-replayable can pick it up...
+    summary_path = run_path / "metrics" / "replay_summary.json"
+    assert summary_path.exists()
+    on_disk = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert on_disk["replayable"] is True
+    # ...but score-only never promotes: no curated dataset / promotion index written.
+    assert out["sources"][0]["promotion"] is None
+    assert not (target_root / "_promotion_index.jsonl").exists()
+
+
+def test_score_only_then_promote_self_heals_without_duplicate_rows(tmp_path: Path) -> None:
+    """Acceptance: a finalized run missing its replay_summary (cut-off mid-finalize) is
+    scored by the score-only catch-up job and then promoted by the existing
+    promote-replayable job — exactly once, with no duplicate curated rows even when the
+    promote job runs repeatedly."""
+    from types import SimpleNamespace
+
+    import pyarrow.dataset as ds
+
+    from crypto_collector.cli import run_backfill_stream_depth
+    from crypto_collector.promotion import promote_replayable_runs
+
+    raw_root = tmp_path / "raw"
+    source_root = raw_root / "bybit_depth"
+    target_root = tmp_path / "curated" / "market_replayable"
+    run_path = source_root / "20260406_000003"
+    _write_stream_depth_run(
+        run_path,
+        [
+            _bybit_stream_row(event_type="snapshot", update_id=100, bids=[[100.0, 1.0]], asks=[[101.0, 2.0]]),
+            _bybit_stream_row(event_type="delta", update_id=101, asks=[[101.0, 1.5]], event_time="2026-04-06T00:00:01+00:00"),
+        ],
+    )
+    # Cut-off run: clean events exist, but no inline replay summary.
+    assert not (run_path / "metrics" / "replay_summary.json").exists()
+
+    # 1) Score-only catch-up job writes the summary; promote-replayable would have
+    #    skipped this run before (skipped_missing_replay).
+    run_backfill_stream_depth(
+        SimpleNamespace(
+            raw_root=raw_root,
+            source=["bybit_depth"],
+            target_root=target_root,
+            limit=200,
+            max_age_hours=1_000_000.0,
+            apply=False,
+            score_only=True,
+            format="json",
+        )
+    )
+    assert (run_path / "metrics" / "replay_summary.json").exists()
+
+    # 2) The existing promote job promotes it once.
+    first = promote_replayable_runs(source_root, target_root, limit=200, max_age_hours=1_000_000.0)
+    assert first.promoted_run_count == 1
+    promoted_rows = first.promoted_row_count
+    assert promoted_rows == 2
+
+    # 3) Re-running the promote job (every poll) must NOT re-promote — the promotion
+    #    index dedups, so no duplicate curated rows accumulate.
+    second = promote_replayable_runs(source_root, target_root, limit=200, max_age_hours=1_000_000.0)
+    assert second.promoted_run_count == 0
+    assert any(run.action == "skipped_promoted" for run in second.runs)
+
+    dataset = ds.dataset(target_root, format="parquet", partitioning="hive")
+    assert dataset.count_rows() == promoted_rows
+    index_rows = (target_root / "_promotion_index.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(index_rows) == 1

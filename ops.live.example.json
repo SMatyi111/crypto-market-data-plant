@@ -486,6 +486,86 @@
       }
     },
     {
+      "name": "score-binance-depth",
+      "job_type": "backfill-replay",
+      "interval_seconds": 3600,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\binance_depth",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "score-binance-trades",
+      "job_type": "backfill-trades-replay",
+      "interval_seconds": 3600,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\binance_trades",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "score-coinbase-trades",
+      "job_type": "backfill-trades-replay",
+      "interval_seconds": 3600,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\coinbase_trades",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "score-kraken-trades",
+      "job_type": "backfill-trades-replay",
+      "interval_seconds": 3600,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\kraken_trades",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "score-bybit-trades",
+      "job_type": "backfill-trades-replay",
+      "interval_seconds": 3600,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\bybit_trades",
+        "stream": true,
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "score-mexc-trades",
+      "job_type": "backfill-trades-replay",
+      "interval_seconds": 3600,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\mexc_trades",
+        "stream": true,
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "score-stream-depth",
+      "job_type": "backfill-stream-depth",
+      "interval_seconds": 3600,
+      "args": {
+        "raw_root": "G:\\market_archive\\raw\\market",
+        "source": [
+          "coinbase_depth",
+          "bybit_depth",
+          "kraken_depth",
+          "mexc_depth"
+        ],
+        "target_root": "G:\\market_archive\\curated\\research\\market_replayable",
+        "score_only": true,
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
       "name": "cleanup-dry-run",
       "job_type": "cleanup",
       "interval_seconds": 3600,

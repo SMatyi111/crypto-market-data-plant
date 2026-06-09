@@ -729,6 +729,16 @@ def build_parser() -> argparse.ArgumentParser:
             "replayable runs. Without this flag the command is a read-only dry run."
         ),
     )
+    backfill_parser.add_argument(
+        "--score-only",
+        action="store_true",
+        help=(
+            "Regenerate each run's metrics/replay_summary.json but DO NOT promote. "
+            "Promotion is left to the quarantine-aware promote-replayable jobs so a "
+            "single promoter owns the curated parquet (avoids duplicate rows). This "
+            "is the mode the live ops scoring catch-up job uses. Wins over --apply."
+        ),
+    )
     backfill_parser.add_argument("--format", choices=["json", "text"], default="text")
 
     subparsers.add_parser("state", help="Show archive and package state")
@@ -1998,6 +2008,12 @@ def _execute_ops_job_inprocess(job: JobSpec) -> JobExecutionResult | str | None:
     if job.job_type == "backfill-replay":
         run_backfill_replay(args)
         return "backfill replay completed"
+    if job.job_type == "backfill-trades-replay":
+        run_backfill_trades_replay(args)
+        return "backfill trades replay completed"
+    if job.job_type == "backfill-stream-depth":
+        run_backfill_stream_depth(args)
+        return "backfill stream depth completed"
     if job.job_type == "quarantine-runs":
         run_quarantine_runs(args)
         return "quarantine completed"
@@ -2294,6 +2310,32 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             overwrite=raw_args.get("overwrite", False),
             format=raw_args.get("format", "text"),
         )
+    if job.job_type == "backfill-trades-replay":
+        # Trades scorer (run_backfill_trades_replay) — write replay summaries only, no
+        # promotion. stream=True selects the none_native UUID scorer (Bybit/MEXC);
+        # default is the dense sequence-bearing scorer (Binance/Coinbase/Kraken).
+        return SimpleNamespace(
+            source_root=Path(raw_args.get("source_root", default_archive_root() / "raw" / "market" / "binance_trades")),
+            limit=raw_args.get("limit", 50),
+            max_age_hours=raw_args.get("max_age_hours", 24.0),
+            overwrite=raw_args.get("overwrite", False),
+            stream=raw_args.get("stream", False),
+            format=raw_args.get("format", "text"),
+        )
+    if job.job_type == "backfill-stream-depth":
+        # Non-binance depth scorer. Defaults to score_only so the live catch-up job
+        # writes replay summaries without promoting — promotion stays in the
+        # quarantine-aware promote-replayable jobs (single promoter, no dup rows).
+        return SimpleNamespace(
+            raw_root=Path(raw_args.get("raw_root", default_output_root())),
+            source=raw_args.get("source", ["coinbase_depth", "bybit_depth", "kraken_depth"]),
+            target_root=Path(raw_args.get("target_root", default_curated_root("market_replayable"))),
+            limit=raw_args.get("limit", 200),
+            max_age_hours=raw_args.get("max_age_hours", 720.0),
+            apply=raw_args.get("apply", False),
+            score_only=raw_args.get("score_only", True),
+            format=raw_args.get("format", "text"),
+        )
     if job.job_type == "quarantine-runs":
         return SimpleNamespace(
             source_root=Path(raw_args.get("source_root", default_archive_root() / "raw" / "market" / "binance_depth")),
@@ -2523,9 +2565,25 @@ def run_backfill_stream_depth(args: argparse.Namespace) -> None:
     """Re-replay already-collected stream-snapshot depth runs with the current
     multi-anchor logic and (with --apply) promote the replayable ones. The live
     collector writes its own replay summary at collection time; this rescues the
-    backlog collected before the multi-anchor logic existed."""
+    backlog collected before the multi-anchor logic existed.
+
+    Three modes:
+    - dry-run (default): score in memory, write nothing.
+    - --score-only: write each run's metrics/replay_summary.json but do NOT promote.
+      This is the mode the live ops catch-up job uses so the quarantine-aware
+      promote-replayable jobs stay the single promoter into the curated parquet (two
+      concurrent promoters writing the same dataset = duplicate curated rows, since
+      the promotion index can't dedup a run it hasn't recorded yet).
+    - --apply: score AND promote here (manual one-shot; ignores the quarantine index).
+    score-only wins if both flags are passed."""
     raw_root: Path = args.raw_root
     apply = bool(getattr(args, "apply", False))
+    score_only = bool(getattr(args, "score_only", False))
+    # score_only writes summaries without promoting; apply (only when not score_only)
+    # both writes summaries and promotes. Dry run writes nothing.
+    write_summaries = apply or score_only
+    do_promote = apply and not score_only
+    mode = "score_only" if score_only else ("apply" if apply else "dry_run")
     summary_rows: list[dict[str, object]] = []
     for source_dir_name in args.source:
         venue = (
@@ -2548,7 +2606,7 @@ def run_backfill_stream_depth(args: argparse.Namespace) -> None:
             symbol = _backfill_first_event_product(run_dir)
             kwargs = _stream_depth_replay_kwargs(venue, symbol)
             try:
-                result = replay_depth_stream_run(run_dir, write_summary=apply, **kwargs)
+                result = replay_depth_stream_run(run_dir, write_summary=write_summaries, **kwargs)
             except Exception:  # noqa: BLE001 - keep going; tally as a finding
                 finding_counts["replay_error"] = finding_counts.get("replay_error", 0) + 1
                 continue
@@ -2559,7 +2617,7 @@ def run_backfill_stream_depth(args: argparse.Namespace) -> None:
                 for finding in result.findings:
                     finding_counts[finding] = finding_counts.get(finding, 0) + 1
         promotion: dict[str, int] | None = None
-        if apply and replayable > 0:
+        if do_promote and replayable > 0:
             report = promote_replayable_runs(
                 source_root=source_root,
                 target_root=args.target_root,
@@ -2585,7 +2643,7 @@ def run_backfill_stream_depth(args: argparse.Namespace) -> None:
         )
 
     payload = {
-        "mode": "apply" if apply else "dry_run",
+        "mode": mode,
         "raw_root": str(raw_root),
         "target_root": str(args.target_root),
         "sources": summary_rows,
@@ -2593,9 +2651,14 @@ def run_backfill_stream_depth(args: argparse.Namespace) -> None:
     if args.format == "json":
         print(json.dumps(payload, indent=2, sort_keys=True))
         return
-    print(f"backfill-stream-depth mode={'APPLY' if apply else 'dry-run (no writes)'}")
+    mode_label = {
+        "apply": "APPLY (score + promote)",
+        "score_only": "SCORE-ONLY (write summaries, no promote)",
+        "dry_run": "dry-run (no writes)",
+    }[mode]
+    print(f"backfill-stream-depth mode={mode_label}")
     print(f"raw_root={raw_root}")
-    if apply:
+    if do_promote:
         print(f"target_root={args.target_root}")
     for row in summary_rows:
         print(
@@ -2611,10 +2674,11 @@ def run_backfill_stream_depth(args: argparse.Namespace) -> None:
                 f"      promoted: runs={p['promoted_run_count']} rows={p['promoted_row_count']} "
                 f"skipped={p['skipped_count']} failed={p['failed_count']}"
             )
-    if not apply:
+    if mode == "dry_run":
         print(
-            "Dry run only (no files written). Re-run with --apply to regenerate "
-            "replay summaries and promote the replayable runs."
+            "Dry run only (no files written). Re-run with --score-only to regenerate "
+            "replay summaries (promotion left to the promote-replayable jobs), or "
+            "--apply to also promote the replayable runs here."
         )
 
 

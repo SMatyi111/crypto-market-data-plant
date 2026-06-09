@@ -16,6 +16,7 @@ from crypto_collector.cli import (
     _ops_root_from_jobs,
     _segment_deadline_utc,
     build_parser,
+    default_archive_root,
     run_binance_depth_worker,
     run_health,
     run_ops_runner,
@@ -31,6 +32,33 @@ from crypto_collector.ops import (
     load_ops_config,
     prune_stale_worker_artifacts,
 )
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.mark.parametrize("config_name", ["ops.live.local.json", "ops.live.example.json"])
+def test_live_config_job_types_are_all_dispatchable(config_name: str) -> None:
+    """Every job_type shipped in a live ops config must have an arg builder in _job_args
+    (which raises ValueError on unknown types). This guards the exact regression this
+    catch-up work fixes: a scorer job_type living in the config that the runner can't
+    actually dispatch (backfill-trades-replay / backfill-stream-depth used to be
+    CLI-only). _job_args and _execute_ops_job_inprocess enumerate the same job_types, so
+    a passing build here means the runner can dispatch it."""
+    config_path = _REPO_ROOT / config_name
+    if not config_path.exists():
+        pytest.skip(f"{config_name} not present")
+    jobs = load_ops_config(config_path)
+    for job in jobs:
+        # Raises ValueError("Unsupported job_type: ...") if the type has no builder.
+        assert _job_args(job) is not None, job.name
+    # The scoring catch-up lanes that self-heal cut-off segments must be wired in.
+    by_type: dict[str, list[str]] = {}
+    for job in jobs:
+        by_type.setdefault(job.job_type, []).append(job.name)
+    assert "backfill-replay" in by_type  # binance_depth scorer
+    assert len(by_type.get("backfill-trades-replay", [])) == 5  # 5 trades lanes
+    assert "backfill-stream-depth" in by_type  # 4 non-binance depth lanes (one job)
 
 
 def test_load_ops_config_filters_disabled_jobs(tmp_path: Path) -> None:
@@ -828,6 +856,124 @@ def test_run_single_job_reconstructs_and_dispatches_in_process(monkeypatch: pyte
     run_single_job(args)
     assert seen["job"].job_type == "coinbase-trades-worker"
     assert seen["job"].args["symbol"] == "BTC-USD"
+
+
+def test_execute_ops_job_inprocess_dispatches_backfill_trades_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The trades scorer must be dispatchable as an ops job so cut-off trade segments
+    that never got an inline replay summary get scored by a live catch-up job (the old
+    code only knew the depth scorers, so promote-replayable never saw these runs)."""
+    import crypto_collector.cli as cli_mod
+
+    captured: dict = {}
+    monkeypatch.setattr(cli_mod, "run_backfill_trades_replay", lambda args: captured.update(args=args))
+    job = JobSpec(
+        name="score-bybit-trades",
+        job_type="backfill-trades-replay",
+        interval_seconds=3600,
+        args={"source_root": r"G:\x\raw\market\bybit_trades", "stream": True, "limit": 1000},
+    )
+
+    assert _execute_ops_job_inprocess(job) == "backfill trades replay completed"
+    assert captured["args"].source_root == Path(r"G:\x\raw\market\bybit_trades")
+    assert captured["args"].stream is True
+    assert captured["args"].limit == 1000
+
+
+def test_execute_ops_job_inprocess_dispatches_backfill_stream_depth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The non-binance depth scorer must be dispatchable as an ops job, defaulting to
+    score-only so the live catch-up job writes replay summaries WITHOUT promoting —
+    promotion stays single-sourced in the quarantine-aware promote-replayable jobs."""
+    import crypto_collector.cli as cli_mod
+
+    captured: dict = {}
+    monkeypatch.setattr(cli_mod, "run_backfill_stream_depth", lambda args: captured.update(args=args))
+    job = JobSpec(
+        name="score-stream-depth",
+        job_type="backfill-stream-depth",
+        interval_seconds=3600,
+        args={
+            "raw_root": r"G:\x\raw\market",
+            "source": ["coinbase_depth", "bybit_depth", "kraken_depth", "mexc_depth"],
+            "limit": 1000,
+        },
+    )
+
+    assert _execute_ops_job_inprocess(job) == "backfill stream depth completed"
+    assert captured["args"].raw_root == Path(r"G:\x\raw\market")
+    assert captured["args"].source == ["coinbase_depth", "bybit_depth", "kraken_depth", "mexc_depth"]
+    # Ops job defaults to score-only: never promotes from the scorer.
+    assert captured["args"].score_only is True
+    assert captured["args"].apply is False
+
+
+def test_job_args_backfill_trades_replay_defaults_and_stream() -> None:
+    """_job_args wires the trades scorer: defaults to binance_trades + dense scorer,
+    honors source_root / stream / limit / max_age_hours overrides per lane."""
+    defaults = _job_args(
+        JobSpec(name="x", job_type="backfill-trades-replay", interval_seconds=3600, args={})
+    )
+    assert defaults.source_root == default_archive_root() / "raw" / "market" / "binance_trades"
+    assert defaults.stream is False
+    assert defaults.overwrite is False
+    assert defaults.limit == 50
+    assert defaults.max_age_hours == 24.0
+
+    overridden = _job_args(
+        JobSpec(
+            name="x",
+            job_type="backfill-trades-replay",
+            interval_seconds=3600,
+            args={
+                "source_root": r"G:\x\raw\market\mexc_trades",
+                "stream": True,
+                "limit": 1000,
+                "max_age_hours": 168,
+            },
+        )
+    )
+    assert overridden.source_root == Path(r"G:\x\raw\market\mexc_trades")
+    assert overridden.stream is True
+    assert overridden.limit == 1000
+    assert overridden.max_age_hours == 168
+
+
+def test_job_args_backfill_stream_depth_defaults_to_score_only() -> None:
+    """_job_args defaults the stream-depth scorer to score_only=True (write summaries,
+    no promote) so the live catch-up job can't double-promote against the
+    promote-replayable jobs. Config can still flip score_only / apply / source."""
+    defaults = _job_args(
+        JobSpec(name="x", job_type="backfill-stream-depth", interval_seconds=3600, args={})
+    )
+    assert isinstance(defaults.raw_root, Path)
+    assert defaults.source == ["coinbase_depth", "bybit_depth", "kraken_depth"]
+    assert defaults.score_only is True
+    assert defaults.apply is False
+    assert defaults.limit == 200
+    assert defaults.max_age_hours == 720.0
+
+    overridden = _job_args(
+        JobSpec(
+            name="x",
+            job_type="backfill-stream-depth",
+            interval_seconds=3600,
+            args={
+                "raw_root": r"G:\x\raw\market",
+                "source": ["coinbase_depth", "bybit_depth", "kraken_depth", "mexc_depth"],
+                "score_only": False,
+                "apply": True,
+                "limit": 1000,
+            },
+        )
+    )
+    assert overridden.raw_root == Path(r"G:\x\raw\market")
+    assert overridden.source == ["coinbase_depth", "bybit_depth", "kraken_depth", "mexc_depth"]
+    assert overridden.score_only is False
+    assert overridden.apply is True
+    assert overridden.limit == 1000
 
 
 @pytest.mark.parametrize(
