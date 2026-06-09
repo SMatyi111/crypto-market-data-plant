@@ -5,7 +5,7 @@ from typing import Any
 
 _EPOCH_UTC = datetime(1970, 1, 1, tzinfo=UTC)
 
-from .asset_registry import resolve_spot_instrument
+from .asset_registry import resolve_perp_instrument, resolve_spot_instrument
 from .context_models import NormalizedDepthUpdate
 from .models import NormalizedL3Event, RawMessage
 
@@ -204,7 +204,17 @@ class BybitTradeNormalizer:
     `S` is the **taker (aggressor) side** directly (`"Buy"`/`"Sell"`), so unlike
     Coinbase no flip is needed; `buyer_is_maker` is derived for the cross-venue
     convention (taker sold ⇒ the buyer was the maker).
+
+    The v5 `publicTrade` frame is identical for spot and linear (USDT-perp), so the
+    only market-dependent behavior is instrument identity: `instrument_type="perp"`
+    resolves `perp:bybit:SYM` (canonical `BTC/USDT-PERP`) instead of `spot:bybit:SYM`,
+    keeping the curated perp lane distinct from spot.
     """
+
+    def __init__(self, *, instrument_type: str = "spot") -> None:
+        self._resolve_instrument = (
+            resolve_perp_instrument if instrument_type == "perp" else resolve_spot_instrument
+        )
 
     def normalize_many(self, raw: RawMessage) -> list[NormalizedL3Event]:
         data = raw.payload.get("data")
@@ -221,7 +231,7 @@ class BybitTradeNormalizer:
         price = _optional_float(item.get("p"), "price", parse_errors)
         size = _optional_float(item.get("v"), "size", parse_errors)
         trade_id = item.get("i")
-        instrument = resolve_spot_instrument(
+        instrument = self._resolve_instrument(
             _strip_symbol_separators(product), venue=raw.source
         )
 
@@ -329,7 +339,16 @@ class BybitDepthNormalizer:
     `first_update_id`/`final_update_id` are therefore always None and gaplessness is not
     provable from the stream; the run is validated by `replay_depth_stream_run`, which
     downgrades `replayable` to structurally-clean-only.
+
+    Spot and linear (USDT-perp) `orderbook` frames are structurally identical, so the
+    only market-dependent behavior is instrument identity: `instrument_type="perp"`
+    resolves `perp:bybit:SYM` (canonical `BTC/USDT-PERP`) instead of `spot:bybit:SYM`.
     """
+
+    def __init__(self, *, instrument_type: str = "spot") -> None:
+        self._resolve_instrument = (
+            resolve_perp_instrument if instrument_type == "perp" else resolve_spot_instrument
+        )
 
     def normalize(self, raw: RawMessage) -> NormalizedDepthUpdate:
         payload = raw.payload
@@ -346,7 +365,7 @@ class BybitDepthNormalizer:
         )
         bids = _parse_levels(data.get("b"), "bids", parse_errors)
         asks = _parse_levels(data.get("a"), "asks", parse_errors)
-        instrument = resolve_spot_instrument(
+        instrument = self._resolve_instrument(
             _strip_symbol_separators(product), venue=raw.source
         )
         metadata: dict[str, Any] = {
