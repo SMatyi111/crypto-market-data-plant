@@ -780,6 +780,7 @@ def build_health_report(
     recent_failure_window_seconds: int = 900,
     min_disk_free_gb: float = 100.0,
     quarantine_ratio_threshold: float = 0.20,
+    normalized_root: Path | None = None,
 ) -> HealthReport:
     checked_at = datetime.now(tz=UTC)
     heartbeat_path = ops_root / "heartbeat.json"
@@ -906,6 +907,7 @@ def build_health_report(
                 latest_partition_write = _latest_partition_write(
                     dataset=partition_dataset,
                     source=partition_source,
+                    normalized_root=normalized_root,
                 )
                 if latest_partition_write is None:
                     partition_stale = True
@@ -1724,8 +1726,18 @@ def _job_partition_target(job: JobSpec) -> tuple[str | None, str | None]:
     return None, None
 
 
-def _latest_partition_write(*, dataset: str, source: str) -> datetime | None:
-    dataset_root = default_normalized_root(dataset)
+def _latest_partition_write(
+    *, dataset: str, source: str, normalized_root: Path | None = None
+) -> datetime | None:
+    # When the caller derives the normalized root from the discovered config (bare
+    # `health` following the live collection root), use it; otherwise fall back to the
+    # env/default root. This keeps the partition-staleness check off the stale
+    # pre-migration tree (the old D:\market_archive\normalized) when no env is set.
+    dataset_root = (
+        normalized_root / dataset
+        if normalized_root is not None
+        else default_normalized_root(dataset)
+    )
     latest: datetime | None = None
     if not dataset_root.exists():
         return None

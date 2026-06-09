@@ -2402,6 +2402,20 @@ def _ops_root_from_jobs(jobs: list | None) -> Path | None:
     return Path(max(counts.items(), key=lambda kv: kv[1])[0])
 
 
+def _normalized_root_from_jobs(jobs: list | None) -> Path | None:
+    """Derive the normalized root the runner actually writes to from the discovered
+    config, so a bare `health` checks the live partition tree rather than the stale
+    env/default (pre-migration D:\\market_archive\\normalized) root. The ops_root in the
+    job args sits directly under the archive root (archive/ops) and normalized data sits
+    beside it (archive/normalized) — same layout default_normalized_root() builds. Returns
+    None when the config carries no ops_root, so build_health_report falls back to the
+    env/default root (unchanged behavior for configs that predate the migration)."""
+    ops_root = _ops_root_from_jobs(jobs)
+    if ops_root is None:
+        return None
+    return ops_root.parent / "normalized"
+
+
 def run_health(args: argparse.Namespace) -> None:
     # Without an explicit --config the report was blind to interval jobs (poll-based
     # lanes like Kalshi never appear in standalone_workers), so auto-discover the
@@ -2412,6 +2426,10 @@ def run_health(args: argparse.Namespace) -> None:
     # env/default fallback, so a bare `health` reports on the running collection rather
     # than a stale pre-migration root.
     ops_root = args.ops_root or _ops_root_from_jobs(jobs) or default_ops_root()
+    # Follow the discovered config's normalized root too (mirrors the ops_root logic
+    # above), so a bare `health` checks the live partition tree instead of the stale
+    # env/default root. None => build_health_report uses the env/default fallback.
+    normalized_root = _normalized_root_from_jobs(jobs)
     report = build_health_report(
         ops_root=ops_root,
         jobs=jobs,
@@ -2420,6 +2438,7 @@ def run_health(args: argparse.Namespace) -> None:
         recent_failure_window_seconds=args.recent_failure_window_seconds,
         min_disk_free_gb=args.min_disk_free_gb,
         quarantine_ratio_threshold=float(getattr(args, "quarantine_ratio_threshold", 0.20)),
+        normalized_root=normalized_root,
     )
     if args.format == "json":
         print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
