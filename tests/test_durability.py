@@ -2,9 +2,12 @@
 and verify every line in the produced JSONL files still parses cleanly. No torn
 tails, no partial JSON objects.
 
-This is the regression test for commit #3 (fsync on every JSONL write). If a
-future refactor removes the flush+fsync, this test fails — the killed subprocess
-would otherwise drop the last buffered ~4-8KB of writes on the floor.
+This guards the no-torn-tail invariant of the JSONL sinks. The pipeline now BATCHES
+fsync (fsync only every N events / ~200 ms) to lift the per-event-fsync throughput
+ceiling, but it still flushes after EVERY line — so the OS only ever holds whole
+lines and a hard kill (which drops the process's in-memory buffer, not the OS page
+cache) can't leave a truncated final record. If a future refactor stops flushing
+per line, the killed subprocess would expose a torn tail and this test fails.
 
 We use subprocess.Popen + kill() (which is TerminateProcess on Windows,
 equivalent to SIGKILL — the process gets no chance to flush its own buffers).
@@ -60,8 +63,9 @@ def _assert_jsonl_clean(path: Path) -> int:
     - a final line without trailing newline (truncated mid-write), OR
     - a final line with truncated content that doesn't parse.
 
-    fsync after every write should prevent both: each completed line is
-    durable before the next write begins.
+    Flushing after every line prevents both: each completed line is handed to the
+    OS (which survives the kill) before the next write begins, even though the
+    disk-blocking fsync is batched.
     """
     raw = path.read_bytes()
     # If the file ends with a partial line (no trailing newline), that's a torn tail.

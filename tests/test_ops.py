@@ -1080,17 +1080,20 @@ def test_job_args_backfill_stream_depth_defaults_to_score_only() -> None:
     "job_type",
     ["coinbase-trades-worker", "kraken-trades-worker", "bybit-trades-worker", "mexc-trades-worker"],
 )
-def test_job_args_trades_default_to_buffered_jsonl(job_type: str) -> None:
-    """High-volume trade lanes must default to buffered JSONL (jsonl_fsync=False).
-    Per-event fsync throttled the consumer below the feed rate, growing the backlog
-    past the 60s freshness gate so valid trades were quarantined as stale."""
+def test_job_args_trades_default_to_durable_batched_jsonl(job_type: str) -> None:
+    """High-volume trade lanes default to fsync ON (jsonl_fsync=True), now that fsync is
+    BATCHED in the pipeline. Per-event fsync throttled the consumer below the feed rate
+    (backlog grew past the 60s freshness gate, valid trades quarantined as stale); batched
+    fsync flushes every line but fsyncs only every N events / ms, so the lane stays
+    crash-durable without that throughput ceiling. A lane can still opt all the way out to
+    buffered, never-fsynced JSONL with jsonl_fsync:false."""
     args = _job_args(JobSpec(name="x", job_type=job_type, interval_seconds=3600, args={}))
-    assert args.jsonl_fsync is False
-    # Config can still force fsync back on per lane.
-    args_on = _job_args(
-        JobSpec(name="x", job_type=job_type, interval_seconds=3600, args={"jsonl_fsync": True})
+    assert args.jsonl_fsync is True
+    # Config can still force fsync fully off per lane.
+    args_off = _job_args(
+        JobSpec(name="x", job_type=job_type, interval_seconds=3600, args={"jsonl_fsync": False})
     )
-    assert args_on.jsonl_fsync is True
+    assert args_off.jsonl_fsync is False
 
 
 @pytest.mark.parametrize(
