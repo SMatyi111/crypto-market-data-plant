@@ -1,5 +1,7 @@
 # Crypto Market Data Plant
 
+[![CI](https://github.com/SMatyi111/crypto-market-data-plant/actions/workflows/ci.yml/badge.svg)](https://github.com/SMatyi111/crypto-market-data-plant/actions/workflows/ci.yml)
+
 Research-grade public crypto market data collection for a Windows workstation.
 
 This repo is a data plant, not a trading bot. It runs public collectors, writes durable segmented raw chunks, replays and quality-checks them, quarantines bad chunks, and promotes good chunks into deterministic curated datasets for research.
