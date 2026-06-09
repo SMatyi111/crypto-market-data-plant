@@ -2198,3 +2198,31 @@ def test_collect_kraken_depth_segment_btcusd_validates_checksum(tmp_path, monkey
     assert summary["gap_detection"] == "checksum"
     assert summary["mode"] == "stream_snapshot_checksum"
     assert summary["replayable"] is True
+
+
+def test_binance_rest_snapshot_clean_row_builds_snapshot_event() -> None:
+    """The REST snapshot must become a clean 'snapshot' event matching the delta schema,
+    with update ids pinned to lastUpdateId, so promotion carries a binance snapshot row."""
+    from crypto_collector.cli import _binance_rest_snapshot_clean_row
+    from crypto_collector.market_normalizers import BinanceDepthNormalizer
+
+    row = _binance_rest_snapshot_clean_row(
+        BinanceDepthNormalizer(),
+        source="binance",
+        product="btcusdt",
+        snapshot={
+            "lastUpdateId": 42,
+            "bids": [["100.0", "1.0"], ["99.0", "2.0"]],
+            "asks": [["101.0", "1.5"]],
+        },
+        snapshot_last_update_id=42,
+        received_at=datetime(2026, 6, 9, 0, 0, 0, tzinfo=UTC),
+    )
+
+    assert row["event_type"] == "snapshot"
+    assert row["first_update_id"] == 42
+    assert row["final_update_id"] == 42
+    assert row["product"] == "BTCUSDT"
+    assert len(row["bids"]) == 2 and len(row["asks"]) == 1
+    assert row["bids"][0][0] == 100.0 and row["bids"][1][0] == 99.0
+    assert row["asks"][0][0] == 101.0

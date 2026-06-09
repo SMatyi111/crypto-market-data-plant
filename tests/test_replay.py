@@ -102,6 +102,58 @@ def test_replay_depth_run_reconstructs_book_and_writes_summary(tmp_path: Path) -
     assert Path(summary.summary_path).exists()
 
 
+def test_replay_depth_run_skips_leading_binance_snapshot_event(tmp_path: Path) -> None:
+    """Binance now emits its REST snapshot as a leading clean event (event_type=snapshot,
+    first=final=lastUpdateId) so the curated dataset is self-contained. Raw-run replay
+    seeds from the sidecar, so that leading event must be harmlessly skipped — not applied,
+    double-counted, or flagged as a gap."""
+    run_path = tmp_path / "binance_depth" / "20260609_000000"
+    clean_path = run_path / "clean"
+    clean_path.mkdir(parents=True)
+    snapshot_path = run_path / "snapshots"
+    snapshot_path.mkdir(parents=True)
+    (snapshot_path / "book_snapshot.json").write_text(
+        json.dumps(
+            {
+                "source": "binance",
+                "product": "BTCUSDT",
+                "received_at": "2026-06-09T00:00:00+00:00",
+                "snapshot": {"lastUpdateId": 100, "bids": [["100.0", "1.0"]], "asks": [["101.0", "1.0"]]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    events = [
+        {  # leading snapshot clean event the collector now writes
+            "source": "binance", "product": "BTCUSDT",
+            "event_time": "2026-06-09T00:00:00+00:00", "received_at": "2026-06-09T00:00:00.050000+00:00",
+            "event_type": "snapshot", "first_update_id": 100, "final_update_id": 100,
+            "instrument": {"instrument_id": "spot:binance:BTCUSDT"},
+            "bids": [[100.0, 1.0]], "asks": [[101.0, 1.0]],
+        },
+        {  # first real delta, bridges the snapshot (101 == lastUpdateId+1)
+            "source": "binance", "product": "BTCUSDT",
+            "event_time": "2026-06-09T00:00:01+00:00", "received_at": "2026-06-09T00:00:01.100000+00:00",
+            "event_type": "depthUpdate", "first_update_id": 101, "final_update_id": 102,
+            "instrument": {"instrument_id": "spot:binance:BTCUSDT"},
+            "bids": [[100.0, 0.0], [99.0, 2.0]], "asks": [[101.0, 1.5]],
+        },
+    ]
+    (clean_path / "events.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in events), encoding="utf-8"
+    )
+
+    summary = replay_depth_run(run_path, write_summary=False)
+
+    assert summary.snapshot_gap_count == 0  # leading snapshot event not miscounted
+    assert summary.gap_count == 0
+    assert summary.event_count == 2
+    # Book seeded from the sidecar; the delta removes the 100 bid -> best bid 99, ask stays 101.
+    assert summary.best_bid == 99.0
+    assert summary.best_ask == 101.0
+    assert summary.replayable is True
+
+
 def test_replay_depth_run_flags_gaps_invalid_ranges_and_crossed_book(tmp_path: Path) -> None:
     run_path = tmp_path / "binance_depth" / "20260406_000001"
     clean_path = run_path / "clean"

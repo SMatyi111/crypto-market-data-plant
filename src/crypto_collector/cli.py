@@ -753,6 +753,42 @@ async def run_mock(args: argparse.Namespace) -> None:
     print(f"mock run finished: {summary.to_dict()} -> {run_paths.base}")
 
 
+def _binance_rest_snapshot_clean_row(
+    normalizer: BinanceDepthNormalizer,
+    *,
+    source: str,
+    product: str,
+    snapshot: dict[str, object],
+    snapshot_last_update_id: int,
+    received_at: datetime,
+) -> dict[str, object]:
+    """Build an ``event_type="snapshot"`` clean-event row from binance's REST order-book
+    snapshot. Binance's diff-depth WS sends no snapshot frame (unlike coinbase/bybit/
+    kraken/mexc, whose in-stream snapshot becomes a clean event), so without this the REST
+    seed lived only in the sidecar file and the curated market_replayable dataset had no
+    binance snapshot row — i.e. it wasn't self-contained for replay. Built through the
+    normal BinanceDepthNormalizer so the row schema matches the deltas exactly, with
+    first/final_update_id pinned to the snapshot's lastUpdateId. That id placement means
+    raw-run replay (replay_depth_run, which seeds from the sidecar) harmlessly skips this
+    row (final_id <= snapshot_last_update_id), while stream/curated replay reseeds from it."""
+    event = normalizer.normalize(
+        RawMessage(
+            source=source,
+            received_at=received_at,
+            payload={
+                "e": "snapshot",
+                "E": int(received_at.timestamp() * 1000),
+                "s": str(product).upper(),
+                "U": snapshot_last_update_id,
+                "u": snapshot_last_update_id,
+                "b": snapshot.get("bids", []),
+                "a": snapshot.get("asks", []),
+            },
+        )
+    )
+    return event.to_dict()
+
+
 async def collect_binance_depth_segment(args: argparse.Namespace) -> dict[str, object]:
     try:
         import websockets
@@ -814,6 +850,23 @@ async def collect_binance_depth_segment(args: argparse.Namespace) -> dict[str, o
     # Tracks the latest event id we've consumed so reconnect-in-place can check
     # whether the next event bridges where we left off (not where the snapshot started).
     last_seen_final_update_id = snapshot_last_update_id
+
+    # Emit the REST snapshot as the FIRST clean event so the curated dataset carries a
+    # binance snapshot row like the other venues (their in-stream snapshot already does).
+    # Without it, curated market_replayable has only binance deltas and can't be replayed
+    # without the raw sidecar. Written to clean + normalized parquet (what promotion reads).
+    snapshot_clean_row = _binance_rest_snapshot_clean_row(
+        normalizer,
+        source=config.source,
+        product=str(config.product),
+        snapshot=snapshot,
+        snapshot_last_update_id=snapshot_last_update_id,
+        received_at=utc_now(),
+    )
+    clean_sink.write(snapshot_clean_row)
+    parquet_sink.write(snapshot_clean_row)
+    clean_count += 1
+
     deadline_utc: datetime | None = getattr(args, "deadline_utc", None)
 
     def _deadline_crossed() -> bool:
