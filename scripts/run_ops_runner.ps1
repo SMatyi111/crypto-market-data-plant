@@ -2,12 +2,16 @@ param(
     [string]$ConfigPath,
     [string]$OpsRoot = "G:\market_archive\ops",
     [string]$LogPath,
-    # Live default: run every collector lane concurrently so each records CONTINUOUSLY
-    # (10 BTC lanes today + headroom). With fewer slots than lanes, lanes round-robin
-    # through the pool and each idles a large fraction of the time -> coverage gaps.
-    # Maintenance jobs (quarantine/promote/manifest/cleanup/health) run in the runner's
-    # scheduler thread, NOT the pool, so they don't consume collector slots.
-    [int]$CollectorConcurrency = 12
+    # Live default: run every collector lane concurrently so each records CONTINUOUSLY.
+    # The fleet is now 17 collector lanes (BTC spot x5 venues + BTC/USDC on Binance &
+    # Coinbase + Bybit linear perp + Binance USDT-M perp trades), so 17 gives one slot
+    # per lane. With fewer slots than lanes, lanes round-robin through the pool and each
+    # idles a large fraction of the time -> coverage gaps. WS collectors are I/O-bound
+    # (measured ~0.1 core total for 12 live lanes) and process-isolated, so 17 stays
+    # light on the 8-physical / 16-logical-core box. Maintenance jobs (quarantine/
+    # promote/manifest/cleanup/health) run in the runner's scheduler thread, NOT the
+    # pool, so they don't consume collector slots.
+    [int]$CollectorConcurrency = 17
 )
 
 $ErrorActionPreference = "Stop"

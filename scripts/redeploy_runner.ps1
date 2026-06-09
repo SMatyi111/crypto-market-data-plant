@@ -17,7 +17,10 @@
   can terminate it). Interrupts every lane briefly (clean segment boundary, not data loss).
 #>
 param(
-    [string]$OpsRoot = "D:\market_archive\ops"
+    [string]$OpsRoot = "G:\market_archive\ops",
+    # Match run_ops_runner.ps1's live default (one slot per collector lane). Keep these
+    # in sync — a redeploy with a lower value silently throttles coverage until reboot.
+    [int]$CollectorConcurrency = 17
 )
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
@@ -50,7 +53,7 @@ Remove-Item $lockPath -Force -ErrorAction SilentlyContinue
 # 3. Relaunch directly (no wrapper mutex), loading this repo's src via PYTHONPATH.
 $env:PYTHONPATH = Join-Path $repo "src"
 Start-Process -WindowStyle Hidden -WorkingDirectory $repo -FilePath $python `
-    -ArgumentList '-m','crypto_collector.cli','ops-runner','--config',$config,'--ops-root',$OpsRoot,'--collector-concurrency','4'
+    -ArgumentList '-m','crypto_collector.cli','ops-runner','--config',$config,'--ops-root',$OpsRoot,'--collector-concurrency',$CollectorConcurrency
 
 # 4. Verify it came up (heartbeat advances + a fresh lock pid).
 Start-Sleep -Seconds 12
