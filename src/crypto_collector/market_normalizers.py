@@ -698,6 +698,171 @@ def _parse_mexc_book_levels(
     return levels
 
 
+class OkxTradeNormalizer:
+    """Normalize OKX v5 `trades` channel frames.
+
+    Like Bybit/Kraken, one frame batches several trades in `data: [...]`, so this
+    exposes `normalize_many`. OKX `side` is the **taker (aggressor) side** directly
+    (`"buy"`/`"sell"`), so no flip is needed; `buyer_is_maker` is derived for the
+    cross-venue convention (taker sold ⇒ the buyer was the maker).
+
+    OKX `tradeId` is a per-instrument counter, but the public `trades` channel does
+    not guarantee every fill is delivered (it can conflate), so it is **not** trusted
+    as a dense gap-detection sequence: `sequence` is left `None` and the run is curated
+    by `replay_trades_stream_run` as a non-sequence (`none_native`) feed — structurally
+    clean, not gap-proof (STANDARDS §4.3), same class as Bybit/MEXC trades.
+
+    Spot (`BTC-USDT`) and swap (`BTC-USDT-SWAP`) frames are structurally identical, so
+    the only market-dependent behavior is instrument identity: `instrument_type="perp"`
+    resolves `perp:okx:SYM` (canonical `BTC/USDT-PERP`) instead of `spot:okx:SYM`.
+    """
+
+    def __init__(self, *, instrument_type: str = "spot") -> None:
+        self._resolve_instrument = (
+            resolve_perp_instrument if instrument_type == "perp" else resolve_spot_instrument
+        )
+
+    def normalize_many(self, raw: RawMessage) -> list[NormalizedL3Event]:
+        data = raw.payload.get("data")
+        if not isinstance(data, list):
+            return []
+        return [self._normalize_one(item, raw) for item in data]
+
+    def _normalize_one(self, item: Any, raw: RawMessage) -> NormalizedL3Event:
+        item = item if isinstance(item, dict) else {}
+        parse_errors: list[str] = []
+        product = str(item.get("instId") or "UNKNOWN")
+        trade_time = _parse_timestamp_ms(item.get("ts"), parse_errors)
+        taker_side = _okx_taker_side(item.get("side"), parse_errors)
+        price = _optional_float(item.get("px"), "price", parse_errors)
+        size = _optional_float(item.get("sz"), "size", parse_errors)
+        trade_id = item.get("tradeId")
+        instrument = self._resolve_instrument(
+            _okx_resolve_symbol(product), venue=raw.source
+        )
+
+        metadata: dict[str, Any] = {
+            "instrument_id": instrument.instrument_id if instrument is not None else None,
+            "canonical_symbol": instrument.canonical_symbol if instrument is not None else None,
+            "buyer_is_maker": (taker_side == "sell") if taker_side is not None else None,
+            # Kept for forensics only — NOT used as a dense gap-detection sequence.
+            "okx_trade_id": str(trade_id) if trade_id not in (None, "") else None,
+        }
+        if parse_errors:
+            metadata["parse_errors"] = parse_errors
+
+        return NormalizedL3Event(
+            source=raw.source,
+            product=product,
+            channel="trades",
+            event_type="trade",
+            exchange_time=trade_time,
+            received_at=raw.received_at,
+            side=taker_side,
+            price=price,
+            size=size,
+            trade_id=str(trade_id) if trade_id not in (None, "") else None,
+            # The trades channel may conflate fills, so the id is not a dense counter.
+            sequence=None,
+            raw_type="trade",
+            metadata={key: value for key, value in metadata.items() if value is not None},
+        )
+
+
+class OkxDepthNormalizer:
+    """Normalize OKX v5 `books` channel frames.
+
+    OKX `books` delivers an in-stream snapshot (`action:"snapshot"`, 400 levels) on
+    subscribe followed by incremental updates (`action:"update"`); `bids`/`asks` are
+    `[[price, size, _deprecated, num_orders]]` arrays (a size of `"0"` removes the
+    level — `_parse_levels` keeps the first two fields). The payload nests a single
+    book object in `data: [ {...} ]`.
+
+    Unlike Bybit's `+1` update id, OKX proves continuity with a **linked sequence**:
+    each update carries `seqId` and `prevSeqId`, and `prevSeqId(N)` must equal
+    `seqId(N-1)`. That maps onto the depth model's `first_update_id`/`final_update_id`
+    so `replay_depth_stream_run(chain_sequence=True)` can validate the chain by
+    equality (not `delta == 1`): `first_update_id = prevSeqId`, `final_update_id = seqId`.
+    A broken link is a provable gap that blocks promotion, so this lane is curated as
+    `gap_detection="sequence"` (STANDARDS §4.1). The per-frame CRC32 `checksum` is kept
+    in metadata for forensics / a future checksum gate but is not validated here.
+
+    Spot (`BTC-USDT`) and swap (`BTC-USDT-SWAP`) `books` frames are structurally
+    identical, so the only market-dependent behavior is instrument identity:
+    `instrument_type="perp"` resolves `perp:okx:SYM` instead of `spot:okx:SYM`.
+    """
+
+    def __init__(self, *, instrument_type: str = "spot") -> None:
+        self._resolve_instrument = (
+            resolve_perp_instrument if instrument_type == "perp" else resolve_spot_instrument
+        )
+
+    def normalize(self, raw: RawMessage) -> NormalizedDepthUpdate:
+        payload = raw.payload
+        parse_errors: list[str] = []
+        arg = payload.get("arg")
+        arg = arg if isinstance(arg, dict) else {}
+        product = str(arg.get("instId") or "UNKNOWN")
+        # OKX nests one book object in a single-element data list.
+        data = payload.get("data")
+        book = data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else {}
+        action = payload.get("action")
+        event_type = "snapshot" if action == "snapshot" else "delta"
+        event_time = _parse_timestamp_ms(book.get("ts"), parse_errors)
+        bids = _parse_levels(book.get("bids"), "bids", parse_errors)
+        asks = _parse_levels(book.get("asks"), "asks", parse_errors)
+        seq_id = _optional_int(book.get("seqId"), "seq_id", parse_errors)
+        prev_seq_id = _optional_int(book.get("prevSeqId"), "prev_seq_id", parse_errors)
+        instrument = self._resolve_instrument(
+            _okx_resolve_symbol(product), venue=raw.source
+        )
+        metadata: dict[str, Any] = {
+            "okx_seq_id": seq_id,
+            "okx_prev_seq_id": prev_seq_id,
+            # CRC32 over the top-25 book; kept for forensics / a future checksum gate.
+            "okx_checksum": _optional_int(book.get("checksum"), "checksum", parse_errors),
+        }
+        if parse_errors:
+            metadata["parse_errors"] = parse_errors
+        return NormalizedDepthUpdate(
+            source=raw.source,
+            product=product,
+            channel="depth",
+            event_type=event_type,
+            event_time=event_time,
+            received_at=raw.received_at,
+            # prevSeqId/seqId form the linked chain validated by chain_sequence replay.
+            first_update_id=prev_seq_id,
+            final_update_id=seq_id,
+            instrument=instrument,
+            bids=bids,
+            asks=asks,
+            metadata={key: value for key, value in metadata.items() if value is not None},
+        )
+
+
+def _okx_resolve_symbol(product: str) -> str:
+    """Map an OKX instId to the bare base+quote the resolver expects.
+
+    `BTC-USDT` (spot) and `BTC-USDT-SWAP` (perp) both collapse to `BTCUSDT` so the
+    perp resolves to `perp:okx:BTCUSDT` (canonical `BTC/USDT-PERP`), matching the
+    Bybit perp convention and keeping a cross-venue `*:BTCUSDT` query uniform."""
+    value = product.upper()
+    if value.endswith("-SWAP"):
+        value = value[: -len("-SWAP")]
+    return _strip_symbol_separators(value)
+
+
+def _okx_taker_side(value: Any, errors: list[str]) -> str | None:
+    # OKX `side` is the taker (aggressor) side, lowercase.
+    if value in ("buy", "sell"):
+        return value
+    if value in (None, ""):
+        return None
+    errors.append("invalid_side")
+    return None
+
+
 def _bybit_taker_side(value: Any, errors: list[str]) -> str | None:
     # Bybit `S` is the taker (aggressor) side, capitalized.
     if value == "Buy":

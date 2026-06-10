@@ -63,8 +63,10 @@ class CollectorConfig:
     # idle public connections after ~10 min and documents a {"op":"ping"} roughly
     # every 20 s, so its lanes opt in. Leaving this off preserves the exact behavior
     # of every other (incl. the live Binance) collector.
+    # A dict is sent as JSON (Bybit `{"op":"ping"}`); a str is sent verbatim as a
+    # text frame (OKX, whose v5 keepalive is the bare string "ping" → "pong").
     ping_interval_seconds: float = 0.0
-    ping_message: dict | None = None
+    ping_message: dict | str | None = None
     # Max inbound WS frame size handed to `websockets.connect(max_size=...)`. The
     # library default is 1 MiB, which silently kills any feed that sends a large
     # snapshot — Coinbase's `level2_50` full-book snapshot is ~1.4 MiB and trips it

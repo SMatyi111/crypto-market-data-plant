@@ -20,7 +20,7 @@ param(
     [string]$OpsRoot = "G:\market_archive\ops",
     # Match run_ops_runner.ps1's live default (one slot per collector lane). Keep these
     # in sync — a redeploy with a lower value silently throttles coverage until reboot.
-    [int]$CollectorConcurrency = 17
+    [int]$CollectorConcurrency = 21
 )
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot

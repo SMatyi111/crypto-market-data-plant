@@ -135,8 +135,10 @@ class GenericWebsocketCollector(BaseCollector):
             return None
         return asyncio.ensure_future(self._keepalive_loop(websocket, interval, message))
 
-    async def _keepalive_loop(self, websocket: object, interval: float, message: dict) -> None:
-        payload = json.dumps(message)
+    async def _keepalive_loop(self, websocket: object, interval: float, message: dict | str) -> None:
+        # A dict ping is JSON-encoded (Bybit `{"op":"ping"}`); a str is sent verbatim
+        # as a text frame (OKX's v5 keepalive is the bare string "ping").
+        payload = message if isinstance(message, str) else json.dumps(message)
         # CancelledError is a BaseException and propagates out of this `except` —
         # so a normal teardown (cancel) ends the task cleanly, while a dead socket
         # (send raises) just ends the ping loop and lets the main loop reconnect.
@@ -169,6 +171,12 @@ class GenericWebsocketCollector(BaseCollector):
         decoder = self.config.message_decoder
         if decoder is not None and isinstance(message, (bytes, bytearray)):
             return decoder(bytes(message))
+        # Some venues answer the app-level keepalive with a bare text frame rather
+        # than JSON (OKX replies the literal "pong" to a "ping"). json.loads would
+        # raise on it, so map the control strings to an empty dict that `_should_emit`
+        # drops. Other venues send JSON pongs, so this never matches their traffic.
+        if isinstance(message, str) and message in ("ping", "pong"):
+            return {}
         return json.loads(message)
 
     async def _subscribe(self, websocket: object) -> list[RawMessage]:
@@ -230,6 +238,9 @@ class GenericWebsocketCollector(BaseCollector):
             # has code 0 + msg:"PONG", but the keepalive only starts AFTER this
             # handshake, so a pong can't be mistaken for the ack here.
             return payload.get("code") == 0 and "msg" in payload
+        if self.config.subscription_style == "okx":
+            # {"event":"subscribe","arg":{"channel":..,"instId":..},"connId":..}.
+            return payload.get("event") == "subscribe"
         return False
 
     def _is_subscription_error(self, payload: object) -> bool:
@@ -251,6 +262,9 @@ class GenericWebsocketCollector(BaseCollector):
             # A non-zero code is an error (e.g. a blocked / unknown subscription).
             code = payload.get("code")
             return "code" in payload and code not in (None, 0)
+        if self.config.subscription_style == "okx":
+            # {"event":"error","code":"60012","msg":..,"connId":..}.
+            return payload.get("event") == "error"
         return False
 
     def _subscription_message(self) -> dict[str, object]:
@@ -288,6 +302,13 @@ class GenericWebsocketCollector(BaseCollector):
             # "spot@public.aggre.deals.v3.api.pb@100ms@BTCUSDT" (trades) or
             # "spot@public.limit.depth.v3.api.pb@BTCUSDT@20" (limit depth).
             return {"method": "SUBSCRIPTION", "params": [self.config.channel]}
+        if self.config.subscription_style == "okx":
+            # One arg object per (channel, instId); the instId carries the market
+            # (BTC-USDT spot vs BTC-USDT-SWAP perp). Both use the same public socket.
+            return {
+                "op": "subscribe",
+                "args": [{"channel": self.config.channel, "instId": self.config.product}],
+            }
         raise ValueError(f"Unsupported subscription_style: {self.config.subscription_style}")
 
     def _should_emit(self, payload: object) -> bool:
@@ -313,6 +334,10 @@ class GenericWebsocketCollector(BaseCollector):
             return "channel" in payload and (
                 "publicAggreDeals" in payload or "publicLimitDepths" in payload
             )
+        if self.config.subscription_style == "okx":
+            # Data frames carry both "arg" (channel+instId) and "data"; the subscribe
+            # ack / error carry "event" and no "data", and the "pong" maps to {} above.
+            return "data" in payload and "arg" in payload
         return True
 
 
