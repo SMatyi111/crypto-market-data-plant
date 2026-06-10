@@ -1,0 +1,418 @@
+"""Cold-tier offload for raw run directories.
+
+Moves *accounted-for* raw run dirs (promoted into curated parquet, or quarantined
+with a diagnostics bundle) older than a retention window from the hot archive
+(NVMe) to a cold archive on another disk, freeing the hot disk while keeping raw
+forever. The hot raw tree stays bounded at ~retention-window days.
+
+Safety model — a run dir is only ever deleted from the hot tier when BOTH hold:
+
+* it appears in its lane's `_promotion_index.jsonl` (the promoter flushes parquet
+  rows durably BEFORE writing the index entry, so an index hit implies the curated
+  copy is on disk) OR in the lane's `_quarantine_index.jsonl` (known-bad, has a
+  diagnostics bundle); and
+* a byte-identical copy (per-file relative paths + sizes) exists in the cold tier.
+
+Old run dirs in NEITHER index are never touched; they are surfaced as
+`stuck_unaccounted_runs` findings so a silently-stalled scorer/promoter shows up
+in the offload report instead of aging data into deletion (the trap a purely
+age-based cleanup has).
+"""
+
+from __future__ import annotations
+
+import json
+import shutil
+from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+from .storage import JsonlSink
+
+# Cap how many stuck (old-but-unaccounted) run paths are listed per lane in the
+# report. The COUNT is always exact; this only bounds the example paths so a
+# stalled lane with thousands of unscored runs doesn't balloon the job log.
+_STUCK_EXAMPLE_CAP = 5
+
+# Staging directory inside each cold lane dir. A copy lands here first and is
+# renamed into place only after it verifies, so a crash mid-copy can never leave
+# a half-written run dir that looks final.
+_PARTIAL_DIRNAME = ".offload_partial"
+
+OFFLOAD_INDEX_FILENAME = "_offload_index.jsonl"
+
+
+@dataclass(slots=True)
+class OffloadLaneSpec:
+    """One raw lane eligible for offload.
+
+    Index paths are explicit (not derived from the lane name) on purpose: lane-name
+    convention drift has already produced one real bug in the offline scorer's venue
+    derivation, and the promote jobs in the same ops config carry these exact paths
+    anyway, so the config is the single source of truth.
+
+    gate="indexed" (default) offloads only promoted/quarantined runs and flags the
+    rest as stuck — for lanes whose curation runs as separate score/promote jobs.
+    gate="age_only" offloads every sufficiently old run — for lanes with no per-run
+    promotion index because curation happens at write time (kalshi normalizes inline)
+    or the lane is dead (delisted venue) and nothing will ever promote it. Offload
+    verifies the cold copy before deleting either way, so age_only relocates data,
+    it cannot lose it.
+    """
+
+    source: str
+    promotion_index: Path | None = None
+    quarantine_index: Path | None = None
+    gate: str = "indexed"
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> OffloadLaneSpec:
+        source = str(raw.get("source") or "").strip()
+        gate = str(raw.get("gate") or "indexed")
+        if gate not in ("indexed", "age_only"):
+            raise ValueError(f"offload lane gate must be 'indexed' or 'age_only': {raw!r}")
+        promotion_index = raw.get("promotion_index")
+        if not source or (gate == "indexed" and not promotion_index):
+            raise ValueError(
+                f"offload lane needs 'source' (and 'promotion_index' unless gate=age_only): {raw!r}"
+            )
+        quarantine_index = raw.get("quarantine_index")
+        return cls(
+            source=source,
+            promotion_index=Path(promotion_index) if promotion_index else None,
+            quarantine_index=Path(quarantine_index) if quarantine_index else None,
+            gate=gate,
+        )
+
+
+@dataclass(slots=True)
+class OffloadRunStatus:
+    run_path: str
+    lane: str
+    action: str
+    cold_path: str | None = None
+    bytes: int = 0
+    file_count: int = 0
+    error: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class OffloadLaneStatus:
+    source: str
+    scanned_count: int = 0
+    eligible_count: int = 0
+    moved_count: int = 0
+    stuck_unaccounted_count: int = 0
+    stuck_examples: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class OffloadReport:
+    status: str
+    mode: str
+    checked_at: str
+    raw_root: str
+    cold_root: str
+    min_age_days: float
+    scanned_run_count: int
+    eligible_count: int
+    moved_count: int
+    moved_bytes: int
+    failed_count: int
+    stuck_unaccounted_count: int
+    findings: list[str]
+    lanes: list[OffloadLaneStatus]
+    runs: list[OffloadRunStatus]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "mode": self.mode,
+            "checked_at": self.checked_at,
+            "raw_root": self.raw_root,
+            "cold_root": self.cold_root,
+            "min_age_days": self.min_age_days,
+            "scanned_run_count": self.scanned_run_count,
+            "eligible_count": self.eligible_count,
+            "moved_count": self.moved_count,
+            "moved_bytes": self.moved_bytes,
+            "failed_count": self.failed_count,
+            "stuck_unaccounted_count": self.stuck_unaccounted_count,
+            "findings": self.findings,
+            "lanes": [lane.to_dict() for lane in self.lanes],
+            "runs": [run.to_dict() for run in self.runs],
+        }
+
+
+def offload_accounted_runs(
+    *,
+    raw_root: Path,
+    cold_root: Path,
+    lanes: list[OffloadLaneSpec],
+    min_age_days: float = 14.0,
+    limit: int = 200,
+    apply: bool = False,
+) -> OffloadReport:
+    checked_at = datetime.now(tz=UTC)
+    cutoff = checked_at - timedelta(days=min_age_days)
+
+    findings: list[str] = []
+    lane_statuses: list[OffloadLaneStatus] = []
+    runs: list[OffloadRunStatus] = []
+    scanned_run_count = 0
+    eligible_count = 0
+    moved_count = 0
+    moved_bytes = 0
+    failed_count = 0
+    stuck_total = 0
+    budget = max(0, int(limit))
+
+    # A lane that exists on disk but is absent from the config would silently hoard
+    # the hot disk forever (the same shape as the collector-concurrency starvation
+    # trap: config grows, companion setting doesn't). Surface it loudly.
+    configured = {lane.source for lane in lanes}
+    if raw_root.exists():
+        for child in sorted(raw_root.iterdir()):
+            if not child.is_dir() or child.name.startswith("_"):
+                continue
+            if child.name not in configured:
+                findings.append(f"unconfigured_lane:{child.name}")
+
+    index_cache: dict[str, set[str]] = {}
+    index_sink: JsonlSink | None = None
+
+    for lane in lanes:
+        lane_status = OffloadLaneStatus(source=lane.source)
+        lane_statuses.append(lane_status)
+        lane_raw = raw_root / lane.source
+        if not lane_raw.exists():
+            findings.append(f"missing_lane_dir:{lane.source}")
+            continue
+
+        accounted: set[str] | None = None
+        if lane.gate == "indexed":
+            # No promotion index on an indexed lane means nothing can be proven
+            # promoted => every old run reports stuck rather than anything moving.
+            accounted = set()
+            if lane.promotion_index is not None:
+                accounted |= _load_index_run_paths(lane.promotion_index, index_cache)
+            if lane.quarantine_index is not None:
+                accounted |= _load_index_run_paths(lane.quarantine_index, index_cache)
+
+        # Oldest first so a backlog drains deterministically from the far end.
+        for run_dir in sorted(path for path in lane_raw.iterdir() if path.is_dir()):
+            started_at = _parse_run_started_at(run_dir)
+            if started_at is None or started_at >= cutoff:
+                continue
+            scanned_run_count += 1
+            lane_status.scanned_count += 1
+            run_key = str(run_dir)
+
+            if accounted is not None and run_key not in accounted:
+                stuck_total += 1
+                lane_status.stuck_unaccounted_count += 1
+                if len(lane_status.stuck_examples) < _STUCK_EXAMPLE_CAP:
+                    lane_status.stuck_examples.append(run_key)
+                continue
+
+            if budget <= 0:
+                continue
+            budget -= 1
+            eligible_count += 1
+            lane_status.eligible_count += 1
+
+            if not apply:
+                size, count = _measure_dir(run_dir)
+                runs.append(
+                    OffloadRunStatus(
+                        run_path=run_key,
+                        lane=lane.source,
+                        action="would_move",
+                        cold_path=str(cold_root / lane.source / run_dir.name),
+                        bytes=size,
+                        file_count=count,
+                    )
+                )
+                continue
+
+            if index_sink is None:
+                cold_root.mkdir(parents=True, exist_ok=True)
+                index_sink = JsonlSink(cold_root, OFFLOAD_INDEX_FILENAME)
+            status = _move_run_dir(
+                run_dir=run_dir,
+                lane=lane.source,
+                cold_lane_root=cold_root / lane.source,
+                index_sink=index_sink,
+                checked_at=checked_at,
+            )
+            runs.append(status)
+            if status.error is not None:
+                failed_count += 1
+            else:
+                moved_count += 1
+                moved_bytes += status.bytes
+                lane_status.moved_count += 1
+
+    if stuck_total:
+        findings.append(f"stuck_unaccounted_runs:{stuck_total}")
+    if eligible_count == 0:
+        findings.append("no_offload_candidates")
+
+    status = "ok"
+    if any(finding.startswith(("stuck_unaccounted_runs", "unconfigured_lane", "missing_lane_dir")) for finding in findings):
+        status = "warn"
+    if failed_count:
+        status = "error"
+
+    return OffloadReport(
+        status=status,
+        mode="apply" if apply else "dry-run",
+        checked_at=checked_at.isoformat(),
+        raw_root=str(raw_root),
+        cold_root=str(cold_root),
+        min_age_days=min_age_days,
+        scanned_run_count=scanned_run_count,
+        eligible_count=eligible_count,
+        moved_count=moved_count,
+        moved_bytes=moved_bytes,
+        failed_count=failed_count,
+        stuck_unaccounted_count=stuck_total,
+        findings=findings,
+        lanes=lane_statuses,
+        runs=runs,
+    )
+
+
+def _move_run_dir(
+    *,
+    run_dir: Path,
+    lane: str,
+    cold_lane_root: Path,
+    index_sink: JsonlSink,
+    checked_at: datetime,
+) -> OffloadRunStatus:
+    run_key = str(run_dir)
+    final_target = cold_lane_root / run_dir.name
+    try:
+        source_manifest = _file_manifest(run_dir)
+
+        if final_target.exists():
+            # Resume: a previous cycle copied (and possibly indexed) this run but died
+            # before deleting the source. Re-verify against the source before deleting —
+            # a name collision with different content must never cost the hot copy.
+            if _file_manifest(final_target) != source_manifest:
+                return OffloadRunStatus(
+                    run_path=run_key,
+                    lane=lane,
+                    action="cold_target_mismatch",
+                    cold_path=str(final_target),
+                    error="cold target exists with different content; source kept",
+                )
+            shutil.rmtree(run_dir)
+            size = sum(source_manifest.values())
+            return OffloadRunStatus(
+                run_path=run_key,
+                lane=lane,
+                action="resumed_delete",
+                cold_path=str(final_target),
+                bytes=size,
+                file_count=len(source_manifest),
+            )
+
+        partial_target = cold_lane_root / _PARTIAL_DIRNAME / run_dir.name
+        if partial_target.exists():
+            shutil.rmtree(partial_target)  # stale half-copy from a crashed cycle
+        partial_target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(run_dir, partial_target)
+
+        if _file_manifest(partial_target) != source_manifest:
+            shutil.rmtree(partial_target)
+            return OffloadRunStatus(
+                run_path=run_key,
+                lane=lane,
+                action="copy_verify_failed",
+                cold_path=str(partial_target),
+                error="copied tree did not match source; source kept",
+            )
+
+        partial_target.rename(final_target)
+        size = sum(source_manifest.values())
+        # Index BEFORE deleting the source: an index entry must imply the cold copy is
+        # in place, and a crash between index and delete resumes safely above.
+        index_sink.write(
+            {
+                "run_path": run_key,
+                "cold_path": str(final_target),
+                "lane": lane,
+                "moved_at": checked_at.isoformat(),
+                "bytes": size,
+                "file_count": len(source_manifest),
+            }
+        )
+        shutil.rmtree(run_dir)
+        return OffloadRunStatus(
+            run_path=run_key,
+            lane=lane,
+            action="moved",
+            cold_path=str(final_target),
+            bytes=size,
+            file_count=len(source_manifest),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return OffloadRunStatus(
+            run_path=run_key,
+            lane=lane,
+            action="failed",
+            cold_path=str(final_target),
+            error=str(exc),
+        )
+
+
+def _file_manifest(root: Path) -> dict[str, int]:
+    """Relative path -> size for every file under root. Size+path equality is the
+    verification bar: cheap enough to run on every move, and a truncated or missing
+    file (the realistic copy-failure modes) always changes it."""
+    manifest: dict[str, int] = {}
+    for path in root.rglob("*"):
+        if path.is_file():
+            manifest[path.relative_to(root).as_posix()] = path.stat().st_size
+    return manifest
+
+
+def _measure_dir(root: Path) -> tuple[int, int]:
+    manifest = _file_manifest(root)
+    return sum(manifest.values()), len(manifest)
+
+
+def _load_index_run_paths(path: Path, cache: dict[str, set[str]]) -> set[str]:
+    key = str(path)
+    if key in cache:
+        return cache[key]
+    run_paths: set[str] = set()
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            run_path = row.get("run_path")
+            if run_path:
+                run_paths.add(str(run_path))
+    cache[key] = run_paths
+    return run_paths
+
+
+def _parse_run_started_at(path: Path) -> datetime | None:
+    try:
+        return datetime.strptime(path.name, "%Y%m%d_%H%M%S").replace(tzinfo=UTC)
+    except ValueError:
+        return None
