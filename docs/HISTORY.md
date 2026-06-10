@@ -1,0 +1,221 @@
+# History — resolved work narrative
+
+Root causes, design decisions, and verification notes for completed work, newest
+first. Moved out of the former `FOLLOW_UPS.md` on 2026-06-11 — the forward-looking
+plan now lives in [`../ROADMAP.md`](../ROADMAP.md). The terse per-change record is
+git log + the merged PR descriptions; this file keeps the *why*.
+
+---
+
+## 2026-06-09 → 06-11 — BTC instrument expansion sprint (PRs #3–#13)
+
+Took the plant from 10 BTC-spot lanes to the full 22-lane matrix in three days.
+Condensed; each PR description carries the detail.
+
+- **Phases 1–2 (PR #3):** BTC/USDC spot lanes (Binance) + Bybit USDT linear perp via a
+  `--market spot|linear` flag. Coinbase BTC-USDC was planned but the product is
+  **delisted** — lanes removed (PR #6).
+- **Phase 3 trades (PR #4):** Binance USDT-M perp aggTrades via `--market futures`.
+  Live rollout exposed that the **futures websocket is jurisdiction-blocked from this
+  box** (acks SUBSCRIBE, streams zero frames; spot WS + `fapi` REST fine), so the WS
+  lane was retired in favor of…
+- **REST polling collector (PRs #7, #8):** `binance-futures-rest-worker --stream
+  trades|depth|funding`. Trades poll `/fapi/v1/aggTrades` with a persisted resume
+  cursor (gap-proof, survives segment rotation after the PR #8 cursor fix); depth
+  polls full-book snapshots (`none_native`); funding polls `premiumIndex` into its own
+  `funding` dataset. One boot 429 (three cold-starting REST workers burst the per-IP
+  limit) self-healed on restart.
+- **Concurrency-cap starvation, twice (PRs #5, #10/fb75ad9):** the runner's
+  `-CollectorConcurrency` default lagged the lane count after each expansion
+  (12 < 17, then 17 < 21), silently starving the newest lanes. Now 21. Lesson recorded:
+  **bump the cap in `run_ops_runner.ps1` + `redeploy_runner.ps1` whenever lanes are added.**
+- **Lambda arg-drop trap, twice (PRs #6, #9):** the per-venue `build_segment_args`
+  lambdas silently dropped newly-added fields — first `market` (perp lanes collected
+  as spot), then `jsonl_fsync` (config `false` ignored). Fix centralized the
+  threading in `_run_segmented_worker` with regression tests.
+- **Fsync backlog on hot lanes (PR #9):** the two highest-tick-rate lanes
+  (`binance_trades`, `bybit_perp_trades`) grew a `received_at` backlog (~12 s/min)
+  from per-event `jsonl_fsync` disk latency, tripping the 60 s clock-skew gate so
+  segments stopped promoting. Fix: **batched fsync** in the JSONL sinks (flush every
+  line so no torn tails; fsync every 64 events / 200 ms; final batch on close) with
+  per-lane knobs. Trade lanes are batched-durable; Binance depth keeps per-event fsync.
+- **Phase 5 — OKX spot + linear perp (PR #10):** new normalizers + a `chain_sequence`
+  replay mode validating OKX's `prevSeqId`/`seqId` **linked chain by equality**
+  (ids aren't contiguous; the link is) — making OKX the second provably-replayable
+  depth venue after Binance. Raw-string `"ping"` keepalive + pong guard. Also fixed a
+  latent offline-scorer venue-derivation drift on `*_perp_depth` lanes (affected Bybit
+  perp too). Live probe confirmed OKX WS is reachable from this box.
+- **Cold-tier archive offload (PR #11):** G: fills in ~25 days at ~30 GB/day raw, so
+  the `archive-offload` ops job verify-moves aged raw runs `G:` → `D:\market_archive_cold`,
+  gated on the run appearing in its lane's promotion or quarantine index, recording
+  every move in `_offload_index.jsonl`. First candidates age in ~2026-06-22.
+- **Normalized-root drift (PR #12):** normalized Parquet was still landing on the
+  abandoned `D:` default for some lanes — per-lane `normalized_root` is now threaded
+  explicitly, default flipped `D:` → `G:`. Verified landing on G: after restart.
+- **Redeploy alive-check scope (PR #13):** `redeploy_runner.ps1` killed/checked *all*
+  `python.exe` processes, taking out unrelated Pythons during the 2026-06-10 redeploy
+  (~30-min outage). Now scoped to plant processes only.
+
+Also in this window (no PR): MEXC lanes validated against live frames and enabled
+(see the MEXC entry below); both configs settled at 83/84 jobs.
+
+---
+
+## 2026-06-09 — self-heal cut-off segments via score-only catch-up jobs (PR #1)
+
+A segment cut off mid-finalize (clean events written to disk, but no inline
+`metrics/replay_summary.json`) was invisible to curation: `promote_replayable_runs`
+skips any run without a summary (`skipped_missing_replay`), so those rows never reached
+the curated dataset. Fixed by making the trades + non-binance-depth scorers dispatchable
+as **ops job types** (`backfill-trades-replay`, `backfill-stream-depth` — previously
+CLI-only) and adding hourly per-lane `score-*` catch-up jobs that (re)write each run's
+`replay_summary.json`. The depth scorer runs in a new `--score-only` mode that writes
+summaries but does **not** promote, so the quarantine-aware `promote-replayable` jobs
+stay the *single* promoter into the curated parquet — two concurrent promoters would
+duplicate curated rows (the promotion index can't dedup a run it hasn't recorded yet).
+8 tests incl. an end-to-end self-heal + no-duplicate-rows acceptance test. The same PR
+added GitHub Actions CI (windows-latest, py3.11+3.12) — which exposed that local "284
+passed" leaned on the workstation's >100 GB disk + live data; 5 non-hermetic
+health/runner tests were made hermetic.
+
+## 2026-06-09 — Binance emits its REST snapshot as a clean event (084f8c9)
+
+coinbase/bybit/kraken/mexc receive their book snapshot **in-stream** (the WS sends a
+`type:snapshot` frame, normalized to a clean event with `event_type="snapshot"`), so
+each run's curated data is self-contained for replay. **Binance was the exception:** its
+diff-depth WS sends no snapshot frame — the seed is fetched via REST and was written only
+to the sidecar `…/snapshots/book_snapshot.json`, so binance clean/curated rows were pure
+`depthUpdate` deltas with **no snapshot row**, and the curated `market_replayable`
+dataset could not be replayed for binance without the raw sidecar.
+
+**Resolved:** after the REST snapshot is captured, the collector synthesizes a
+binance-format snapshot `RawMessage` (`e="snapshot"`, `U=u=lastUpdateId`, `b`/`a` =
+snapshot levels), runs it through `BinanceDepthNormalizer` (correct `event_type="snapshot"`
+clean row), and writes it to `clean_sink` + `parquet_sink` as the FIRST clean event
+(bypassing the quality gate — the REST snapshot is authoritative). Collector + replay
+tests cover the leading-snapshot clean event so it doesn't double-seed. Confirmed live
+2026-06-09. **Residual** (tracked in ROADMAP): partitions collected *before* the fix
+still lack a snapshot row and would need re-promotion for self-contained historical replay.
+
+## 2026-06-09 — bare `health` follows the config's normalized root
+
+Was: `_latest_partition_write` (ops.py) used env-based `default_normalized_root`, so a
+bare `health` with no env set checked the abandoned `D:\market_archive\normalized` and
+emitted a false `stale_partition:binance-*` (monitoring-only artifact in ad-hoc runs; the
+runner with the correct env was unaffected). **Fixed** the same way as the ops-root fix
+(`2d3a415`): `_normalized_root_from_jobs()` derives the live normalized root from the
+discovered config, threaded through `build_health_report → _latest_partition_write`
+via an optional `normalized_root`. When unset the env/default fallback is preserved.
+Regression test: `test_health_follows_config_normalized_root_not_env_fallback`.
+
+## 2026-06-08 — Continuous capture: time-based segment rotation + full concurrency
+
+**Problem:** every collector lane was only recording ~one short segment per hour then
+idling. Root cause: each lane is `max_segments=1` and the runner re-dispatches it at
+`finish + interval_seconds` (interval was 3600 s), so the idle gap after each segment ≈
+the interval. Measured coverage was brutal — coinbase trades ~13%, binance trades ~17%,
+kraken/mexc ~15–40%, coinbase_depth ~8%, kraken_depth ~2%. Quality was fine (replayable,
+0 quarantine); *continuity* was broken. Also only `collector_concurrency=4` of 10 lanes
+could run at once.
+
+**Fix (continuous capture):** new `max_segment_seconds` knob → segments rotate on a
+fixed wall-clock cadence regardless of volume (set to **1800 s** for all lanes);
+`interval_seconds` → **5** (re-dispatch ~immediately); `segment_count` → **100000**
+(safety cap; the time bound fires first); `collector_concurrency` raised so all lanes
+stream simultaneously. Net: each lane records continuously, rotating a finalized 30-min
+segment with only a ~5–8 s reconnect gap (~0.3–0.4% per segment — eliminating it needs
+separating connection lifecycle from file lifecycle; tracked in ROADMAP).
+
+## 2026-06-08 — Live collection migrated D: → G: (NVMe)
+
+Cut live collection from `D:\market_archive` to `G:\market_archive` (NVMe). **Why:** the
+D: disk couldn't keep up with concurrent collection — high-volume trade lanes backlogged
+past the 60 s freshness gate and quarantined valid, merely-late trades (coinbase ~0.55,
+bybit ~1.0 quarantine ratios). Software fixes shipped first — Binance depth
+snapshot-anchor (`206beb5`), trades buffered JSONL (`9e6e50b`), 900 s trades stale gate
+(`a4bfd9d`), collector process isolation (`a7b9544`) — but the real bottleneck was disk
+I/O, so the NVMe cut-over is what removed it. On G:, **all five trade lanes ran at 0%
+quarantine**. `ops.live.local.json`, `run_ops_runner.ps1`, the runbook, and the
+scheduled task all point at G:. `D:\market_archive` is kept read-only as history —
+the retention/merge decision is tracked in ROADMAP.
+
+## 2026-05-30 → 06-04 — venue expansion groundwork ("Next steps after Phase 2")
+
+All six items landed:
+
+1. **Real-socket validation of Coinbase/Kraken/Bybit lanes (2026-05-31).** All 6 lanes
+   ran bounded real-socket segments to a throwaway archive and produced
+   `replayable: true` with the expected contract. One real bug: **Coinbase depth
+   `level2_batch` is dead** (public `level2`/`level2_batch` now require auth) —
+   switched to `level2_50` and raised WS `max_size` for its ~1.4 MiB snapshot
+   (`d616e52`).
+2. **`instrument=` partition column (2026-06-01).** Parquet `schema_version` v1→v2
+   cutover: v2 partitions on `["schema_version", "source", "instrument", "event_date"]`,
+   deriving `instrument` from the canonical symbol (`BTC/USDT`→`BTC-USDT`); the resolved
+   `InstrumentRef` moved to an `instrument_ref` column. v1 data untouched.
+   `STANDARDS_VERSION` 3→4.
+3. **App-level keepalive ping for Bybit (2026-05-31).** Opt-in
+   `CollectorConfig.ping_message` + `ping_interval_seconds`; per-connection keepalive
+   task. Bybit lanes opt in at `{"op":"ping"}` / 20 s; every other venue relies on
+   protocol-level ping/pong.
+4. **Stronger gap-proofing for `none_native` depth.** Bybit `data.u` proved dense
+   (+1 per message, 60/60 live frames) → upgraded to provable `sequence` (`b5ca110`,
+   `STANDARDS_VERSION` 1→2). Kraken CRC32 solved empirically (asks top-10 asc then bids
+   top-10 desc, decimal stripped) and verified against live snapshot+update checksums →
+   `gap_detection="checksum"` (`STANDARDS_VERSION` 2→3) with a frozen golden-vector test.
+5. **Data-arrival watchdog (2026-06-01).** Opt-in `idle_timeout_seconds`: a stalled WS
+   ends the segment **cleanly** (fresh segment = clean single-snapshot run) instead of
+   blocking forever; surfaced as `idle_timeout_count` + a non-blocking health finding.
+6. **Parallel collection runner (2026-06-03).** Collector job types dispatch through a
+   `ThreadPoolExecutor` sized by `--collector-concurrency`; maintenance jobs stay
+   serialized in the scheduler thread. Heartbeat gained `current_jobs`; health treats
+   any active job as in-progress. Barrier-proven concurrency tests.
+
+Plus two late additions:
+
+7. **Multi-anchor stream-depth replay + backfill (2026-06-03).** Root cause of
+   Coinbase/Bybit/Kraken depth showing **0 curated rows** while raw collection was
+   clean: `replay_depth_stream_run` required exactly one snapshot anchor at position 0
+   (the Binance REST model), but stream-snapshot venues re-snapshot mid-run by design.
+   Fixed by re-anchoring at each in-stream snapshot and validating integrity **within
+   each sub-book**, plus a `book_depth` param trimming Kraken's book to the subscribed
+   top-N (Kraken silently evicts the worst level past depth — ~90% of frames CRC-diverged
+   without the trim). Added `backfill-stream-depth` CLI. `STANDARDS_VERSION` 4→5.
+8. **MEXC spot adapter — protobuf transport (2026-06-04, live 2026-06-09).** MEXC
+   retired its JSON websocket 2025-08-04; public market data is now Protocol Buffers on
+   `wss://wbs-api.mexc.com/ws` — the only binary-transport venue. Vendored `.proto` +
+   committed generated bindings + an opt-in `CollectorConfig.message_decoder` seam
+   (binary frames → payload dict; JSON ack/PING unchanged). Both lanes `none_native`
+   (aggregated deals carry no per-trade id; limit-depth pushes independent full top-N
+   books). Raw frames carry a `_mexc_decode` provenance block (schema/sha256/base64) so
+   raw stays a rebuild source. Shipped disabled (schema built from published docs, not a
+   live capture); validated against real frames and enabled live 2026-06-09 — both lanes
+   promoting clean curated rows (~79.5k trades / ~86.8k depth at verification).
+
+## 2026-05-25 — initial hardening (items closed over the following week)
+
+1. **Reconnect depth-worker in place** — `collect_binance_depth_segment` reconnects on
+   retryable WS errors reusing the original snapshot anchor against a rolling
+   `last_seen_final_update_id`; a post-reconnect gap ends the segment cleanly. Metrics:
+   `reconnect_count`, `alignment_break_count`.
+2. **Quality-gated curation chain for trades** — `replay_trades_run` gives every trades
+   run the same `{replayable, findings}` summary the depth chain uses; quarantine +
+   promote work unchanged. Bar: trade_id monotone + gapless, price/size finite-positive,
+   exchange_time within clock-skew gate.
+3. **Real durability test under SIGKILL** — `tests/test_durability.py` kills the mock
+   pipeline subprocess mid-write (`TerminateProcess`) and asserts every JSONL line
+   parses and the file ends with a newline. Removing per-write fsync fails the test.
+4. **`health` consumes partial metrics** — last row of the in-flight run's
+   `metrics/summary.jsonl` surfaces as `partial_metrics` + `quarantine_ratio`, with a
+   `high_quarantine_ratio:<worker>` finding for active workers past the threshold.
+5. **Wake-from-sleep for the scheduled task** — `-WakeToRun` added (no-op for the
+   boot/logon triggers, ready for time-based ones).
+6. **ParquetDatasetSink batch_size 1000 → 100** — lost-on-kill window for the
+   normalized layer now ~100 events (raw JSONL stays fsync-durable).
+
+## Retired — `Crypto_L3 collection` (2026-06-09)
+
+The predecessor project is **retired**: its `CryptoL3Collector` +
+`CryptoL3MarketSupervisor` scheduled tasks were removed and the tree archived to
+`G:\04-archive\Crypto_L3 collection`. Not a re-enable candidate — any of its unique
+feeds still wanted get built as native lanes in this plant.

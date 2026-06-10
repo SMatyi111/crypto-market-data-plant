@@ -7,13 +7,20 @@ The archive is split by data lifecycle.
 Raw collection runs are timestamped directories under:
 
 ```text
-D:\market_archive\raw\market\<source>\<run_id>
+G:\market_archive\raw\market\<source>\<run_id>
 ```
 
 `<source>` is the **lane** directory `<venue>_<dataset>[_<suffix>]`:
 `binance_depth`, `binance_trades`, `coinbase_trades`, `coinbase_depth`,
-`kraken_trades`, `kraken_depth`, `bybit_trades`, `bybit_depth`, plus an optional
-per-instrument suffix (`binance_trades_ethusdt`).
+`kraken_trades`, `kraken_depth`, `bybit_trades`, `bybit_depth`, `mexc_trades`,
+`mexc_depth`, `okx_trades`, `okx_depth`, plus an optional per-instrument suffix
+(`binance_trades_btcusdc`). Perp lanes get their own `<venue>_perp_<dataset>`
+directories (`bybit_perp_trades`, `okx_perp_depth`, `binance_perp_trades`,
+`binance_perp_depth`, `binance_perp_funding`).
+
+Aged raw runs are verify-moved to the cold tier `D:\market_archive_cold` by the
+`archive-offload` ops job once promoted or quarantined; every move is recorded in
+the lane's `_offload_index.jsonl` (see [`../STANDARDS.md`](../STANDARDS.md) §7).
 
 Each run contains:
 
@@ -32,13 +39,15 @@ Normalized datasets are append-only Parquet datasets (every collected run, befor
 curation):
 
 ```text
-D:\market_archive\normalized\<dataset>\schema_version=v2\source=<venue>\instrument=<canonical>\event_date=<YYYY-MM-DD>
+G:\market_archive\normalized\<dataset>\schema_version=v2\source=<venue>\instrument=<canonical>\event_date=<YYYY-MM-DD>
 ```
 
 Datasets:
 
 - `market`: depth (order book) updates from all venues
 - `trades`: public trades from all venues
+- `funding`: perp funding / mark-price metric rows (Binance USDT-M REST poll)
+- `binary_options`: Kalshi crypto binary-option quote telemetry
 
 Since the `schema_version=v2` cutover the path carries an `instrument=` partition
 (the sanitized canonical symbol, e.g. `BTC-USDT`), so per-instrument lanes of the
@@ -51,9 +60,10 @@ history. The resolved `InstrumentRef` detail is kept in the `instrument_ref` col
 Curated datasets contain only quality-gated research inputs:
 
 ```text
-D:\market_archive\curated\research\market_replayable    # depth
-D:\market_archive\curated\research\trades_replayable     # trades
-D:\market_archive\curated\research\manifests             # readiness manifests
+G:\market_archive\curated\research\market_replayable     # depth
+G:\market_archive\curated\research\trades_replayable     # trades
+G:\market_archive\curated\research\funding                # perp funding/mark-price
+G:\market_archive\curated\research\manifests              # readiness manifests
 ```
 
 A run is promoted only when its `metrics/replay_summary.json` marks it
@@ -64,8 +74,8 @@ see [`../STANDARDS.md`](../STANDARDS.md) §4 for the per-class definition.
 
 The live ops config writes `research_manifest_latest.json`,
 `research_manifest_latest.md`, and timestamped manifest snapshots to
-`D:\market_archive\curated\research\manifests`. Treat
-`D:\market_archive\manifests` as legacy/manual output unless the active config
+`G:\market_archive\curated\research\manifests`. Treat
+`G:\market_archive\manifests` as legacy/manual output unless the active config
 explicitly uses it.
 
 ## Ops State
@@ -73,7 +83,7 @@ explicitly uses it.
 Ops files live under:
 
 ```text
-D:\market_archive\ops
+G:\market_archive\ops
 ```
 
 Important files:

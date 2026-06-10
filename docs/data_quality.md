@@ -17,18 +17,20 @@ There are two checkpoints:
 The bar a run must clear is set by its `gap_detection` class, recorded in
 `replay_summary.json`:
 
-- **`sequence`** (Binance depth/trades, Coinbase trades, Kraken trades, Bybit
-  `orderbook` depth) — carries a dense per-stream counter (Bybit orderbook `data.u`
-  is +1 per message), so gaplessness is **provable**. `replayable` here means
-  gap-proof.
+- **`sequence`** (Binance depth/trades, Binance USDT-M perp aggTrades via REST,
+  Coinbase trades, Kraken trades, Bybit `orderbook` depth, OKX `books` depth) —
+  a per-message id proves gaplessness, either dense (Bybit orderbook `data.u` is
+  +1 per message) or as a linked chain (OKX `prevSeqId(N) == seqId(N-1)`, validated
+  by equality — STANDARDS §4.4). `replayable` here means gap-proof.
 - **`checksum`** (Kraken `book` depth) — a per-frame CRC32 over the reconstructed
   top-10 book is validated, so a dropped/corrupted update is caught. Also
   **provable** — `replayable` means gap-proof.
-- **`none_native`** (Coinbase depth, Bybit trades) — no usable integrity signal
-  (no sequence at all, or only a UUID / shared counter). `replayable` is downgraded
-  to **structurally clean only**: a single snapshot anchor that is the first event,
-  parse-clean events, monotonic timestamps — **not** gap-proof. Consumers MUST key
-  off the lane's `gap_detection` tag, not the dataset name.
+- **`none_native`** (Coinbase depth, Bybit trades, OKX trades, both MEXC lanes,
+  Binance perp REST depth/funding) — no usable integrity signal (no sequence at
+  all, or only a UUID / shared counter). `replayable` is downgraded to
+  **structurally clean only**: runs start with a snapshot anchor, parse-clean
+  events, monotonic timestamps — **not** gap-proof. Consumers MUST key off the
+  lane's `gap_detection` tag, not the dataset name.
 
 ## Quality Gates (live filter)
 
@@ -51,7 +53,7 @@ Depth runs are additionally checked at replay time for:
 Use:
 
 ```powershell
-market-data-plant quarantine-runs --source-root D:\market_archive\raw\market\binance_depth --quarantine-root D:\market_archive\quarantine\market\binance_depth
+market-data-plant quarantine-runs --source-root G:\market_archive\raw\market\binance_depth --quarantine-root G:\market_archive\quarantine\market\binance_depth
 ```
 
 Quarantined runs are tracked in `_quarantine_index.jsonl` and skipped by promotion.
@@ -61,7 +63,7 @@ Quarantined runs are tracked in `_quarantine_index.jsonl` and skipped by promoti
 Use:
 
 ```powershell
-market-data-plant promote-replayable --source-root D:\market_archive\raw\market\binance_depth --target-root D:\market_archive\curated\research\market_replayable
+market-data-plant promote-replayable --source-root G:\market_archive\raw\market\binance_depth --target-root G:\market_archive\curated\research\market_replayable
 ```
 
 Promotion writes a `_promotion_index.jsonl` so repeated runs are idempotent.
@@ -77,7 +79,7 @@ manual/backfill use.
 Use:
 
 ```powershell
-market-data-plant research-manifest --archive-root D:\market_archive --output-root D:\market_archive\curated\research\manifests
+market-data-plant research-manifest --archive-root G:\market_archive --output-root G:\market_archive\curated\research\manifests
 ```
 
 The manifest is the per-`(venue, instrument, dataset, event_date)` readiness

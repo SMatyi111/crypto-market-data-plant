@@ -1,7 +1,20 @@
 # Data Standards
 
-`STANDARDS_VERSION = 5`
+`STANDARDS_VERSION = 6`
 
+> **v6 (2026-06-11):** catches the contract up to the lanes that went live 2026-06-09/10.
+> (1) **OKX** spot + linear-perp lanes: `books` depth proves continuity via a **linked
+> chain** — `prevSeqId(N) == seqId(N-1)`, validated by equality instead of `delta == 1`
+> (`mode="stream_snapshot_chain"`) — and is tagged `gap_detection="sequence"` (provable;
+> a broken link blocks promotion); OKX trades are `none_native` (§4.4). (2) **Binance
+> USDT-M perp via REST polling**: aggTrades = `sequence` (dense aggregate-trade id,
+> persisted resume cursor), depth = per-poll full-book snapshots (`none_native`), plus a
+> new **`funding` dataset** (premiumIndex mark/index/funding-rate metric, `none_native`)
+> curated to `curated/research/funding` (§4.5). (3) Perp lanes are tagged
+> `perp:<venue>:<symbol>` and write to `<venue>_perp_<dataset>` lane directories.
+> (4) MEXC verified against live frames and enabled. (5) Retention: aged raw runs are
+> verify-moved to a cold tier by the `archive-offload` job (§7). No change to existing
+> v2 Parquet schemas or partition layout.
 > **v5 (2026-06-03):** in-stream-snapshot depth replay now handles **multiple snapshot
 > anchors per run**. Stream-snapshot venues (Coinbase/Bybit/Kraken) re-snapshot mid-run
 > by design (reconnect/resync); replay re-anchors at each `snapshot` and validates each
@@ -39,32 +52,40 @@ bump `STANDARDS_VERSION` and update this file in the same change.
 
 ## 1. Datasets
 
-Two normalized datasets, each collected per (venue, instrument) lane:
+Three normalized datasets, each collected per (venue, market, instrument) lane:
 
 | Dataset  | Channel  | Normalizer(s)                                  | Curated target            |
 | -------- | -------- | ---------------------------------------------- | ------------------------- |
-| `depth`  | order book diffs | `BinanceDepthNormalizer`, `CoinbaseDepthNormalizer`, `BybitDepthNormalizer`, `KrakenDepthNormalizer` | `market_replayable`  |
-| `trades` | trade prints     | `BinanceTradeNormalizer`, `CoinbaseTradeNormalizer`, `KrakenTradeNormalizer`, `BybitTradeNormalizer` | `trades_replayable` |
+| `depth`  | order book diffs / snapshots | `BinanceDepthNormalizer`, `CoinbaseDepthNormalizer`, `BybitDepthNormalizer`, `KrakenDepthNormalizer`, `MexcDepthNormalizer`, `OkxDepthNormalizer` (+ Binance USDT-M REST snapshot polling) | `market_replayable`  |
+| `trades` | trade prints     | `BinanceTradeNormalizer`, `CoinbaseTradeNormalizer`, `KrakenTradeNormalizer`, `BybitTradeNormalizer`, `MexcTradeNormalizer`, `OkxTradeNormalizer` (+ Binance USDT-M REST aggTrades polling) | `trades_replayable` |
+| `funding` | perp funding / mark-price metric | Binance USDT-M `premiumIndex` REST poll (native dict passthrough) | `funding` |
 
-Venues live today: **Binance** (depth + trades), **Coinbase** (trades + depth),
-**Kraken** (trades + depth), **Bybit** (trades + depth). **MEXC** (trades + depth) is
-implemented and tested but ships **disabled**, pending live-frame schema verification
-— it is the only **protobuf-transport** venue (see §4.3). See Roadmap for the rest.
+Venues live today: **Binance** (spot USDT + USDC depth + trades; USDT-M perp trades +
+depth + funding via REST polling — §4.5), **Coinbase** (trades + depth), **Kraken**
+(trades + depth), **Bybit** (spot + linear perp, trades + depth), **MEXC** (trades +
+depth; the only **protobuf-transport** venue, verified against live frames 2026-06-09 —
+see §4.3), **OKX** (spot + linear perp, trades + depth — §4.4). Perp lanes are tagged
+`perp:<venue>:<symbol>` and write to their own `<venue>_perp_<dataset>` lane
+directories, so perp never mixes with spot.
 
 > **Gap-detection class differs by feed, not just by venue.** Three classes, tagged
 > per lane as `gap_detection` in the manifest (§6):
 >
-> - **`sequence`** — a dense per-message counter proves gaplessness (§4.1/§4.2):
->   Binance depth/trades, Coinbase trades, **Kraken trades** (`trade_id` is a dense
->   per-pair counter), and **Bybit spot `orderbook` depth** (`data.u` increments by
->   exactly 1 per message).
+> - **`sequence`** — a per-message id proves gaplessness, either as a dense counter
+>   (§4.1/§4.2) or a linked chain (§4.4): Binance depth/trades (spot), Binance USDT-M
+>   perp aggTrades (dense aggregate-trade id — §4.5), Coinbase trades, **Kraken
+>   trades** (`trade_id` is a dense per-pair counter), **Bybit `orderbook` depth**
+>   (`data.u` increments by exactly 1 per message; spot + linear), and **OKX `books`
+>   depth** (`prevSeqId`/`seqId` linked chain, validated by equality — §4.4).
 > - **`checksum`** — a per-frame CRC32 over the reconstructed book proves integrity,
 >   so a dropped/corrupted update is caught (§4.3): **Kraken `book` depth**.
 > - **`none_native`** — no usable integrity signal, so `replayable` means
 >   *structurally clean*, **not** gap-proof: Coinbase depth (`level2_50`), **Bybit
->   spot trades** (`publicTrade`, whose trade id is a UUID), and **both MEXC lanes**
->   (aggregated-deals trades carry no per-trade id; limit-depth pushes independent full
->   books whose `version` is metadata-only — see §4.3).
+>   trades** (`publicTrade`, whose trade id is a UUID; spot + linear), **OKX trades**,
+>   **both MEXC lanes** (aggregated-deals trades carry no per-trade id; limit-depth
+>   pushes independent full books whose `version` is metadata-only — see §4.3), and
+>   the **Binance USDT-M perp REST `depth` + `funding`** lanes (per-poll snapshots /
+>   metric rows — §4.5).
 >
 > `sequence` and `checksum` are both **provable** (consumers can rely on
 > completeness); `none_native` is best-effort. Two lanes of the same dataset can
@@ -243,7 +264,7 @@ can be a legitimate venue artifact, and the gaplessness proof above is what the
 guarantee rests on. Consumers who require an uncrossed book at every tick should
 check `crossed_book_count` in `replay_summary.json` themselves.
 
-### 4.2 `trades` (sequence-bearing — Binance, Coinbase, Kraken)
+### 4.2 `trades` (sequence-bearing — Binance, Coinbase, Kraken; Binance USDT-M perp aggTrades via §4.5)
 
 `replayable` iff **all** hold:
 
@@ -483,6 +504,45 @@ depth took); the `version` is already captured for that.
 
 ---
 
+### 4.4 OKX `books` depth — linked-chain `sequence` (provable)
+
+OKX `books` carries `seqId` and `prevSeqId` on every update, where
+`prevSeqId(N) == seqId(N-1)` — a **linked chain** rather than a dense counter (the
+ids themselves are not contiguous). The normalizer maps `prevSeqId` →
+`first_update_id` and `seqId` → `final_update_id`, and replay
+(`replay_depth_stream_run(chain_sequence=True)`, `mode="stream_snapshot_chain"`)
+validates the chain by **equality** instead of `delta == 1`: within an anchored
+sub-book, a delta whose `first_update_id` does not match the previous event's
+`final_update_id` is a provable gap, and a regressed `final_update_id` is a
+reorder — both **block promotion**. A snapshot reseeds the baseline (its
+`prevSeqId` is `-1`), so the id jump at a re-snapshot is never miscounted. The
+summary is tagged `gap_detection="sequence"` — same provable class as Binance/Bybit
+depth, different proof shape. OKX **trades** carry no provable sequence and are
+`none_native` (§4.3). Both apply to spot and the linear perp (`BTC-USDT-SWAP` →
+`okx_perp_*` lanes).
+
+### 4.5 Binance USDT-M perp — REST polling lanes
+
+The Binance futures *websocket* is jurisdiction-blocked from the maintainer's
+deployment (acks SUBSCRIBE, streams zero frames), while `fapi` REST works — so the
+perp lanes poll REST (`binance-futures-rest-worker`), one lane per stream:
+
+- **`trades`** (`/fapi/v1/aggTrades` → `binance_perp_trades/`): the aggregate-trade
+  id is a dense per-symbol counter, and the poll cursor (last seen id + 1) is
+  **persisted across segments and restarts**, so the lane is **gap-proof end-to-end**
+  — `gap_detection="sequence"`, same §4.2 bar.
+- **`depth`** (`/fapi/v1/depth` → `binance_perp_depth/`): per-poll independent
+  full-book snapshots, no diff stream — `none_native` (§4.3), each poll is its own
+  anchor.
+- **`funding`** (`/fapi/v1/premiumIndex` → `binance_perp_funding/`): mark price,
+  index price, and funding rate — a low-rate metric (mark ticks ~1/s, funding every
+  8 h), so REST polling loses no fidelity. Normalized into the **`funding` dataset**
+  and promoted to `curated/research/funding`; scored by `replay_funding_run`
+  (`none_native`: finite-positive marks, monotonic timestamps — there is no sequence
+  to prove).
+
+---
+
 ## 5. Live quality gate (pre-replay)
 
 Applied per event during collection; failures go to `quarantine/events.jsonl`
@@ -500,8 +560,9 @@ verdict that gates promotion.
 ## 6. Consuming the data
 
 1. **Read curated, not raw.** Pull from
-   `curated/research/{market_replayable,trades_replayable}/schema_version=v1/source=<src>/event_date=<date>/`.
-   Everything there passed §4.
+   `curated/research/{market_replayable,trades_replayable,funding}/schema_version=v2/source=<src>/instrument=<canonical>/event_date=<date>/`.
+   Everything there passed §4. (Legacy pre-cutover data sits under
+   `schema_version=v1` with venue-only partitions.)
 2. **Check the manifest first.** `research_manifest_latest.json` is tagged with
    `standards_version` (matches `STANDARDS_VERSION` above) and carries two views:
    - `lanes` — the canonical per-`(venue, instrument, dataset)` readiness. Each
@@ -539,6 +600,13 @@ verdict that gates promotion.
 - **Raw** (`raw/market/<src>`): default **14 days**, overridable per dataset via
   the cleanup job's `raw_policy` (`market/<src>=<days>`). Raw is the rebuild
   source; keep it long enough to re-promote after a logic fix.
+- **Raw cold tier**: aged raw runs are **verify-moved** (not deleted) to
+  `D:\market_archive_cold` by the `archive-offload` ops job. A run is offloaded
+  only after it appears in its lane's promotion index (the curated copy is
+  durably on disk) or quarantine index (known-bad); runs in neither index are
+  never touched and are surfaced as `unindexed`. Every move is recorded in the
+  lane's `_offload_index.jsonl`, so raw remains a locatable rebuild source after
+  offload.
 - **Normalized / curated / quarantine / manifests**: retained indefinitely (no
   auto-prune today). Curated is the long-lived research artifact.
 - Cleanup runs in **dry-run by default** (`--apply` to act).
@@ -547,12 +615,13 @@ verdict that gates promotion.
 
 ## 8. Roadmap (NOT guaranteed yet)
 
-These are aspirations in `FOLLOW_UPS.md`, listed so nobody mistakes them for the
-current contract:
+The forward-looking plan lives in [`ROADMAP.md`](ROADMAP.md). Items there are
+aspirations, listed so nobody mistakes them for the current contract — notably:
 
 - **Per-pair precision table for Kraken `depth` checksum validation.** Checksum
   validation is live for BTC/USD (`_KRAKEN_BOOK_PRECISION`); other Kraken pairs
-  fall back to `none_native` until their `(price, qty)` precision is added (from
-  the REST `AssetPairs` `pair_decimals`/`lot_decimals`). Could be auto-fetched at
-  collect time instead of hardcoded.
-- Continuous day-bounded rotation as the default run model (vs. count-bounded).
+  fall back to `none_native` until their `(price, qty)` precision is added.
+- **MEXC depth upgrade to provable `sequence`** if the captured `version` proves
+  dense against live frames (the Bybit-depth path).
+- Continuous day-bounded rotation as the default run model (vs. wall-clock
+  segment rotation).
