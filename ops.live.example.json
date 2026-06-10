@@ -562,7 +562,9 @@
           "bybit_perp_depth",
           "binance_perp_depth",
           "kraken_depth",
-          "mexc_depth"
+          "mexc_depth",
+          "okx_depth",
+          "okx_perp_depth"
         ],
         "target_root": "G:\\market_archive\\curated\\research\\market_replayable",
         "score_only": true,
@@ -961,6 +963,206 @@
         "source_root": "G:\\market_archive\\raw\\market\\binance_perp_funding",
         "target_root": "G:\\market_archive\\curated\\research\\funding",
         "quarantine_index": "G:\\market_archive\\quarantine\\market\\binance_perp_funding\\_quarantine_index.jsonl",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "okx-btc-trades",
+      "job_type": "okx-trades-worker",
+      "interval_seconds": 5,
+      "enabled": false,
+      "args": {
+        "symbol": "BTC-USDT",
+        "channel": "trades",
+        "market": "spot",
+        "segment_count": 100000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "worker_name": "okx-trades-worker",
+        "idle_timeout_seconds": 120,
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops",
+        "max_segment_seconds": 1800
+      }
+    },
+    {
+      "name": "quarantine-okx-trades",
+      "job_type": "quarantine-runs",
+      "interval_seconds": 300,
+      "enabled": false,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\okx_trades",
+        "quarantine_root": "G:\\market_archive\\quarantine\\market\\okx_trades",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "promote-okx-trades",
+      "job_type": "promote-replayable",
+      "interval_seconds": 300,
+      "enabled": false,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\okx_trades",
+        "target_root": "G:\\market_archive\\curated\\research\\trades_replayable",
+        "quarantine_index": "G:\\market_archive\\quarantine\\market\\okx_trades\\_quarantine_index.jsonl",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "score-okx-trades",
+      "job_type": "backfill-trades-replay",
+      "interval_seconds": 3600,
+      "enabled": false,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\okx_trades",
+        "stream": true,
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "okx-btc-depth",
+      "job_type": "okx-depth-worker",
+      "interval_seconds": 5,
+      "enabled": false,
+      "args": {
+        "symbol": "BTC-USDT",
+        "channel": "books",
+        "market": "spot",
+        "segment_count": 100000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "worker_name": "okx-depth-worker",
+        "idle_timeout_seconds": 120,
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops",
+        "max_segment_seconds": 1800
+      }
+    },
+    {
+      "name": "quarantine-okx-depth",
+      "job_type": "quarantine-runs",
+      "interval_seconds": 300,
+      "enabled": false,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\okx_depth",
+        "quarantine_root": "G:\\market_archive\\quarantine\\market\\okx_depth",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "promote-okx-depth",
+      "job_type": "promote-replayable",
+      "interval_seconds": 300,
+      "enabled": false,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\okx_depth",
+        "target_root": "G:\\market_archive\\curated\\research\\market_replayable",
+        "quarantine_index": "G:\\market_archive\\quarantine\\market\\okx_depth\\_quarantine_index.jsonl",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "okx-perp-trades",
+      "job_type": "okx-trades-worker",
+      "interval_seconds": 5,
+      "enabled": false,
+      "args": {
+        "symbol": "BTC-USDT",
+        "channel": "trades",
+        "market": "linear",
+        "segment_count": 100000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "worker_name": "okx-trades-worker-perp",
+        "idle_timeout_seconds": 120,
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops",
+        "max_segment_seconds": 1800
+      }
+    },
+    {
+      "name": "quarantine-okx-perp-trades",
+      "job_type": "quarantine-runs",
+      "interval_seconds": 300,
+      "enabled": false,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\okx_perp_trades",
+        "quarantine_root": "G:\\market_archive\\quarantine\\market\\okx_perp_trades",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "promote-okx-perp-trades",
+      "job_type": "promote-replayable",
+      "interval_seconds": 300,
+      "enabled": false,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\okx_perp_trades",
+        "target_root": "G:\\market_archive\\curated\\research\\trades_replayable",
+        "quarantine_index": "G:\\market_archive\\quarantine\\market\\okx_perp_trades\\_quarantine_index.jsonl",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "score-okx-perp-trades",
+      "job_type": "backfill-trades-replay",
+      "interval_seconds": 3600,
+      "enabled": false,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\okx_perp_trades",
+        "stream": true,
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "okx-perp-depth",
+      "job_type": "okx-depth-worker",
+      "interval_seconds": 5,
+      "enabled": false,
+      "args": {
+        "symbol": "BTC-USDT",
+        "channel": "books",
+        "market": "linear",
+        "segment_count": 100000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "worker_name": "okx-depth-worker-perp",
+        "idle_timeout_seconds": 120,
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops",
+        "max_segment_seconds": 1800
+      }
+    },
+    {
+      "name": "quarantine-okx-perp-depth",
+      "job_type": "quarantine-runs",
+      "interval_seconds": 300,
+      "enabled": false,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\okx_perp_depth",
+        "quarantine_root": "G:\\market_archive\\quarantine\\market\\okx_perp_depth",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "promote-okx-perp-depth",
+      "job_type": "promote-replayable",
+      "interval_seconds": 300,
+      "enabled": false,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\okx_perp_depth",
+        "target_root": "G:\\market_archive\\curated\\research\\market_replayable",
+        "quarantine_index": "G:\\market_archive\\quarantine\\market\\okx_perp_depth\\_quarantine_index.jsonl",
         "limit": 1000,
         "max_age_hours": 168
       }

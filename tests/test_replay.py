@@ -829,6 +829,119 @@ def test_replay_depth_stream_run_without_sequence_key_stays_none_native(tmp_path
     assert "update_id_gaps" not in summary.findings
 
 
+def _okx_stream_row(
+    *,
+    event_type: str,
+    prev_seq_id: int | None,
+    seq_id: int | None,
+    bids: list[list[float]] | None = None,
+    asks: list[list[float]] | None = None,
+    event_time: str | None = None,
+) -> dict:
+    # Mirrors a normalized OKX books event: the linked chain lives in the event-level
+    # first_update_id (prevSeqId) / final_update_id (seqId), validated by equality.
+    return {
+        "source": "okx",
+        "product": "BTC-USDT",
+        "channel": "depth",
+        "event_type": event_type,
+        "event_time": event_time,
+        "received_at": "2026-04-06T00:00:00.100000+00:00",
+        "first_update_id": prev_seq_id,
+        "final_update_id": seq_id,
+        "instrument": {"instrument_id": "spot:okx:BTCUSDT"},
+        "bids": bids or [],
+        "asks": asks or [],
+        "metadata": {"okx_seq_id": seq_id, "okx_prev_seq_id": prev_seq_id},
+    }
+
+
+def test_replay_depth_stream_run_chain_contiguous_is_gap_proof(tmp_path: Path) -> None:
+    """With chain_sequence (OKX), prevSeqId(N)==seqId(N-1) across the run upgrades the
+    verdict to a provable `sequence` gap proof — even though the ids are not +1 dense."""
+    run_path = tmp_path / "okx_depth" / "20260406_000000"
+    _write_stream_depth_run(
+        run_path,
+        [
+            _okx_stream_row(event_type="snapshot", prev_seq_id=-1, seq_id=100, bids=[[100.0, 1.0]], asks=[[101.0, 2.0]]),
+            _okx_stream_row(event_type="delta", prev_seq_id=100, seq_id=157, bids=[[100.0, 0.0]], event_time="2026-04-06T00:00:01+00:00"),
+            _okx_stream_row(event_type="delta", prev_seq_id=157, seq_id=203, asks=[[101.0, 1.5]], event_time="2026-04-06T00:00:02+00:00"),
+        ],
+    )
+
+    summary = replay_depth_stream_run(run_path, chain_sequence=True)
+
+    assert summary.replayable is True, summary.findings
+    assert summary.gap_detection == "sequence"
+    assert summary.mode == "stream_snapshot_chain"
+    assert summary.first_update_id == 100
+    assert summary.last_update_id == 203
+    assert summary.gap_count == 0
+    assert summary.findings == []
+
+
+def test_replay_depth_stream_run_chain_broken_link_blocks_promotion(tmp_path: Path) -> None:
+    """A delta whose prevSeqId doesn't point at the previous seqId (a dropped message)
+    breaks the link — a provable gap, NOT replayable."""
+    run_path = tmp_path / "okx_depth" / "20260406_000001"
+    _write_stream_depth_run(
+        run_path,
+        [
+            _okx_stream_row(event_type="snapshot", prev_seq_id=-1, seq_id=100, bids=[[100.0, 1.0]], asks=[[101.0, 2.0]]),
+            _okx_stream_row(event_type="delta", prev_seq_id=100, seq_id=157, asks=[[101.0, 1.5]], event_time="2026-04-06T00:00:01+00:00"),
+            # prevSeqId 999 != previous seqId 157 -> broken link.
+            _okx_stream_row(event_type="delta", prev_seq_id=999, seq_id=1000, asks=[[101.0, 1.6]], event_time="2026-04-06T00:00:02+00:00"),
+        ],
+    )
+
+    summary = replay_depth_stream_run(run_path, chain_sequence=True)
+
+    assert summary.replayable is False
+    assert summary.gap_detection == "sequence"
+    assert "update_id_gaps" in summary.findings
+    assert summary.gap_count == 1
+
+
+def test_replay_depth_stream_run_chain_reorder_blocks_promotion(tmp_path: Path) -> None:
+    """A seqId that regresses below the running baseline is a reorder/reset and blocks."""
+    run_path = tmp_path / "okx_depth" / "20260406_000002"
+    _write_stream_depth_run(
+        run_path,
+        [
+            _okx_stream_row(event_type="snapshot", prev_seq_id=-1, seq_id=100, bids=[[100.0, 1.0]], asks=[[101.0, 2.0]]),
+            _okx_stream_row(event_type="delta", prev_seq_id=100, seq_id=90, asks=[[101.0, 1.5]], event_time="2026-04-06T00:00:02+00:00"),
+        ],
+    )
+
+    summary = replay_depth_stream_run(run_path, chain_sequence=True)
+
+    assert summary.replayable is False
+    assert "non_monotonic_update_id" in summary.findings
+    assert summary.reordered_count == 1
+
+
+def test_replay_depth_stream_run_chain_mid_run_resnapshot_reanchors(tmp_path: Path) -> None:
+    """A mid-run re-snapshot (reconnect) reseeds the chain baseline; the seqId jump at
+    the new anchor is expected, not a gap."""
+    run_path = tmp_path / "okx_depth" / "20260406_000003"
+    _write_stream_depth_run(
+        run_path,
+        [
+            _okx_stream_row(event_type="snapshot", prev_seq_id=-1, seq_id=100, bids=[[100.0, 1.0]], asks=[[101.0, 2.0]]),
+            _okx_stream_row(event_type="delta", prev_seq_id=100, seq_id=157, asks=[[101.0, 1.5]], event_time="2026-04-06T00:00:01+00:00"),
+            # reconnect: a fresh snapshot with an unrelated seqId baseline.
+            _okx_stream_row(event_type="snapshot", prev_seq_id=-1, seq_id=9000, bids=[[100.0, 1.0]], asks=[[101.0, 2.0]], event_time="2026-04-06T00:00:02+00:00"),
+            _okx_stream_row(event_type="delta", prev_seq_id=9000, seq_id=9001, asks=[[101.0, 1.7]], event_time="2026-04-06T00:00:03+00:00"),
+        ],
+    )
+
+    summary = replay_depth_stream_run(run_path, chain_sequence=True)
+
+    assert summary.replayable is True, summary.findings
+    assert summary.gap_detection == "sequence"
+    assert summary.gap_count == 0
+
+
 def _kraken_stream_row(
     *,
     event_type: str,

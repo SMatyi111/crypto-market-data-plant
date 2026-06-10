@@ -75,6 +75,8 @@ from .market_normalizers import (
     KrakenTradeNormalizer,
     MexcDepthNormalizer,
     MexcTradeNormalizer,
+    OkxDepthNormalizer,
+    OkxTradeNormalizer,
 )
 from .market_snapshots import fetch_binance_order_book_snapshot, write_snapshot_file
 from .models import RawMessage, utc_now
@@ -518,6 +520,88 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Rotate the run directory at midnight UTC instead of at --segment-count "
         "messages. See the depth worker's help text for the same flag.",
+    )
+
+    okx_trades_parser = subparsers.add_parser(
+        "okx-trades-worker", help="Run segmented OKX v5 `trades` collection (non-sequence feed)"
+    )
+    okx_trades_parser.add_argument(
+        "--symbol",
+        default="BTC-USDT",
+        help="OKX instId base, e.g. BTC-USDT. For --market linear the '-SWAP' suffix "
+        "is added automatically, so pass the spot form here for both markets.",
+    )
+    okx_trades_parser.add_argument("--channel", default="trades", help="OKX v5 trades channel.")
+    okx_trades_parser.add_argument(
+        "--market",
+        choices=list(_OKX_MARKETS),
+        default="spot",
+        help="OKX v5 market. 'spot' (default) collects BTC-USDT into okx_trades/ "
+        "(spot:okx:* instrument). 'linear' = USDT-margined perpetual swap (BTC-USDT-SWAP): "
+        "runs land in okx_perp_trades/ tagged perp:okx:* so perp never mixes with spot.",
+    )
+    okx_trades_parser.add_argument("--segment-count", type=int, default=5000)
+    okx_trades_parser.add_argument("--max-segments", type=int)
+    okx_trades_parser.add_argument("--cooldown-seconds", type=float, default=1.0)
+    okx_trades_parser.add_argument("--output-root", type=Path, default=default_output_root())
+    okx_trades_parser.add_argument("--ops-root", type=Path, default=default_ops_root())
+    okx_trades_parser.add_argument("--worker-name", default="okx-trades-worker")
+    okx_trades_parser.add_argument("--heartbeat-interval-seconds", type=float, default=30.0)
+    okx_trades_parser.add_argument("--max-delay-ms", type=int, default=60_000)
+    okx_trades_parser.add_argument("--max-future-skew-ms", type=int, default=5_000)
+    okx_trades_parser.add_argument("--max-clock-skew-ms", type=float, default=60_000.0)
+    okx_trades_parser.add_argument(
+        "--source-suffix",
+        default="",
+        help="Optional per-instrument lane suffix. When non-empty, runs go to "
+        "<output_root>/okx_trades_<suffix>/<timestamp>/ instead of okx_trades/.",
+    )
+    okx_trades_parser.add_argument(
+        "--rotate-at-midnight",
+        action="store_true",
+        help="Rotate the run directory at midnight UTC instead of at --segment-count messages.",
+    )
+
+    okx_depth_parser = subparsers.add_parser(
+        "okx-depth-worker",
+        help="Run segmented OKX v5 `books` orderbook depth collection (seqId chain, provable)",
+    )
+    okx_depth_parser.add_argument(
+        "--symbol",
+        default="BTC-USDT",
+        help="OKX instId base, e.g. BTC-USDT. For --market linear the '-SWAP' suffix "
+        "is added automatically.",
+    )
+    okx_depth_parser.add_argument(
+        "--channel",
+        default="books",
+        help="OKX v5 depth channel. 'books' (default) = 400-level in-stream snapshot + "
+        "incremental updates carrying seqId/prevSeqId (provable chain) + a CRC32 checksum.",
+    )
+    okx_depth_parser.add_argument(
+        "--market",
+        choices=list(_OKX_MARKETS),
+        default="spot",
+        help="OKX v5 market. 'spot' (default) -> okx_depth/, spot:okx:*. 'linear' = "
+        "USDT-margined perpetual swap (BTC-USDT-SWAP) -> okx_perp_depth/, perp:okx:*.",
+    )
+    okx_depth_parser.add_argument("--segment-count", type=int, default=5000)
+    okx_depth_parser.add_argument("--max-segments", type=int)
+    okx_depth_parser.add_argument("--cooldown-seconds", type=float, default=1.0)
+    okx_depth_parser.add_argument("--output-root", type=Path, default=default_output_root())
+    okx_depth_parser.add_argument("--ops-root", type=Path, default=default_ops_root())
+    okx_depth_parser.add_argument("--worker-name", default="okx-depth-worker")
+    okx_depth_parser.add_argument("--heartbeat-interval-seconds", type=float, default=30.0)
+    okx_depth_parser.add_argument(
+        "--source-suffix",
+        default="",
+        help="Optional per-instrument lane suffix. When non-empty, runs go to "
+        "<output_root>/okx_depth_<suffix>/<timestamp>/ instead of okx_depth/.",
+    )
+    okx_depth_parser.add_argument(
+        "--rotate-at-midnight",
+        action="store_true",
+        help="Rotate the run directory at midnight UTC instead of at --segment-count messages.",
     )
 
     kraken_depth_parser = subparsers.add_parser(
@@ -1355,6 +1439,83 @@ def _bybit_instrument_type(market: str) -> str:
     return "perp" if market == "linear" else "spot"
 
 
+# OKX v5 public market data. Spot and USDT-margined perpetual swap share ONE public
+# socket; the market is carried by the instId (BTC-USDT vs BTC-USDT-SWAP), not the URL.
+# The v5 keepalive is the bare text string "ping" (server replies "pong"), unlike
+# Bybit's JSON {"op":"ping"}; send it every <30 s or the idle socket is dropped.
+_OKX_WS_URL = "wss://ws.okx.com:8443/ws/v5/public"
+_OKX_PING_MESSAGE = "ping"
+_OKX_PING_INTERVAL_SECONDS = 15.0
+_OKX_MARKETS = ("spot", "linear")
+
+
+def _okx_market(args: argparse.Namespace) -> str:
+    market = str(getattr(args, "market", "spot") or "spot").lower()
+    if market not in _OKX_MARKETS:
+        raise SystemExit(
+            f"--market must be one of {', '.join(_OKX_MARKETS)} (got {market!r})"
+        )
+    return market
+
+
+def _okx_instrument_type(market: str) -> str:
+    return "perp" if market == "linear" else "spot"
+
+
+def _okx_instid(symbol: str, market: str) -> str:
+    """The OKX instId to subscribe. linear appends `-SWAP` to the spot base so a lane
+    can pass the same `BTC-USDT` symbol for both markets (BTC-USDT / BTC-USDT-SWAP)."""
+    base = str(symbol).upper()
+    if base.endswith("-SWAP"):
+        base = base[: -len("-SWAP")]
+    return f"{base}-SWAP" if market == "linear" else base
+
+
+async def collect_okx_trades_segment(args: argparse.Namespace) -> dict[str, object]:
+    # OKX `tradeId` is per-instrument but the public `trades` channel may conflate
+    # fills, so it isn't trusted as a dense counter: curate as a non-sequence
+    # ("none_native") feed — structurally clean only, NOT gap-proof (STANDARDS §4.3),
+    # same class as Bybit/MEXC trades. spot vs linear only changes the instId suffix,
+    # the lane directory (okx_trades vs okx_perp_trades) and the resolved instrument.
+    market = _okx_market(args)
+    instid = _okx_instid(getattr(args, "symbol", "BTC-USDT"), market)
+    args.symbol = instid
+    return await _collect_trades_segment(
+        args,
+        source="okx",
+        websocket_url=_OKX_WS_URL,
+        subscription_style="okx",
+        normalizer=OkxTradeNormalizer(instrument_type=_okx_instrument_type(market)),
+        source_base="okx_trades" if market == "spot" else "okx_perp_trades",
+        replay_fn=replay_trades_stream_run,
+        ping_message=_OKX_PING_MESSAGE,
+        ping_interval_seconds=_OKX_PING_INTERVAL_SECONDS,
+    )
+
+
+async def collect_okx_depth_segment(args: argparse.Namespace) -> dict[str, object]:
+    # OKX `books` delivers a 400-level in-stream snapshot + incremental updates carrying
+    # seqId/prevSeqId, where prevSeqId(N) == seqId(N-1). Passing chain_sequence promotes
+    # this lane from none_native to a provable `sequence` gap proof (chain equality), so
+    # a dropped message breaks the link and blocks promotion (STANDARDS §4.1). The same
+    # books frames carry the chain for spot and swap; only the instId suffix, lane dir
+    # and instrument (perp) differ.
+    market = _okx_market(args)
+    instid = _okx_instid(getattr(args, "symbol", "BTC-USDT"), market)
+    args.symbol = instid
+    return await _collect_depth_stream_segment(
+        args,
+        source="okx",
+        websocket_url=_OKX_WS_URL,
+        subscription_style="okx",
+        normalizer=OkxDepthNormalizer(instrument_type=_okx_instrument_type(market)),
+        source_base="okx_depth" if market == "spot" else "okx_perp_depth",
+        ping_message=_OKX_PING_MESSAGE,
+        ping_interval_seconds=_OKX_PING_INTERVAL_SECONDS,
+        **_stream_depth_replay_kwargs("okx", instid),
+    )
+
+
 async def collect_bybit_trades_segment(args: argparse.Namespace) -> dict[str, object]:
     # Bybit trade id is a UUID (not a dense counter), so gaplessness is unprovable:
     # curate as a non-sequence ("none_native") feed — structurally clean only, NOT
@@ -1409,7 +1570,7 @@ async def _collect_trades_segment(
     normalizer: object,
     source_base: str,
     replay_fn=replay_trades_run,
-    ping_message: dict | None = None,
+    ping_message: dict | str | None = None,
     ping_interval_seconds: float = 0.0,
     message_decoder=None,
     channel_override: str | None = None,
@@ -1551,11 +1712,14 @@ def _stream_depth_replay_kwargs(source: str, symbol: str | None = None) -> dict[
     (`backfill-stream-depth`) so the two cannot drift:
 
     - bybit  -> provable `sequence` via the dense `bybit_update_id`
+    - okx    -> provable `sequence` via the prevSeqId/seqId chain (chain_sequence)
     - kraken -> provable `checksum` (when the pair precision is known) + depth-bounded book
     - others -> none_native (structural-only)
     """
     if source == "bybit":
         return {"sequence_metadata_key": "bybit_update_id"}
+    if source == "okx":
+        return {"chain_sequence": True}
     if source == "kraken":
         kwargs: dict[str, object] = {"book_depth": _KRAKEN_BOOK_DEPTH}
         precision = _KRAKEN_BOOK_PRECISION.get(symbol or "")
@@ -1619,9 +1783,10 @@ async def _collect_depth_stream_segment(
     subscription_style: str,
     normalizer: object,
     source_base: str,
-    ping_message: dict | None = None,
+    ping_message: dict | str | None = None,
     ping_interval_seconds: float = 0.0,
     sequence_metadata_key: str | None = None,
+    chain_sequence: bool = False,
     checksum_metadata_key: str | None = None,
     checksum_price_precision: int | None = None,
     checksum_qty_precision: int | None = None,
@@ -1681,6 +1846,7 @@ async def _collect_depth_stream_segment(
             run_paths.base,
             write_summary=True,
             sequence_metadata_key=sequence_metadata_key,
+            chain_sequence=chain_sequence,
             checksum_metadata_key=checksum_metadata_key,
             checksum_price_precision=checksum_price_precision,
             checksum_qty_precision=checksum_qty_precision,
@@ -2010,6 +2176,59 @@ def run_kraken_trades_worker(args: argparse.Namespace) -> None:
         collect_segment=collect_kraken_trades_segment,
         progress_message=lambda segment_index, summary: (
             "kraken trades segment finished: "
+            f"segment={segment_index} clean_events={summary['clean_events']} "
+            f"replayable={summary.get('replayable')} run_path={summary['run_path']}"
+        ),
+    )
+
+
+def run_okx_trades_worker(args: argparse.Namespace) -> None:
+    _run_segmented_worker(
+        args=args,
+        default_worker_name="okx-trades-worker",
+        worker_type="okx-trades-worker",
+        venue="okx",
+        build_segment_args=lambda source_args: SimpleNamespace(
+            symbol=source_args.symbol,
+            channel=source_args.channel,
+            # `market` MUST be carried explicitly — the enumeration trap that once
+            # dropped it for bybit (PR #6) silently ran perp lanes as spot.
+            market=getattr(source_args, "market", "spot"),
+            count=source_args.segment_count,
+            output_root=source_args.output_root,
+            max_delay_ms=source_args.max_delay_ms,
+            max_future_skew_ms=getattr(source_args, "max_future_skew_ms", 5_000),
+            max_clock_skew_ms=getattr(source_args, "max_clock_skew_ms", 60_000.0),
+            source_suffix=getattr(source_args, "source_suffix", ""),
+            deadline_utc=None,  # _run_segmented_worker overrides this when rotate_at_midnight is set
+        ),
+        collect_segment=collect_okx_trades_segment,
+        progress_message=lambda segment_index, summary: (
+            "okx trades segment finished: "
+            f"segment={segment_index} clean_events={summary['clean_events']} "
+            f"replayable={summary.get('replayable')} run_path={summary['run_path']}"
+        ),
+    )
+
+
+def run_okx_depth_worker(args: argparse.Namespace) -> None:
+    _run_segmented_worker(
+        args=args,
+        default_worker_name="okx-depth-worker",
+        worker_type="okx-depth-worker",
+        venue="okx",
+        build_segment_args=lambda source_args: SimpleNamespace(
+            symbol=source_args.symbol,
+            channel=source_args.channel,
+            market=getattr(source_args, "market", "spot"),
+            count=source_args.segment_count,
+            output_root=source_args.output_root,
+            source_suffix=getattr(source_args, "source_suffix", ""),
+            deadline_utc=None,  # _run_segmented_worker overrides this when rotate_at_midnight is set
+        ),
+        collect_segment=collect_okx_depth_segment,
+        progress_message=lambda segment_index, summary: (
+            "okx depth segment finished: "
             f"segment={segment_index} clean_events={summary['clean_events']} "
             f"replayable={summary.get('replayable')} run_path={summary['run_path']}"
         ),
@@ -2383,6 +2602,12 @@ def _execute_ops_job_inprocess(job: JobSpec) -> JobExecutionResult | str | None:
     if job.job_type == "bybit-depth-worker":
         run_bybit_depth_worker(args)
         return "bybit depth worker completed"
+    if job.job_type == "okx-trades-worker":
+        run_okx_trades_worker(args)
+        return "okx trades worker completed"
+    if job.job_type == "okx-depth-worker":
+        run_okx_depth_worker(args)
+        return "okx depth worker completed"
     if job.job_type == "kraken-depth-worker":
         run_kraken_depth_worker(args)
         return "kraken depth worker completed"
@@ -2635,6 +2860,44 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             # Per-lane data-arrival watchdog (0.0 = off; see
             # CollectorConfig.idle_timeout_seconds). Honored by the generic-WS lanes;
             # the Binance depth lane runs its own socket loop and ignores it.
+            idle_timeout_seconds=raw_args.get("idle_timeout_seconds", 0.0),
+        )
+    if job.job_type == "okx-trades-worker":
+        return SimpleNamespace(
+            symbol=raw_args.get("symbol", "BTC-USDT"),
+            channel=raw_args.get("channel", "trades"),
+            market=raw_args.get("market", "spot"),
+            segment_count=raw_args.get("segment_count", 5000),
+            max_segments=raw_args.get("max_segments"),
+            cooldown_seconds=raw_args.get("cooldown_seconds", 1.0),
+            output_root=raw_args.get("output_root", default_output_root()),
+            ops_root=Path(raw_args.get("ops_root", default_ops_root())),
+            worker_name=raw_args.get("worker_name", "okx-trades-worker"),
+            # Durable batched JSONL by default — see coinbase-trades-worker.
+            jsonl_fsync=raw_args.get("jsonl_fsync", True),
+            heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
+            max_delay_ms=raw_args.get("max_delay_ms", _TRADES_STALE_WINDOW_MS),
+            max_future_skew_ms=raw_args.get("max_future_skew_ms", 5_000),
+            max_clock_skew_ms=raw_args.get("max_clock_skew_ms", 60_000.0),
+            source_suffix=raw_args.get("source_suffix", ""),
+            rotate_at_midnight=raw_args.get("rotate_at_midnight", False),
+            idle_timeout_seconds=raw_args.get("idle_timeout_seconds", 0.0),
+        )
+    if job.job_type == "okx-depth-worker":
+        return SimpleNamespace(
+            symbol=raw_args.get("symbol", "BTC-USDT"),
+            # OKX `books`: 400-level in-stream snapshot + seqId/prevSeqId chain.
+            channel=raw_args.get("channel", "books"),
+            market=raw_args.get("market", "spot"),
+            segment_count=raw_args.get("segment_count", 5000),
+            max_segments=raw_args.get("max_segments"),
+            cooldown_seconds=raw_args.get("cooldown_seconds", 1.0),
+            output_root=raw_args.get("output_root", default_output_root()),
+            ops_root=Path(raw_args.get("ops_root", default_ops_root())),
+            worker_name=raw_args.get("worker_name", "okx-depth-worker"),
+            heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
+            source_suffix=raw_args.get("source_suffix", ""),
+            rotate_at_midnight=raw_args.get("rotate_at_midnight", False),
             idle_timeout_seconds=raw_args.get("idle_timeout_seconds", 0.0),
         )
     if job.job_type == "kraken-depth-worker":
@@ -3036,6 +3299,13 @@ def run_backfill_stream_depth(args: argparse.Namespace) -> None:
             if source_dir_name.endswith("_depth")
             else source_dir_name
         )
+        # A perp lane dir is "<venue>_perp_depth"; strip the "_perp" so the venue maps
+        # to the same `_stream_depth_replay_kwargs` branch the LIVE collector uses
+        # (which hardcodes the bare venue regardless of market). Without this, e.g.
+        # "bybit_perp_depth" -> "bybit_perp" -> none_native, drifting from the live
+        # collector's provable `sequence` summary and overwriting it on re-score.
+        if venue.endswith("_perp"):
+            venue = venue[: -len("_perp")]
         source_root = raw_root / source_dir_name
         run_dirs = (
             sorted(d for d in source_root.glob("*") if d.is_dir())[-args.limit :]
@@ -3581,6 +3851,10 @@ def main() -> None:
         run_bybit_trades_worker(args)
     elif args.command == "bybit-depth-worker":
         run_bybit_depth_worker(args)
+    elif args.command == "okx-trades-worker":
+        run_okx_trades_worker(args)
+    elif args.command == "okx-depth-worker":
+        run_okx_depth_worker(args)
     elif args.command == "kraken-depth-worker":
         run_kraken_depth_worker(args)
     elif args.command == "mexc-trades-worker":

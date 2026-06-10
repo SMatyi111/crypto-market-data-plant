@@ -323,6 +323,7 @@ def replay_depth_stream_run(
     max_levels: int = 10,
     write_summary: bool = True,
     sequence_metadata_key: str | None = None,
+    chain_sequence: bool = False,
     checksum_metadata_key: str | None = None,
     checksum_price_precision: int | None = None,
     checksum_qty_precision: int | None = None,
@@ -361,6 +362,19 @@ def replay_depth_stream_run(
     reseeds the baseline, so the id jump at a re-snapshot is never miscounted as a gap —
     only a missing/duplicate/regressed id *between consecutive deltas of the same
     sub-book* blocks promotion.
+
+    **`sequence` chain (when `chain_sequence=True` — OKX `books`).** Some feeds prove
+    continuity with a **linked** sequence rather than a dense `+1` counter: OKX `books`
+    carries `seqId` and `prevSeqId` on every update, and `prevSeqId(N)` must equal
+    `seqId(N-1)` (the ids themselves are not contiguous). The normalizer maps these onto
+    the depth model's `first_update_id` (= `prevSeqId`) and `final_update_id` (= `seqId`),
+    so this mode validates the chain by **equality** instead of `delta == 1`: within an
+    anchored sub-book a delta whose `first_update_id` does not match the previous event's
+    `final_update_id` is a provable gap, and a `final_update_id` that regresses is a
+    reorder. A snapshot reseeds the baseline (its `prevSeqId` is `-1`), so the jump at a
+    re-snapshot is never miscounted. Like the dense-id mode it is tagged
+    `gap_detection="sequence"` (`mode="stream_snapshot_chain"`) and a broken link *blocks*
+    promotion. `chain_sequence` and `sequence_metadata_key` are mutually exclusive.
 
     **`checksum` (when `checksum_metadata_key` + precisions are set — Kraken `book`).**
     Kraken carries no dense sequence, but every frame ships a CRC32 `checksum` over
@@ -403,6 +417,12 @@ def replay_depth_stream_run(
     # Optional dense update-id gap detection (Bybit orderbook). When enabled, the id
     # in event metadata must advance by exactly 1 across every event.
     seq_enabled = sequence_metadata_key is not None
+    # Optional linked-sequence gap detection (OKX books): validate prevSeqId(N) ==
+    # seqId(N-1) via first_update_id/final_update_id by equality, not delta == 1.
+    chain_enabled = bool(chain_sequence) and not seq_enabled
+    # Both modes share the same counters, findings and summary fields (a provable
+    # `sequence` proof); only the per-event comparison differs.
+    seq_like = seq_enabled or chain_enabled
     missing_update_id_count = 0
     update_id_gap_count = 0
     update_id_reorder_count = 0
@@ -455,6 +475,30 @@ def replay_depth_stream_run(
                         elif delta > 1:
                             update_id_gap_count += 1
                     previous_uid = uid
+        elif chain_enabled:
+            # OKX linked chain: first_update_id = prevSeqId, final_update_id = seqId.
+            # Continuity is prevSeqId(N) == seqId(N-1) (equality, not +1). The seqId
+            # (final id) is what the next delta must point back to, so it drives the
+            # baseline; a delta whose prevSeqId doesn't match it is a provable gap.
+            first_id = _optional_int(row.get("first_update_id"))
+            final_id = _optional_int(row.get("final_update_id"))
+            if final_id is None:
+                missing_update_id_count += 1
+            else:
+                if first_uid is None:
+                    first_uid = final_id
+                last_uid = final_id
+                if is_snapshot:
+                    # Snapshot reseeds the chain (its prevSeqId is -1); the jump from
+                    # the previous sub-book's last seqId is expected, not a gap.
+                    previous_uid = final_id
+                else:
+                    if previous_uid is not None:
+                        if final_id < previous_uid:
+                            update_id_reorder_count += 1
+                        elif first_id is None or first_id != previous_uid:
+                            update_id_gap_count += 1
+                    previous_uid = final_id
 
         exchange_time = _optional_str(row.get("event_time"))
         display_time = exchange_time or _optional_str(row.get("received_at"))
@@ -528,7 +572,7 @@ def replay_depth_stream_run(
         findings.append("non_monotonic_event_time")
     if crossed_book_count:
         findings.append("crossed_book_states")
-    if seq_enabled:
+    if seq_like:
         if missing_update_id_count:
             findings.append("missing_update_id")
         if update_id_gap_count:
@@ -547,9 +591,10 @@ def replay_depth_stream_run(
         and first_event_is_snapshot
         and non_monotonic_time_count == 0
     )
-    if seq_enabled:
-        # A dense update id makes gaps provable, so a gap/reorder/missing id now
-        # blocks promotion (a dropped message means the book can't be reconstructed).
+    if seq_like:
+        # A provable sequence (dense +1 id, or OKX's prevSeqId/seqId chain) makes gaps
+        # provable, so a gap/reorder/missing id now blocks promotion (a dropped message
+        # means the book can't be reconstructed).
         replayable = replayable and (
             missing_update_id_count == 0
             and update_id_gap_count == 0
@@ -571,6 +616,8 @@ def replay_depth_stream_run(
             if checksum_enabled
             else "stream_snapshot_sequence"
             if seq_enabled
+            else "stream_snapshot_chain"
+            if chain_enabled
             else "stream_snapshot"
         ),
         run_path=str(resolved_run_path),
@@ -583,15 +630,15 @@ def replay_depth_stream_run(
         event_count=event_count,
         applied_bid_updates=applied_bid_updates,
         applied_ask_updates=applied_ask_updates,
-        gap_count=update_id_gap_count if seq_enabled else 0,
+        gap_count=update_id_gap_count if seq_like else 0,
         snapshot_gap_count=0,
-        reordered_count=update_id_reorder_count if seq_enabled else 0,
+        reordered_count=update_id_reorder_count if seq_like else 0,
         invalid_range_count=0,
         crossed_book_count=crossed_book_count,
         first_event_time=first_event_time,
         last_event_time=last_event_time,
-        first_update_id=first_uid if seq_enabled else None,
-        last_update_id=last_uid if seq_enabled else None,
+        first_update_id=first_uid if seq_like else None,
+        last_update_id=last_uid if seq_like else None,
         bid_levels=len(bids),
         ask_levels=len(asks),
         best_bid=best_bid,
@@ -602,7 +649,7 @@ def replay_depth_stream_run(
         top_bids=_top_levels(bids, reverse=True, max_levels=max_levels),
         top_asks=_top_levels(asks, reverse=False, max_levels=max_levels),
         gap_detection=(
-            "checksum" if checksum_enabled else "sequence" if seq_enabled else "none_native"
+            "checksum" if checksum_enabled else "sequence" if seq_like else "none_native"
         ),
         summary_path=str(summary_path) if summary_path is not None else None,
     )

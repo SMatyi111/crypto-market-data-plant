@@ -17,6 +17,12 @@ from crypto_collector.cli import (
     _bybit_ws_url,
     _capture_binance_snapshot_and_buffer,
     _job_args,
+    _okx_instid,
+    _okx_instrument_type,
+    _okx_market,
+    _OKX_WS_URL,
+    collect_okx_depth_segment,
+    collect_okx_trades_segment,
     _next_utc_midnight,
     _post_reconnect_alignment_holds,
     _reopen_binance_depth_connection,
@@ -42,6 +48,9 @@ from crypto_collector.market_normalizers import (
     CoinbaseTradeNormalizer,
     KrakenDepthNormalizer,
     KrakenTradeNormalizer,
+    OkxDepthNormalizer,
+    OkxTradeNormalizer,
+    _okx_resolve_symbol,
 )
 from crypto_collector.collectors.generic_ws import (
     GenericWebsocketCollector,
@@ -1611,6 +1620,203 @@ def test_job_args_threads_bybit_market_through_inprocess_path() -> None:
         )
     )
     assert depth_linear.market == "linear"
+
+
+# ----------------------------- OKX (spot + linear perp) -----------------------------
+
+
+def _okx_trades_frame(*, trades: list[dict], inst_id: str = "BTC-USDT") -> dict:
+    """OKX v5 `trades` channel frame. One frame batches trades in `data`; each carries
+    `side` (taker side, lowercase), `tradeId`, `px`, `sz`, `ts` (ms string)."""
+    return {"arg": {"channel": "trades", "instId": inst_id}, "data": trades}
+
+
+def _okx_trade(*, trade_id, price, size, side, time_ms, inst_id="BTC-USDT") -> dict:
+    return {
+        "instId": inst_id, "tradeId": trade_id, "px": price, "sz": size,
+        "side": side, "ts": time_ms,
+    }
+
+
+def _okx_books_frame(
+    *,
+    bids: list[list[str]],
+    asks: list[list[str]],
+    seq_id: int,
+    prev_seq_id: int,
+    inst_id: str = "BTC-USDT",
+    action: str = "snapshot",
+    ts_ms: int = 1_780_000_000_000,
+    checksum: int = -855196043,
+) -> dict:
+    """OKX v5 `books` frame. The book object is nested in a single-element `data` list;
+    each level is [price, size, deprecated, num_orders]; prevSeqId/seqId form the chain."""
+    book = {
+        "asks": asks, "bids": bids, "ts": str(ts_ms),
+        "checksum": checksum, "seqId": seq_id, "prevSeqId": prev_seq_id,
+    }
+    return {"arg": {"channel": "books", "instId": inst_id}, "action": action, "data": [book]}
+
+
+def test_okx_trade_normalizer_uses_taker_side_directly_and_no_sequence() -> None:
+    """OKX `side` is the taker side already (lowercase), so no flip. tradeId is kept in
+    metadata but NOT used as a dense `sequence` (the trades channel may conflate)."""
+    raw = RawMessage(
+        source="okx",
+        received_at=datetime(2026, 6, 10, tzinfo=UTC),
+        payload=_okx_trades_frame(
+            trades=[_okx_trade(trade_id="130639474", price="61000.5", size="0.25",
+                               side="sell", time_ms="1780000000000")]
+        ),
+    )
+    events = OkxTradeNormalizer().normalize_many(raw)
+    assert len(events) == 1
+    e = events[0]
+    assert e.side == "sell"  # taker side used directly
+    assert e.metadata["buyer_is_maker"] is True  # taker sold -> buyer was maker
+    assert e.price == 61000.5
+    assert e.size == 0.25
+    assert e.channel == "trades"
+    assert e.trade_id == "130639474"
+    assert e.sequence is None  # none_native
+    assert e.metadata["okx_trade_id"] == "130639474"
+    assert e.metadata["instrument_id"] == "spot:okx:BTCUSDT"
+
+
+def test_okx_trade_normalizer_fans_out_and_flags_invalid_side() -> None:
+    raw = RawMessage(
+        source="okx",
+        received_at=utc_now(),
+        payload=_okx_trades_frame(
+            trades=[
+                _okx_trade(trade_id="1", price="100", size="1", side="buy", time_ms="1780000000000"),
+                _okx_trade(trade_id="2", price="101", size="2", side="sell", time_ms="1780000000001"),
+                _okx_trade(trade_id="3", price="102", size="3", side="sideways", time_ms="1780000000002"),
+            ]
+        ),
+    )
+    events = OkxTradeNormalizer().normalize_many(raw)
+    assert [e.trade_id for e in events] == ["1", "2", "3"]
+    assert [e.side for e in events] == ["buy", "sell", None]
+    assert "invalid_side" in events[2].metadata["parse_errors"]
+    assert all(e.sequence is None for e in events)
+
+
+def test_okx_trade_normalizer_empty_data_yields_nothing() -> None:
+    assert OkxTradeNormalizer().normalize_many(
+        RawMessage(source="okx", received_at=utc_now(), payload=_okx_trades_frame(trades=[]))
+    ) == []
+
+
+def test_okx_trade_normalizer_perp_tags_perp_instrument() -> None:
+    raw = RawMessage(
+        source="okx",
+        received_at=utc_now(),
+        payload=_okx_trades_frame(
+            inst_id="BTC-USDT-SWAP",
+            trades=[_okx_trade(trade_id="1", price="61000", size="1", side="buy",
+                               time_ms="1780000000000", inst_id="BTC-USDT-SWAP")],
+        ),
+    )
+    perp = OkxTradeNormalizer(instrument_type="perp").normalize_many(raw)[0]
+    assert perp.metadata["instrument_id"] == "perp:okx:BTCUSDT"
+    assert perp.metadata["canonical_symbol"] == "BTC/USDT-PERP"
+
+
+def test_okx_depth_normalizer_snapshot_maps_prevseqid_seqid_to_chain() -> None:
+    """The in-stream snapshot maps prevSeqId/seqId onto first/final update id so the
+    chain validator can check prevSeqId(N) == seqId(N-1); checksum kept in metadata."""
+    raw = RawMessage(
+        source="okx",
+        received_at=utc_now(),
+        payload=_okx_books_frame(
+            bids=[["61000", "2", "0", "3"], ["60999", "1", "0", "1"]],
+            asks=[["61001", "0.5", "0", "2"]],
+            seq_id=100, prev_seq_id=-1,
+        ),
+    )
+    e = OkxDepthNormalizer().normalize(raw)
+    assert e.event_type == "snapshot"
+    assert e.channel == "depth"
+    assert e.bids == [[61000.0, 2.0], [60999.0, 1.0]]  # 4-field levels keep [price, size]
+    assert e.asks == [[61001.0, 0.5]]
+    assert e.first_update_id == -1  # prevSeqId
+    assert e.final_update_id == 100  # seqId
+    assert e.metadata["okx_seq_id"] == 100
+    assert e.metadata["okx_prev_seq_id"] == -1
+    assert e.metadata["okx_checksum"] == -855196043
+    assert e.instrument.instrument_id == "spot:okx:BTCUSDT"
+
+
+def test_okx_depth_normalizer_update_preserves_removal_and_perp_tag() -> None:
+    raw = RawMessage(
+        source="okx",
+        received_at=utc_now(),
+        payload=_okx_books_frame(
+            inst_id="BTC-USDT-SWAP", action="update",
+            bids=[["60999", "0", "0", "0"]],  # removal
+            asks=[["61001", "2", "0", "1"]],
+            seq_id=101, prev_seq_id=100,
+        ),
+    )
+    e = OkxDepthNormalizer(instrument_type="perp").normalize(raw)
+    assert e.event_type == "delta"
+    assert e.bids == [[60999.0, 0.0]]
+    assert e.first_update_id == 100
+    assert e.final_update_id == 101
+    assert e.instrument.instrument_id == "perp:okx:BTCUSDT"
+    assert e.instrument.canonical_symbol == "BTC/USDT-PERP"
+
+
+def test_okx_resolve_symbol_strips_swap_and_separators() -> None:
+    assert _okx_resolve_symbol("BTC-USDT") == "BTCUSDT"
+    assert _okx_resolve_symbol("BTC-USDT-SWAP") == "BTCUSDT"
+
+
+def test_okx_market_and_instid_helpers() -> None:
+    import pytest
+
+    assert _okx_instrument_type("spot") == "spot"
+    assert _okx_instrument_type("linear") == "perp"
+    assert _okx_market(SimpleNamespace()) == "spot"
+    assert _okx_market(SimpleNamespace(market="LINEAR")) == "linear"
+    with pytest.raises(SystemExit):
+        _okx_market(SimpleNamespace(market="inverse"))
+    # linear appends -SWAP to the spot base; spot leaves it; idempotent if already -SWAP.
+    assert _okx_instid("BTC-USDT", "spot") == "BTC-USDT"
+    assert _okx_instid("BTC-USDT", "linear") == "BTC-USDT-SWAP"
+    assert _okx_instid("BTC-USDT-SWAP", "linear") == "BTC-USDT-SWAP"
+    assert _OKX_WS_URL.startswith("wss://ws.okx.com")
+
+
+def test_cli_parser_okx_workers_defaults_and_market_flag() -> None:
+    parser = build_parser()
+    t = parser.parse_args(["okx-trades-worker"])
+    assert t.symbol == "BTC-USDT"
+    assert t.channel == "trades"
+    assert t.market == "spot"
+    d = parser.parse_args(["okx-depth-worker", "--market", "linear"])
+    assert d.channel == "books"
+    assert d.market == "linear"
+    import pytest
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["okx-depth-worker", "--market", "inverse"])
+
+
+def test_job_args_threads_okx_market_through_inprocess_path() -> None:
+    # The ops-runner in-process path builds args from the job dict (not argparse), so
+    # `market` must be carried there too (the bybit PR #6 drop-trap); default spot.
+    trades_default = _job_args(
+        SimpleNamespace(job_type="okx-trades-worker", args={"symbol": "BTC-USDT"})
+    )
+    assert trades_default.market == "spot"
+    assert trades_default.channel == "trades"
+    depth_linear = _job_args(
+        SimpleNamespace(job_type="okx-depth-worker", args={"symbol": "BTC-USDT", "market": "linear"})
+    )
+    assert depth_linear.market == "linear"
+    assert depth_linear.channel == "books"
 
 
 def _binance_aggtrade_frame(*, symbol="BTCUSDT", agg_id=12345, price="50000", qty="0.1"):

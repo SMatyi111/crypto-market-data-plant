@@ -30,6 +30,8 @@ COLLECTOR_JOB_TYPES: frozenset[str] = frozenset(
         "kraken-depth-worker",
         "bybit-trades-worker",
         "bybit-depth-worker",
+        "okx-trades-worker",
+        "okx-depth-worker",
         "mexc-trades-worker",
         "mexc-depth-worker",
         "binance-futures-rest-worker",
