@@ -195,6 +195,24 @@ def test_startup_task_installer_disables_execution_time_limit() -> None:
     assert "-ExecutionTimeLimit (New-TimeSpan -Seconds 0)" in script
 
 
+def test_redeploy_alive_check_is_scoped_to_plant_pythons() -> None:
+    """2026-06-10 outage: the redeploy script's step-2 alive-check matched ANY
+    python.exe, so unrelated (crypto-modelling backtest) pythons aborted the redeploy
+    AFTER step 1 had already killed the runner — leaving collection down with a stale
+    lock. The check must only consider this plant's runner/workers, identifiable by
+    `crypto_collector` in the command line (every worker is spawned as
+    `sys.executable -m crypto_collector.cli run-job ...`) or the repo root in the
+    process paths."""
+    script = Path("scripts/redeploy_runner.ps1").read_text(encoding="utf-8")
+
+    assert "crypto_collector" in script
+    # The old unscoped check's abort message must not come back.
+    assert "python.exe still running" not in script
+    # Unreadable (other-principal, e.g. SYSTEM boot runner) pythons must still abort:
+    # they may BE the live runner, and step 1's taskkill failed against them too.
+    assert "Select-UnreadablePython" in script
+
+
 def test_run_ops_runner_rejects_duplicate_lock(tmp_path: Path) -> None:
     config_path = tmp_path / "ops.json"
     config_path.write_text(
