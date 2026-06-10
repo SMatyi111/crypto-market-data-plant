@@ -990,10 +990,22 @@ async def run_mock(args: argparse.Namespace) -> None:
         normalizer=GenericL3Normalizer(),
         quality_gate=QualityGate(session_id=run_paths.base.name),
         run_paths=run_paths,
-        normalized_root=default_normalized_root("market"),
+        normalized_root=_resolve_normalized_root(args, "market"),
     )
     summary = await pipeline.run(limit=args.count)
     print(f"mock run finished: {summary.to_dict()} -> {run_paths.base}")
+
+
+def _resolve_normalized_root(args: argparse.Namespace, dataset: str) -> Path:
+    """Normalized-parquet root for a worker: explicit per-lane config beats the
+    env/default fallback. The fallback default once pointed at the pre-migration
+    disk and the workers were the only writers not fed from the ops config, so
+    their normalized output silently landed on the retired drive — explicit
+    threading makes the next disk migration a config-only change."""
+    configured = getattr(args, "normalized_root", None)
+    if configured:
+        return Path(configured)
+    return default_normalized_root(dataset)
 
 
 def _binance_rest_snapshot_clean_row(
@@ -1053,7 +1065,7 @@ async def collect_binance_depth_segment(args: argparse.Namespace) -> dict[str, o
     clean_sink = JsonlSink(run_paths.clean, "events.jsonl")
     quarantine_sink = JsonlSink(run_paths.quarantine, "events.jsonl")
     metrics_sink = JsonlSink(run_paths.metrics, "summary.jsonl")
-    parquet_sink = ParquetDatasetSink(default_normalized_root("market"))
+    parquet_sink = ParquetDatasetSink(_resolve_normalized_root(args, "market"))
     normalizer = BinanceDepthNormalizer()
     quality_gate = MetadataQualityGate()
 
@@ -1632,7 +1644,7 @@ async def _collect_trades_segment(
         ),
         run_paths=run_paths,
         normalized_root=(
-            default_normalized_root("trades")
+            _resolve_normalized_root(args, "trades")
             if bool(getattr(args, "normalized_parquet", True))
             else None
         ),
@@ -1850,7 +1862,7 @@ async def _collect_depth_stream_segment(
         # for sequence feeds), which is the right bar for a depth diff stream.
         quality_gate=MetadataQualityGate(),
         run_paths=run_paths,
-        normalized_root=default_normalized_root("market"),
+        normalized_root=_resolve_normalized_root(args, "market"),
         jsonl_fsync=bool(getattr(args, "jsonl_fsync", True)),
         fsync_interval_events=fsync_events,
         fsync_interval_ms=fsync_ms,
@@ -1982,7 +1994,7 @@ async def collect_binance_futures_rest_segment(args: argparse.Namespace) -> dict
         quality_gate=quality_gate,
         run_paths=run_paths,
         normalized_root=(
-            default_normalized_root(normalized_dataset)
+            _resolve_normalized_root(args, normalized_dataset)
             if bool(getattr(args, "normalized_parquet", True))
             else None
         ),
@@ -2471,6 +2483,11 @@ def _run_segmented_worker(
                     fsync_events, fsync_ms = _fsync_intervals(args)
                     segment_args.fsync_interval_events = fsync_events
                     segment_args.fsync_interval_ms = fsync_ms
+                    # Thread the normalized-parquet root centrally too: this was the one
+                    # output path NOT carried by the ops config, so the 2026-06-08 disk
+                    # migration missed it and workers kept writing normalized parquet to
+                    # the retired drive via the env/default fallback.
+                    segment_args.normalized_root = getattr(args, "normalized_root", None)
                     summary = asyncio.run(collect_segment(segment_args))
                 except Exception as exc:
                     runtime.record_event("segment_error", details={"segment_index": segment_index, "error": str(exc)})
@@ -2705,6 +2722,7 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             cooldown_seconds=raw_args.get("cooldown_seconds", 1.0),
             output_root=raw_args.get("output_root", default_output_root()),
             ops_root=Path(raw_args.get("ops_root", default_ops_root())),
+            normalized_root=raw_args.get("normalized_root"),
             worker_name=raw_args.get("worker_name", "binance-depth-worker"),
             heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
             snapshot_limit=raw_args.get("snapshot_limit", 1000),
@@ -2733,6 +2751,7 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             cooldown_seconds=raw_args.get("cooldown_seconds", 1.0),
             output_root=raw_args.get("output_root", default_output_root()),
             ops_root=Path(raw_args.get("ops_root", default_ops_root())),
+            normalized_root=raw_args.get("normalized_root"),
             worker_name=raw_args.get("worker_name", "binance-trades-worker"),
             heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
             max_delay_ms=raw_args.get("max_delay_ms", _TRADES_STALE_WINDOW_MS),
@@ -2759,6 +2778,7 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             cooldown_seconds=raw_args.get("cooldown_seconds", 1.0),
             output_root=raw_args.get("output_root", default_output_root()),
             ops_root=Path(raw_args.get("ops_root", default_ops_root())),
+            normalized_root=raw_args.get("normalized_root"),
             worker_name=raw_args.get("worker_name", "binance-futures-rest-worker"),
             heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
             max_delay_ms=raw_args.get("max_delay_ms", 60_000),
@@ -2778,6 +2798,7 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             cooldown_seconds=raw_args.get("cooldown_seconds", 1.0),
             output_root=raw_args.get("output_root", default_output_root()),
             ops_root=Path(raw_args.get("ops_root", default_ops_root())),
+            normalized_root=raw_args.get("normalized_root"),
             worker_name=raw_args.get("worker_name", "coinbase-trades-worker"),
             # Durable batched JSONL by default: fsync is now BATCHED in the pipeline (every
             # line is flushed, but the disk-blocking fsync is amortized over
@@ -2809,6 +2830,7 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             cooldown_seconds=raw_args.get("cooldown_seconds", 1.0),
             output_root=raw_args.get("output_root", default_output_root()),
             ops_root=Path(raw_args.get("ops_root", default_ops_root())),
+            normalized_root=raw_args.get("normalized_root"),
             worker_name=raw_args.get("worker_name", "coinbase-depth-worker"),
             heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
             source_suffix=raw_args.get("source_suffix", ""),
@@ -2827,6 +2849,7 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             cooldown_seconds=raw_args.get("cooldown_seconds", 1.0),
             output_root=raw_args.get("output_root", default_output_root()),
             ops_root=Path(raw_args.get("ops_root", default_ops_root())),
+            normalized_root=raw_args.get("normalized_root"),
             worker_name=raw_args.get("worker_name", "kraken-trades-worker"),
             # Durable batched JSONL by default — see coinbase-trades-worker.
             jsonl_fsync=raw_args.get("jsonl_fsync", True),
@@ -2851,6 +2874,7 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             cooldown_seconds=raw_args.get("cooldown_seconds", 1.0),
             output_root=raw_args.get("output_root", default_output_root()),
             ops_root=Path(raw_args.get("ops_root", default_ops_root())),
+            normalized_root=raw_args.get("normalized_root"),
             worker_name=raw_args.get("worker_name", "bybit-trades-worker"),
             # Durable batched JSONL by default — see coinbase-trades-worker.
             jsonl_fsync=raw_args.get("jsonl_fsync", True),
@@ -2876,6 +2900,7 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             cooldown_seconds=raw_args.get("cooldown_seconds", 1.0),
             output_root=raw_args.get("output_root", default_output_root()),
             ops_root=Path(raw_args.get("ops_root", default_ops_root())),
+            normalized_root=raw_args.get("normalized_root"),
             worker_name=raw_args.get("worker_name", "bybit-depth-worker"),
             heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
             source_suffix=raw_args.get("source_suffix", ""),
@@ -2895,6 +2920,7 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             cooldown_seconds=raw_args.get("cooldown_seconds", 1.0),
             output_root=raw_args.get("output_root", default_output_root()),
             ops_root=Path(raw_args.get("ops_root", default_ops_root())),
+            normalized_root=raw_args.get("normalized_root"),
             worker_name=raw_args.get("worker_name", "okx-trades-worker"),
             # Durable batched JSONL by default — see coinbase-trades-worker.
             jsonl_fsync=raw_args.get("jsonl_fsync", True),
@@ -2917,6 +2943,7 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             cooldown_seconds=raw_args.get("cooldown_seconds", 1.0),
             output_root=raw_args.get("output_root", default_output_root()),
             ops_root=Path(raw_args.get("ops_root", default_ops_root())),
+            normalized_root=raw_args.get("normalized_root"),
             worker_name=raw_args.get("worker_name", "okx-depth-worker"),
             heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
             source_suffix=raw_args.get("source_suffix", ""),
@@ -2932,6 +2959,7 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             cooldown_seconds=raw_args.get("cooldown_seconds", 1.0),
             output_root=raw_args.get("output_root", default_output_root()),
             ops_root=Path(raw_args.get("ops_root", default_ops_root())),
+            normalized_root=raw_args.get("normalized_root"),
             worker_name=raw_args.get("worker_name", "kraken-depth-worker"),
             heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
             source_suffix=raw_args.get("source_suffix", ""),
@@ -2952,6 +2980,7 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             cooldown_seconds=raw_args.get("cooldown_seconds", 1.0),
             output_root=raw_args.get("output_root", default_output_root()),
             ops_root=Path(raw_args.get("ops_root", default_ops_root())),
+            normalized_root=raw_args.get("normalized_root"),
             worker_name=raw_args.get("worker_name", "mexc-trades-worker"),
             # Durable batched JSONL by default — see coinbase-trades-worker.
             jsonl_fsync=raw_args.get("jsonl_fsync", True),
@@ -2976,6 +3005,7 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             cooldown_seconds=raw_args.get("cooldown_seconds", 1.0),
             output_root=raw_args.get("output_root", default_output_root()),
             ops_root=Path(raw_args.get("ops_root", default_ops_root())),
+            normalized_root=raw_args.get("normalized_root"),
             worker_name=raw_args.get("worker_name", "mexc-depth-worker"),
             heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
             source_suffix=raw_args.get("source_suffix", ""),

@@ -8,7 +8,12 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_ARCHIVE_ROOT = Path(r"D:\market_archive")
+# Fallback when no MARKET_DATA_*/CRYPTO_COLLECTOR_* env override is set. Must track
+# the LIVE archive disk: the 2026-06-08 D:->G: migration moved every config-carried
+# path but this constant kept pointing at D:, so the workers' normalized-parquet
+# sinks (the one root not threaded through the ops config at the time) silently
+# wrote ~117k files/day to the retired D: tree for three days.
+DEFAULT_ARCHIVE_ROOT = Path(r"G:\market_archive")
 
 # Contract version for the data the plant produces. Mirrors `STANDARDS_VERSION`
 # in STANDARDS.md (repo root); bump both together when the schema, partition

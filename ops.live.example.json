@@ -14,6 +14,7 @@
         "retry_backoff_seconds": 2.0,
         "output_root": "G:\\market_archive\\raw\\market",
         "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\market",
         "max_segment_seconds": 1800
       }
     },
@@ -34,6 +35,7 @@
         "cooldown_seconds": 1.0,
         "output_root": "G:\\market_archive\\raw\\market",
         "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\trades",
         "max_segment_seconds": 1800
       }
     },
@@ -55,6 +57,7 @@
         "worker_name": "binance-depth-worker-ethusdt",
         "output_root": "G:\\market_archive\\raw\\market",
         "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\market",
         "max_segment_seconds": 1800
       }
     },
@@ -75,6 +78,7 @@
         "worker_name": "binance-trades-worker-ethusdt",
         "output_root": "G:\\market_archive\\raw\\market",
         "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\trades",
         "max_segment_seconds": 1800
       }
     },
@@ -93,6 +97,7 @@
         "worker_name": "coinbase-trades-worker",
         "output_root": "G:\\market_archive\\raw\\market",
         "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\trades",
         "max_segment_seconds": 1800
       }
     },
@@ -136,6 +141,7 @@
         "worker_name": "coinbase-depth-worker",
         "output_root": "G:\\market_archive\\raw\\market",
         "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\market",
         "max_segment_seconds": 1800
       }
     },
@@ -179,6 +185,7 @@
         "worker_name": "kraken-trades-worker",
         "output_root": "G:\\market_archive\\raw\\market",
         "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\trades",
         "max_segment_seconds": 1800
       }
     },
@@ -222,6 +229,7 @@
         "worker_name": "bybit-trades-worker",
         "output_root": "G:\\market_archive\\raw\\market",
         "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\trades",
         "max_segment_seconds": 1800
       }
     },
@@ -265,6 +273,7 @@
         "worker_name": "bybit-depth-worker",
         "output_root": "G:\\market_archive\\raw\\market",
         "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\market",
         "max_segment_seconds": 1800
       }
     },
@@ -308,6 +317,7 @@
         "worker_name": "kraken-depth-worker",
         "output_root": "G:\\market_archive\\raw\\market",
         "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\market",
         "max_segment_seconds": 1800
       }
     },
@@ -352,6 +362,7 @@
         "worker_name": "mexc-trades-worker",
         "output_root": "G:\\market_archive\\raw\\market",
         "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\trades",
         "max_segment_seconds": 1800
       }
     },
@@ -396,6 +407,7 @@
         "worker_name": "mexc-depth-worker",
         "output_root": "G:\\market_archive\\raw\\market",
         "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\market",
         "max_segment_seconds": 1800
       }
     },
@@ -590,6 +602,7 @@
         "worker_name": "binance-depth-worker-usdc",
         "output_root": "G:\\market_archive\\raw\\market",
         "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\market",
         "max_segment_seconds": 1800
       }
     },
@@ -656,6 +669,7 @@
         "worker_name": "binance-trades-worker-usdc",
         "output_root": "G:\\market_archive\\raw\\market",
         "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\trades",
         "max_segment_seconds": 1800
       }
     },
@@ -715,6 +729,7 @@
         "idle_timeout_seconds": 120,
         "output_root": "G:\\market_archive\\raw\\market",
         "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\trades",
         "max_segment_seconds": 1800
       }
     },
@@ -771,6 +786,7 @@
         "idle_timeout_seconds": 120,
         "output_root": "G:\\market_archive\\raw\\market",
         "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\market",
         "max_segment_seconds": 1800
       }
     },
@@ -817,6 +833,7 @@
         "worker_name": "binance-trades-worker-perp",
         "output_root": "G:\\market_archive\\raw\\market",
         "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\trades",
         "max_segment_seconds": 1800
       }
     },
@@ -875,6 +892,7 @@
         "worker_name": "binance-futures-rest-trades",
         "output_root": "G:\\market_archive\\raw\\market",
         "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\trades",
         "max_segment_seconds": 1800
       }
     },
@@ -895,6 +913,7 @@
         "worker_name": "binance-futures-rest-depth",
         "output_root": "G:\\market_archive\\raw\\market",
         "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\market",
         "max_segment_seconds": 1800
       }
     },
@@ -939,6 +958,7 @@
         "worker_name": "binance-futures-rest-funding",
         "output_root": "G:\\market_archive\\raw\\market",
         "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\funding",
         "max_segment_seconds": 1800
       }
     },
@@ -983,6 +1003,7 @@
         "idle_timeout_seconds": 120,
         "output_root": "G:\\market_archive\\raw\\market",
         "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\trades",
         "max_segment_seconds": 1800
       }
     },
@@ -1039,6 +1060,7 @@
         "idle_timeout_seconds": 120,
         "output_root": "G:\\market_archive\\raw\\market",
         "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\market",
         "max_segment_seconds": 1800
       }
     },
@@ -1083,6 +1105,7 @@
         "idle_timeout_seconds": 120,
         "output_root": "G:\\market_archive\\raw\\market",
         "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\trades",
         "max_segment_seconds": 1800
       }
     },
@@ -1139,6 +1162,7 @@
         "idle_timeout_seconds": 120,
         "output_root": "G:\\market_archive\\raw\\market",
         "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\market",
         "max_segment_seconds": 1800
       }
     },
