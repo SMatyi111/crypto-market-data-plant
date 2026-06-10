@@ -99,6 +99,7 @@ from .pipeline import (
     DEFAULT_FSYNC_INTERVAL_MS,
     CollectorPipeline,
 )
+from .offload import OffloadLaneSpec, offload_accounted_runs
 from .promotion import promote_replayable_runs
 from .quality import MetadataQualityGate, QualityGate
 from .quarantine import quarantine_bad_runs
@@ -847,6 +848,25 @@ def build_parser() -> argparse.ArgumentParser:
     cleanup_parser.add_argument("--raw-policy", action="append", default=[], metavar="DATASET/SOURCE=DAYS")
     cleanup_parser.add_argument("--apply", action="store_true")
     cleanup_parser.add_argument("--format", choices=["json", "text"], default="text")
+
+    offload_parser = subparsers.add_parser(
+        "archive-offload",
+        help="Move promoted/quarantined raw run dirs older than the retention window "
+        "to a cold archive on another disk (verify-then-delete; dry-run by default)",
+    )
+    offload_parser.add_argument("--raw-root", type=Path, default=default_output_root())
+    offload_parser.add_argument("--cold-root", type=Path, required=True)
+    offload_parser.add_argument(
+        "--lanes-file",
+        type=Path,
+        required=True,
+        help="JSON file: list of {source, promotion_index, quarantine_index} lane specs "
+        "(same shape as the archive-offload ops job's 'lanes' arg)",
+    )
+    offload_parser.add_argument("--min-age-days", type=float, default=14.0)
+    offload_parser.add_argument("--limit", type=int, default=200)
+    offload_parser.add_argument("--apply", action="store_true")
+    offload_parser.add_argument("--format", choices=["json", "text"], default="text")
 
     prune_parser = subparsers.add_parser("ops-prune-stale-workers", help="Archive stale unmanaged worker metadata")
     prune_parser.add_argument("--ops-root", type=Path, default=default_ops_root())
@@ -2650,6 +2670,9 @@ def _execute_ops_job_inprocess(job: JobSpec) -> JobExecutionResult | str | None:
     if job.job_type == "cleanup":
         run_cleanup_command(args)
         return "cleanup completed"
+    if job.job_type == "archive-offload":
+        run_archive_offload(args)
+        return "archive offload completed"
     raise ValueError(f"Unsupported job_type: {job.job_type}")
 
 
@@ -3057,6 +3080,21 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             apply=raw_args.get("apply", False),
             format=raw_args.get("format", "text"),
         )
+    if job.job_type == "archive-offload":
+        # No defaulted cold_root/lanes on purpose: a wrong default here silently
+        # moves (then deletes) raw data somewhere unintended, so the config must
+        # spell both out. Missing keys fail the job loudly at dispatch.
+        if "cold_root" not in raw_args or "lanes" not in raw_args:
+            raise ValueError("archive-offload job requires 'cold_root' and 'lanes' args")
+        return SimpleNamespace(
+            raw_root=Path(raw_args.get("raw_root", default_output_root())),
+            cold_root=Path(raw_args["cold_root"]),
+            lanes=raw_args["lanes"],
+            min_age_days=raw_args.get("min_age_days", 14.0),
+            limit=raw_args.get("limit", 200),
+            apply=raw_args.get("apply", False),
+            format=raw_args.get("format", "text"),
+        )
     raise ValueError(f"Unsupported job_type: {job.job_type}")
 
 
@@ -3167,6 +3205,47 @@ def run_cleanup_command(args: argparse.Namespace) -> None:
     print(f"total_bytes={report.total_bytes}")
     print(f"removed_count={report.removed_count}")
     print(f"removed_bytes={report.removed_bytes}")
+
+
+def run_archive_offload(args: argparse.Namespace) -> None:
+    # Lanes arrive either inline (ops-runner job args) or as a JSON file (manual CLI).
+    raw_lanes = getattr(args, "lanes", None)
+    if raw_lanes is None:
+        lanes_file: Path = args.lanes_file
+        raw_lanes = json.loads(lanes_file.read_text(encoding="utf-8"))
+    lanes = [OffloadLaneSpec.from_dict(item) for item in raw_lanes]
+    report = offload_accounted_runs(
+        raw_root=args.raw_root,
+        cold_root=args.cold_root,
+        lanes=lanes,
+        min_age_days=args.min_age_days,
+        limit=args.limit,
+        apply=args.apply,
+    )
+    if args.format == "json":
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+    else:
+        print(f"status={report.status}")
+        print(f"mode={report.mode}")
+        print(f"scanned_run_count={report.scanned_run_count}")
+        print(f"eligible_count={report.eligible_count}")
+        print(f"moved_count={report.moved_count}")
+        print(f"moved_bytes={report.moved_bytes}")
+        print(f"failed_count={report.failed_count}")
+        print(f"stuck_unaccounted_count={report.stuck_unaccounted_count}")
+        print(f"findings={','.join(report.findings) if report.findings else 'none'}")
+        for lane in report.lanes:
+            if lane.scanned_count or lane.stuck_unaccounted_count:
+                print(
+                    f"  {lane.source}: scanned={lane.scanned_count}"
+                    f" eligible={lane.eligible_count} moved={lane.moved_count}"
+                    f" stuck={lane.stuck_unaccounted_count}"
+                )
+    # Unlike the report-only maintenance jobs, this one DELETES hot data after
+    # verification — a verify/copy failure must register as a job failure in the
+    # runner (and thus in health's recent_job_failures), not scroll by in a log.
+    if report.failed_count:
+        raise RuntimeError(f"archive-offload had {report.failed_count} failed moves")
 
 
 def run_ops_prune_stale_workers(args: argparse.Namespace) -> None:
@@ -3875,6 +3954,8 @@ def main() -> None:
         run_health(args)
     elif args.command == "cleanup":
         run_cleanup_command(args)
+    elif args.command == "archive-offload":
+        run_archive_offload(args)
     elif args.command == "ops-prune-stale-workers":
         run_ops_prune_stale_workers(args)
     elif args.command == "replay":
