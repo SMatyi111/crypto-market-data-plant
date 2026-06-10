@@ -42,12 +42,51 @@ if (Test-Path $lockPath) {
     }
 }
 
-# 2. Clear the lock only if no python runner is alive (avoid stomping a live one).
-$alive = Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue
-if ($alive) {
-    Write-Warning "python.exe still running (pids: $($alive.ProcessId -join ',')). Aborting to avoid a double runner."
+# 2. Clear the lock only if no PLANT python process is alive (avoid stomping a live
+#    runner/worker). Scoped to THIS plant's processes, NOT every python.exe on the box:
+#    on 2026-06-10 an any-python version of this check saw unrelated crypto-modelling
+#    backtest pythons AFTER step 1 had already killed the runner, aborted before
+#    relaunching, and left collection down ~30 min with a stale lock. The runner and
+#    every worker it spawns run `-m crypto_collector.cli ...` via this repo's venv
+#    python (cli.py _run_collector_in_subprocess), so plant processes are matched by
+#    'crypto_collector' in the command line or the repo root in either path field.
+$repoPattern = "*$([System.Management.Automation.WildcardPattern]::Escape($repo))*"
+function Select-PlantPython([object[]]$Processes) {
+    @($Processes | Where-Object {
+        $_.CommandLine -like '*crypto_collector*' -or
+        $_.CommandLine -like $repoPattern -or
+        $_.ExecutablePath -like $repoPattern
+    })
+}
+# A python whose CommandLine AND ExecutablePath are both unreadable (null) belongs to
+# another principal (typically SYSTEM -- e.g. the boot-task runner seen from a
+# non-elevated shell). It could be the live runner, and step 1's taskkill would have
+# failed against it for the same reason, so it must still block the redeploy.
+function Select-UnreadablePython([object[]]$Processes) {
+    @($Processes | Where-Object { -not $_.CommandLine -and -not $_.ExecutablePath })
+}
+
+# taskkill /T fans out across the worker tree, so poll briefly: kill latency must not
+# read as a live double runner.
+$deadline = (Get-Date).AddSeconds(12)
+while ($true) {
+    $pythons = @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue)
+    $plant = Select-PlantPython $pythons
+    $unreadable = Select-UnreadablePython $pythons
+    if (($plant.Count -eq 0 -and $unreadable.Count -eq 0) -or ((Get-Date) -ge $deadline)) { break }
+    Start-Sleep -Seconds 2
+}
+if ($plant.Count -gt 0) {
+    Write-Warning "Plant python still running (pids: $($plant.ProcessId -join ',')). Aborting to avoid a double runner."
     exit 1
 }
+if ($unreadable.Count -gt 0) {
+    Write-Warning "python.exe pids $($unreadable.ProcessId -join ',') have an unreadable CommandLine/ExecutablePath (owned by another principal, e.g. the SYSTEM boot runner) -- can't rule out the plant. Rerun from an elevated shell. Aborting."
+    exit 1
+}
+# No plant process is alive past this point: if a lock file remains (e.g. step 1
+# killed the runner, or it died earlier), it is stale by definition -- clear it and
+# proceed. Unrelated python.exe processes no longer block this.
 Remove-Item $lockPath -Force -ErrorAction SilentlyContinue
 
 # 3. Relaunch directly (no wrapper mutex), loading this repo's src via PYTHONPATH.
