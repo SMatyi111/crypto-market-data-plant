@@ -27,6 +27,7 @@ from crypto_collector.cli import (
 )
 from crypto_collector.models import utc_now
 from crypto_collector.ops import (
+    COLLECTOR_JOB_TYPES,
     JobExecutionResult,
     JobSpec,
     OpsRunner,
@@ -2272,3 +2273,166 @@ def test_ops_runner_collector_concurrency_defaults_to_one(tmp_path: Path) -> Non
         ["ops-runner", "--config", config, "--collector-concurrency", "4"]
     )
     assert explicit_args.collector_concurrency == 4
+
+
+def test_stream_depth_score_only_skips_already_scored_runs(tmp_path, capsys):
+    """Regression for the 2026-06-11 scheduler stall: the hourly score-only catch-up
+    re-CRC-replayed EVERY run in scope in the scheduler thread (~100 min/pass once
+    the backlog grew). Already-scored runs must be skipped unless --overwrite."""
+    import json as json_mod
+    from types import SimpleNamespace
+
+    from crypto_collector.cli import run_backfill_stream_depth
+
+    lane = tmp_path / "raw" / "coinbase_depth"
+    scored = lane / "20990101_000000"
+    unscored = lane / "20990101_000001"
+    for run in (scored, unscored):
+        (run / "clean").mkdir(parents=True)
+        (run / "clean" / "events.jsonl").write_text("", encoding="utf-8")
+    (scored / "metrics").mkdir()
+    sentinel = json_mod.dumps({"replayable": True, "findings": [], "sentinel": "DO-NOT-TOUCH"})
+    (scored / "metrics" / "replay_summary.json").write_text(sentinel, encoding="utf-8")
+
+    args = SimpleNamespace(
+        raw_root=tmp_path / "raw",
+        source=["coinbase_depth"],
+        target_root=tmp_path / "curated",
+        limit=50,
+        max_age_hours=24.0,
+        apply=False,
+        score_only=True,
+        overwrite=False,
+        format="json",
+    )
+    run_backfill_stream_depth(args)
+    payload = json_mod.loads(capsys.readouterr().out)
+
+    # The scored run was untouched; the unscored one got a (failing: no events) summary.
+    assert (scored / "metrics" / "replay_summary.json").read_text(encoding="utf-8") == sentinel
+    assert (unscored / "metrics" / "replay_summary.json").exists()
+    assert payload["sources"][0]["skipped_already_scored"] == 1
+
+    # --overwrite restores the old re-score-everything behavior.
+    args.overwrite = True
+    run_backfill_stream_depth(args)
+    capsys.readouterr()
+    assert "sentinel" not in (scored / "metrics" / "replay_summary.json").read_text(encoding="utf-8")
+
+
+def test_stream_depth_limit_counts_unscored_runs_after_skips(tmp_path, capsys):
+    """A small work limit must not let newer scored runs hide an older cut-off run
+    forever. The limit applies to runs that actually need replay work."""
+    import json as json_mod
+    from types import SimpleNamespace
+
+    from crypto_collector.cli import run_backfill_stream_depth
+
+    lane = tmp_path / "raw" / "coinbase_depth"
+    unscored = lane / "20990101_000000"
+    scored_runs = [lane / f"20990101_00000{index}" for index in range(1, 4)]
+    for run in [unscored, *scored_runs]:
+        (run / "clean").mkdir(parents=True)
+        (run / "clean" / "events.jsonl").write_text("", encoding="utf-8")
+    for run in scored_runs:
+        (run / "metrics").mkdir()
+        (run / "metrics" / "replay_summary.json").write_text("{}", encoding="utf-8")
+
+    run_backfill_stream_depth(
+        SimpleNamespace(
+            raw_root=tmp_path / "raw",
+            source=["coinbase_depth"],
+            target_root=tmp_path / "curated",
+            limit=1,
+            max_age_hours=1_000_000.0,
+            apply=False,
+            score_only=True,
+            overwrite=False,
+            format="json",
+        )
+    )
+    payload = json_mod.loads(capsys.readouterr().out)
+
+    assert (unscored / "metrics" / "replay_summary.json").exists()
+    assert payload["sources"][0]["scanned"] == 1
+    assert payload["sources"][0]["skipped_already_scored"] == 3
+
+
+def test_kalshi_jobs_are_pool_dispatched():
+    """Kalshi REST jobs must never run in the scheduler thread again (a hung HTTP
+    call there blocked ALL dispatch for 15 hours on 2026-06-11)."""
+    assert "kalshi-collect-crypto-quotes" in COLLECTOR_JOB_TYPES
+    assert "kalshi-discover-crypto" in COLLECTOR_JOB_TYPES
+
+
+def test_standalone_worker_lock_breaks_stale_lock_with_recycled_pid(tmp_path):
+    """A lock whose pid is alive but whose heartbeat is stale/ancient is a recycled
+    pid (or a worker hung beyond rescue) and must be broken, not crash-loop the lane."""
+    import json as json_mod
+
+    from crypto_collector.ops import StandaloneWorkerLock
+
+    lock_root = tmp_path / "standalone_workers"
+    lock_root.mkdir(parents=True)
+    stale = {
+        "worker_name": "w",
+        "pid": os.getpid(),  # guaranteed-alive pid, like a recycled one
+        "created_at": "2020-01-01T00:00:00+00:00",
+    }
+    (lock_root / "w.lock").write_text(json_mod.dumps(stale), encoding="utf-8")
+
+    lock = StandaloneWorkerLock(tmp_path, worker_name="w")
+    lock.acquire()  # must break the stale lock instead of raising
+    lock.release()
+
+    # Fresh sibling heartbeat = genuinely active worker: must still block.
+    (lock_root / "w.lock").write_text(json_mod.dumps(stale), encoding="utf-8")
+    (lock_root / "w.json").write_text(
+        json_mod.dumps(
+            {"pid": os.getpid(), "last_seen": datetime.now(tz=UTC).isoformat()}
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="already active"):
+        StandaloneWorkerLock(tmp_path, worker_name="w").acquire()
+
+    # Startup race: a stale heartbeat from the previous process must not invalidate
+    # a freshly-created lock before the new owner writes its first heartbeat.
+    fresh_lock = {
+        "worker_name": "w",
+        "pid": os.getpid(),
+        "created_at": datetime.now(tz=UTC).isoformat(),
+    }
+    (lock_root / "w.lock").write_text(json_mod.dumps(fresh_lock), encoding="utf-8")
+    (lock_root / "w.json").write_text(
+        json_mod.dumps({"pid": os.getpid(), "last_seen": "2020-01-01T00:00:00+00:00"}),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="already active"):
+        StandaloneWorkerLock(tmp_path, worker_name="w").acquire()
+
+
+def test_health_flags_stalled_scheduler_behind_fresh_heartbeat(tmp_path):
+    """last_seen is refreshed by a separate thread, so it stayed green through a
+    15-hour scheduler stall. Health must flag a stale last_scheduler_tick."""
+    import json as json_mod
+
+    now = datetime.now(tz=UTC)
+    heartbeat = {
+        "runner_name": "r",
+        "status": "running",
+        "last_seen": now.isoformat(),
+        "last_scheduler_tick": (now - timedelta(hours=2)).isoformat(),
+    }
+    (tmp_path / "heartbeat.json").write_text(json_mod.dumps(heartbeat), encoding="utf-8")
+    report = build_health_report(ops_root=tmp_path)
+    assert "scheduler_stalled" in report.findings
+
+    heartbeat["last_scheduler_tick"] = now.isoformat()
+    (tmp_path / "heartbeat.json").write_text(json_mod.dumps(heartbeat), encoding="utf-8")
+    assert "scheduler_stalled" not in build_health_report(ops_root=tmp_path).findings
+
+    # Pre-field heartbeats (older runners) must not false-alarm.
+    del heartbeat["last_scheduler_tick"]
+    (tmp_path / "heartbeat.json").write_text(json_mod.dumps(heartbeat), encoding="utf-8")
+    assert "scheduler_stalled" not in build_health_report(ops_root=tmp_path).findings

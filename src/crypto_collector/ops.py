@@ -35,6 +35,13 @@ COLLECTOR_JOB_TYPES: frozenset[str] = frozenset(
         "mexc-trades-worker",
         "mexc-depth-worker",
         "binance-futures-rest-worker",
+        # Kalshi REST jobs run in the POOL (subprocess + timeout), NOT the scheduler
+        # thread: on 2026-06-11 an in-scheduler kalshi-collect hung inside an HTTP
+        # call at boot (urlopen's timeout does not cover DNS/proxy resolution) and
+        # silently blocked ALL dispatch + maintenance for 15 hours while the
+        # heartbeat refresher kept the plant looking alive.
+        "kalshi-collect-crypto-quotes",
+        "kalshi-discover-crypto",
     }
 )
 
@@ -278,7 +285,11 @@ class StandaloneWorkerLock:
             except FileExistsError:
                 owner = _read_json_file(self.lock_path)
                 owner_pid = _read_pid(owner)
-                if owner_pid is not None and _pid_exists(owner_pid):
+                if (
+                    owner_pid is not None
+                    and _pid_exists(owner_pid)
+                    and self._owner_is_fresh(owner_pid=owner_pid)
+                ):
                     raise RuntimeError(
                         f"standalone worker already active for {self.worker_name} "
                         f"(pid={owner_pid})"
@@ -294,6 +305,36 @@ class StandaloneWorkerLock:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 json.dump(payload, handle, indent=2, sort_keys=True)
             return
+
+    def _owner_is_fresh(
+        self,
+        *,
+        owner_pid: int,
+        max_age_seconds: float = 600.0,
+    ) -> bool:
+        """Recycled-PID guard. After a hard kill or reboot the lock's recorded pid can
+        belong to a live but UNRELATED process (Windows reuses pids aggressively — on
+        2026-06-11 stale locks pointed at svchost.exe and even at the new runner's own
+        workers for other lanes, crash-looping three lanes), so pid existence alone
+        must not block a lane. A genuinely active worker refreshes its sibling
+        standalone_workers/<name>.json heartbeat every ~30s; if that heartbeat is
+        stale or absent, fall back to the lock's own age. Past max_age_seconds the
+        lock is treated as stale and broken."""
+        heartbeat = _read_json_file(self.lock_root / f"{self.worker_name}.json")
+        last_seen = _parse_dt((heartbeat or {}).get("last_seen"))
+        if last_seen is not None and _read_pid(heartbeat) == owner_pid:
+            heartbeat_age = (datetime.now(tz=UTC) - last_seen).total_seconds()
+            if heartbeat_age <= max_age_seconds:
+                return True
+        # A stale or mismatched heartbeat may be residue from the previous process.
+        # During startup the new owner has created the lock but may not have written
+        # its first heartbeat yet, so the fresh lock itself must still block a second
+        # launcher. Only an old lock plus no matching fresh heartbeat is reclaimable.
+        created = _parse_dt((_read_json_file(self.lock_path) or {}).get("created_at"))
+        if created is None:
+            # Unreadable/garbage lock with no usable heartbeat: stale by definition.
+            return False
+        return (datetime.now(tz=UTC) - created).total_seconds() <= max_age_seconds
 
     def release(self) -> None:
         self.lock_path.unlink(missing_ok=True)
@@ -487,6 +528,11 @@ class OpsRunner:
         pending_error: BaseException | None = None
         try:
             while True:
+                # Liveness proof for the SCHEDULER specifically: last_seen alone is
+                # refreshed by a separate thread and stayed green through a 15-hour
+                # scheduler stall on 2026-06-11. Only this loop advances the tick, so
+                # a stale tick in the heartbeat means dispatch/maintenance is blocked.
+                self._last_scheduler_tick = datetime.now(tz=UTC)
                 with self._run_lock:
                     run_count = self._sched_run_count
                 if max_runs is not None and run_count >= max_runs:
@@ -717,10 +763,14 @@ class OpsRunner:
             }
             for entry in active_sorted
         ]
+        last_tick = getattr(self, "_last_scheduler_tick", None)
         return {
             "runner_name": self.runner_name,
             "status": status,
             "last_seen": datetime.now(tz=UTC).isoformat(),
+            # Advanced ONLY by the scheduler loop (the refresher thread just re-emits
+            # it), so consumers can tell a live scheduler from a fresh-looking corpse.
+            "last_scheduler_tick": last_tick.isoformat() if last_tick is not None else None,
             "run_count": self._sched_run_count,
             "job_count": len(self._sched_jobs),
             "next_run_at": {
@@ -804,6 +854,14 @@ def build_health_report(
                 findings.append("stale_heartbeat")
         if heartbeat.get("status") == "error":
             findings.append("runner_error_state")
+        # A fresh last_seen with a stale scheduler tick = the refresher thread is
+        # alive but the scheduler loop is blocked (hung maintenance job): nothing
+        # dispatches or promotes. This exact failure hid a 15-hour outage on
+        # 2026-06-11. Old heartbeats without the field are skipped (no false alarm).
+        if heartbeat.get("status") in ("running", "idle"):
+            tick = _parse_dt(heartbeat.get("last_scheduler_tick"))
+            if tick is not None and (checked_at - tick).total_seconds() > 900.0:
+                findings.append("scheduler_stalled")
     job_counters = heartbeat.get("job_counters", {}) if isinstance(heartbeat, dict) else {}
     next_run_at_map = heartbeat.get("next_run_at", {}) if isinstance(heartbeat, dict) else {}
     runner_status = str(heartbeat.get("status") or "") if isinstance(heartbeat, dict) else ""
