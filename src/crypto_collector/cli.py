@@ -3405,6 +3405,13 @@ def _backfill_first_event_product(run_dir: Path) -> str | None:
     return None
 
 
+def _backfill_run_started_at(run_dir: Path) -> datetime | None:
+    try:
+        return datetime.strptime(run_dir.name, "%Y%m%d_%H%M%S").replace(tzinfo=UTC)
+    except ValueError:
+        return None
+
+
 def run_backfill_stream_depth(args: argparse.Namespace) -> None:
     """Re-replay already-collected stream-snapshot depth runs with the current
     multi-anchor logic and (with --apply) promote the replayable ones. The live
@@ -3443,28 +3450,38 @@ def run_backfill_stream_depth(args: argparse.Namespace) -> None:
         if venue.endswith("_perp"):
             venue = venue[: -len("_perp")]
         source_root = raw_root / source_dir_name
-        run_dirs = (
-            sorted(d for d in source_root.glob("*") if d.is_dir())[-args.limit :]
-            if source_root.is_dir()
-            else []
-        )
         scanned = 0
         replayable = 0
         skipped_scored = 0
         finding_counts: dict[str, int] = {}
-        for run_dir in run_dirs:
-            if not (run_dir / "clean" / "events.jsonl").exists():
-                continue
-            # Self-heal only needs runs cut off before their summary was written.
-            # Re-replaying ALREADY-SCORED runs (CRC reconstruction over full books)
-            # made every hourly score-only pass grind through the whole window in
-            # the scheduler thread — ~100 min of blocked dispatch by 2026-06-11.
-            if (
-                not bool(getattr(args, "overwrite", False))
-                and (run_dir / "metrics" / "replay_summary.json").exists()
+        overwrite = bool(getattr(args, "overwrite", False))
+        cutoff = datetime.now(tz=UTC) - timedelta(hours=args.max_age_hours)
+        run_dirs: list[Path] = []
+        candidate_limit = max(0, int(args.limit))
+        if source_root.is_dir() and candidate_limit > 0:
+            for run_dir in sorted(
+                (path for path in source_root.iterdir() if path.is_dir()),
+                key=lambda path: path.name,
+                reverse=True,
             ):
-                skipped_scored += 1
-                continue
+                started_at = _backfill_run_started_at(run_dir)
+                if started_at is not None and started_at < cutoff:
+                    continue
+                if not (run_dir / "clean" / "events.jsonl").exists():
+                    continue
+                # Apply the work limit AFTER excluding already-scored runs. Otherwise,
+                # N newer scored runs permanently hide an older cut-off run from this
+                # self-healing pass.
+                if (
+                    not overwrite
+                    and (run_dir / "metrics" / "replay_summary.json").exists()
+                ):
+                    skipped_scored += 1
+                    continue
+                run_dirs.append(run_dir)
+                if len(run_dirs) >= candidate_limit:
+                    break
+        for run_dir in run_dirs:
             symbol = _backfill_first_event_product(run_dir)
             kwargs = _stream_depth_replay_kwargs(venue, symbol)
             try:

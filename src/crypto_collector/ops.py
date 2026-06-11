@@ -288,7 +288,7 @@ class StandaloneWorkerLock:
                 if (
                     owner_pid is not None
                     and _pid_exists(owner_pid)
-                    and self._owner_is_fresh()
+                    and self._owner_is_fresh(owner_pid=owner_pid)
                 ):
                     raise RuntimeError(
                         f"standalone worker already active for {self.worker_name} "
@@ -306,7 +306,12 @@ class StandaloneWorkerLock:
                 json.dump(payload, handle, indent=2, sort_keys=True)
             return
 
-    def _owner_is_fresh(self, *, max_age_seconds: float = 600.0) -> bool:
+    def _owner_is_fresh(
+        self,
+        *,
+        owner_pid: int,
+        max_age_seconds: float = 600.0,
+    ) -> bool:
         """Recycled-PID guard. After a hard kill or reboot the lock's recorded pid can
         belong to a live but UNRELATED process (Windows reuses pids aggressively — on
         2026-06-11 stale locks pointed at svchost.exe and even at the new runner's own
@@ -317,8 +322,14 @@ class StandaloneWorkerLock:
         lock is treated as stale and broken."""
         heartbeat = _read_json_file(self.lock_root / f"{self.worker_name}.json")
         last_seen = _parse_dt((heartbeat or {}).get("last_seen"))
-        if last_seen is not None:
-            return (datetime.now(tz=UTC) - last_seen).total_seconds() <= max_age_seconds
+        if last_seen is not None and _read_pid(heartbeat) == owner_pid:
+            heartbeat_age = (datetime.now(tz=UTC) - last_seen).total_seconds()
+            if heartbeat_age <= max_age_seconds:
+                return True
+        # A stale or mismatched heartbeat may be residue from the previous process.
+        # During startup the new owner has created the lock but may not have written
+        # its first heartbeat yet, so the fresh lock itself must still block a second
+        # launcher. Only an old lock plus no matching fresh heartbeat is reclaimable.
         created = _parse_dt((_read_json_file(self.lock_path) or {}).get("created_at"))
         if created is None:
             # Unreadable/garbage lock with no usable heartbeat: stale by definition.
