@@ -75,7 +75,9 @@ def promote_replayable_runs(
     # write_to_dataset as the partition dir fills (a backfill of thousands of runs can
     # stall on it). Sizing the buffer past a run's row count means exactly one flush
     # (≈one part-file) per run, with the same per-run durability guarantee.
-    parquet_sink = ParquetDatasetSink(target_root, batch_size=parquet_batch_size)
+    # fsync_parts: the index write below promises the curated rows are durably on
+    # disk, so curated part-files must be fsynced before each index append.
+    parquet_sink = ParquetDatasetSink(target_root, batch_size=parquet_batch_size, fsync_parts=True)
 
     runs: list[PromotionRunStatus] = []
     promoted_run_count = 0

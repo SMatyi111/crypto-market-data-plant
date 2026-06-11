@@ -1382,7 +1382,12 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     concurrent maintenance passes, and a kill mid-write previously left a
     permanently unparseable file."""
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    with tmp.open("w", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, indent=2, sort_keys=True))
+        handle.flush()
+        # fsync before the rename (same as write_aggtrades_cursor): without it a
+        # power cut can atomically promote a zero-length/garbage tmp into place.
+        os.fsync(handle.fileno())
     os.replace(tmp, path)
 
 

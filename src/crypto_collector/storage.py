@@ -272,6 +272,7 @@ class ParquetDatasetSink:
         *,
         schema_version: str = "v2",
         batch_size: int = 100,
+        fsync_parts: bool = False,
     ) -> None:
         # batch_size caps how many normalized rows live in memory before a flush.
         # On a hard kill / power cut, anything buffered here is lost — raw JSONL
@@ -288,6 +289,12 @@ class ParquetDatasetSink:
         self.root = root
         self.schema_version = schema_version
         self.batch_size = batch_size
+        # fsync_parts: force every flushed part-file to disk before flush() returns.
+        # ONLY promotion needs this (its index entry promises the curated rows are
+        # durably on disk). The normalized-pipeline sinks have no such contract and
+        # flush every ~100 rows on hot lanes — fsyncing those would tax the same
+        # disk-latency budget that caused the 2026-06-09 fsync backlog.
+        self.fsync_parts = fsync_parts
         self._partition_by_instrument = schema_version != "v1"
         # v2 puts `instrument` ABOVE `event_date` so one instrument's full history
         # lives under a single dir (the north-star pull-by-instrument layout); v1 is
@@ -354,15 +361,16 @@ class ParquetDatasetSink:
             basename_template=f"part-{uuid4().hex}-{{i}}.parquet",
             file_visitor=lambda visited: written_files.append(visited.path),
         )
-        # fsync every part-file before returning: promotion appends a per-line-fsynced
-        # index entry right after flush() on the promise that "an index hit implies the
-        # curated copy is on disk". pyarrow only writes to the OS page cache, so without
-        # this a power cut could persist the index while the parquet bytes are lost.
-        # (Windows has no usable directory fsync; file-level durability is the
-        # achievable guarantee here.)
-        for file_path in written_files:
-            with open(file_path, "ab") as handle:
-                os.fsync(handle.fileno())
+        if self.fsync_parts:
+            # fsync every part-file before returning: promotion appends a per-line-
+            # fsynced index entry right after flush() on the promise that "an index
+            # hit implies the curated copy is on disk". pyarrow only writes to the OS
+            # page cache, so without this a power cut could persist the index while
+            # the parquet bytes are lost. (Windows has no usable directory fsync;
+            # file-level durability is the achievable guarantee here.)
+            for file_path in written_files:
+                with open(file_path, "ab") as handle:
+                    os.fsync(handle.fileno())
         self._rows.clear()
 
 

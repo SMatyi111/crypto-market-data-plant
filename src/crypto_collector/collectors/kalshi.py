@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
+import functools
 import hashlib
 import inspect
 import json
@@ -440,27 +441,15 @@ def collect_kalshi_crypto_quotes(
     assets = _normalize_assets(target_assets)
     frequencies = _normalize_frequencies(target_frequencies)
     run_paths = prepare_run_paths(output_root=resolved_output_root, source="kalshi_crypto_quotes")
-    raw_sink = RotatingJsonlSink(
-        run_paths.raw,
-        "messages.jsonl",
-        fsync=jsonl_fsync,
-        fsync_interval_events=fsync_interval_events,
-        fsync_interval_ms=fsync_interval_ms,
-    )
-    clean_sink = JsonlSink(
-        run_paths.clean,
-        "events.jsonl",
-        fsync=jsonl_fsync,
-        fsync_interval_events=fsync_interval_events,
-        fsync_interval_ms=fsync_interval_ms,
-    )
-    quarantine_sink = JsonlSink(
-        run_paths.quarantine,
-        "events.jsonl",
-        fsync=jsonl_fsync,
-        fsync_interval_events=fsync_interval_events,
-        fsync_interval_ms=fsync_interval_ms,
-    )
+    # One durability posture shared by all three data sinks (metrics stays per-event).
+    sink_durability = {
+        "fsync": jsonl_fsync,
+        "fsync_interval_events": fsync_interval_events,
+        "fsync_interval_ms": fsync_interval_ms,
+    }
+    raw_sink = RotatingJsonlSink(run_paths.raw, "messages.jsonl", **sink_durability)
+    clean_sink = JsonlSink(run_paths.clean, "events.jsonl", **sink_durability)
+    quarantine_sink = JsonlSink(run_paths.quarantine, "events.jsonl", **sink_durability)
     metrics_sink = JsonlSink(run_paths.metrics, "summary.jsonl")
     parquet_sink = (
         ParquetDatasetSink(resolved_normalized_root)
@@ -799,9 +788,12 @@ def _load_markets(
             return rows[:markets_per_series], responses
 
 
+@functools.lru_cache(maxsize=8)
 def _fetch_accepts_cursor(fetch: Any) -> bool:
     """True when `fetch` can take a `cursor=` kwarg (named param or **kwargs).
-    Unknowable signatures default to True (the real client accepts it)."""
+    Unknowable signatures default to True (the real client accepts it). Cached:
+    _load_markets runs once per series per sample (every few seconds for the whole
+    run) against the same client, and the answer never changes for a given fetch."""
     try:
         parameters = inspect.signature(fetch).parameters.values()
     except (TypeError, ValueError):
