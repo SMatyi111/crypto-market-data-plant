@@ -39,6 +39,13 @@ than ~3 days old at session start, audit the live plant first — see `CLAUDE.md
 
 ## Open work items (rough value order)
 
+0. **Finish the baseline src/ audit — 7 subsystems still unreviewed.** The 2026-06-11
+   audit confirmed+fixed 15 findings (PR #15) but covered only kalshi, rest-collectors,
+   replay, and curation before hitting session token limits; still unreviewed:
+   ws-core (generic_ws/pipeline), cli-collection, cli-ops-wiring, normalize,
+   ops-runner, support, mexc-misc. Re-run with the SLIM design only: one reviewer per
+   subsystem, NO verifier fleet — findings triaged personally in the main session
+   (the 3-verifiers-per-finding design burned ~1.7M tokens in 11 minutes, twice).
 1. **Kalshi near-expiry burst sampling (requested 2026-06-11 — high leverage, small
    change).** For any hourly BTC (`KXBTC*`) market within 10 minutes of its
    `close_time`, poll its quote every **5–10 s**; cadence outside that window, lanes,
@@ -76,7 +83,12 @@ than ~3 days old at session start, audit the live plant first — see `CLAUDE.md
 8. **Day-bounded rotation as the default run model.** `--rotate-at-midnight` exists
    and works; the live model is 30-min wall-clock segments (`max_segment_seconds=1800`).
    Parked — analysts pull by `event_date` partition, so per-run boundaries rarely matter.
-9. **Zero-gap segment rotation.** The ~5–8s WS reconnect between segments costs
+9. **fapi REST 429 handling — honor Retry-After / pace cold-start bursts.** Audit
+   finding (real, deferred as a design change): a 429 currently crashes the segment
+   (self-heals by restart, seen once at boot 2026-06-09) and a seeded resume fires
+   up to 5 unpaced catch-up pages; repeated 429s risk escalation to a fapi 418 IP
+   ban. Add Retry-After-aware backoff in `_get_json` / pacing between catch-up pages.
+10. **Zero-gap segment rotation.** The ~5–8s WS reconnect between segments costs
    ~0.3–0.4% per segment. Eliminating it means separating connection lifecycle from
    file lifecycle in the collector core — a real refactor, parked unless that loss
    starts to matter.

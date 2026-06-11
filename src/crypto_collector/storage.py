@@ -310,6 +310,16 @@ class ParquetDatasetSink:
         if len(self._rows) >= self.batch_size:
             self.flush()
 
+    def discard(self) -> None:
+        """Drop all buffered (un-flushed) rows without writing them.
+
+        Used by promotion's per-run failure path: a failed run is retried from
+        scratch on the next pass (it has no index entry), so flushing its partial
+        rows would duplicate them in curated parquet on the retry — and a poisoned
+        buffer would cascade the failure into every later run sharing the sink.
+        """
+        self._rows.clear()
+
     def flush(self) -> None:
         if not self._rows:
             return
@@ -336,12 +346,23 @@ class ParquetDatasetSink:
                     column_names.append(key)
         arrays = [pa.array([row.get(name) for row in self._rows]) for name in column_names]
         table = pa.Table.from_arrays(arrays, names=column_names)
+        written_files: list[str] = []
         pq.write_to_dataset(
             table,
             root_path=str(self.root),
             partition_cols=self._partition_cols,
             basename_template=f"part-{uuid4().hex}-{{i}}.parquet",
+            file_visitor=lambda visited: written_files.append(visited.path),
         )
+        # fsync every part-file before returning: promotion appends a per-line-fsynced
+        # index entry right after flush() on the promise that "an index hit implies the
+        # curated copy is on disk". pyarrow only writes to the OS page cache, so without
+        # this a power cut could persist the index while the parquet bytes are lost.
+        # (Windows has no usable directory fsync; file-level durability is the
+        # achievable guarantee here.)
+        for file_path in written_files:
+            with open(file_path, "ab") as handle:
+                os.fsync(handle.fileno())
         self._rows.clear()
 
 

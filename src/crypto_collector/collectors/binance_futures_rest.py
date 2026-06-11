@@ -153,7 +153,9 @@ def read_aggtrades_cursor(path: Path | str) -> dict | None:
     lane on every restart."""
     try:
         text = Path(path).read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeDecodeError):
+        # UnicodeDecodeError: a torn write / disk garbage can leave non-UTF-8 bytes;
+        # without this the "never raises" contract broke and the lane crash-looped.
         return None
     try:
         data = json.loads(text)
@@ -174,7 +176,13 @@ def write_aggtrades_cursor(
         "updated_at": (now or datetime.now(tz=UTC)).isoformat(),
     }
     tmp = target.with_name(f"{target.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    with tmp.open("w", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, sort_keys=True))
+        handle.flush()
+        # fsync BEFORE the atomic rename: without it a power cut can promote a
+        # zero-length/garbage tmp into place, and a corrupt cursor re-anchors the
+        # lane to live silently — an unlogged gap on an otherwise gap-proof lane.
+        os.fsync(handle.fileno())
     tmp.replace(target)
 
 

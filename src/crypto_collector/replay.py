@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import zlib
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
@@ -280,10 +281,7 @@ def replay_depth_run(
 
     if write_summary and summary_path is not None:
         summary_path.parent.mkdir(parents=True, exist_ok=True)
-        summary_path.write_text(
-            json.dumps(summary.to_dict(), indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
+        _write_json_atomic(summary_path, summary.to_dict())
 
     return summary
 
@@ -656,10 +654,7 @@ def replay_depth_stream_run(
 
     if write_summary and summary_path is not None:
         summary_path.parent.mkdir(parents=True, exist_ok=True)
-        summary_path.write_text(
-            json.dumps(summary.to_dict(), indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
+        _write_json_atomic(summary_path, summary.to_dict())
 
     return summary
 
@@ -916,6 +911,10 @@ class TradesReplaySummary:
     duplicate_trade_id_count: int
     replayable: bool
     findings: list[str]
+    # Rows whose dense trade id was missing/unparseable. Only meaningful for the
+    # `sequence` scorer (replay_trades_run): every row there MUST carry an id, or
+    # the gap proof silently shrinks to the rows that happened to have one.
+    missing_trade_id_count: int = 0
     # "sequence" = dense per-product trade_id proves no dropped trades (Binance,
     # Coinbase, Kraken; STANDARDS §4.2). "none_native" = no dense counter (Bybit spot,
     # whose trade id is a UUID), so `replayable` is structurally-clean-only and
@@ -957,6 +956,7 @@ def replay_trades_run(
     excessive_clock_skew_count = 0
     max_clock_skew_ms_seen: float | None = None
     duplicate_trade_id_count = 0
+    missing_trade_id_count = 0
     source: str | None = None
     product: str | None = None
     instrument_id: str | None = None
@@ -979,7 +979,13 @@ def replay_trades_run(
         trade_id = _optional_int(row.get("sequence"))
         if trade_id is None:
             trade_id = _optional_int(row.get("trade_id"))
-        if trade_id is not None:
+        if trade_id is None:
+            # This scorer exists for sequence-class lanes only (STANDARDS §4.2), so
+            # every row must carry a dense id. Silently skipping id-less rows let a
+            # run be certified gap_detection="sequence" with zero ids checked — a
+            # provable-class overclaim if a normalizer regression drops `sequence`.
+            missing_trade_id_count += 1
+        else:
             if first_trade_id is None:
                 first_trade_id = trade_id
             last_trade_id = trade_id
@@ -1025,6 +1031,8 @@ def replay_trades_run(
         findings.append("invalid_sizes")
     if excessive_clock_skew_count:
         findings.append("excessive_clock_skew")
+    if missing_trade_id_count:
+        findings.append("missing_trade_ids")
 
     replayable = (
         event_count > 0
@@ -1033,6 +1041,7 @@ def replay_trades_run(
         and invalid_price_count == 0
         and invalid_size_count == 0
         and excessive_clock_skew_count == 0
+        and missing_trade_id_count == 0
     )
 
     summary = TradesReplaySummary(
@@ -1058,15 +1067,13 @@ def replay_trades_run(
         duplicate_trade_id_count=duplicate_trade_id_count,
         replayable=replayable,
         findings=findings,
+        missing_trade_id_count=missing_trade_id_count,
         summary_path=str(summary_path) if summary_path is not None else None,
     )
 
     if write_summary and summary_path is not None:
         summary_path.parent.mkdir(parents=True, exist_ok=True)
-        summary_path.write_text(
-            json.dumps(summary.to_dict(), indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
+        _write_json_atomic(summary_path, summary.to_dict())
 
     return summary
 
@@ -1197,10 +1204,7 @@ def replay_trades_stream_run(
 
     if write_summary and summary_path is not None:
         summary_path.parent.mkdir(parents=True, exist_ok=True)
-        summary_path.write_text(
-            json.dumps(summary.to_dict(), indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
+        _write_json_atomic(summary_path, summary.to_dict())
 
     return summary
 
@@ -1310,10 +1314,7 @@ def replay_funding_run(
 
     if write_summary and summary_path is not None:
         summary_path.parent.mkdir(parents=True, exist_ok=True)
-        summary_path.write_text(
-            json.dumps(summary.to_dict(), indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
+        _write_json_atomic(summary_path, summary.to_dict())
 
     return summary
 
@@ -1375,10 +1376,26 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    """Write-then-rename so readers (promotion, book-sync-health, the score jobs)
+    never observe a torn half-written summary: replay summaries are read by
+    concurrent maintenance passes, and a kill mid-write previously left a
+    permanently unparseable file."""
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def _load_snapshot(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
-    return json.loads(path.read_text(encoding="utf-8"))
+    # A torn/corrupt snapshot sidecar must read as "no snapshot" (the run scores
+    # unreplayable and is re-scorable), not crash every replay/health pass forever.
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
 
 
 def _recent_run_dirs(source_root: Path, *, limit: int) -> list[Path]:

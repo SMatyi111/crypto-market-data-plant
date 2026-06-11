@@ -400,3 +400,41 @@ def test_collect_segment_funding_perp(tmp_path, monkeypatch) -> None:
     rows = [json.loads(line) for line in (next(run.iterdir()) / "clean" / "events.jsonl").read_text().splitlines()]
     assert rows[0]["channel"] == "funding"
     assert rows[0]["metadata"]["instrument_id"] == "perp:binance-futures:BTCUSDT"
+
+
+def test_read_cursor_tolerates_non_utf8_garbage(tmp_path):
+    """A torn write / disk garbage can leave non-UTF-8 bytes in the cursor file.
+    read_aggtrades_cursor documents a never-raises contract — a UnicodeDecodeError
+    here crash-looped the lane on every segment start."""
+    from crypto_collector.collectors.binance_futures_rest import read_aggtrades_cursor
+
+    path = tmp_path / "binance_perp_trades.json"
+    path.write_bytes(b"\xff\xfe\x00garbage\xff")
+    assert read_aggtrades_cursor(path) is None
+
+
+def test_job_args_threads_max_resume_gap_and_resume_friendly_stale_windows():
+    """Regression for the per-job-type enumeration trap: a config-set
+    max_resume_gap_seconds must reach the worker, and the default staleness windows
+    must cover the resume gap — a 60s gate quarantined every cursor-resumed backfill
+    after an outage (then advanced the cursor past it: silent loss on a gap-proof lane)."""
+    from crypto_collector.cli import _job_args
+    from crypto_collector.ops import JobSpec
+
+    defaults = _job_args(
+        JobSpec(name="x", job_type="binance-futures-rest-worker", interval_seconds=5, args={})
+    )
+    assert defaults.max_resume_gap_seconds == 21_600.0
+    # Windows must be >= the resume gap, or resumed backfill is quarantined/blocked.
+    assert defaults.max_delay_ms >= defaults.max_resume_gap_seconds * 1000
+    assert defaults.max_clock_skew_ms >= defaults.max_resume_gap_seconds * 1000
+
+    overridden = _job_args(
+        JobSpec(
+            name="x",
+            job_type="binance-futures-rest-worker",
+            interval_seconds=5,
+            args={"max_resume_gap_seconds": 120.0},
+        )
+    )
+    assert overridden.max_resume_gap_seconds == 120.0

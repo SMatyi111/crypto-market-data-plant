@@ -3,9 +3,11 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 import hashlib
+import inspect
 import json
 import math
 from pathlib import Path
+import sys
 import time
 from typing import Any
 from urllib.error import HTTPError
@@ -416,6 +418,8 @@ def collect_kalshi_crypto_quotes(
     client: Any | None = None,
     jsonl_fsync: bool = True,
     normalized_parquet: bool = True,
+    fsync_interval_events: int = 1,
+    fsync_interval_ms: float = 0.0,
 ) -> KalshiCollectionSummary:
     if duration_seconds <= 0:
         raise ValueError("duration_seconds must be positive")
@@ -436,9 +440,27 @@ def collect_kalshi_crypto_quotes(
     assets = _normalize_assets(target_assets)
     frequencies = _normalize_frequencies(target_frequencies)
     run_paths = prepare_run_paths(output_root=resolved_output_root, source="kalshi_crypto_quotes")
-    raw_sink = RotatingJsonlSink(run_paths.raw, "messages.jsonl", fsync=jsonl_fsync)
-    clean_sink = JsonlSink(run_paths.clean, "events.jsonl", fsync=jsonl_fsync)
-    quarantine_sink = JsonlSink(run_paths.quarantine, "events.jsonl", fsync=jsonl_fsync)
+    raw_sink = RotatingJsonlSink(
+        run_paths.raw,
+        "messages.jsonl",
+        fsync=jsonl_fsync,
+        fsync_interval_events=fsync_interval_events,
+        fsync_interval_ms=fsync_interval_ms,
+    )
+    clean_sink = JsonlSink(
+        run_paths.clean,
+        "events.jsonl",
+        fsync=jsonl_fsync,
+        fsync_interval_events=fsync_interval_events,
+        fsync_interval_ms=fsync_interval_ms,
+    )
+    quarantine_sink = JsonlSink(
+        run_paths.quarantine,
+        "events.jsonl",
+        fsync=jsonl_fsync,
+        fsync_interval_events=fsync_interval_events,
+        fsync_interval_ms=fsync_interval_ms,
+    )
     metrics_sink = JsonlSink(run_paths.metrics, "summary.jsonl")
     parquet_sink = (
         ParquetDatasetSink(resolved_normalized_root)
@@ -535,18 +557,28 @@ def collect_kalshi_crypto_quotes(
             if sample_count is not None and samples_done >= sample_count:
                 break
             sleep_seconds = poll_interval_seconds - (datetime.now(tz=UTC) - sample_started).total_seconds()
-            if sleep_seconds > 0 and time.monotonic() + sleep_seconds < deadline:
-                time.sleep(sleep_seconds)
+            # Cap the sleep at the time remaining instead of skipping it: skipping
+            # made the loop poll back-to-back (unthrottled) for the final
+            # poll_interval of every run once a full sleep no longer fit.
+            sleep_for = min(sleep_seconds, deadline - time.monotonic())
+            if sleep_for > 0:
+                time.sleep(sleep_for)
     except KalshiApiError as exc:
         raw_sink.write(exc.response.to_raw_row())
         counters["raw_messages"] += 1
         counters["error_events"] += 1
         finding_set.add("api_errors")
     finally:
+        # An exception other than the handled KalshiApiError (TypeError, Ctrl-C, ...)
+        # is still in flight when this block runs — record the run honestly instead
+        # of writing status="ok" for an aborted run.
+        aborted = sys.exc_info()[0] is not None
+        if aborted:
+            finding_set.add("aborted_run")
         if counters["quote_count"] == 0:
             finding_set.add("no_quote_rows")
         summary = KalshiCollectionSummary(
-            status="ok" if not finding_set else "warn",
+            status="error" if aborted else ("ok" if not finding_set else "warn"),
             built_at=datetime.now(tz=UTC).isoformat(),
             run_path=str(run_paths.base),
             raw_path=str(run_paths.raw / "messages.jsonl"),
@@ -568,17 +600,25 @@ def collect_kalshi_crypto_quotes(
             findings=sorted(finding_set),
             **counters,
         )
-        metrics_sink.write({**summary.to_dict(), "partial": False})
-        (run_paths.metrics / "collection_summary.json").write_text(
-            json.dumps(summary.to_dict(), indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-        if parquet_sink is not None:
-            parquet_sink.flush()
-        for sink in (raw_sink, clean_sink, quarantine_sink, metrics_sink):
-            close = getattr(sink, "close", None)
-            if callable(close):
-                close()
+        try:
+            try:
+                # Flush buffered normalized rows BEFORE the summary writes, and keep
+                # the summary writes in a finally: previously a failing metrics write
+                # skipped both the parquet flush (dropping up to a full batch of
+                # normalized rows) and every sink close() (losing batched-fsync tails).
+                if parquet_sink is not None:
+                    parquet_sink.flush()
+            finally:
+                metrics_sink.write({**summary.to_dict(), "partial": False})
+                (run_paths.metrics / "collection_summary.json").write_text(
+                    json.dumps(summary.to_dict(), indent=2, sort_keys=True),
+                    encoding="utf-8",
+                )
+        finally:
+            for sink in (raw_sink, clean_sink, quarantine_sink, metrics_sink):
+                close = getattr(sink, "close", None)
+                if callable(close):
+                    close()
     return summary
 
 
@@ -730,23 +770,52 @@ def _load_markets(
     rows: list[dict[str, Any]] = []
     responses: list[KalshiApiResponse] = []
     cursor: str | None = None
+    # Decide cursor support from the signature instead of an exception-driven
+    # TypeError fallback: under the old `except TypeError` retry, (a) a genuine
+    # TypeError raised INSIDE fetch silently re-fetched and duplicated page 1, and
+    # (b) a KalshiApiError raised by the fallback call escaped the sibling except
+    # clause (exceptions inside an except handler skip its siblings) and aborted
+    # the whole sampling iteration.
+    passes_cursor = _fetch_accepts_cursor(fetch)
     while True:
         try:
-            response = fetch(series_ticker=series_ticker, status="open", limit=markets_per_series, cursor=cursor)
-        except TypeError:
-            response = fetch(series_ticker=series_ticker, status="open", limit=markets_per_series)
+            if passes_cursor:
+                response = fetch(
+                    series_ticker=series_ticker, status="open", limit=markets_per_series, cursor=cursor
+                )
+            else:
+                response = fetch(series_ticker=series_ticker, status="open", limit=markets_per_series)
         except KalshiApiError as exc:
-            return [], [exc.response]
+            # Keep the pages already received: their markets are real data and their
+            # responses must still reach the raw archive — only the failing page is
+            # represented by the error response.
+            return rows[:markets_per_series], [*responses, exc.response]
         responses.append(response)
-        values = response.payload.get("markets") if isinstance(response.payload, dict) else []
+        payload = response.payload if isinstance(response.payload, dict) else {}
+        values = payload.get("markets") or []
         rows.extend(item for item in values if isinstance(item, dict))
-        cursor = _optional_str(response.payload.get("cursor")) if isinstance(response.payload, dict) else None
+        cursor = _optional_str(payload.get("cursor"))
         if not cursor or len(rows) >= markets_per_series:
             return rows[:markets_per_series], responses
 
 
+def _fetch_accepts_cursor(fetch: Any) -> bool:
+    """True when `fetch` can take a `cursor=` kwarg (named param or **kwargs).
+    Unknowable signatures default to True (the real client accepts it)."""
+    try:
+        parameters = inspect.signature(fetch).parameters.values()
+    except (TypeError, ValueError):
+        return True
+    return any(
+        param.name == "cursor" or param.kind is inspect.Parameter.VAR_KEYWORD
+        for param in parameters
+    )
+
+
 def _extract_series(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    values = payload.get("series") if isinstance(payload, dict) else []
+    # `or []`: a dict payload missing the key (or carrying null) must yield no
+    # series, not a TypeError from iterating None.
+    values = (payload.get("series") or []) if isinstance(payload, dict) else []
     return [item for item in values if isinstance(item, dict)]
 
 
@@ -964,9 +1033,16 @@ def _price(row: dict[str, Any], key: str) -> float | None:
     dollar_value = _optional_float(row.get(f"{key}_dollars"))
     if dollar_value is not None:
         return dollar_value
-    value = _optional_float(row.get(key))
+    raw = row.get(key)
+    value = _optional_float(raw)
     if value is None:
         return None
+    # The API's bare price fields are integer CENTS (1..100). Integers always divide:
+    # the old magnitude heuristic (`> 1.0`) read a 1-cent quote as $1.00 — and 1c is
+    # exactly where deep-OTM near-expiry binary quotes sit. The magnitude fallback
+    # remains only for non-int values that may already be dollars.
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        return value / 100.0
     return value / 100.0 if abs(value) > 1.0 else value
 
 

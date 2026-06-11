@@ -64,6 +64,10 @@ Resolved-work narrative: [`docs/HISTORY.md`](docs/HISTORY.md). Runbook:
   PR description with why they were left. Docs-only PRs skip agent review.
 - **Add `/security-review`** when a change touches collectors/network endpoints,
   configs, subprocess or script execution, or the publication surface.
+- **Agent fan-out budget:** this plan's session token limits cannot absorb
+  verifier fleets. Reviews/audits use at most one agent per subsystem (or the
+  /code-review skill); findings are verified by reading the code in the main
+  session, never by per-finding verifier agents.
 - **Session-start ops audit ritual:** if the "Last ops audit" stamp in ROADMAP.md
   is more than ~3 days old, audit the live plant before starting new work: health
   report, job success rate since last restart, per-lane freshness/backlog,

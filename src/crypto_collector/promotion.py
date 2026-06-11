@@ -195,12 +195,14 @@ def promote_replayable_runs(
                 )
             )
         except Exception as exc:  # noqa: BLE001
-            # Best-effort flush of any partial rows already written for this run so we
-            # don't lose them silently on subsequent failures.
-            try:
-                parquet_sink.flush()
-            except Exception:  # noqa: BLE001
-                pass
+            # DISCARD this run's buffered rows — do not flush them. The run has no
+            # index entry, so the next promotion pass re-promotes it from scratch;
+            # persisting the partial rows here would duplicate them in curated
+            # parquet on that retry. The buffer holds only the current run (success
+            # flushes per-run above), so discarding cannot drop other runs' rows —
+            # and it un-poisons the shared buffer so one bad run can't cascade
+            # failures into every later run in the pass.
+            parquet_sink.discard()
             failed_count += 1
             runs.append(
                 PromotionRunStatus(
@@ -277,7 +279,15 @@ def _parse_run_started_at(path: Path) -> datetime | None:
 def _read_json_file(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
-    return json.loads(path.read_text(encoding="utf-8"))
+    # A torn/partial replay_summary.json (collector finalizing a segment concurrently
+    # with this maintenance pass, or a killed scorer) must skip THIS run, not abort
+    # the whole promotion pass. Treated as missing: the run is retried next pass once
+    # the summary is whole (the hourly score jobs rewrite it if needed).
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
