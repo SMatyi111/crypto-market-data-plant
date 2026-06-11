@@ -90,23 +90,18 @@ see `CLAUDE.md` "Quality gates & review protocol".
 Decisions waiting on the owner; agents must not act on these without an explicit OK
 (see `CLAUDE.md` Governance):
 
-- **Deploy the incident-fix PR:** after merge, in `ops.live.local.json` re-enable
-  the two kalshi jobs (`enabled:true`) and raise `score-stream-depth` `limit`
-  back to ~50 (the skip-already-scored fix makes the limit cheap), then redeploy.
-  The 2026-06-11 mitigations (kalshi disabled, limit 6) are interim state.
-- **Housekeeping deletions** — the list below.
 - **D:\market_archive legacy history** — retention vs. merge (open item 1 above).
+  Owner deferred 2026-06-11: stays read-only until research needs pre-cutover dates.
 
-### Housekeeping (pending deletion OK)
-
-None of this is tracked in git (all gitignored); awaiting an explicit OK to delete:
-
-- `ops.live.local.json.bak2` … `.bak5`/`.bak6` — superseded config snapshots (Jun 1–8).
-- `screen-primary.png`, `screen-4k-command-result*.png` — debugging screenshots (~2.8 MB).
-- `.tmp_research/` — 2026-05-30 Bybit/Kraken doc-page scrapes; findings long since
-  encoded in `STANDARDS.md` and the normalizers.
-- Merged remote branches on origin: `phase5-okx`, `archive-offload-cold-tier`,
-  `normalized-root-threading`, `redeploy-alive-check-plant-scope`.
+Decided 2026-06-11 (recorded, closed):
+- Incident-fix PR #17 merged + deployed same day; kalshi re-enabled as pool jobs,
+  `score-stream-depth` limit restored to 50, runner verified stable.
+- Housekeeping deletions executed (bak configs, screenshots, `.tmp_research/`,
+  all merged remote branches — origin now carries `main` only).
+- Active alerting for blocking health findings: **declined** — the session-start
+  audit ritual's ~3-day detection latency is accepted.
+- Baseline-audit completion (open item 0): **approved** for the next session,
+  slim design; the deferred PR #17 review pass folds into its ops-runner pass.
 
 ## Environmental constraints (verified, not bugs)
 
