@@ -26,3 +26,6 @@ build/
 .tmp_research/
 *.bak*
 screen-*.png
+
+# Cross-repo request docs (modelling-side context, local-only)
+docs/*_request.md

@@ -20,7 +20,7 @@ market-data-plant kalshi-collect-crypto-quotes --sample-count 120 --poll-interva
 Summarize a run:
 
 ```powershell
-market-data-plant kalshi-summarize-crypto-quotes --input-path D:\market_archive\raw\market\kalshi_crypto_quotes\<run_id>
+market-data-plant kalshi-summarize-crypto-quotes --input-path G:\market_archive\raw\market\kalshi_crypto_quotes\<run_id>
 ```
 
 For live experiments, keep `--stale-after-seconds` near the polling cadence you are
@@ -32,7 +32,7 @@ markets fetched from each selected series.
 Collection writes one run directory under the normal raw market root:
 
 ```text
-D:\market_archive
+G:\market_archive
   raw\
     market\
       kalshi_crypto_quotes\<run_id>\
@@ -53,7 +53,7 @@ D:\market_archive
 Discovery reports are written under:
 
 ```text
-D:\market_archive\curated\research\kalshi_crypto_binary_options
+G:\market_archive\curated\research\kalshi_crypto_binary_options
 ```
 
 ## Normalized Rows
