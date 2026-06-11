@@ -21,7 +21,6 @@ from crypto_collector.collectors.rest_poll import RestPollingCollector
 from crypto_collector.market_normalizers import (
     BinanceDepthNormalizer,
     BinanceFuturesFundingNormalizer,
-    BinanceTradeNormalizer,
 )
 from crypto_collector.models import RawMessage, utc_now
 from crypto_collector.replay import replay_funding_run
@@ -304,7 +303,7 @@ def test_collect_segment_trades_gapless_perp(tmp_path, monkeypatch) -> None:
     assert summary["clean_events"] == 3
     assert summary["replayable"] is True
     run = tmp_path / "binance_perp_trades"
-    rows = [json.loads(l) for l in (next(run.iterdir()) / "clean" / "events.jsonl").read_text().splitlines()]
+    rows = [json.loads(line) for line in (next(run.iterdir()) / "clean" / "events.jsonl").read_text().splitlines()]
     assert rows[0]["metadata"]["instrument_id"] == "perp:binance-futures:BTCUSDT"
     assert [r["sequence"] for r in rows] == [10, 11, 12]  # dense -> gap-proof
 
@@ -364,7 +363,7 @@ def test_collect_segment_trades_resumes_across_rotations_no_gap_no_dup(tmp_path,
     seqs = []
     for run_dir in sorted(d for d in run_root.iterdir() if d.is_dir()):
         ev = run_dir / "clean" / "events.jsonl"
-        seqs += [json.loads(l)["sequence"] for l in ev.read_text().splitlines() if l.strip()]
+        seqs += [json.loads(line)["sequence"] for line in ev.read_text().splitlines() if line.strip()]
     assert seqs == [10, 11, 12, 13, 14]
 
 
@@ -381,7 +380,7 @@ def test_collect_segment_depth_snapshot_perp(tmp_path, monkeypatch) -> None:
     summary = _run(cli.collect_binance_futures_rest_segment(_segment_args(tmp_path, "depth")))
     assert summary["clean_events"] == 3 and summary["replayable"] is True
     run = tmp_path / "binance_perp_depth"
-    rows = [json.loads(l) for l in (next(run.iterdir()) / "clean" / "events.jsonl").read_text().splitlines()]
+    rows = [json.loads(line) for line in (next(run.iterdir()) / "clean" / "events.jsonl").read_text().splitlines()]
     assert rows[0]["instrument"]["instrument_id"] == "perp:binance-futures:BTCUSDT"
 
 
@@ -398,6 +397,44 @@ def test_collect_segment_funding_perp(tmp_path, monkeypatch) -> None:
     summary = _run(cli.collect_binance_futures_rest_segment(_segment_args(tmp_path, "funding")))
     assert summary["clean_events"] == 3 and summary["replayable"] is True
     run = tmp_path / "binance_perp_funding"
-    rows = [json.loads(l) for l in (next(run.iterdir()) / "clean" / "events.jsonl").read_text().splitlines()]
+    rows = [json.loads(line) for line in (next(run.iterdir()) / "clean" / "events.jsonl").read_text().splitlines()]
     assert rows[0]["channel"] == "funding"
     assert rows[0]["metadata"]["instrument_id"] == "perp:binance-futures:BTCUSDT"
+
+
+def test_read_cursor_tolerates_non_utf8_garbage(tmp_path):
+    """A torn write / disk garbage can leave non-UTF-8 bytes in the cursor file.
+    read_aggtrades_cursor documents a never-raises contract — a UnicodeDecodeError
+    here crash-looped the lane on every segment start."""
+    from crypto_collector.collectors.binance_futures_rest import read_aggtrades_cursor
+
+    path = tmp_path / "binance_perp_trades.json"
+    path.write_bytes(b"\xff\xfe\x00garbage\xff")
+    assert read_aggtrades_cursor(path) is None
+
+
+def test_job_args_threads_max_resume_gap_and_resume_friendly_stale_windows():
+    """Regression for the per-job-type enumeration trap: a config-set
+    max_resume_gap_seconds must reach the worker, and the default staleness windows
+    must cover the resume gap — a 60s gate quarantined every cursor-resumed backfill
+    after an outage (then advanced the cursor past it: silent loss on a gap-proof lane)."""
+    from crypto_collector.cli import _job_args
+    from crypto_collector.ops import JobSpec
+
+    defaults = _job_args(
+        JobSpec(name="x", job_type="binance-futures-rest-worker", interval_seconds=5, args={})
+    )
+    assert defaults.max_resume_gap_seconds == 21_600.0
+    # Windows must be >= the resume gap, or resumed backfill is quarantined/blocked.
+    assert defaults.max_delay_ms >= defaults.max_resume_gap_seconds * 1000
+    assert defaults.max_clock_skew_ms >= defaults.max_resume_gap_seconds * 1000
+
+    overridden = _job_args(
+        JobSpec(
+            name="x",
+            job_type="binance-futures-rest-worker",
+            interval_seconds=5,
+            args={"max_resume_gap_seconds": 120.0},
+        )
+    )
+    assert overridden.max_resume_gap_seconds == 120.0

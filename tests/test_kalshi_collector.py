@@ -3,7 +3,6 @@ from __future__ import annotations
 from datetime import UTC, datetime
 import json
 from pathlib import Path
-import time
 
 import pyarrow.dataset as ds
 import pytest
@@ -258,3 +257,103 @@ def _quote_row(event_time: str, symbol: str, quote_id: str) -> dict:
 
 def _read_jsonl(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def test_price_integer_cents_one_cent_boundary():
+    """Integer price fields are API cents and must always divide by 100: the old
+    magnitude heuristic (abs > 1.0) read a 1-cent quote as $1.00 — and 1c is exactly
+    where deep-OTM near-expiry binary quotes sit."""
+    from crypto_collector.collectors.kalshi import _price
+
+    assert _price({"yes_bid": 1}, "yes_bid") == 0.01
+    assert _price({"yes_bid": 45}, "yes_bid") == 0.45
+    assert _price({"yes_bid": 100}, "yes_bid") == 1.0
+    # Non-int values: already-dollar floats pass through below 1.0.
+    assert _price({"yes_bid": 0.45}, "yes_bid") == 0.45
+    # Explicit dollar field always wins.
+    assert _price({"yes_bid_dollars": 0.01, "yes_bid": 1}, "yes_bid") == 0.01
+
+
+def test_extract_series_tolerates_missing_or_null_key():
+    from crypto_collector.collectors.kalshi import _extract_series
+
+    assert _extract_series({}) == []
+    assert _extract_series({"series": None}) == []
+    assert _extract_series({"series": [{"ticker": "KXBTC"}, "junk"]}) == [{"ticker": "KXBTC"}]
+
+
+def test_load_markets_preserves_pages_received_before_pagination_error():
+    """A mid-pagination API error must keep the pages already received: their markets
+    are real data and their responses must still reach the raw archive. The old path
+    returned ([], [error]) — discarding every earlier successful page."""
+    from datetime import UTC, datetime
+
+    from crypto_collector.collectors.kalshi import (
+        KalshiApiError,
+        KalshiApiResponse,
+        _load_markets,
+    )
+
+    def _response(payload, success=True, error=None):
+        now = datetime.now(tz=UTC)
+        return KalshiApiResponse(
+            endpoint="/markets",
+            params={},
+            url="fake/markets",
+            payload=payload,
+            request_sent_at=now,
+            response_received_at=now,
+            latency_ms=1.0,
+            http_status=200 if success else 500,
+            success=success,
+            error=error,
+        )
+
+    class _Api:
+        def __init__(self):
+            self.calls = 0
+
+        def fetch_markets(self, *, series_ticker, status, limit, cursor=None):
+            self.calls += 1
+            if self.calls == 1:
+                assert cursor is None
+                return _response({"markets": [{"ticker": "M1"}], "cursor": "page2"})
+            raise KalshiApiError(
+                response=_response({}, success=False, error="boom")
+            )
+
+    rows, responses = _load_markets(_Api(), series_ticker="KXBTC", markets_per_series=10)
+    assert rows == [{"ticker": "M1"}]
+    assert len(responses) == 2
+    assert responses[0].success is True
+    assert responses[1].success is False
+
+
+def test_load_markets_fetch_without_cursor_param_is_not_retried_via_typeerror():
+    """Cursor support is now decided from the fetch signature, not an except-TypeError
+    retry (under which an internal TypeError silently duplicated page 1, and a
+    KalshiApiError from the fallback escaped its sibling handler)."""
+    from datetime import UTC, datetime
+
+    from crypto_collector.collectors.kalshi import KalshiApiResponse, _load_markets
+
+    calls = []
+
+    class _Api:
+        def fetch_markets(self, *, series_ticker, status, limit):
+            calls.append(1)
+            now = datetime.now(tz=UTC)
+            return KalshiApiResponse(
+                endpoint="/markets",
+                params={},
+                url="fake/markets",
+                payload={"markets": [{"ticker": "M1"}]},
+                request_sent_at=now,
+                response_received_at=now,
+                latency_ms=1.0,
+                http_status=200,
+            )
+
+    rows, responses = _load_markets(_Api(), series_ticker="KXBTC", markets_per_series=10)
+    assert rows == [{"ticker": "M1"}]
+    assert len(calls) == 1

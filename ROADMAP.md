@@ -30,53 +30,69 @@ cold-tier archive offload. CI green on `main`; live runner restarted
 | --- | --- |
 | **2026-06-22** | First `archive-offload` candidates reach offload age. Spot-check the lane `_offload_index.jsonl` entries against the `D:\market_archive_cold` tree: files verified-moved, counts match, no `unindexed` pile-up. |
 
+**Last ops audit:** 2026-06-10 (redeploy verification: runner healthy, normalized
+root landing on G:, all 21 collectors dispatched). Ritual: if this stamp is more
+than ~3 days old at session start, audit the live plant first — see `CLAUDE.md`
+"Quality gates & review protocol".
+
 ---
 
 ## Open work items (rough value order)
 
-1. **Kalshi near-expiry burst sampling (requested 2026-06-11 — high leverage, small
-   change).** For any hourly BTC (`KXBTC*`) market within 10 minutes of its
-   `close_time`, poll its quote every **5–10 s**; cadence outside that window, lanes,
-   storage layout, and fields all unchanged. Acceptance: a spot-check hour shows ≥30
-   samples for the closing BTC hourly market in its final 10 minutes (currently a
-   handful). Burst set is small (1–3 markets near close + neighbouring strikes);
-   deprioritising far-from-expiry markets during bursts is acceptable. Full request
-   context: `docs/kalshi_near_expiry_sampling_request.md` (local-only, untracked —
-   modelling-side detail stays out of this public repo).
-2. **D:\market_archive legacy history — decide retention or merge.** The pre-2026-06-08
+0. **Finish the baseline src/ audit — 7 subsystems still unreviewed.** The 2026-06-11
+   audit confirmed+fixed 15 findings (PR #15) but covered only kalshi, rest-collectors,
+   replay, and curation before hitting session token limits; still unreviewed:
+   ws-core (generic_ws/pipeline), cli-collection, cli-ops-wiring, normalize,
+   ops-runner, support, mexc-misc. Re-run with the SLIM design only: one reviewer per
+   subsystem, NO verifier fleet — findings triaged personally in the main session
+   (the 3-verifiers-per-finding design burned ~1.7M tokens in 11 minutes, twice).
+1. **D:\market_archive legacy history — decide retention or merge.** The pre-2026-06-08
    D: archive is kept read-only as history. Decide: backfill/merge its runs into the
    G: curated dataset (score with `backfill-trades-replay` / `backfill-stream-depth
    --score-only`, then let the promote jobs pick them up) or declare it cold history
    and leave it. Blocks nothing, but the disjoint pre-cutover data limits historical
    research coverage.
-3. **Phase 6 candidate — inverse (coin-margined) BTCUSD perps.** Natural next
+2. **Phase 6 candidate — inverse (coin-margined) BTCUSD perps.** Natural next
    instrument-expansion step after the linear-perp triangle. Note: Binance USDT-M
    *websocket* is jurisdiction-blocked from this box (REST works — see Constraints),
    so plan venue choice accordingly (Bybit/OKX inverse WS, or Binance dapi REST
    mirroring the fapi REST lanes).
-4. **OKX funding channel.** Deferred from Phase 5. Would mirror the
+3. **OKX funding channel.** Deferred from Phase 5. Would mirror the
    `binance-futures-rest-funding` lane (`funding-rate` channel or REST poll) so both
    perp venues carry funding context.
-5. **MEXC depth → provable `sequence` upgrade.** The pushed `version` is already
+4. **MEXC depth → provable `sequence` upgrade.** The pushed `version` is already
    captured as `metadata.mexc_version`; if live frames prove it dense per symbol,
    upgrade the lane the way Bybit depth was upgraded (`data.u` +1). Until then depth
    stays `none_native`.
-6. **Re-promote pre-fix Binance depth history (optional).** Binance depth partitions
+5. **Re-promote pre-fix Binance depth history (optional).** Binance depth partitions
    collected before commit `084f8c9` (2026-06-09) lack the leading synthesized
    `snapshot` row, so self-contained replay of those dates needs re-promotion from
    raw. Only matters if historical self-contained replay is wanted.
-7. **Kraken checksum precision table for non-BTC/USD pairs.** `_KRAKEN_BOOK_PRECISION`
+6. **Kraken checksum precision table for non-BTC/USD pairs.** `_KRAKEN_BOOK_PRECISION`
    covers BTC/USD only; other pairs fall back to `none_native`. Moot until a non-BTC
    Kraken pair is actually collected; could auto-fetch from REST `AssetPairs`.
-8. **Day-bounded rotation as the default run model.** `--rotate-at-midnight` exists
+7. **Day-bounded rotation as the default run model.** `--rotate-at-midnight` exists
    and works; the live model is 30-min wall-clock segments (`max_segment_seconds=1800`).
    Parked — analysts pull by `event_date` partition, so per-run boundaries rarely matter.
+8. **fapi REST 429 handling — honor Retry-After / pace cold-start bursts.** Audit
+   finding (real, deferred as a design change): a 429 currently crashes the segment
+   (self-heals by restart, seen once at boot 2026-06-09) and a seeded resume fires
+   up to 5 unpaced catch-up pages; repeated 429s risk escalation to a fapi 418 IP
+   ban. Add Retry-After-aware backoff in `_get_json` / pacing between catch-up pages.
 9. **Zero-gap segment rotation.** The ~5–8s WS reconnect between segments costs
    ~0.3–0.4% per segment. Eliminating it means separating connection lifecycle from
    file lifecycle in the collector core — a real refactor, parked unless that loss
    starts to matter.
 
-## Housekeeping (pending maintainer decision)
+## Decision queue (owner)
+
+Decisions waiting on the owner; agents must not act on these without an explicit OK
+(see `CLAUDE.md` Governance):
+
+- **Housekeeping deletions** — the list below.
+- **D:\market_archive legacy history** — retention vs. merge (open item 1 above).
+
+### Housekeeping (pending deletion OK)
 
 None of this is tracked in git (all gitignored); awaiting an explicit OK to delete:
 
@@ -112,6 +128,11 @@ BTC derivatives/market-data coverage is split across repos by design:
 
 ## Retired (not candidates)
 
+- **Kalshi near-expiry burst sampling (modelling-side request, 2026-06-11)** —
+  REJECTED by the owner 2026-06-11: the live lane already samples every ~9 s
+  per market (close to the requested 5-10 s), and settlement outcomes can be
+  downloaded from the API directly, so the backtest does not depend on captured
+  quotes at close. Response recorded in the local request doc.
 - **`Crypto_L3 collection`** — retired 2026-06-09, tree archived to
   `G:\04-archive\Crypto_L3 collection`, scheduled tasks removed. Any feed it had
   that's still wanted gets built as a native lane here instead.

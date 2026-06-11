@@ -21,8 +21,6 @@ from crypto_collector.cli import (
     _okx_instrument_type,
     _okx_market,
     _OKX_WS_URL,
-    collect_okx_depth_segment,
-    collect_okx_trades_segment,
     _next_utc_midnight,
     _post_reconnect_alignment_holds,
     _reopen_binance_depth_connection,

@@ -11,6 +11,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  lint:
+    # Bug-focused lint only (see [tool.ruff.lint] in pyproject.toml): a failure here
+    # should always mean "probable bug", never cosmetics. Platform-independent, so it
+    # runs on the fast Linux runner for quick feedback.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ruff
+        run: pip install ruff
+      - name: ruff check
+        run: ruff check src tests scripts
+
   test:
     # Windows-native plant (PowerShell scripts, G:/D: paths, scheduled task).
     # Run CI where the code actually runs so green here means green in prod.

@@ -1616,3 +1616,36 @@ def test_score_only_then_promote_self_heals_without_duplicate_rows(tmp_path: Pat
     assert dataset.count_rows() == promoted_rows
     index_rows = (target_root / "_promotion_index.jsonl").read_text(encoding="utf-8").splitlines()
     assert len(index_rows) == 1
+
+
+def test_replay_trades_run_blocks_runs_with_missing_trade_ids(tmp_path):
+    """replay_trades_run exists for sequence-class lanes only: a row without a dense
+    id must surface as a finding and block replayable. Silently skipping id-less rows
+    let a run be certified gap_detection="sequence" with zero ids checked."""
+    import json
+
+    from crypto_collector.replay import replay_trades_run
+
+    run_dir = tmp_path / "binance_trades" / "20990101_000000"
+    clean = run_dir / "clean"
+    clean.mkdir(parents=True)
+    base = {
+        "source": "binance",
+        "price": 100.0,
+        "size": 1.0,
+        "exchange_time": "2026-04-06T00:00:00+00:00",
+        "received_at": "2026-04-06T00:00:00.100000+00:00",
+    }
+    rows = [
+        {**base, "sequence": 10},
+        {**base},  # missing id — must not be silently skipped
+        {**base, "sequence": 11},
+    ]
+    (clean / "events.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+
+    summary = replay_trades_run(run_dir, write_summary=False)
+    assert summary.missing_trade_id_count == 1
+    assert "missing_trade_ids" in summary.findings
+    assert summary.replayable is False

@@ -129,7 +129,7 @@ def test_old_unaccounted_run_is_kept_and_flagged(tmp_path: Path) -> None:
     assert report.status == "warn"
     assert report.moved_count == 0
     assert report.stuck_unaccounted_count == 1
-    assert f"stuck_unaccounted_runs:1" in report.findings
+    assert "stuck_unaccounted_runs:1" in report.findings
     assert report.lanes[0].stuck_examples == [str(run_dir)]
     assert run_dir.exists()
 

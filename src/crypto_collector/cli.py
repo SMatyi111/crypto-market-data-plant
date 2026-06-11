@@ -7,7 +7,6 @@ import logging
 import shutil
 import subprocess
 import sys
-import threading
 import time
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -55,7 +54,6 @@ from .collectors.binance_futures_rest import (
 )
 from .collectors.rest_poll import RestPollingCollector
 from .config import (
-    DEFAULT_ARCHIVE_ROOT,
     CollectorConfig,
     default_archive_root,
     default_curated_root,
@@ -284,6 +282,13 @@ def build_parser() -> argparse.ArgumentParser:
         "full); depth/funding poll on this cadence.",
     )
     bfr_parser.add_argument("--page-limit", type=int, default=1000, help="aggTrades page size (trades).")
+    bfr_parser.add_argument(
+        "--max-resume-gap-seconds",
+        type=float,
+        default=21_600.0,
+        help="Oldest cursor age (seconds) the trades stream will backfill from; older "
+        "cursors re-anchor to live with a logged cursor_reset_stale_gap finding.",
+    )
     bfr_parser.add_argument("--depth", type=int, default=1000, help="Order-book snapshot depth (depth stream).")
     bfr_parser.add_argument("--segment-count", type=int, default=5000)
     bfr_parser.add_argument("--max-segments", type=int)
@@ -292,9 +297,15 @@ def build_parser() -> argparse.ArgumentParser:
     bfr_parser.add_argument("--ops-root", type=Path, default=default_ops_root())
     bfr_parser.add_argument("--worker-name", default="binance-futures-rest-worker")
     bfr_parser.add_argument("--heartbeat-interval-seconds", type=float, default=30.0)
-    bfr_parser.add_argument("--max-delay-ms", type=int, default=60_000)
+    # Staleness windows default to the resume gap (6h), NOT the WS lanes' 60s: after
+    # any outage >60s the cursor deliberately backfills old trades whose
+    # exchange_time→received_at delay IS the outage length. A 60s gate quarantined
+    # the entire backfilled window (and the replay skew gate then blocked what was
+    # left), silently losing the outage window from curated on a lane whose whole
+    # point is gaplessness — the dense `a` sequence, not freshness, is its proof.
+    bfr_parser.add_argument("--max-delay-ms", type=int, default=21_600_000)
     bfr_parser.add_argument("--max-future-skew-ms", type=int, default=5_000)
-    bfr_parser.add_argument("--max-clock-skew-ms", type=float, default=60_000.0)
+    bfr_parser.add_argument("--max-clock-skew-ms", type=float, default=21_600_000.0)
     bfr_parser.add_argument(
         "--source-suffix",
         default="",
@@ -2067,9 +2078,11 @@ def run_binance_futures_rest_worker(args: argparse.Namespace) -> None:
             depth=getattr(source_args, "depth", 1000),
             count=source_args.segment_count,
             output_root=source_args.output_root,
-            max_delay_ms=getattr(source_args, "max_delay_ms", 60_000),
+            # Defaults track the resume gap (see the bfr_parser comment): a 60s gate
+            # quarantined every cursor-resumed backfill after an outage.
+            max_delay_ms=getattr(source_args, "max_delay_ms", 21_600_000),
             max_future_skew_ms=getattr(source_args, "max_future_skew_ms", 5_000),
-            max_clock_skew_ms=getattr(source_args, "max_clock_skew_ms", 60_000.0),
+            max_clock_skew_ms=getattr(source_args, "max_clock_skew_ms", 21_600_000.0),
             jsonl_fsync=getattr(source_args, "jsonl_fsync", True),
             normalized_parquet=getattr(source_args, "normalized_parquet", True),
             source_suffix=getattr(source_args, "source_suffix", ""),
@@ -2772,6 +2785,9 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             stream=raw_args.get("stream", "trades"),
             poll_interval_seconds=raw_args.get("poll_interval_seconds", 1.0),
             page_limit=raw_args.get("page_limit", 1000),
+            # Was silently absent here (the documented per-job-type enumeration trap):
+            # a config-set max_resume_gap_seconds never reached the worker.
+            max_resume_gap_seconds=raw_args.get("max_resume_gap_seconds", 21_600.0),
             depth=raw_args.get("depth", 1000),
             segment_count=raw_args.get("segment_count", 5000),
             max_segments=raw_args.get("max_segments"),
@@ -2781,9 +2797,11 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             normalized_root=raw_args.get("normalized_root"),
             worker_name=raw_args.get("worker_name", "binance-futures-rest-worker"),
             heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
-            max_delay_ms=raw_args.get("max_delay_ms", 60_000),
+            # Staleness windows track the resume gap (see the bfr_parser comment): a
+            # 60s gate quarantined every cursor-resumed backfill after an outage.
+            max_delay_ms=raw_args.get("max_delay_ms", 21_600_000),
             max_future_skew_ms=raw_args.get("max_future_skew_ms", 5_000),
-            max_clock_skew_ms=raw_args.get("max_clock_skew_ms", 60_000.0),
+            max_clock_skew_ms=raw_args.get("max_clock_skew_ms", 21_600_000.0),
             source_suffix=raw_args.get("source_suffix", ""),
             rotate_at_midnight=raw_args.get("rotate_at_midnight", False),
             jsonl_fsync=raw_args.get("jsonl_fsync", True),
@@ -3574,6 +3592,10 @@ def run_kalshi_discover_crypto(args: argparse.Namespace) -> None:
 
 
 def run_kalshi_collect_crypto_quotes(args: argparse.Namespace) -> None:
+    # Thread the batched-fsync cadence through: the flags were exposed on this
+    # subparser (and injected by the ops runner) but never reached the collector,
+    # so the heaviest raw-volume lane silently stayed per-event fsync.
+    fsync_events, fsync_ms = _fsync_intervals(args)
     summary = collect_kalshi_crypto_quotes(
         output_root=args.output_root,
         normalized_root=args.normalized_root,
@@ -3587,6 +3609,8 @@ def run_kalshi_collect_crypto_quotes(args: argparse.Namespace) -> None:
         markets_per_series=args.markets_per_series,
         jsonl_fsync=args.jsonl_fsync,
         normalized_parquet=args.normalized_parquet,
+        fsync_interval_events=fsync_events,
+        fsync_interval_ms=fsync_ms,
     )
     if args.format == "json":
         print(json.dumps(summary.to_dict(), indent=2, sort_keys=True))

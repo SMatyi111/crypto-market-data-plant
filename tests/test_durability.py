@@ -96,7 +96,6 @@ def test_jsonl_writes_survive_sigkill_mid_stream(tmp_path: Path) -> None:
     # 500 events @ 10ms = 5s total; we kill after ~1s, so we expect ~80-120 lines.
     proc = _start_mock_subprocess(output_root=output_root, count=500, delay_ms=10.0)
     try:
-        raw_path = output_root / "mock" / "*" / "raw" / "messages.jsonl"
         # We can't glob-stat reliably across platforms; just sleep then kill.
         time.sleep(1.0)
         # Make sure the subprocess actually has written something before we kill it.

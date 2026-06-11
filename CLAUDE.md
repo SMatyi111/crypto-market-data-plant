@@ -51,3 +51,37 @@ Resolved-work narrative: [`docs/HISTORY.md`](docs/HISTORY.md). Runbook:
   narrative to `docs/HISTORY.md`.
 - This repo is public-safe by contract: no keys, no signed endpoints, no archive
   data, no notebooks (see `docs/publication_safety.md`).
+
+## Quality gates & review protocol
+
+- **CI gates (all must be green before handing a PR to the owner):** pytest
+  (windows-latest, py3.11+3.12), ruff (bug-focused rule set in `pyproject.toml` —
+  a lint failure means "probable bug", never cosmetics), and the repo-hygiene
+  tests (`tests/test_repo_hygiene.py`: ASCII-only `.ps1`, concurrency-cap covers
+  enabled lanes, runner-script defaults in sync).
+- **Every code PR** gets a `/code-review` pass at medium effort before the owner
+  sees it. Fix confirmed findings in the same PR, or list them explicitly in the
+  PR description with why they were left. Docs-only PRs skip agent review.
+- **Add `/security-review`** when a change touches collectors/network endpoints,
+  configs, subprocess or script execution, or the publication surface.
+- **Agent fan-out budget:** this plan's session token limits cannot absorb
+  verifier fleets. Reviews/audits use at most one agent per subsystem (or the
+  /code-review skill); findings are verified by reading the code in the main
+  session, never by per-finding verifier agents.
+- **Session-start ops audit ritual:** if the "Last ops audit" stamp in ROADMAP.md
+  is more than ~3 days old, audit the live plant before starting new work: health
+  report, job success rate since last restart, per-lane freshness/backlog,
+  quarantine ratios, G: disk headroom, offload index sanity. Findings go to
+  ROADMAP; update the stamp; escalate only decisions.
+
+## Governance (who decides what)
+
+- **Claude acts autonomously** (always via PR — the owner merges): bug fixes,
+  tests, docs, reviews, hygiene and refactors that do not change the data
+  contract.
+- **The owner decides:** PR merges, live runner restarts/redeploys, STANDARDS /
+  contract changes, new venues/lanes/instruments (rate-limit + jurisdiction
+  exposure), data retention or deletion, anything that publishes content or
+  spends money.
+- Pending owner decisions queue in ROADMAP's **Decision queue** — don't interrupt
+  mid-task, and never act on a queued decision without an explicit OK.
