@@ -19,7 +19,7 @@
 param(
     [string]$OpsRoot = "G:\market_archive\ops",
     # Match run_ops_runner.ps1's live default (one slot per collector lane). Keep these
-    # in sync — a redeploy with a lower value silently throttles coverage until reboot.
+    # in sync -- a redeploy with a lower value silently throttles coverage until reboot.
     [int]$CollectorConcurrency = 21
 )
 $ErrorActionPreference = "Stop"
@@ -31,6 +31,17 @@ $heartbeatPath = Join-Path $OpsRoot "heartbeat.json"
 
 if (-not (Test-Path $python)) { throw "venv python not found: $python" }
 if (-not (Test-Path $config)) { throw "ops config not found: $config" }
+
+# Guard BEFORE stopping anything: more enabled collector lanes than pool slots means
+# the lanes sorting last are never dispatched (silent starvation -- shipped twice).
+# Pool-dispatched job types all end in -worker (pinned by tests/test_repo_hygiene.py).
+$configPayload = Get-Content -LiteralPath $config -Raw -Encoding utf8 | ConvertFrom-Json
+$collectorLanes = @($configPayload.jobs | Where-Object {
+    $_.job_type -like "*-worker" -and ($null -eq $_.enabled -or $_.enabled)
+})
+if ($collectorLanes.Count -gt $CollectorConcurrency) {
+    throw "$($collectorLanes.Count) enabled collector lanes exceed CollectorConcurrency=$CollectorConcurrency. Raise the default in run_ops_runner.ps1 AND redeploy_runner.ps1 before redeploying."
+}
 
 # 1. Stop the current runner (if any) named in the lock.
 if (Test-Path $lockPath) {

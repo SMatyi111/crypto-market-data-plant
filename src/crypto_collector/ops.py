@@ -217,7 +217,7 @@ class OpsRunnerLock:
                     raise RuntimeError(
                         f"ops runner already active for {self.ops_root} "
                         f"(pid={owner_pid}, runner={owner.get('runner_name', 'unknown')})"
-                    )
+                    ) from None
                 # Stale lock: the recorded pid is gone, OR it was recycled to an unrelated
                 # process (Windows OpenProcess -> access-denied makes _pid_exists report
                 # "alive") while the heartbeat has gone stale. A live runner writes
@@ -282,7 +282,7 @@ class StandaloneWorkerLock:
                     raise RuntimeError(
                         f"standalone worker already active for {self.worker_name} "
                         f"(pid={owner_pid})"
-                    )
+                    ) from None
                 self.lock_path.unlink(missing_ok=True)
                 continue
             payload = {

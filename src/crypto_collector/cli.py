@@ -7,7 +7,6 @@ import logging
 import shutil
 import subprocess
 import sys
-import threading
 import time
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -55,7 +54,6 @@ from .collectors.binance_futures_rest import (
 )
 from .collectors.rest_poll import RestPollingCollector
 from .config import (
-    DEFAULT_ARCHIVE_ROOT,
     CollectorConfig,
     default_archive_root,
     default_curated_root,

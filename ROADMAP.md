@@ -30,6 +30,11 @@ cold-tier archive offload. CI green on `main`; live runner restarted
 | --- | --- |
 | **2026-06-22** | First `archive-offload` candidates reach offload age. Spot-check the lane `_offload_index.jsonl` entries against the `D:\market_archive_cold` tree: files verified-moved, counts match, no `unindexed` pile-up. |
 
+**Last ops audit:** 2026-06-10 (redeploy verification: runner healthy, normalized
+root landing on G:, all 21 collectors dispatched). Ritual: if this stamp is more
+than ~3 days old at session start, audit the live plant first — see `CLAUDE.md`
+"Quality gates & review protocol".
+
 ---
 
 ## Open work items (rough value order)
@@ -76,7 +81,15 @@ cold-tier archive offload. CI green on `main`; live runner restarted
    file lifecycle in the collector core — a real refactor, parked unless that loss
    starts to matter.
 
-## Housekeeping (pending maintainer decision)
+## Decision queue (owner)
+
+Decisions waiting on the owner; agents must not act on these without an explicit OK
+(see `CLAUDE.md` Governance):
+
+- **Housekeeping deletions** — the list below.
+- **D:\market_archive legacy history** — retention vs. merge (open item 2 above).
+
+### Housekeeping (pending deletion OK)
 
 None of this is tracked in git (all gitignored); awaiting an explicit OK to delete:
 

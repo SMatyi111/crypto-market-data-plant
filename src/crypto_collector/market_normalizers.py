@@ -3,11 +3,11 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-_EPOCH_UTC = datetime(1970, 1, 1, tzinfo=UTC)
-
 from .asset_registry import resolve_perp_instrument, resolve_spot_instrument
 from .context_models import NormalizedDepthUpdate
 from .models import NormalizedL3Event, RawMessage
+
+_EPOCH_UTC = datetime(1970, 1, 1, tzinfo=UTC)
 
 
 class BinanceDepthNormalizer:

@@ -71,6 +71,17 @@ if ($invalidJobs.Count -gt 0) {
     throw "ops config jobs missing name or job_type: $resolvedConfig"
 }
 
+# Guard: more enabled collector lanes than pool slots means the lanes sorting last in
+# the config are NEVER dispatched (silent starvation -- shipped twice: 12<17, 17<21).
+# Pool-dispatched job types all end in -worker (pinned by tests/test_repo_hygiene.py).
+$collectorLanes = @($configPayload.jobs | Where-Object {
+    $_.job_type -like "*-worker" -and ($null -eq $_.enabled -or $_.enabled)
+})
+if ($collectorLanes.Count -gt $CollectorConcurrency) {
+    "[$(Get-Date -Format o)] $($collectorLanes.Count) enabled collector lanes exceed CollectorConcurrency=$CollectorConcurrency ($resolvedConfig)" | Out-File -FilePath $LogPath -Append -Encoding utf8
+    throw "$($collectorLanes.Count) enabled collector lanes exceed CollectorConcurrency=$CollectorConcurrency. Raise the default in run_ops_runner.ps1 AND redeploy_runner.ps1 (one slot per lane)."
+}
+
 $mutex = New-Object System.Threading.Mutex($false, "Global\CryptoMarketDataPlantOpsRunner")
 $hasHandle = $false
 

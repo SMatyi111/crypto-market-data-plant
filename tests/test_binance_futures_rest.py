@@ -21,7 +21,6 @@ from crypto_collector.collectors.rest_poll import RestPollingCollector
 from crypto_collector.market_normalizers import (
     BinanceDepthNormalizer,
     BinanceFuturesFundingNormalizer,
-    BinanceTradeNormalizer,
 )
 from crypto_collector.models import RawMessage, utc_now
 from crypto_collector.replay import replay_funding_run
@@ -304,7 +303,7 @@ def test_collect_segment_trades_gapless_perp(tmp_path, monkeypatch) -> None:
     assert summary["clean_events"] == 3
     assert summary["replayable"] is True
     run = tmp_path / "binance_perp_trades"
-    rows = [json.loads(l) for l in (next(run.iterdir()) / "clean" / "events.jsonl").read_text().splitlines()]
+    rows = [json.loads(line) for line in (next(run.iterdir()) / "clean" / "events.jsonl").read_text().splitlines()]
     assert rows[0]["metadata"]["instrument_id"] == "perp:binance-futures:BTCUSDT"
     assert [r["sequence"] for r in rows] == [10, 11, 12]  # dense -> gap-proof
 
@@ -364,7 +363,7 @@ def test_collect_segment_trades_resumes_across_rotations_no_gap_no_dup(tmp_path,
     seqs = []
     for run_dir in sorted(d for d in run_root.iterdir() if d.is_dir()):
         ev = run_dir / "clean" / "events.jsonl"
-        seqs += [json.loads(l)["sequence"] for l in ev.read_text().splitlines() if l.strip()]
+        seqs += [json.loads(line)["sequence"] for line in ev.read_text().splitlines() if line.strip()]
     assert seqs == [10, 11, 12, 13, 14]
 
 
@@ -381,7 +380,7 @@ def test_collect_segment_depth_snapshot_perp(tmp_path, monkeypatch) -> None:
     summary = _run(cli.collect_binance_futures_rest_segment(_segment_args(tmp_path, "depth")))
     assert summary["clean_events"] == 3 and summary["replayable"] is True
     run = tmp_path / "binance_perp_depth"
-    rows = [json.loads(l) for l in (next(run.iterdir()) / "clean" / "events.jsonl").read_text().splitlines()]
+    rows = [json.loads(line) for line in (next(run.iterdir()) / "clean" / "events.jsonl").read_text().splitlines()]
     assert rows[0]["instrument"]["instrument_id"] == "perp:binance-futures:BTCUSDT"
 
 
@@ -398,6 +397,6 @@ def test_collect_segment_funding_perp(tmp_path, monkeypatch) -> None:
     summary = _run(cli.collect_binance_futures_rest_segment(_segment_args(tmp_path, "funding")))
     assert summary["clean_events"] == 3 and summary["replayable"] is True
     run = tmp_path / "binance_perp_funding"
-    rows = [json.loads(l) for l in (next(run.iterdir()) / "clean" / "events.jsonl").read_text().splitlines()]
+    rows = [json.loads(line) for line in (next(run.iterdir()) / "clean" / "events.jsonl").read_text().splitlines()]
     assert rows[0]["channel"] == "funding"
     assert rows[0]["metadata"]["instrument_id"] == "perp:binance-futures:BTCUSDT"
