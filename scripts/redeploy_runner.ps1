@@ -18,9 +18,10 @@
 #>
 param(
     [string]$OpsRoot = "G:\market_archive\ops",
-    # Match run_ops_runner.ps1's live default (one slot per collector lane). Keep these
-    # in sync -- a redeploy with a lower value silently throttles coverage until reboot.
-    [int]$CollectorConcurrency = 21
+    # Match run_ops_runner.ps1's live default (one slot per pooled lane: 21 workers +
+    # 2 kalshi REST jobs). Keep these in sync -- a redeploy with a lower value silently
+    # throttles coverage until reboot.
+    [int]$CollectorConcurrency = 23
 )
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
@@ -37,18 +38,28 @@ if (-not (Test-Path $config)) { throw "ops config not found: $config" }
 # Pool-dispatched job types all end in -worker (pinned by tests/test_repo_hygiene.py).
 $configPayload = Get-Content -LiteralPath $config -Raw -Encoding utf8 | ConvertFrom-Json
 $collectorLanes = @($configPayload.jobs | Where-Object {
-    $_.job_type -like "*-worker" -and ($null -eq $_.enabled -or $_.enabled)
+    ($_.job_type -like "*-worker" -or $_.job_type -like "kalshi-*") -and ($null -eq $_.enabled -or $_.enabled)
 })
 if ($collectorLanes.Count -gt $CollectorConcurrency) {
     throw "$($collectorLanes.Count) enabled collector lanes exceed CollectorConcurrency=$CollectorConcurrency. Raise the default in run_ops_runner.ps1 AND redeploy_runner.ps1 before redeploying."
 }
 
-# 1. Stop the current runner (if any) named in the lock.
+# 1. Stop the current runner (if any) named in the lock. PS-native kill-tree:
+#    taskkill writes to stderr when any process in the tree is unkillable or already
+#    gone, and PS 5.1 wraps that as a terminating NativeCommandError even with
+#    2>$null under ErrorActionPreference=Stop -- which aborted two redeploys on
+#    2026-06-11 BEFORE the relaunch, leaving collection down with a stale lock.
+#    Stop-Process -ErrorAction SilentlyContinue cannot abort the script.
+function Stop-PlantProcessTree([int]$RootPid) {
+    @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$RootPid" -ErrorAction SilentlyContinue) |
+        ForEach-Object { Stop-PlantProcessTree ([int]$_.ProcessId) }
+    Stop-Process -Id $RootPid -Force -ErrorAction SilentlyContinue
+}
 if (Test-Path $lockPath) {
     $lock = Get-Content $lockPath -Raw | ConvertFrom-Json
     Write-Host "Current runner: pid=$($lock.pid) created_at=$($lock.created_at)"
     if ($lock.pid) {
-        & taskkill /F /T /PID $lock.pid 2>$null | Out-Null
+        Stop-PlantProcessTree ([int]$lock.pid)
         Start-Sleep -Seconds 3
     }
 }

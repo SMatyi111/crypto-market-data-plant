@@ -54,11 +54,15 @@ def test_ps1_scripts_are_ascii(script: Path) -> None:
     )
 
 
-def test_collector_job_types_all_end_with_worker() -> None:
-    # The .ps1 preflights count collector lanes with `job_type -like "*-worker"`.
-    # That heuristic is only correct while every pool-dispatched job type ends in
-    # -worker; if this fails, update both runner scripts' preflight match too.
-    assert all(job_type.endswith("-worker") for job_type in COLLECTOR_JOB_TYPES)
+def test_collector_job_types_match_ps1_preflight_patterns() -> None:
+    # The .ps1 preflights count pooled lanes with
+    # `job_type -like "*-worker" -or job_type -like "kalshi-*"`. That heuristic is
+    # only correct while every pool-dispatched job type matches one of the two
+    # patterns; if this fails, update both runner scripts' preflight match too.
+    assert all(
+        job_type.endswith("-worker") or job_type.startswith("kalshi-")
+        for job_type in COLLECTOR_JOB_TYPES
+    )
 
 
 def test_runner_scripts_concurrency_defaults_match() -> None:

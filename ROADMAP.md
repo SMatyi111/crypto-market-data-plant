@@ -30,10 +30,11 @@ cold-tier archive offload. CI green on `main`; live runner restarted
 | --- | --- |
 | **2026-06-22** | First `archive-offload` candidates reach offload age. Spot-check the lane `_offload_index.jsonl` entries against the `D:\market_archive_cold` tree: files verified-moved, counts match, no `unindexed` pile-up. |
 
-**Last ops audit:** 2026-06-10 (redeploy verification: runner healthy, normalized
-root landing on G:, all 21 collectors dispatched). Ritual: if this stamp is more
-than ~3 days old at session start, audit the live plant first — see `CLAUDE.md`
-"Quality gates & review protocol".
+**Last ops audit:** 2026-06-11 (scheduler-stall incident response — see
+`docs/HISTORY.md` 2026-06-11 entry; plant verified stable post-mitigation: 21
+lanes collecting, full maintenance cycle 122s, zero errors). Ritual: if this
+stamp is more than ~3 days old at session start, audit the live plant first —
+see `CLAUDE.md` "Quality gates & review protocol".
 
 ---
 
@@ -89,6 +90,10 @@ than ~3 days old at session start, audit the live plant first — see `CLAUDE.md
 Decisions waiting on the owner; agents must not act on these without an explicit OK
 (see `CLAUDE.md` Governance):
 
+- **Deploy the incident-fix PR:** after merge, in `ops.live.local.json` re-enable
+  the two kalshi jobs (`enabled:true`) and raise `score-stream-depth` `limit`
+  back to ~50 (the skip-already-scored fix makes the limit cheap), then redeploy.
+  The 2026-06-11 mitigations (kalshi disabled, limit 6) are interim state.
 - **Housekeeping deletions** — the list below.
 - **D:\market_archive legacy history** — retention vs. merge (open item 1 above).
 

@@ -7,6 +7,39 @@ git log + the merged PR descriptions; this file keeps the *why*.
 
 ---
 
+## 2026-06-11 — scheduler-stall incident (15-hour outage masked by a fresh heartbeat)
+
+After an overnight reboot (03:02 UTC) the plant dispatched everything once, then
+collected **nothing for 15 hours** while `heartbeat.json` stayed fresh. Three
+distinct causes, all fixed in the incident PR:
+
+1. **`score-stream-depth` re-scored every depth run in scope, every hour, in the
+   scheduler thread.** `run_backfill_stream_depth` had no already-scored skip, so
+   each hourly score-only pass re-CRC-replayed the whole window (~508 runs × ~12 s
+   ≈ 100 min of blocked dispatch, growing daily since the self-heal jobs landed).
+   Fix: skip runs that already have a `replay_summary.json` unless `--overwrite`
+   (a fresh pass dropped from ~100 min to 122 s).
+2. **`kalshi-collect` hung inside an HTTP call at boot** — `urlopen`'s timeout does
+   not cover DNS/proxy resolution — and it ran *in the scheduler thread*, blocking
+   all dispatch and maintenance indefinitely. Fix: both kalshi REST job types moved
+   into `COLLECTOR_JOB_TYPES` (pool + subprocess + 7200 s timeout); concurrency
+   default 21 → 23; the `.ps1` preflights count `kalshi-*` lanes too.
+3. **`StandaloneWorkerLock` trusted pid existence alone.** After hard kills/reboots,
+   recycled pids made stale locks read "already active" (one pointed at svchost,
+   another at the *new* runner's own worker for a different lane), crash-looping
+   three lanes. Fix: pid-alive must be corroborated by a fresh sibling worker
+   heartbeat (≤ 10 min), else the lock is stale and broken.
+
+Compounding factors, also fixed: the heartbeat refresher thread kept `last_seen`
+fresh while the scheduler was dead (fix: `last_scheduler_tick` advanced only by the
+scheduler loop + a `scheduler_stalled` health finding); and `redeploy_runner.ps1`
+died on `taskkill` stderr (PS 5.1 `NativeCommandError` despite `2>$null`) before
+its own relaunch step — twice — leaving collection down with a stale lock (fix:
+PS-native recursive `Stop-Process -ErrorAction SilentlyContinue` kill-tree).
+
+Interim mitigations applied live during the incident (to revert on deploy of the
+fix): kalshi jobs `enabled:false`, `score-stream-depth` limit 1000 → 6.
+
 ## 2026-06-09 → 06-11 — BTC instrument expansion sprint (PRs #3–#13)
 
 Took the plant from 10 BTC-spot lanes to the full 22-lane matrix in three days.

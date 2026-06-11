@@ -955,6 +955,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     backfill_parser.add_argument("--raw-root", type=Path, default=default_output_root())
     backfill_parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Re-score runs that already have a replay_summary.json. Without this, "
+        "already-scored runs are skipped (the catch-up job only needs to rescue "
+        "cut-off segments, and re-replaying everything blocked the scheduler for "
+        "~100 minutes per hourly pass once the backlog grew).",
+    )
+    backfill_parser.add_argument(
         "--source",
         nargs="+",
         default=["coinbase_depth", "bybit_depth", "kraken_depth"],
@@ -3094,6 +3102,7 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             max_age_hours=raw_args.get("max_age_hours", 720.0),
             apply=raw_args.get("apply", False),
             score_only=raw_args.get("score_only", True),
+            overwrite=raw_args.get("overwrite", False),
             format=raw_args.get("format", "text"),
         )
     if job.job_type == "quarantine-runs":
@@ -3441,9 +3450,20 @@ def run_backfill_stream_depth(args: argparse.Namespace) -> None:
         )
         scanned = 0
         replayable = 0
+        skipped_scored = 0
         finding_counts: dict[str, int] = {}
         for run_dir in run_dirs:
             if not (run_dir / "clean" / "events.jsonl").exists():
+                continue
+            # Self-heal only needs runs cut off before their summary was written.
+            # Re-replaying ALREADY-SCORED runs (CRC reconstruction over full books)
+            # made every hourly score-only pass grind through the whole window in
+            # the scheduler thread — ~100 min of blocked dispatch by 2026-06-11.
+            if (
+                not bool(getattr(args, "overwrite", False))
+                and (run_dir / "metrics" / "replay_summary.json").exists()
+            ):
+                skipped_scored += 1
                 continue
             symbol = _backfill_first_event_product(run_dir)
             kwargs = _stream_depth_replay_kwargs(venue, symbol)
@@ -3479,6 +3499,7 @@ def run_backfill_stream_depth(args: argparse.Namespace) -> None:
                 "scanned": scanned,
                 "replayable": replayable,
                 "not_replayable": scanned - replayable,
+                "skipped_already_scored": skipped_scored,
                 "findings": finding_counts,
                 "promotion": promotion,
             }

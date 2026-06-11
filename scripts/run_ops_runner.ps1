@@ -12,7 +12,9 @@ param(
     # 8-physical / 16-logical-core box. Maintenance jobs (quarantine/promote/manifest/
     # cleanup/health) run in the runner's scheduler thread, NOT the pool, so they don't
     # consume collector slots.
-    [int]$CollectorConcurrency = 21
+    # 21 worker lanes + the 2 kalshi REST jobs (pool-dispatched since the 2026-06-11
+    # scheduler-stall incident) = 23 slots, one per pooled lane.
+    [int]$CollectorConcurrency = 23
 )
 
 $ErrorActionPreference = "Stop"
@@ -73,9 +75,10 @@ if ($invalidJobs.Count -gt 0) {
 
 # Guard: more enabled collector lanes than pool slots means the lanes sorting last in
 # the config are NEVER dispatched (silent starvation -- shipped twice: 12<17, 17<21).
-# Pool-dispatched job types all end in -worker (pinned by tests/test_repo_hygiene.py).
+# Pool-dispatched job types end in -worker or start with kalshi- (pinned by
+# tests/test_repo_hygiene.py).
 $collectorLanes = @($configPayload.jobs | Where-Object {
-    $_.job_type -like "*-worker" -and ($null -eq $_.enabled -or $_.enabled)
+    ($_.job_type -like "*-worker" -or $_.job_type -like "kalshi-*") -and ($null -eq $_.enabled -or $_.enabled)
 })
 if ($collectorLanes.Count -gt $CollectorConcurrency) {
     "[$(Get-Date -Format o)] $($collectorLanes.Count) enabled collector lanes exceed CollectorConcurrency=$CollectorConcurrency ($resolvedConfig)" | Out-File -FilePath $LogPath -Append -Encoding utf8
