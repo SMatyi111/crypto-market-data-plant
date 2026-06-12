@@ -902,6 +902,13 @@ class OpsRunner:
         counters["last_finished_at"] = result.finished_at.isoformat()
 
 
+# How much extra staleness "the single maintenance slot was busy" may explain
+# before a queued maintenance job flags stale anyway. Sized to one long holder
+# pass (cleanup currently runs ~19 min and grows with the archive): a job whose
+# staleness exceeds its threshold by more than this is dead, not queued.
+_MAINTENANCE_SLOT_WAIT_ALLOWANCE_SECONDS = 1800.0
+
+
 def build_health_report(
     *,
     ops_root: Path,
@@ -991,6 +998,30 @@ def build_health_report(
         for row in run_rows:
             latest_by_job[row.get("job_name", "")] = row
 
+        # Maintenance is serialized on a single executor slot: while one long
+        # pass runs (cleanup scans the whole archive for ~15-20 min), every other
+        # due maintenance job is QUEUED, not stale — flagging them produced a
+        # burst of stale_job warnings on every cleanup pass. Derived from the
+        # heartbeat's own job_type (not a join against this config) so a renamed
+        # job in an undeployed config can't misread the slot, and gated on runner
+        # liveness so a dead runner's frozen current_jobs can't suppress anything.
+        active_entries = (
+            current_jobs_raw
+            if isinstance(current_jobs_raw, list)
+            else ([current_job] if isinstance(current_job, dict) else [])
+        )
+        maintenance_slot_busy = (
+            runner_status == "running"
+            and heartbeat_is_fresh
+            and any(
+                isinstance(item, dict)
+                and item.get("name")
+                and item.get("job_type")
+                and str(item["job_type"]) not in COLLECTOR_JOB_TYPES
+                for item in active_entries
+            )
+        )
+
         for job in jobs:
             latest = latest_by_job.get(job.name)
             counters = job_counters.get(job.name, {}) if isinstance(job_counters, dict) else {}
@@ -1032,11 +1063,24 @@ def build_health_report(
                 and current_job_age_seconds > long_running_threshold
             )
             is_stale = False if in_progress else age_seconds is None or age_seconds > stale_threshold
+            # Bounded: only staleness explainable by waiting for the slot is
+            # suppressed (one long holder pass on top of the cadence). The live
+            # slot is busy at MOST health checks, so an unbounded suppression
+            # would hide a genuinely-dead maintenance job indefinitely — past the
+            # allowance the stale_job finding fires regardless.
+            waiting_on_maintenance_slot = (
+                is_stale
+                and not in_progress
+                and job.job_type not in COLLECTOR_JOB_TYPES
+                and maintenance_slot_busy
+                and age_seconds is not None
+                and age_seconds <= stale_threshold + _MAINTENANCE_SLOT_WAIT_ALLOWANCE_SECONDS
+            )
             partition_dataset, partition_source = _job_partition_target(job)
             last_partition_write_at: str | None = None
             partition_age_seconds: float | None = None
             partition_stale: bool | None = None
-            if is_stale:
+            if is_stale and not waiting_on_maintenance_slot:
                 findings.append(f"stale_job:{job.name}")
             if long_running:
                 findings.append(f"long_running_job:{job.name}")
@@ -1071,6 +1115,7 @@ def build_health_report(
                     "long_running_threshold_seconds": long_running_threshold,
                     "status": latest.get("status") if latest else "missing",
                     "stale": is_stale,
+                    "waiting_on_maintenance_slot": waiting_on_maintenance_slot,
                     "normalized_dataset": partition_dataset,
                     "normalized_source": partition_source,
                     "last_partition_write_at": last_partition_write_at,
@@ -1973,6 +2018,14 @@ def _raw_retention_days(
 
 
 def _job_partition_target(job: JobSpec) -> tuple[str | None, str | None]:
+    # A lane that opts out of normalized parquet produces no partition writes BY
+    # CONFIG — checking its partition freshness would warn forever. (Latent until
+    # the 2026-06-12 audit fix: the opt-out toggle used to be silently inert, so
+    # opted-out lanes kept writing parquet and this check kept passing.)
+    # Truthiness, not `is False`, mirroring the worker side (`bool(job.args[...])`)
+    # so a hand-edited `0`/`null` disables both the writes and this check together.
+    if "normalized_parquet" in job.args and not job.args["normalized_parquet"]:
+        return None, None
     if job.job_type == "mock":
         return "market", "mock"
     if job.job_type == "binance-depth-worker":

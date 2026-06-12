@@ -2583,3 +2583,119 @@ def test_prune_managed_names_cover_every_collector_job_type(tmp_path: Path) -> N
         cli.prune_stale_worker_artifacts = original
 
     assert captured["managed_worker_names"] == {"okx-depth-worker", "bybit-trades-custom"}
+
+
+def test_partition_freshness_check_skips_lanes_that_opt_out_of_normalized_parquet() -> None:
+    """A lane with normalized_parquet:false produces no partition writes by config;
+    expecting its partition to advance warned forever once the audit fix made the
+    (previously inert) toggle effective — the live binance trades lanes hit this
+    within minutes of the deploy."""
+    from crypto_collector.ops import _job_partition_target
+
+    opted_out = JobSpec(
+        name="binance-btc-trades",
+        job_type="binance-trades-worker",
+        interval_seconds=5,
+        args={"normalized_parquet": False},
+    )
+    assert _job_partition_target(opted_out) == (None, None)
+
+    writing = JobSpec(
+        name="binance-btc-trades",
+        job_type="binance-trades-worker",
+        interval_seconds=5,
+        args={},
+    )
+    assert _job_partition_target(writing) == ("trades", "binance")
+
+
+def test_maintenance_jobs_queued_behind_the_slot_are_not_flagged_stale(tmp_path: Path) -> None:
+    """Maintenance is serialized on one executor slot: while a long pass holds it
+    (cleanup scans the archive for ~15-20 min), other due maintenance jobs are
+    queued, not stale -- flagging them sprayed stale_job warnings on every cleanup
+    pass after the executor deploy. Suppression is BOUNDED (the live slot is busy
+    at most checks, so unbounded suppression would hide a dead job forever),
+    collector-blind (an active collector is not the maintenance slot), and gated
+    on runner liveness (a dead runner's frozen current_jobs suppresses nothing)."""
+    import json as json_mod
+
+    now = datetime.now(tz=UTC)
+    config = tmp_path / "ops.json"
+    config.write_text(
+        json_mod.dumps(
+            {
+                "jobs": [
+                    {"name": "cleanup-dry-run", "job_type": "cleanup", "interval_seconds": 3600},
+                    {"name": "promote-kraken-depth", "job_type": "promote-replayable", "interval_seconds": 600},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    heartbeat = {
+        "runner_name": "r",
+        "status": "running",
+        "last_seen": now.isoformat(),
+        "last_scheduler_tick": now.isoformat(),
+        "current_jobs": [
+            {
+                "name": "cleanup-dry-run",
+                "job_type": "cleanup",
+                "started_at": (now - timedelta(seconds=900)).isoformat(),
+            },
+            # An active COLLECTOR must never count as the maintenance slot.
+            {
+                "name": "kraken-btc-depth",
+                "job_type": "kraken-depth-worker",
+                "started_at": (now - timedelta(seconds=900)).isoformat(),
+            },
+        ],
+    }
+    (tmp_path / "heartbeat.json").write_text(json_mod.dumps(heartbeat), encoding="utf-8")
+
+    def write_promote_run(age_seconds: float) -> None:
+        (tmp_path / "job_runs.jsonl").write_text(
+            json_mod.dumps(
+                {
+                    "job_name": "promote-kraken-depth",
+                    "job_type": "promote-replayable",
+                    "status": "success",
+                    "started_at": (now - timedelta(seconds=age_seconds)).isoformat(),
+                    "finished_at": (now - timedelta(seconds=age_seconds)).isoformat(),
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    from crypto_collector.ops import load_ops_config
+
+    # Past its 600s*2.5 staleness threshold, but within the bounded slot-wait
+    # allowance: queued, not stale.
+    write_promote_run(2000.0)
+    report = build_health_report(ops_root=tmp_path, jobs=load_ops_config(config))
+    assert "stale_job:promote-kraken-depth" not in report.findings
+    promote_row = next(r for r in report.jobs if r["name"] == "promote-kraken-depth")
+    assert promote_row["waiting_on_maintenance_slot"] is True
+
+    # Stale far beyond what waiting can explain: flags DESPITE the busy slot.
+    write_promote_run(4 * 3600.0)
+    report = build_health_report(ops_root=tmp_path, jobs=load_ops_config(config))
+    assert "stale_job:promote-kraken-depth" in report.findings
+
+    # Maintenance slot FREE (only the collector in flight): bounded staleness
+    # flags again -- an active collector must not read as a busy slot.
+    write_promote_run(2000.0)
+    heartbeat["current_jobs"] = [heartbeat["current_jobs"][1]]
+    (tmp_path / "heartbeat.json").write_text(json_mod.dumps(heartbeat), encoding="utf-8")
+    report = build_health_report(ops_root=tmp_path, jobs=load_ops_config(config))
+    assert "stale_job:promote-kraken-depth" in report.findings
+
+    # A DEAD runner's frozen current_jobs must not suppress anything either.
+    heartbeat["current_jobs"] = [
+        {"name": "cleanup-dry-run", "job_type": "cleanup", "started_at": now.isoformat()}
+    ]
+    heartbeat["last_seen"] = (now - timedelta(hours=1)).isoformat()
+    (tmp_path / "heartbeat.json").write_text(json_mod.dumps(heartbeat), encoding="utf-8")
+    report = build_health_report(ops_root=tmp_path, jobs=load_ops_config(config))
+    assert "stale_job:promote-kraken-depth" in report.findings
