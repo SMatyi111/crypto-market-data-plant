@@ -45,10 +45,15 @@ class JsonlSink:
       what caps a hot lane's sustainable events/sec.
     * Batched fsync (`fsync=True`, a >1 event interval and/or a >0 ms interval): one
       handle stays open and EVERY line is flushed (so the OS always holds whole lines and
-      a hard kill can't leave a torn tail), while the disk-blocking fsync is amortized to
-      once per `fsync_interval_events` events OR `fsync_interval_ms` milliseconds,
-      whichever comes first. Raises the throughput ceiling; a clean close still fsyncs
-      (no loss on shutdown) and a hard kill loses at most one un-fsynced batch.
+      a hard PROCESS kill loses nothing and can't leave a torn tail), while the
+      disk-blocking fsync is amortized to once per `fsync_interval_events` events OR
+      `fsync_interval_ms` milliseconds, whichever comes first. Raises the throughput
+      ceiling; a clean close still fsyncs (no loss on shutdown). The weaker guarantee is
+      POWER LOSS / OS crash: up to one un-fsynced batch can vanish and the page-cache
+      writeback may persist a torn final line — readers of raw must tolerate a torn tail
+      (STANDARDS §2.1 documents this posture). Note the ms bound is evaluated on the
+      next write, so an idle lane holds its last flushed-but-unfsynced batch until
+      traffic resumes or close().
     * Buffered, no fsync (`fsync=False`): one handle, flushed every `flush_every` rows,
       never fsynced. Fastest, least durable.
     """

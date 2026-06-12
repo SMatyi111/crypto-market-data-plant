@@ -1,10 +1,19 @@
 from __future__ import annotations
 
+import math
 import threading
 from collections import Counter
 from datetime import UTC, datetime
 
 from .models import NormalizedL3Event, ValidationResult
+
+# Every trades-lane normalizer emits channel="trades" (event_type varies by
+# venue: "trade", Coinbase "match"/"last_match"). The promotion bar
+# (`replay_trades_run`) fails a whole run when any clean print has a missing or
+# non-positive price/size, so the live gate must quarantine those per-event —
+# otherwise one odd print silently costs the full segment at scoring time.
+# Funding (channel="funding") and depth lanes use other gates/shapes.
+_TRADES_CHANNEL = "trades"
 
 
 class QualityGate:
@@ -43,6 +52,19 @@ class QualityGate:
 
         if event.size is not None and event.size < 0:
             reasons.append("negative_size")
+
+        if event.channel == _TRADES_CHANNEL:
+            if event.price is None or not (math.isfinite(event.price) and event.price > 0):
+                reasons.append("invalid_trade_price")
+            if event.size is None or not (math.isfinite(event.size) and event.size > 0):
+                reasons.append("invalid_trade_size")
+
+        # Trades a venue replays at subscribe time (Kraken's trade-channel snapshot
+        # frame, Coinbase's last_match) re-deliver history the previous segment
+        # already captured. Promotion dedups by run only, so letting them into clean
+        # lands duplicate prints in curated. Normalizers tag them; raw keeps them.
+        if event.metadata.get("subscribe_replay") is True:
+            reasons.append("subscribe_replay")
 
         if event.exchange_time is not None:
             delay_ms = (event.received_at - event.exchange_time.astimezone(UTC)).total_seconds() * 1000

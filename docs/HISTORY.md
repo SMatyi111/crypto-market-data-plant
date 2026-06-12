@@ -7,6 +7,91 @@ git log + the merged PR descriptions; this file keeps the *why*.
 
 ---
 
+## 2026-06-12 — baseline src/ audit completed (7 remaining subsystems; ~35 findings fixed)
+
+Finished the one-time baseline audit PR #15 started: one reviewer agent per
+subsystem (ws-core, cli-collection, cli-ops-wiring, normalize, ops-runner,
+support, mexc-misc — the slim design, no verifier fleet), every finding verified
+by reading the code in the main session, fixes + regression tests in one PR. The
+deferred PR #17 review folded into the ops-runner pass; verdict: its four fixes
+are sound, with three gaps closed here (garbage-lock self-heal, stall-finding
+escalation, the surviving long-maintenance stall class). The five headline
+findings:
+
+1. **websockets ≥ 13 rotted the reconnect allowlist.** The installed library (16.0)
+   raises `InvalidStatus` for a non-101 handshake, not the legacy
+   `InvalidStatusCode` the allowlist knew — so a routine 429/503 during venue
+   maintenance crashed the worker on the FIRST attempt instead of backing off.
+   Any `InvalidHandshake` subclass is now retryable (MRO-name check).
+2. **A torn/0-byte lock file crash-looped its lane forever.** `_read_json_file`
+   raised `JSONDecodeError` straight out of `acquire()`, bypassing the stale-lock
+   self-heal PR #17 built — and on `ops-runner.lock` it was a plant-wide boot
+   failure. Lock/heartbeat JSON reads are now never-raise; stale locks are broken
+   via atomic rename (closing an unlink/create TOCTOU that could double-acquire a
+   lane = double promoter).
+3. **The research manifest silently omitted every perp lane and the whole
+   `funding` dataset** — `parse_lane` couldn't parse `<venue>_perp_<dataset>` and
+   `DATASET_CONFIG` predated v6's funding dataset, so the contract's canonical
+   readiness view covered 14 of 21 lanes. Also fixed there: non-atomic
+   `research_manifest_latest.json` writes (torn consumer reads), the
+   `gap_detection` latch (Kraken's checksum lane published as `sequence`;
+   no-evidence lanes defaulted to provable — now worst-class-wins with an
+   explicit `unknown`), and one torn index line crash-looping the manifest job.
+4. **Kraken subscribe-time trade snapshots became duplicate prints in curated.**
+   Kraken replays the last ~50 trades in a `type:"snapshot"` frame on EVERY
+   subscribe; the normalizer ignored the frame type, the gate's per-run sequence
+   cursor starts empty, and promotion dedups by run only — so every segment
+   boundary curated up to ~50 duplicated prints into the provably-gapless trades
+   dataset (Coinbase's `last_match` is the 1-per-subscribe variant). Normalizers
+   now tag `subscribe_replay`; the gate quarantines it (raw keeps everything).
+   The gate also mirrors the promotion bar for prints (missing/zero price or size
+   quarantines the event, not the whole segment at scoring).
+5. **Binance REST aggTrades duplicated a full segment into curated on every
+   unclean worker death.** The resume cursor only advances on clean segment end;
+   a killed segment left durable rows beyond the cursor, the hourly catch-up
+   scorer certified the re-fetch, and run-keyed promotion curated both. The
+   resume floor is now raised to the durable on-disk high-water (age-bounded by
+   the same resume-gap rule).
+
+Runner-architecture fix motivated by the audit: **maintenance jobs moved off the
+scheduler thread onto a dedicated single-slot executor** (still strictly
+serialized with itself, reaped by the scheduler loop). Inline maintenance was the
+remaining scheduler-stall class PR #17's incident exposed — archive-offload's
+first real pass (due ~2026-06-22, tens of GB) would have frozen all dispatch and
+tripped a false `scheduler_stalled`. The stall finding itself now escalates
+health to `error`, heartbeat/run-log write failures (AV contention, full disk)
+no longer kill the runner, and health tail-reads `job_runs.jsonl`.
+
+The enumeration/lambda-drop trap claimed four more victims, now all threaded
+centrally and regression-tested: `normalized_parquet` (inert on every lane but
+one), `snapshot_anchor_timeout_seconds` (binance-depth tuning was a no-op),
+`jsonl_fsync` on the five depth job types, and the REST segment's fsync cadence
+knobs. Other notable fixes: one undecodable WS frame no longer kills a lane
+(skip + count + consecutive-failure cap); the binance-depth deadline rotation no
+longer records a spurious reconnect + alignment break every 30-min segment
+(constant 1-per-segment noise in book-sync-health since the lane went live);
+offload's resume path now writes the index row it owed (and recovers
+interrupted deletes instead of wedging in `cold_target_mismatch`); a configured
+`MARKET_DATA_ARCHIVE_ROOT` on a not-yet-mounted drive no longer silently
+re-routes writes to the default disk; `mock` no longer writes synthetic rows
+into the live normalized dataset (the durability test had been doing exactly
+that on this box); duplicate job names are refused at config load and in both
+`.ps1` preflights; `redeploy_runner.ps1` kills root-first (no surviving
+mid-kill workers), clears stale worker locks after its no-plant-python gate
+(saves each lane the up-to-600s self-heal wait), and its post-relaunch check
+now proves the NEW runner is alive instead of re-reading the dead runner's
+heartbeat. STANDARDS §2.1 was corrected to describe the deployed batched-fsync
+durability posture (process-kill-proof; power loss can cost ≤1 batch + a torn
+tail), §5 documents the new gate reasons, §6 the perp/funding lanes and
+`unknown`/worst-class `gap_detection` semantics — no `STANDARDS_VERSION` bump
+(no schema/partition/replayable change).
+
+Known data-quality residue (owner decision queued in ROADMAP): curated kraken
+trades carry historical subscribe-replay duplicates from before this fix
+(dedupe by `(product, trade_id)` on read, or re-promote); coinbase carries one
+`last_match` per segment boundary; binance perp aggTrades may carry crash-window
+duplicates. Suite 377 → 407; ruff clean; both `.ps1` parse-checked ASCII.
+
 ## 2026-06-11 — scheduler-stall incident (15-hour outage masked by a fresh heartbeat)
 
 After an overnight reboot (03:02 UTC) the plant dispatched everything once, then

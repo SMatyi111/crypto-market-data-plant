@@ -2427,6 +2427,9 @@ def test_health_flags_stalled_scheduler_behind_fresh_heartbeat(tmp_path):
     (tmp_path / "heartbeat.json").write_text(json_mod.dumps(heartbeat), encoding="utf-8")
     report = build_health_report(ops_root=tmp_path)
     assert "scheduler_stalled" in report.findings
+    # A wedged scheduler is a 100%-outage condition: it must rank "error", not sit
+    # at "warn" below a single failing job.
+    assert report.status == "error"
 
     heartbeat["last_scheduler_tick"] = now.isoformat()
     (tmp_path / "heartbeat.json").write_text(json_mod.dumps(heartbeat), encoding="utf-8")
@@ -2436,3 +2439,147 @@ def test_health_flags_stalled_scheduler_behind_fresh_heartbeat(tmp_path):
     del heartbeat["last_scheduler_tick"]
     (tmp_path / "heartbeat.json").write_text(json_mod.dumps(heartbeat), encoding="utf-8")
     assert "scheduler_stalled" not in build_health_report(ops_root=tmp_path).findings
+
+
+def test_locks_reclaim_zero_byte_and_garbage_lock_files(tmp_path: Path) -> None:
+    """Regression: a 0-byte or garbage lock file (kill between the O_EXCL create and
+    the json.dump, or a full disk) raised JSONDecodeError straight out of acquire(),
+    bypassing the stale-lock self-heal — a permanently crash-looping lane, or a
+    plant-wide boot failure for the runner lock."""
+    from crypto_collector.ops import OpsRunnerLock, StandaloneWorkerLock
+
+    lock_root = tmp_path / "standalone_workers"
+    lock_root.mkdir(parents=True)
+    (lock_root / "w.lock").write_text("", encoding="utf-8")  # torn create
+    worker_lock = StandaloneWorkerLock(tmp_path, worker_name="w")
+    worker_lock.acquire()
+    worker_lock.release()
+
+    (lock_root / "w.lock").write_text("{not json", encoding="utf-8")
+    worker_lock = StandaloneWorkerLock(tmp_path, worker_name="w")
+    worker_lock.acquire()
+    worker_lock.release()
+
+    (tmp_path / "ops-runner.lock").write_text("", encoding="utf-8")
+    runner_lock = OpsRunnerLock(tmp_path, runner_name="r")
+    runner_lock.acquire()
+    runner_lock.release()
+
+
+def test_load_ops_config_rejects_duplicate_enabled_job_names(tmp_path: Path) -> None:
+    """Scheduler state is keyed by job name: a copy-pasted lane block that kept its
+    name silently collapses two jobs into one slot (one never runs). Fail loudly."""
+    import json as json_mod
+
+    config = tmp_path / "ops.json"
+    config.write_text(
+        json_mod.dumps(
+            {
+                "jobs": [
+                    {"name": "lane-a", "job_type": "mock", "interval_seconds": 60},
+                    {"name": "lane-a", "job_type": "mock", "interval_seconds": 60},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="duplicate enabled job names.*lane-a"):
+        load_ops_config(config)
+
+    # A disabled duplicate is fine — only enabled jobs share scheduler state.
+    config.write_text(
+        json_mod.dumps(
+            {
+                "jobs": [
+                    {"name": "lane-a", "job_type": "mock", "interval_seconds": 60},
+                    {"name": "lane-a", "job_type": "mock", "interval_seconds": 60, "enabled": False},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert len(load_ops_config(config)) == 1
+
+
+def test_read_jsonl_skips_torn_lines_and_supports_tail_window(tmp_path: Path) -> None:
+    """Regression: one torn line in job_runs.jsonl (crash / full disk) permanently
+    crashed build_health_report. Bad lines are skipped; the tail window bounds the
+    read so an ever-growing run log can't make health unboundedly slow."""
+    from crypto_collector.ops import _read_jsonl
+
+    path = tmp_path / "job_runs.jsonl"
+    path.write_text(
+        '{"job_name": "a", "status": "success"}\n'
+        '{"job_name": "b", "status":\n'  # torn
+        "[1, 2, 3]\n"  # parseable but not a row
+        '{"job_name": "c", "status": "error"}\n',
+        encoding="utf-8",
+    )
+    rows = _read_jsonl(path)
+    assert [row["job_name"] for row in rows] == ["a", "c"]
+
+    # Tail window: only rows in the final N bytes survive, partial first line dropped.
+    tail_rows = _read_jsonl(path, tail_bytes=45)
+    assert [row["job_name"] for row in tail_rows] == ["c"]
+
+
+def test_health_report_survives_torn_job_runs_line(tmp_path: Path) -> None:
+    (tmp_path / "job_runs.jsonl").write_text(
+        '{"job_name": "a", "status": "success", "finished_at": "2026-06-11T00:00:00+00:00"}\n'
+        '{"job_name": "b", "sta',
+        encoding="utf-8",
+    )
+    report = build_health_report(ops_root=tmp_path)
+    assert report is not None  # used to raise JSONDecodeError forever
+
+
+def test_prune_managed_names_cover_every_collector_job_type(tmp_path: Path) -> None:
+    """Regression: the prune command's managed set enumerated only the two Binance
+    job types (it predated the multi-venue expansion), so 19 of 21 live lanes were
+    prunable as 'unmanaged'. Every collector lane in the config is managed."""
+    import argparse
+    import json as json_mod
+
+    import crypto_collector.cli as cli
+
+    config = tmp_path / "ops.json"
+    config.write_text(
+        json_mod.dumps(
+            {
+                "jobs": [
+                    {"name": "okx-d", "job_type": "okx-depth-worker", "interval_seconds": 5},
+                    {
+                        "name": "bybit-t",
+                        "job_type": "bybit-trades-worker",
+                        "interval_seconds": 5,
+                        "args": {"worker_name": "bybit-trades-custom"},
+                    },
+                    {"name": "promote", "job_type": "promote-replayable", "interval_seconds": 5},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_prune(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(to_dict=lambda: {"findings": []}, findings=[])
+
+    original = cli.prune_stale_worker_artifacts
+    cli.prune_stale_worker_artifacts = fake_prune
+    try:
+        cli.run_ops_prune_stale_workers(
+            argparse.Namespace(
+                config=config,
+                ops_root=tmp_path,
+                stale_after_days=7,
+                apply=False,
+                format="json",
+            )
+        )
+    finally:
+        cli.prune_stale_worker_artifacts = original
+
+    assert captured["managed_worker_names"] == {"okx-depth-worker", "bybit-trades-custom"}

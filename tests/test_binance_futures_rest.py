@@ -438,3 +438,58 @@ def test_job_args_threads_max_resume_gap_and_resume_friendly_stale_windows():
         )
     )
     assert overridden.max_resume_gap_seconds == 120.0
+
+
+def _write_run_with_sequences(root, lane: str, name: str, sequences: list[int]) -> None:
+    run_dir = root / lane / name
+    (run_dir / "clean").mkdir(parents=True)
+    (run_dir / "clean" / "events.jsonl").write_text(
+        "".join(json.dumps({"sequence": seq}) + "\n" for seq in sequences),
+        encoding="utf-8",
+    )
+
+
+def test_max_agg_id_in_recent_runs_finds_durable_high_water(tmp_path) -> None:
+    """Regression (crash-resume duplicates): the cursor only advances on a clean
+    segment end, so after a hard kill the durable high-water on disk runs AHEAD of
+    the cursor. The scan must surface it so the resume floor skips the
+    already-written range instead of re-fetching it into curated twice."""
+    from crypto_collector.collectors.binance_futures_rest import max_agg_id_in_recent_runs
+
+    now = datetime(2026, 6, 12, 12, 0, 0, tzinfo=UTC)
+    # An older completed run and a newer crashed run (no cursor advance for it).
+    _write_run_with_sequences(tmp_path, "binance_perp_trades", "20260612_110000", [100, 150])
+    _write_run_with_sequences(tmp_path, "binance_perp_trades", "20260612_113000", [151, 220])
+
+    high = max_agg_id_in_recent_runs(
+        tmp_path, "binance_perp_trades", now=now, max_age_seconds=21_600.0
+    )
+    assert high == 220
+
+    # No lane dir at all -> None (first-ever segment).
+    assert (
+        max_agg_id_in_recent_runs(tmp_path, "nope", now=now, max_age_seconds=21_600.0) is None
+    )
+
+
+def test_max_agg_id_in_recent_runs_ignores_runs_older_than_the_resume_gap(tmp_path) -> None:
+    """An extended outage must still re-anchor to live (bounded fapi weight), exactly
+    like the stale-cursor rule: run dirs older than max_age_seconds don't count."""
+    from crypto_collector.collectors.binance_futures_rest import max_agg_id_in_recent_runs
+
+    now = datetime(2026, 6, 12, 12, 0, 0, tzinfo=UTC)
+    _write_run_with_sequences(tmp_path, "binance_perp_trades", "20260610_110000", [100, 150])
+
+    assert (
+        max_agg_id_in_recent_runs(
+            tmp_path, "binance_perp_trades", now=now, max_age_seconds=21_600.0
+        )
+        is None
+    )
+    # A wider window picks the same run up again.
+    assert (
+        max_agg_id_in_recent_runs(
+            tmp_path, "binance_perp_trades", now=now, max_age_seconds=7 * 86_400.0
+        )
+        == 150
+    )

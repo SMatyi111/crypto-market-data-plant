@@ -139,3 +139,43 @@ def test_normalizer_quarantines_parse_errors_instead_of_crashing() -> None:
     assert "invalid_time" in result.reasons
     assert "invalid_price" in result.reasons
     assert "invalid_sequence" in result.reasons
+
+
+def test_quality_gate_quarantines_subscribe_replay_tagged_events() -> None:
+    """Prints a venue re-delivers at subscribe time (Kraken's trade snapshot frame,
+    Coinbase's last_match) are tagged by the normalizers; the gate must keep them out
+    of clean — promotion has no cross-run row dedup, so letting them through landed
+    duplicate prints in curated trades_replayable on every segment boundary."""
+    gate = QualityGate()
+    event = make_event(channel="trades", event_type="trade", metadata={"subscribe_replay": True})
+    result = gate.validate(event)
+    assert result.accepted is False
+    assert "subscribe_replay" in result.reasons
+    # Untagged (live) prints are unaffected.
+    assert gate.validate(make_event(channel="trades", event_type="trade", sequence=2)).accepted
+
+
+def test_quality_gate_rejects_zero_or_missing_price_size_on_trades_channel() -> None:
+    """The promotion bar (replay_trades_run) fails a WHOLE run when any clean print has
+    a missing or non-positive price/size; the live gate must quarantine those per-event
+    so one odd print doesn't cost the full segment at scoring time."""
+    gate = QualityGate()
+    assert "invalid_trade_size" in gate.validate(
+        make_event(channel="trades", event_type="trade", size=0.0)
+    ).reasons
+    assert "invalid_trade_size" in gate.validate(
+        make_event(channel="trades", event_type="trade", size=None)
+    ).reasons
+    assert "invalid_trade_price" in gate.validate(
+        make_event(channel="trades", event_type="trade", price=None)
+    ).reasons
+    # Coinbase's event types count as prints too (channel is the discriminator).
+    assert "invalid_trade_size" in gate.validate(
+        make_event(channel="trades", event_type="match", size=0.0)
+    ).reasons
+    # Non-trades channels keep the old semantics: size 0 / None price stay acceptable
+    # (L3 lifecycle events legitimately carry them).
+    assert gate.validate(make_event(channel="full", event_type="done", size=0.0)).accepted
+    assert gate.validate(
+        make_event(channel="full", event_type="open", price=None, sequence=2)
+    ).accepted

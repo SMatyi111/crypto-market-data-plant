@@ -225,3 +225,26 @@ def test_build_topics_compose_full_subscription_strings() -> None:
         build_limit_depth_topic(channel=MEXC_LIMIT_DEPTH_CHANNEL, symbol="btcusdt", depth=20)
         == "spot@public.limit.depth.v3.api.pb@BTCUSDT@20"
     )
+
+
+def test_mexc_depth_normalizer_quarantines_missing_body_instead_of_empty_book() -> None:
+    """Regression: a frame without a publicLimitDepths body (e.g. a misdelivered deals
+    frame that passed the emit filter) used to normalize into a CLEAN empty-book
+    snapshot — wiping the reconstructed book with no quarantine trail. It must carry a
+    parse error so MetadataQualityGate quarantines it."""
+    raw = RawMessage(
+        source="mexc",
+        received_at=_BASE,
+        payload={
+            "channel": "spot@public.limit.depth.v3.api.pb@BTCUSDT@20",
+            "symbol": "BTCUSDT",
+            "publicAggreDeals": {"deals": []},  # wrong body for the depth lane
+            "sendTime": str(int(_BASE.timestamp() * 1000)),
+        },
+    )
+
+    event = MexcDepthNormalizer().normalize(raw)
+
+    assert event.bids == [] and event.asks == []
+    assert "missing_publicLimitDepths" in event.metadata["parse_errors"]
+    assert MetadataQualityGate().validate(event).accepted is False

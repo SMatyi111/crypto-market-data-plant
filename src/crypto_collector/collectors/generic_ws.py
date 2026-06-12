@@ -11,6 +11,19 @@ from .base import BaseCollector
 
 logger = logging.getLogger(__name__)
 
+# A single undecodable frame is skipped (counted in `decode_error_count`), but a
+# run of consecutive failures means the wire format itself has drifted (MEXC has
+# already retired one protobuf schema) — keep collecting garbage and the segment
+# records nothing while looking alive. Past this many consecutive failures the
+# stream ends cleanly so the segment finalizes and the worker reconnects fresh.
+_MAX_CONSECUTIVE_DECODE_ERRORS = 20
+
+# Two clean server closes within this window count as a close storm: a venue/LB
+# that accepts the subscription then immediately closes would otherwise drive a
+# zero-delay reconnect loop at connection-storm rates (Binance bans IPs above
+# ~300 connects/5min, which then surfaces as handshake 429s).
+_CLEAN_CLOSE_STORM_WINDOW_SECONDS = 30.0
+
 
 class GenericWebsocketCollector(BaseCollector):
     def __init__(self, config: CollectorConfig) -> None:
@@ -20,6 +33,10 @@ class GenericWebsocketCollector(BaseCollector):
         # the health report can see a silent-but-connected feed. Stays 0 when the
         # watchdog is disabled (the default) or never trips.
         self.idle_timeout_count = 0
+        # Frames that failed to decode (malformed JSON / protobuf) and were skipped.
+        # Surfaced in metrics/summary.jsonl like idle_timeout_count so a quietly
+        # rotting feed is visible to the health report.
+        self.decode_error_count = 0
 
     async def stream(self, limit: int | None = None) -> AsyncIterator[RawMessage]:
         try:
@@ -32,6 +49,9 @@ class GenericWebsocketCollector(BaseCollector):
 
         message_count = 0
         attempt = 0
+        consecutive_decode_errors = 0
+        clean_close_streak = 0
+        last_clean_close_at: float | None = None
         max_attempts = max(1, int(self.config.connect_retries))
         while True:
             try:
@@ -89,7 +109,42 @@ class GenericWebsocketCollector(BaseCollector):
                                     self.idle_timeout_count,
                                 )
                                 return
-                            payload = self._decode_frame(message)
+                            # One undecodable frame must not kill the lane: skip it,
+                            # count it (the ack-wait path already skips these), and
+                            # only end the segment on a sustained decode-failure run.
+                            # The raw frame is absent from raw/messages.jsonl either
+                            # way — raw stores decoded payloads — so skipping loses
+                            # no more than crashing did, and sequence-validated lanes
+                            # surface any resulting gap at replay scoring.
+                            try:
+                                payload = self._decode_frame(message)
+                            except Exception as exc:  # noqa: BLE001
+                                self.decode_error_count += 1
+                                consecutive_decode_errors += 1
+                                log = (
+                                    logger.warning
+                                    if consecutive_decode_errors == 1
+                                    else logger.debug
+                                )
+                                log(
+                                    "websocket frame decode failed source=%s channel=%s "
+                                    "decode_error_count=%d error=%s",
+                                    self.config.source,
+                                    self.config.channel,
+                                    self.decode_error_count,
+                                    exc,
+                                )
+                                if consecutive_decode_errors >= _MAX_CONSECUTIVE_DECODE_ERRORS:
+                                    logger.error(
+                                        "websocket frame decode failing persistently "
+                                        "source=%s channel=%s consecutive=%d; ending segment",
+                                        self.config.source,
+                                        self.config.channel,
+                                        consecutive_decode_errors,
+                                    )
+                                    return
+                                continue
+                            consecutive_decode_errors = 0
                             if not self._should_emit(payload):
                                 continue
                             yield RawMessage(
@@ -103,7 +158,32 @@ class GenericWebsocketCollector(BaseCollector):
                     finally:
                         await self._stop_keepalive(keepalive_task)
                 # Server closed the stream cleanly — reconnect so we keep recording.
+                # A clean close raises no exception, so `attempt` (reset by each
+                # successful subscribe) never accrues backoff on this path. Guard the
+                # fast-close storm explicitly: closes spaced wider than the window
+                # are normal (24h policy closes) and reconnect immediately.
                 logger.warning("websocket closed cleanly; reconnecting source=%s", self.config.source)
+                now = asyncio.get_event_loop().time()
+                if (
+                    last_clean_close_at is not None
+                    and (now - last_clean_close_at) < _CLEAN_CLOSE_STORM_WINDOW_SECONDS
+                ):
+                    clean_close_streak += 1
+                    delay = _backoff_delay(
+                        attempt=clean_close_streak,
+                        base=self.config.retry_backoff_seconds,
+                        cap=self.config.max_backoff_seconds,
+                    )
+                    logger.warning(
+                        "websocket clean-close storm source=%s streak=%d delay=%.2fs",
+                        self.config.source,
+                        clean_close_streak,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    clean_close_streak = 0
+                last_clean_close_at = now
             except Exception as exc:  # noqa: BLE001
                 attempt += 1
                 if attempt >= max_attempts or not _is_retryable_connect_error(exc):
@@ -344,8 +424,20 @@ class GenericWebsocketCollector(BaseCollector):
 def _is_retryable_connect_error(exc: BaseException) -> bool:
     if isinstance(exc, (TimeoutError, OSError, asyncio.TimeoutError)):
         return True
-    name = type(exc).__name__
-    if name in {"ConnectionClosed", "ConnectionClosedError", "ConnectionClosedOK", "InvalidStatusCode"}:
+    # Name-based checks so this module never imports websockets at module scope.
+    # The MRO walk matters: websockets >= 13 raises InvalidStatus (not the legacy
+    # InvalidStatusCode) for a non-101 handshake response, so a routine 429/503
+    # during venue maintenance was classified non-retryable and crashed the worker
+    # on the FIRST attempt. Any InvalidHandshake subclass (InvalidStatus,
+    # InvalidMessage, ...) is a transient-or-retryable connect failure.
+    names = {klass.__name__ for klass in type(exc).__mro__}
+    if names & {
+        "ConnectionClosed",
+        "ConnectionClosedError",
+        "ConnectionClosedOK",
+        "InvalidHandshake",
+        "InvalidStatusCode",
+    }:
         return True
     text = str(exc).lower()
     return any(

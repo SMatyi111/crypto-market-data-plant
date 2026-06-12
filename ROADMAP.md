@@ -8,7 +8,7 @@ changes scope or state. Companion docs:
 - [`STANDARDS.md`](STANDARDS.md) — the data contract (schemas, replayability, retention)
 - [`docs/HISTORY.md`](docs/HISTORY.md) — resolved-work narrative (what was fixed, and why)
 
-Last updated: **2026-06-11**.
+Last updated: **2026-06-12**.
 
 ---
 
@@ -40,13 +40,13 @@ see `CLAUDE.md` "Quality gates & review protocol".
 
 ## Open work items (rough value order)
 
-0. **Finish the baseline src/ audit — 7 subsystems still unreviewed.** The 2026-06-11
-   audit confirmed+fixed 15 findings (PR #15) but covered only kalshi, rest-collectors,
-   replay, and curation before hitting session token limits; still unreviewed:
-   ws-core (generic_ws/pipeline), cli-collection, cli-ops-wiring, normalize,
-   ops-runner, support, mexc-misc. Re-run with the SLIM design only: one reviewer per
-   subsystem, NO verifier fleet — findings triaged personally in the main session
-   (the 3-verifiers-per-finding design burned ~1.7M tokens in 11 minutes, twice).
+0. **Deploy the audit-completion fixes (runner restart).** The baseline src/ audit is
+   COMPLETE (all 11 subsystems; ~35 findings fixed — see `docs/HISTORY.md` 2026-06-12
+   and the audit PR). Merged ≠ deployed: the live runner needs a restart
+   (`scripts/redeploy_runner.ps1`) to pick up the maintenance executor, the lock
+   self-heal fixes, the subscribe-replay quarantine, and the aggTrades resume floor.
+   Deploy BEFORE the 2026-06-22 offload check — inline maintenance would block all
+   dispatch for the first big offload pass on the old code.
 1. **D:\market_archive legacy history — decide retention or merge.** The pre-2026-06-08
    D: archive is kept read-only as history. Decide: backfill/merge its runs into the
    G: curated dataset (score with `backfill-trades-replay` / `backfill-stream-depth
@@ -84,6 +84,11 @@ see `CLAUDE.md` "Quality gates & review protocol".
    ~0.3–0.4% per segment. Eliminating it means separating connection lifecycle from
    file lifecycle in the collector core — a real refactor, parked unless that loss
    starts to matter.
+10. **Ops-root JSONL log rotation/retention.** `job_runs.jsonl`,
+    `heartbeat_history.jsonl`, and `worker_events.jsonl` grow unbounded (~3–5k
+    rows/day). The 2026-06-12 audit made health tail-read the run log (cost
+    contained), but the files themselves still need a rotation or retention policy
+    — fold into `run_cleanup`.
 
 ## Decision queue (owner)
 
@@ -92,6 +97,14 @@ Decisions waiting on the owner; agents must not act on these without an explicit
 
 - **D:\market_archive legacy history** — retention vs. merge (open item 1 above).
   Owner deferred 2026-06-11: stays read-only until research needs pre-cutover dates.
+- **Historical curated duplicates (2026-06-12 audit residue).** Until the audit
+  fixes deploy+age in, curated data carries known duplicates: kraken trades (up to
+  ~50 subscribe-replay prints per segment boundary since the lane went live),
+  coinbase trades (one `last_match` per boundary), and possibly binance perp
+  aggTrades (crash-window re-fetches). Options: (a) document + dedupe by
+  `(product, trade_id)` at read time in research consumers, or (b) re-promote the
+  affected lanes from raw on the fixed code (touches curated data — owner call).
+  New capture is clean once the fix PR deploys.
 
 Decided 2026-06-11 (recorded, closed):
 - Incident-fix PR #17 merged + deployed same day; kalshi re-enabled as pool jobs,

@@ -10,8 +10,8 @@ param(
     # bumped by one per collector lane added. WS collectors are I/O-bound (measured
     # ~0.1 core total for 12 live lanes) and process-isolated, so 21 stays light on the
     # 8-physical / 16-logical-core box. Maintenance jobs (quarantine/promote/manifest/
-    # cleanup/health) run in the runner's scheduler thread, NOT the pool, so they don't
-    # consume collector slots.
+    # cleanup/health) run on the runner's dedicated single-slot maintenance executor,
+    # NOT the pool, so they don't consume collector slots.
     # 21 worker lanes + the 2 kalshi REST jobs (pool-dispatched since the 2026-06-11
     # scheduler-stall incident) = 23 slots, one per pooled lane.
     [int]$CollectorConcurrency = 23
@@ -75,14 +75,27 @@ if ($invalidJobs.Count -gt 0) {
 
 # Guard: more enabled collector lanes than pool slots means the lanes sorting last in
 # the config are NEVER dispatched (silent starvation -- shipped twice: 12<17, 17<21).
-# Pool-dispatched job types end in -worker or start with kalshi- (pinned by
-# tests/test_repo_hygiene.py).
+# Pool-dispatched job types end in -worker, plus the two pooled kalshi REST jobs
+# enumerated EXPLICITLY (pinned by tests/test_repo_hygiene.py): a kalshi- prefix wildcard
+# also matched the maintenance job kalshi-summarize-crypto-quotes, so adding that to
+# the config would have tripped this preflight and refused a valid boot.
+$kalshiPoolTypes = @("kalshi-collect-crypto-quotes", "kalshi-discover-crypto")
 $collectorLanes = @($configPayload.jobs | Where-Object {
-    ($_.job_type -like "*-worker" -or $_.job_type -like "kalshi-*") -and ($null -eq $_.enabled -or $_.enabled)
+    ($_.job_type -like "*-worker" -or $kalshiPoolTypes -contains $_.job_type) -and ($null -eq $_.enabled -or $_.enabled)
 })
 if ($collectorLanes.Count -gt $CollectorConcurrency) {
     "[$(Get-Date -Format o)] $($collectorLanes.Count) enabled collector lanes exceed CollectorConcurrency=$CollectorConcurrency ($resolvedConfig)" | Out-File -FilePath $LogPath -Append -Encoding utf8
     throw "$($collectorLanes.Count) enabled collector lanes exceed CollectorConcurrency=$CollectorConcurrency. Raise the default in run_ops_runner.ps1 AND redeploy_runner.ps1 (one slot per lane)."
+}
+
+# Guard: duplicate ENABLED job names collapse into one scheduler slot (state is keyed
+# by name) -- one copy silently never runs. The runner refuses such a config at load;
+# catching it here surfaces the reason in the boot log instead of a python stack trace.
+$dupNames = @($configPayload.jobs | Where-Object { $null -eq $_.enabled -or $_.enabled } |
+    Group-Object -Property name | Where-Object { $_.Count -gt 1 })
+if ($dupNames.Count -gt 0) {
+    "[$(Get-Date -Format o)] duplicate enabled job names in ${resolvedConfig}: $(($dupNames.Name) -join ', ')" | Out-File -FilePath $LogPath -Append -Encoding utf8
+    throw "Duplicate enabled job names in ${resolvedConfig}: $(($dupNames.Name) -join ', ')"
 }
 
 $mutex = New-Object System.Threading.Mutex($false, "Global\CryptoMarketDataPlantOpsRunner")

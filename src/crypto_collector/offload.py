@@ -307,23 +307,55 @@ def _move_run_dir(
             # Resume: a previous cycle copied (and possibly indexed) this run but died
             # before deleting the source. Re-verify against the source before deleting —
             # a name collision with different content must never cost the hot copy.
-            if _file_manifest(final_target) != source_manifest:
-                return OffloadRunStatus(
-                    run_path=run_key,
-                    lane=lane,
-                    action="cold_target_mismatch",
-                    cold_path=str(final_target),
-                    error="cold target exists with different content; source kept",
+            cold_manifest = _file_manifest(final_target)
+            if cold_manifest != source_manifest:
+                # A crash mid-rmtree leaves a partially-deleted source: every
+                # remaining source file still matches the verified cold copy, the
+                # source is just a strict subset. That's a resumable partial delete
+                # — finish it. Anything else (extra or size-changed source files)
+                # is a genuine collision and the hot copy is kept. Without the
+                # subset check, one interrupted delete wedged the run in a
+                # permanent cold_target_mismatch that errored every later pass.
+                # (vacuously true for an empty leftover dir skeleton — rmtree got
+                # them all; index-before-delete means its row was already written)
+                is_partial_delete = all(
+                    cold_manifest.get(name) == size
+                    for name, size in source_manifest.items()
                 )
+                if not is_partial_delete:
+                    return OffloadRunStatus(
+                        run_path=run_key,
+                        lane=lane,
+                        action="cold_target_mismatch",
+                        cold_path=str(final_target),
+                        error="cold target exists with different content; source kept",
+                    )
+            # Index BEFORE deleting, mirroring the fresh-move ordering. A previous
+            # cycle that died between its rename and its index write left the run
+            # cold-only with NO index row — breaking the "raw remains locatable
+            # after offload" contract (STANDARDS §7). A duplicate row in the
+            # append-only index (prior crash was after the write) is harmless;
+            # a missing one is not.
+            size = sum(cold_manifest.values())
+            index_sink.write(
+                {
+                    "run_path": run_key,
+                    "cold_path": str(final_target),
+                    "lane": lane,
+                    "moved_at": checked_at.isoformat(),
+                    "bytes": size,
+                    "file_count": len(cold_manifest),
+                    "resumed": True,
+                }
+            )
             shutil.rmtree(run_dir)
-            size = sum(source_manifest.values())
             return OffloadRunStatus(
                 run_path=run_key,
                 lane=lane,
                 action="resumed_delete",
                 cold_path=str(final_target),
                 bytes=size,
-                file_count=len(source_manifest),
+                file_count=len(cold_manifest),
             )
 
         partial_target = cold_lane_root / _PARTIAL_DIRNAME / run_dir.name
@@ -356,6 +388,18 @@ def _move_run_dir(
                 "file_count": len(source_manifest),
             }
         )
+        # Defense-in-depth re-verify before the destructive step: a writer appending
+        # to the source AFTER the copy completed (a zombie worker writing into an
+        # aged segment) would otherwise lose the appended tail silently. One stat
+        # pass per moved run.
+        if _file_manifest(run_dir) != source_manifest:
+            return OffloadRunStatus(
+                run_path=run_key,
+                lane=lane,
+                action="source_changed_during_move",
+                cold_path=str(final_target),
+                error="source changed between copy and delete; source kept",
+            )
         shutil.rmtree(run_dir)
         return OffloadRunStatus(
             run_path=run_key,

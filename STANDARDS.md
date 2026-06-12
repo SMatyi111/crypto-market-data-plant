@@ -102,7 +102,7 @@ A collector "run" is one segment directory:
 
 ```
 <output_root>/<source>/<YYYYMMDD_HHMMSS>/
-  raw/messages.jsonl[.N]    # every WS frame, append-only, fsync per line, size-rotated
+  raw/messages.jsonl[.N]    # every WS frame, append-only, flush per line / batched fsync, size-rotated
   clean/events.jsonl        # normalized events that passed the live quality gate
   quarantine/events.jsonl   # normalized events that failed, each with a "reasons" list
   metrics/summary.jsonl     # streamed run metrics (partial rows + a final row)
@@ -125,11 +125,18 @@ straddles two days. A lane configured with the data-arrival watchdog
 silent-but-connected — the run still finalizes (metrics + replay summary) and the
 worker opens a fresh segment (see the watchdog note in §4).
 
-**Durability:** raw JSONL is fsync'd per line, so a hard kill / power loss never
-leaves a torn line — raw is the source of truth you can always rebuild from. The
-normalized Parquet layer buffers up to `batch_size` (100) rows in memory, so on a
-hard kill it can briefly lag raw by up to ~100 events. Rebuild normalized from raw
-if they disagree.
+**Durability:** raw/clean/quarantine JSONL is **flushed per line, fsynced in
+batches** (default every 64 events or 200 ms, whichever first; per-event fsync
+remains available per lane via `fsync_interval_events: 1`). Per-line flush means a
+hard **process kill loses nothing** and never leaves a torn line. The weaker bound
+is **power loss / OS crash**: up to one un-fsynced batch can vanish and the page
+cache may persist a torn final line — readers that rebuild from raw must tolerate
+a torn tail. (This batched posture replaced per-line fsync on 2026-06-09: per-event
+fsync latency capped hot lanes below the feed rate, growing a received_at backlog
+that tripped the clock-skew gate.) Raw remains the source of truth you rebuild
+from. The normalized Parquet layer buffers up to `batch_size` (100) rows in
+memory, so on a hard kill it can briefly lag raw by up to ~100 events. Rebuild
+normalized from raw if they disagree.
 
 ### 2.2 Normalized Parquet (all runs, pre-curation)
 
@@ -436,10 +443,11 @@ produces, via vendored generated bindings + the `protobuf` runtime
 `scripts/generate_mexc_protobuf.py`). The decoded dict — including a `_mexc_decode`
 provenance block (schema, proto source, decoder version, frame byte length, SHA-256,
 and base64 of the original frame) — is what lands in `raw/messages.jsonl`, so raw stays
-a true rebuild source even though the wire bytes were protobuf. **The vendored schema
-and the classifications below were built from MEXC's published proto + docs, not a live
-capture, so both MEXC lanes ship disabled pending live-frame verification**
-(see `src/crypto_collector/proto/mexc/README.md`).
+a true rebuild source even though the wire bytes were protobuf. The vendored schema
+and the classifications below were built from MEXC's published proto + docs and
+shipped disabled until **verified against live frames on 2026-06-09 — both MEXC
+lanes are now enabled** (v6 changelog item 4;
+see `src/crypto_collector/proto/mexc/README.md`).
 
 **Live adapter — MEXC spot `trades` (`aggre.deals`).** Channel
 `spot@public.aggre.deals.v3.api.pb@<interval>@<SYMBOL>`. One frame batches several
@@ -550,7 +558,14 @@ with a `reasons` list and are excluded from the normalized/clean stream:
 
 `parse_errors` (any), `invalid_side`, `non_positive_price`, `negative_size`,
 `stale_or_clock_skew` (delay `> max_delay_ms` or `< -max_future_skew_ms`),
-`non_monotonic_sequence` (strictly decreasing `sequence`), `unknown_event_type`.
+`non_monotonic_sequence` (strictly decreasing `sequence`), `unknown_event_type`,
+`invalid_trade_price` / `invalid_trade_size` (trades-channel events whose price or
+size is missing or not finite-positive — mirrors the §4.2 promotion bar, so one odd
+print quarantines alone instead of failing its whole segment at scoring),
+`subscribe_replay` (prints a venue re-delivers at subscribe time — Kraken's
+trade-channel `snapshot` frame, Coinbase's `last_match`. The previous segment
+already captured them and promotion has no cross-run row dedup, so they must not
+re-enter clean; they remain in raw and in quarantine).
 
 The gate is a fast online filter; §4 replay is the authoritative, whole-run
 verdict that gates promotion.
@@ -567,8 +582,11 @@ verdict that gates promotion.
    `standards_version` (matches `STANDARDS_VERSION` above) and carries two views:
    - `lanes` — the canonical per-`(venue, instrument, dataset)` readiness. Each
      lane is discovered from its raw lane directory
-     (`<venue>_<dataset>[_<instrument>]`), carries a `gap_detection` tag
-     (`sequence`/`checksum` = provable; `none_native` = §4.3 best-effort), and lists
+     (`<venue>[_perp]_<dataset>[_<instrument>]`; perp lanes report venue
+     `<venue>_perp`, covering `depth`/`trades`/`funding`), carries a
+     `gap_detection` tag (`sequence`/`checksum` = provable; `none_native` = §4.3
+     best-effort; `unknown` = no replay summary observed yet — never assume
+     provable; a lane's tag is the worst class it has ever produced), and lists
      per-`event_date` `readiness`. Readiness is driven by the curated promotion index
      (`run_path` → lane, accurate per instrument) and the lane's raw replay
      summaries — **not** the Parquet partitions (which, since v2, do carry an

@@ -61,11 +61,17 @@ def _parse_timestamp(value: Any, errors: list[str]) -> datetime | None:
         if isinstance(value, datetime):
             return value.astimezone(UTC)
         if isinstance(value, (int, float)):
+            # Epoch SECONDS — unlike the market normalizers, which treat numerics
+            # as epoch milliseconds. Only the mock lane uses this generic adapter;
+            # a real venue lane must pre-shape its timestamps (see class docstring)
+            # or use a market normalizer, never feed ms values here.
             return datetime.fromtimestamp(value, tz=UTC)
         if isinstance(value, str):
             text = value.replace("Z", "+00:00")
             return datetime.fromisoformat(text).astimezone(UTC)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OSError, OverflowError):
+        # OSError/OverflowError: fromtimestamp on Windows rejects negative or
+        # out-of-range values with OSError rather than ValueError.
         errors.append("invalid_time")
     return None
 

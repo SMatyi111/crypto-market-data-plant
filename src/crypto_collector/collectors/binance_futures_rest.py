@@ -243,6 +243,64 @@ def max_agg_id_in_events(events_path: Path | str) -> int | None:
     return highest
 
 
+def max_agg_id_in_recent_runs(
+    output_root: Path | str,
+    source_name: str,
+    *,
+    now: datetime,
+    max_age_seconds: float,
+    scan_limit: int = 3,
+) -> int | None:
+    """Highest durably-written aggregate-trade id across the lane's recent run dirs.
+
+    The cursor advances only when a segment completes normally, so a segment that
+    dies mid-run (hard kill, transient HTTP error — the poll has no internal retry)
+    leaves clean events on disk beyond the cursor. Resuming from the stale cursor
+    re-fetches that whole range into the next run, and the hourly catch-up scorer +
+    run-keyed promotion (no cross-run row dedup) then curate every one of those rows
+    TWICE. Scanning the newest few run dirs' clean events recovers the true durable
+    high-water so the resume floor can be raised past the already-written range.
+
+    Only run dirs younger than `max_age_seconds` count — the same bound
+    `aggtrades_resume_from_id` applies to a stale cursor, so an extended outage
+    still re-anchors to live (one logged gap) instead of paging an unbounded
+    backfill through the fapi weight budget."""
+    lane_root = Path(output_root) / source_name
+    try:
+        run_dirs = sorted(
+            (path for path in lane_root.iterdir() if path.is_dir()),
+            key=lambda path: path.name,
+            reverse=True,
+        )
+    except OSError:
+        return None
+    scanned = 0
+    for run_dir in run_dirs:
+        if scanned >= scan_limit:
+            break
+        started_at = _parse_run_dir_timestamp(run_dir.name)
+        if started_at is None:
+            continue
+        if (now - started_at).total_seconds() > max_age_seconds:
+            break  # dirs are sorted newest-first; everything past here is older
+        scanned += 1
+        candidate = max_agg_id_in_events(run_dir / "clean" / "events.jsonl")
+        if candidate is not None:
+            # `a` ids ascend with time, so the newest run that wrote any sequenced
+            # trade already holds the lane's durable maximum — no need to scan older
+            # (larger) files.
+            return candidate
+    return None
+
+
+def _parse_run_dir_timestamp(name: str) -> datetime | None:
+    """Run dirs are named `YYYYMMDD_HHMMSS[...]` (see prepare_run_paths). UTC."""
+    try:
+        return datetime.strptime(name[:15], "%Y%m%d_%H%M%S").replace(tzinfo=UTC)
+    except ValueError:
+        return None
+
+
 def _parse_iso(value: object) -> datetime | None:
     if not isinstance(value, str) or not value:
         return None

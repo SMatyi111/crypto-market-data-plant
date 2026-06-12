@@ -175,6 +175,11 @@ class CoinbaseTradeNormalizer:
             "maker_side": maker_side if maker_side in ("buy", "sell") else None,
             "buyer_is_maker": _coinbase_buyer_is_maker(maker_side),
             "coinbase_sequence": _optional_int(payload.get("sequence"), "sequence", parse_errors),
+            # `last_match` is always the most recent print from BEFORE this
+            # subscription — a subscribe-time replay the previous segment already
+            # captured. Tag it so the gate quarantines it (promotion has no
+            # cross-run dedup); raw keeps the frame verbatim.
+            "subscribe_replay": True if event_type == "last_match" else None,
         }
         if parse_errors:
             metadata["parse_errors"] = parse_errors
@@ -342,9 +347,17 @@ class KrakenTradeNormalizer:
         data = raw.payload.get("data")
         if not isinstance(data, list):
             return []
-        return [self._normalize_one(item, raw) for item in data]
+        # Kraken replays the last ~50 historical trades in a `type:"snapshot"` frame
+        # on EVERY subscribe (segment start, mid-segment reconnect). Those prints were
+        # already captured by the previous segment, and promotion dedups by run only —
+        # untagged, they land in curated twice. Tag them so the quality gate
+        # quarantines them (reason `subscribe_replay`); raw keeps the frame verbatim.
+        subscribe_replay = str(raw.payload.get("type") or "") == "snapshot"
+        return [self._normalize_one(item, raw, subscribe_replay=subscribe_replay) for item in data]
 
-    def _normalize_one(self, item: Any, raw: RawMessage) -> NormalizedL3Event:
+    def _normalize_one(
+        self, item: Any, raw: RawMessage, *, subscribe_replay: bool = False
+    ) -> NormalizedL3Event:
         item = item if isinstance(item, dict) else {}
         parse_errors: list[str] = []
         product = str(item.get("symbol") or "UNKNOWN")
@@ -365,6 +378,7 @@ class KrakenTradeNormalizer:
             "canonical_symbol": instrument.canonical_symbol if instrument is not None else None,
             "buyer_is_maker": (taker_side == "sell") if taker_side is not None else None,
             "ord_type": item.get("ord_type") if item.get("ord_type") in ("limit", "market") else None,
+            "subscribe_replay": True if subscribe_replay else None,
         }
         if parse_errors:
             metadata["parse_errors"] = parse_errors
@@ -611,7 +625,13 @@ class MexcDepthNormalizer:
         payload = raw.payload
         parse_errors: list[str] = []
         body = payload.get("publicLimitDepths")
-        body = body if isinstance(body, dict) else {}
+        if not isinstance(body, dict):
+            # A frame without a limit-depths body (e.g. a misdelivered deals frame
+            # that passed the emit filter) must NOT normalize into a clean empty-book
+            # snapshot — that would wipe the reconstructed book with no quarantine
+            # trail. The parse error routes it to quarantine instead.
+            parse_errors.append("missing_publicLimitDepths")
+            body = {}
         product = str(payload.get("symbol") or "UNKNOWN")
         # The wrapper send time (matching-engine push time) is the per-frame clock;
         # fall back to createTime. Both are epoch-ms decimal strings (proto3 JSON).
@@ -897,7 +917,8 @@ def _split_l2_changes(
             side = item[0]
             price = float(item[1])
             size = float(item[2])
-        except (TypeError, ValueError, IndexError):
+        except (TypeError, ValueError, IndexError, KeyError):
+            # KeyError: a dict-shaped item makes item[0] a key lookup, not an index.
             errors.append("invalid_changes")
             continue
         if side == "buy":
@@ -1020,7 +1041,8 @@ def _parse_levels(
         try:
             price = float(item[0])
             size = float(item[1])
-        except (TypeError, ValueError, IndexError):
+        except (TypeError, ValueError, IndexError, KeyError):
+            # KeyError: a dict-shaped level makes item[0] a key lookup, not an index.
             errors.append(f"invalid_{field_name}")
             continue
         levels.append([price, size])

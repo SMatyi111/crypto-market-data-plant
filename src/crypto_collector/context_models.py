@@ -52,23 +52,6 @@ class NormalizedDepthUpdate:
         return row
 
 
-@dataclass(slots=True)
-class NormalizedTrade:
-    source: str
-    product: str
-    channel: str
-    event_type: str
-    event_time: datetime | None
-    received_at: datetime
-    trade_id: int | None
-    price: float | None
-    size: float | None
-    buyer_is_maker: bool | None
-    instrument: InstrumentRef | None = None
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-    def to_dict(self) -> dict[str, Any]:
-        row = asdict(self)
-        row["event_time"] = self.event_time.isoformat() if self.event_time is not None else None
-        row["received_at"] = self.received_at.isoformat()
-        return row
+# NormalizedTrade used to live here: dead code (no producer or consumer anywhere),
+# with a trade_id typed `int | None` that contradicted the live venues' string ids.
+# Removed before anyone built on it; trades use NormalizedL3Event (models.py).
