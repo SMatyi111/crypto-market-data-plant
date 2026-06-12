@@ -122,16 +122,17 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   cold-tier growth for all lanes). Deciding by the 2026-06-22 offload spot-check
   would let any config change ride that check's verification pass.
 - **2026-06-13 modelling-side collection request (strategy-sensitive venue —
-  details in the gitignored local request doc).** Two new-capture proposals,
-  triaged by the manager: (i) a continuous WS order-book + reference-price lane
-  whose data is **perishable — every day before go-live is unrecoverable**, so
-  the go/no-go has real cost-of-delay; (ii) a low-volume daily external
-  data sweep (dual-source cross-checked, re-fetchable, no urgency). Each
-  needs two owner calls: go/no-go, and build placement — native public-repo lane
-  (CI/review coverage, venue name becomes public) vs. local-only artifact
-  (private, outside the quality gates). A third requested item turned out
-  already satisfied by live capture, and a fourth is moot after the continuous
-  Kalshi switch; both recorded in the request doc.
+  details in the gitignored local request doc).** Triaged by the manager;
+  status: (i) **decided 2026-06-13** — the perishable continuous WS order-book
+  + reference-price capture was approved by the owner as a **local-only
+  artifact** and is live on a per-user scheduled task since 2026-06-12
+  ~23:42 UTC (build, smoke test, and live verification recorded in the local
+  request doc; runs only while the owner is logged on — folds into the pending
+  service-conversion decision there). (ii) Still pending: a low-volume daily
+  external data sweep (dual-source cross-checked, re-fetchable, no
+  urgency) — needs go/no-go + the same placement call. A third requested item
+  turned out already satisfied by live capture, and a fourth is moot after the
+  continuous Kalshi switch; both recorded in the request doc.
 
 Decided 2026-06-11 (recorded, closed):
 - Incident-fix PR #17 merged + deployed same day; kalshi re-enabled as pool jobs,
