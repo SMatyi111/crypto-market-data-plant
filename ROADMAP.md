@@ -12,15 +12,18 @@ Last updated: **2026-06-12**.
 
 ---
 
-## Current state (2026-06-11)
+## Current state (2026-06-12)
 
-All green. 22 enabled collection lanes (21 collector workers + Kalshi quote
-sampling) across Binance (spot USDT + USDC, USDT-M perp via REST), Coinbase,
+All green. 22 enabled collection lanes (21 collector workers + continuous Kalshi
+quote sampling) across Binance (spot USDT + USDC, USDT-M perp via REST), Coinbase,
 Kraken, Bybit (spot + linear perp), MEXC, OKX (spot + linear perp), and Kalshi
 crypto binaries — all BTC. Full quarantine → promote curation chain per lane,
 hourly score catch-up self-heal, research manifest, cleanup retention, and
 cold-tier archive offload. CI green on `main`; live runner restarted
-2026-06-10 23:00 UTC on the current code (83 jobs).
+2026-06-12 16:51 UTC on main tip 8eb4c64 (83 jobs) — that restart also switched
+the Kalshi quote lane from ~50%-duty burst sampling to continuous back-to-back
+1800 s runs (owner request; raw volume roughly doubles to ~16 GB/day — see
+`docs/HISTORY.md` 2026-06-12).
 
 ---
 
@@ -40,13 +43,6 @@ see `CLAUDE.md` "Quality gates & review protocol".
 
 ## Open work items (rough value order)
 
-0. **Deploy the audit-completion fixes (runner restart).** The baseline src/ audit is
-   COMPLETE (all 11 subsystems; ~35 findings fixed — see `docs/HISTORY.md` 2026-06-12
-   and the audit PR). Merged ≠ deployed: the live runner needs a restart
-   (`scripts/redeploy_runner.ps1`) to pick up the maintenance executor, the lock
-   self-heal fixes, the subscribe-replay quarantine, and the aggTrades resume floor.
-   Deploy BEFORE the 2026-06-22 offload check — inline maintenance would block all
-   dispatch for the first big offload pass on the old code.
 1. **D:\market_archive legacy history — decide retention or merge.** The pre-2026-06-08
    D: archive is kept read-only as history. Decide: backfill/merge its runs into the
    G: curated dataset (score with `backfill-trades-replay` / `backfill-stream-depth

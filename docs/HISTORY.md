@@ -7,6 +7,31 @@ git log + the merged PR descriptions; this file keeps the *why*.
 
 ---
 
+## 2026-06-12 — Kalshi quote lane switched to continuous sampling (config-only)
+
+Owner request. Since first light (2026-06-08) the `kalshi-crypto-quotes` lane ran
+~65 s sampling bursts (`duration_seconds=70`, `sample_count=12`) re-dispatched 60 s
+after completion — a ~50% duty cycle with ~60 s coverage gaps every cycle, because
+the scheduler sets `next_run = finished_at + interval`. Post-incident (PR #17) the
+job runs in the collector pool as a subprocess, so a long-running job no longer
+threatens the scheduler thread and the lane can run like the WS lanes do:
+`interval_seconds 60→5`, `duration_seconds 70→1800`, `sample_count` dropped. Two
+supporting args make the runner treat the long run correctly: `max_segment_seconds:
+1800` (health derives the completion cadence from it — without it a 30-min run
+trips `long_running_job` at every check) and `subprocess_timeout_seconds: 2100`
+(the cadence-scaled default for non-segmented jobs would have killed the run at
+300 s; the explicit value also reaps a hung run in 35 min instead of the 7200 s
+worker default). No code change: markets are re-fetched every ~9 s sample
+(only the slow-moving series list is per-run), and `ParquetDatasetSink` flushes
+every 100 rows, so long runs neither stale the market set nor grow memory.
+Trade-off accepted by the owner: kalshi raw volume roughly doubles (~8→~16 GB/day);
+G: had 603 GB free at deploy and the cold-tier offload starts aging runs out
+2026-06-22. Deployed 2026-06-12 16:51 UTC (runner pid 16380) — the same restart
+activated PR #20's in-runner health fixes. Verified live: single run dir spanning
+multiple old burst cycles, health clean, lane `in_progress` and fresh.
+
+---
+
 ## 2026-06-12 — baseline src/ audit completed (7 remaining subsystems; ~35 findings fixed)
 
 Finished the one-time baseline audit PR #15 started: one reviewer agent per
