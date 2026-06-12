@@ -229,6 +229,7 @@ class OpsRunnerLock:
 
     def acquire(self) -> None:
         self.ops_root.mkdir(parents=True, exist_ok=True)
+        started_monotonic = time.monotonic()
         while True:
             try:
                 fd = os.open(
@@ -238,7 +239,16 @@ class OpsRunnerLock:
             except FileExistsError:
                 owner = _read_json_file(self.lock_path)
                 owner_pid = _read_pid(owner)
-                if owner_pid is not None and _pid_exists(owner_pid) and self._heartbeat_is_fresh():
+                if (
+                    owner_pid is not None
+                    and _pid_exists(owner_pid)
+                    and (self._heartbeat_is_fresh() or _lock_created_recently(owner))
+                ):
+                    # The created_at grace covers the startup window: a runner that
+                    # just won the lock hasn't written its first heartbeat yet, and
+                    # a SECOND launcher (boot task + manual redeploy) judging by the
+                    # old heartbeat alone would break the live lock — two runners,
+                    # duplicate promoters plant-wide.
                     raise RuntimeError(
                         f"ops runner already active for {self.ops_root} "
                         f"(pid={owner_pid}, runner={owner.get('runner_name', 'unknown')})"
@@ -250,11 +260,23 @@ class OpsRunnerLock:
                 # runner is dead — reclaim the lock instead of refusing to start. Without
                 # this, a crash or Stop+Start strands collection on a phantom lock until a
                 # manual unlink.
-                if not _break_stale_lock(self.lock_path):
+                if owner is None and _lock_possibly_mid_write(self.lock_path):
+                    # Unreadable but very young: probably another process between its
+                    # O_EXCL create and its json.dump — re-read shortly rather than
+                    # breaking a lock that's about to become valid.
+                    time.sleep(0.1)
+                elif not _break_stale_lock(self.lock_path):
                     # Another process broke (and possibly re-acquired) it first; loop
                     # and re-evaluate against the new state instead of unlinking what
                     # may now be a live owner's fresh lock.
                     time.sleep(0.05)
+                if time.monotonic() - started_monotonic > _LOCK_ACQUIRE_DEADLINE_SECONDS:
+                    # E.g. AV/backup holding the stale file so every rename fails:
+                    # fail loudly instead of spinning invisibly forever.
+                    raise RuntimeError(
+                        f"could not acquire or break ops-runner lock {self.lock_path} "
+                        f"within {_LOCK_ACQUIRE_DEADLINE_SECONDS:.0f}s"
+                    ) from None
                 continue
             payload = {
                 "runner_name": self.runner_name,
@@ -298,6 +320,7 @@ class StandaloneWorkerLock:
 
     def acquire(self) -> None:
         self.lock_root.mkdir(parents=True, exist_ok=True)
+        started_monotonic = time.monotonic()
         while True:
             try:
                 fd = os.open(
@@ -316,8 +339,18 @@ class StandaloneWorkerLock:
                         f"standalone worker already active for {self.worker_name} "
                         f"(pid={owner_pid})"
                     ) from None
-                if not _break_stale_lock(self.lock_path):
+                if owner is None and _lock_possibly_mid_write(self.lock_path):
+                    # Unreadable but very young: probably another process between its
+                    # O_EXCL create and its json.dump — re-read shortly rather than
+                    # breaking a lock that's about to become valid.
+                    time.sleep(0.1)
+                elif not _break_stale_lock(self.lock_path):
                     time.sleep(0.05)
+                if time.monotonic() - started_monotonic > _LOCK_ACQUIRE_DEADLINE_SECONDS:
+                    raise RuntimeError(
+                        f"could not acquire or break worker lock {self.lock_path} "
+                        f"within {_LOCK_ACQUIRE_DEADLINE_SECONDS:.0f}s"
+                    ) from None
                 continue
             payload = {
                 "worker_name": self.worker_name,
@@ -578,6 +611,10 @@ class OpsRunner:
                     self._finalize_run(job, result)
                     self._write_heartbeat_snapshot()
                     if result.status == "error" and stop_on_error:
+                        # Surface "error" NOW: the finally-drain below can block on
+                        # in-flight collectors for a long time, and monitoring must
+                        # not read a healthy heartbeat for that whole window.
+                        self._write_heartbeat_snapshot(status="error")
                         pending_error = RuntimeError(
                             f"collector job {job.name} failed: {result.message}"
                         )
@@ -592,6 +629,7 @@ class OpsRunner:
                     self._finalize_run(finished_job, result)
                     self._write_heartbeat_snapshot()
                     if result.status == "error" and stop_on_error:
+                        self._write_heartbeat_snapshot(status="error")
                         pending_error = RuntimeError(
                             f"maintenance job {finished_job.name} failed: {result.message}"
                         )
@@ -919,7 +957,7 @@ def build_health_report(
         active_started_by_name[str(current_job["name"])] = _parse_dt(current_job.get("started_at"))
     heartbeat_is_fresh = heartbeat_age_seconds is not None and heartbeat_age_seconds <= stale_after_seconds
 
-    run_rows = _read_jsonl(job_runs_path, tail_bytes=16 * 1024 * 1024)
+    run_rows = _read_jsonl(job_runs_path, tail_bytes=64 * 1024 * 1024)
     recent_failures = []
     for row in run_rows[-200:]:
         if row.get("status") == "success":
@@ -1241,6 +1279,22 @@ def prune_stale_worker_artifacts(
     )
 
 
+# Bounded patience for lock acquisition: long enough to ride out a mid-write
+# grace wait or a transient AV hold on the stale file, short enough that a lane
+# stuck on an unbreakable lock fails LOUDLY (job error -> re-dispatch) instead of
+# spinning invisibly inside acquire() while looking active.
+_LOCK_ACQUIRE_DEADLINE_SECONDS = 30.0
+
+# An unreadable lock file younger than this is treated as another process mid-way
+# between its O_EXCL create and its json.dump — wait for it to finish writing
+# rather than breaking a lock that is about to become valid.
+_LOCK_MID_WRITE_GRACE_SECONDS = 5.0
+
+# A readable lock younger than this blocks a second launcher even when the
+# heartbeat is stale: the new owner hasn't written its first heartbeat yet.
+_LOCK_CREATED_GRACE_SECONDS = 180.0
+
+
 def _break_stale_lock(lock_path: Path) -> bool:
     """Atomically claim-and-remove a lock file judged stale. Returns True when this
     process removed it.
@@ -1250,14 +1304,34 @@ def _break_stale_lock(lock_path: Path) -> bool:
     delete the winner's freshly-created NEW lock — a classic unlink/create TOCTOU
     ending with two live owners of one lane (double promoter). Rename is atomic on
     the same directory, so exactly one process wins the rename; the loser loops and
-    re-evaluates the winner's fresh lock instead of deleting it."""
+    re-evaluates the winner's fresh lock instead of deleting it.
+
+    `replace` (not `rename`): a crash between a previous break's rename and its
+    unlink leaves a `.stale-<pid>` file behind, and Windows `rename` refuses to
+    overwrite an existing target — with pid reuse that turned into an infinite
+    acquire() livelock. `replace` overwrites the leftover."""
     stale_path = lock_path.with_name(f"{lock_path.name}.stale-{os.getpid()}")
     try:
-        lock_path.rename(stale_path)
+        lock_path.replace(stale_path)
     except OSError:
         return False
     stale_path.unlink(missing_ok=True)
     return True
+
+
+def _lock_possibly_mid_write(lock_path: Path) -> bool:
+    try:
+        age_seconds = time.time() - lock_path.stat().st_mtime
+    except OSError:
+        return False  # vanished or unreadable — let the acquire loop re-evaluate
+    return age_seconds < _LOCK_MID_WRITE_GRACE_SECONDS
+
+
+def _lock_created_recently(owner: dict[str, Any] | None) -> bool:
+    created = _parse_dt((owner or {}).get("created_at"))
+    if created is None:
+        return False
+    return (datetime.now(tz=UTC) - created).total_seconds() <= _LOCK_CREATED_GRACE_SECONDS
 
 
 def _read_json_file(path: Path) -> dict[str, Any] | None:
@@ -1342,8 +1416,12 @@ def _read_jsonl(path: Path, *, tail_bytes: int | None = None) -> list[dict[str, 
     tolerance `_promoted_rows_by_run` already has).
 
     With `tail_bytes`, only the last N bytes are read (job_runs.jsonl grows
-    unbounded; health only needs the recent window plus latest-run-per-job, and
-    a multi-week tail covers both — a job idle for longer genuinely is stale)."""
+    unbounded; health only needs the recent-failure window plus latest-run-per-job).
+    Size the window against the LARGEST configured job interval: at the live rate
+    (~3 MB/day, growing with lane count) 64 MiB covers ~3 weeks, comfortably above
+    the hourly/daily cadences in use — a job with no run inside the window reports
+    stale, which for those cadences it genuinely is. Rotation (ROADMAP item) is the
+    durable fix."""
     if not path.exists():
         return []
     if tail_bytes is None:
@@ -1430,6 +1508,20 @@ def _standalone_worker_rows(
                 raw_messages = partial_metrics.get("raw_messages")
                 clean_events = partial_metrics.get("clean_events")
                 quarantined_events = partial_metrics.get("quarantined_events")
+                # Subscribe-replay rejects are BY DESIGN (a venue re-delivering
+                # recent history at subscribe time; the gate quarantines exactly
+                # one reason per such event), not stream loss — Kraken's per-
+                # subscribe ~50-print snapshot would otherwise trip the ratio on
+                # every quiet segment. Exclude them from the alarm numerator.
+                if isinstance(quarantined_events, (int, float)):
+                    reject_counts = partial_metrics.get("reject_counts")
+                    by_design = (
+                        reject_counts.get("subscribe_replay", 0)
+                        if isinstance(reject_counts, dict)
+                        else 0
+                    )
+                    if isinstance(by_design, (int, float)) and by_design > 0:
+                        quarantined_events = max(0.0, float(quarantined_events) - float(by_design))
                 if (
                     isinstance(raw_messages, (int, float))
                     and raw_messages > 0

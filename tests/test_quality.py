@@ -179,3 +179,38 @@ def test_quality_gate_rejects_zero_or_missing_price_size_on_trades_channel() -> 
     assert gate.validate(
         make_event(channel="full", event_type="open", price=None, sequence=2)
     ).accepted
+
+
+def test_subscribe_replay_above_run_high_water_heals_reconnect_gap() -> None:
+    """A replayed print ABOVE the run's sequence cursor is genuinely new data (it
+    covers a mid-run reconnect window). Quarantining it would punch a provable id
+    gap into clean and fail the WHOLE run at scoring — so it must pass, while
+    replays at/below the cursor (and all segment-start replays, cursor empty)
+    stay quarantined."""
+    gate = QualityGate(session_id="run-1")
+    # Live capture up to id 100.
+    assert gate.validate(make_event(channel="trades", event_type="trade", sequence=100)).accepted
+    # Mid-run reconnect: the venue replays ids 99-102 in its snapshot frame.
+    replay = {"subscribe_replay": True}
+    assert "subscribe_replay" in gate.validate(
+        make_event(channel="trades", event_type="trade", sequence=99, metadata=dict(replay))
+    ).reasons
+    assert "subscribe_replay" in gate.validate(
+        make_event(channel="trades", event_type="trade", sequence=100, metadata=dict(replay))
+    ).reasons
+    # 101-102 printed while disconnected — only the replay carries them.
+    assert gate.validate(
+        make_event(channel="trades", event_type="trade", sequence=101, metadata=dict(replay))
+    ).accepted
+    assert gate.validate(
+        make_event(channel="trades", event_type="trade", sequence=102, metadata=dict(replay))
+    ).accepted
+    # Cursor advanced through the replayed prints: live stream resumes seamlessly.
+    assert gate.validate(make_event(channel="trades", event_type="trade", sequence=103)).accepted
+
+    # Segment start (fresh gate, no cursor): replays quarantine wholesale — their
+    # originals live in the previous run and promotion has no cross-run dedup.
+    fresh = QualityGate(session_id="run-2")
+    assert "subscribe_replay" in fresh.validate(
+        make_event(channel="trades", event_type="trade", sequence=50, metadata=dict(replay))
+    ).reasons

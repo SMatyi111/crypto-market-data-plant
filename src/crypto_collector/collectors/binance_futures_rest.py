@@ -243,28 +243,49 @@ def max_agg_id_in_events(events_path: Path | str) -> int | None:
     return highest
 
 
+# Tail window for the resume-floor scan: `a` ids ascend within a run, so the
+# durable maximum sits on the last sequenced line — reading the final ~1 MiB
+# (thousands of rows) instead of a full multi-MB events file keeps the scan off
+# the segment-boundary critical path. Full-scan fallback below covers the odd
+# file whose tail happens to contain no matching row.
+_RESUME_SCAN_TAIL_BYTES = 1024 * 1024
+# Hard backstop on directories examined per scan; the age window is the real
+# bound (~12 dirs per 6h at 30-min segments), this only caps crash-spam lanes.
+_RESUME_SCAN_MAX_DIRS = 50
+
+
 def max_agg_id_in_recent_runs(
     output_root: Path | str,
     source_name: str,
     *,
+    symbol: str,
     now: datetime,
     max_age_seconds: float,
-    scan_limit: int = 3,
+    exclude_run_name: str | None = None,
 ) -> int | None:
-    """Highest durably-written aggregate-trade id across the lane's recent run dirs.
+    """Highest durably-written aggregate-trade id for `symbol` across the lane's
+    recent run dirs (newest first).
 
     The cursor advances only when a segment completes normally, so a segment that
     dies mid-run (hard kill, transient HTTP error — the poll has no internal retry)
     leaves clean events on disk beyond the cursor. Resuming from the stale cursor
     re-fetches that whole range into the next run, and the hourly catch-up scorer +
     run-keyed promotion (no cross-run row dedup) then curate every one of those rows
-    TWICE. Scanning the newest few run dirs' clean events recovers the true durable
+    TWICE. Scanning the recent run dirs' clean events recovers the true durable
     high-water so the resume floor can be raised past the already-written range.
 
-    Only run dirs younger than `max_age_seconds` count — the same bound
-    `aggtrades_resume_from_id` applies to a stale cursor, so an extended outage
-    still re-anchors to live (one logged gap) instead of paging an unbounded
-    backfill through the fapi weight budget."""
+    Scoping rules, each closing a real hole:
+    - `symbol` filter: agg ids are per-symbol sequences, so a lane re-pointed to a
+      new symbol must not inherit the old symbol's (arbitrarily distant) id space —
+      that would page `fromId` into the future and capture nothing.
+    - `exclude_run_name`: the CURRENT segment's just-created (empty) run dir must
+      not be scanned.
+    - Empty/unsequenced run dirs don't stop the scan: a crash-restart burst leaves
+      several empty dirs ahead of the run that actually holds the high-water.
+    - Only run dirs younger than `max_age_seconds` count — the same bound
+      `aggtrades_resume_from_id` applies to a stale cursor, so an extended outage
+      still re-anchors to live (one logged gap) instead of paging an unbounded
+      backfill through the fapi weight budget."""
     lane_root = Path(output_root) / source_name
     try:
         run_dirs = sorted(
@@ -274,23 +295,76 @@ def max_agg_id_in_recent_runs(
         )
     except OSError:
         return None
-    scanned = 0
+    examined = 0
     for run_dir in run_dirs:
-        if scanned >= scan_limit:
+        if examined >= _RESUME_SCAN_MAX_DIRS:
             break
+        if run_dir.name == exclude_run_name:
+            continue
         started_at = _parse_run_dir_timestamp(run_dir.name)
         if started_at is None:
             continue
         if (now - started_at).total_seconds() > max_age_seconds:
             break  # dirs are sorted newest-first; everything past here is older
-        scanned += 1
-        candidate = max_agg_id_in_events(run_dir / "clean" / "events.jsonl")
+        examined += 1
+        events_path = run_dir / "clean" / "events.jsonl"
+        candidate = _max_symbol_seq_in_tail(events_path, symbol)
+        if candidate is None:
+            # Rare: a large file whose final window has no matching row (e.g. the
+            # lane symbol just changed back). One bounded full scan settles it.
+            candidate = _max_symbol_seq_in_lines(_iter_lines_full(events_path), symbol)
         if candidate is not None:
             # `a` ids ascend with time, so the newest run that wrote any sequenced
-            # trade already holds the lane's durable maximum — no need to scan older
-            # (larger) files.
+            # trade for this symbol already holds the lane's durable maximum.
             return candidate
     return None
+
+
+def _max_symbol_seq_in_tail(events_path: Path, symbol: str) -> int | None:
+    try:
+        with Path(events_path).open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - _RESUME_SCAN_TAIL_BYTES))
+            data = handle.read()
+    except OSError:
+        return None
+    text = data.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    if size > _RESUME_SCAN_TAIL_BYTES and lines:
+        lines = lines[1:]  # drop the (likely partial) first line of the window
+    return _max_symbol_seq_in_lines(lines, symbol)
+
+
+def _iter_lines_full(events_path: Path):
+    try:
+        handle = Path(events_path).open("r", encoding="utf-8")
+    except OSError:
+        return
+    with handle:
+        yield from handle
+
+
+def _max_symbol_seq_in_lines(lines, symbol: str) -> int | None:
+    wanted = symbol.upper()
+    highest: int | None = None
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            row = json.loads(stripped)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("product", "")).upper() != wanted:
+            continue
+        seq = row.get("sequence")
+        if isinstance(seq, int) and not isinstance(seq, bool):
+            if highest is None or seq > highest:
+                highest = seq
+    return highest
 
 
 def _parse_run_dir_timestamp(name: str) -> datetime | None:

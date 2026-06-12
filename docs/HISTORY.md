@@ -83,14 +83,43 @@ now proves the NEW runner is alive instead of re-reading the dead runner's
 heartbeat. STANDARDS §2.1 was corrected to describe the deployed batched-fsync
 durability posture (process-kill-proof; power loss can cost ≤1 batch + a torn
 tail), §5 documents the new gate reasons, §6 the perp/funding lanes and
-`unknown`/worst-class `gap_detection` semantics — no `STANDARDS_VERSION` bump
-(no schema/partition/replayable change).
+`unknown`/worst-class `gap_detection` semantics — and because those widen
+contract-visible surfaces (manifest vocabulary, lane venues, gate reasons),
+**`STANDARDS_VERSION` bumped 6 → 7** in both files with a v7 changelog.
+
+The pre-handover `/code-review` pass (4 finder angles, candidates verified by
+reading the code in the main session per the fan-out budget) caught five real
+misses in the audit fixes themselves, all fixed before the PR: (1) the blanket
+subscribe-replay quarantine destroyed the mid-segment reconnect heal — within a
+run, the old monotonic gate let the snapshot's NEW prints fill the reconnect
+gap, and quarantining them punched a provable id gap that failed the whole run;
+the gate now passes a tagged print only when the run's sequence cursor proves
+it new. (2) `normalized_parquet` central threading delivered the flag to depth
+segments that never read it — both depth segment bodies now honor it. (3) The
+resume-floor scan wasn't symbol-scoped, could burn its window on the current
+segment's own empty dir, and full-scanned a multi-MB file per rotation — now
+symbol-filtered, exclusion-aware, tail-reading. (4) `OpsRunnerLock` lacked the
+fresh-lock `created_at` grace its worker sibling has (boot task + manual
+redeploy could double-acquire the runner), `_break_stale_lock`'s rename could
+livelock on leftover `.stale-*` residue (now `replace`), unreadable-but-young
+locks get a mid-write grace, and acquire() fails loudly after 30s instead of
+spinning invisibly. (5) The offload pre-delete re-verify ran AFTER the index
+write, leaving a lying index row on abort — reordered, with the orphaned cold
+copy removed. Also from the pass: `health` survives the invalid-config error it
+should be diagnosing; subscribe-replay rejects are excluded from the
+high-quarantine-ratio alarm (Kraken's ~50-print snapshot tripped it on quiet
+segments); `--stop-on-error` surfaces the error heartbeat before the drain; the
+job-runs tail window sized against real growth (64 MiB); shared
+`write_text_atomic` in storage.py (the snapshot anchor is now fsynced — a power
+cut could previously promote a zero-length anchor); one tolerance policy for
+both promotion-index readers. Queued for live verification (ROADMAP item 11):
+whether OKX/Bybit also replay prints at subscribe.
 
 Known data-quality residue (owner decision queued in ROADMAP): curated kraken
 trades carry historical subscribe-replay duplicates from before this fix
 (dedupe by `(product, trade_id)` on read, or re-promote); coinbase carries one
 `last_match` per segment boundary; binance perp aggTrades may carry crash-window
-duplicates. Suite 377 → 407; ruff clean; both `.ps1` parse-checked ASCII.
+duplicates. Suite 377 → 410; ruff clean; both `.ps1` parse-checked ASCII.
 
 ## 2026-06-11 — scheduler-stall incident (15-hour outage masked by a fresh heartbeat)
 

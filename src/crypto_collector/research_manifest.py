@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import STANDARDS_VERSION, default_archive_root
+from .storage import write_text_atomic
 
 
 DEFAULT_MANIFEST_ROOT = default_archive_root() / "curated" / "research" / "manifests"
@@ -51,17 +52,12 @@ def generate_research_manifest(
     # Atomic writes (tmp + replace): research consumers read latest_json at
     # arbitrary times while this runs as a scheduled job — a truncate-then-write
     # would hand them an empty/partial document, and a crash mid-write would leave
-    # the contract entry point torn until the next manifest pass.
-    _write_text_atomic(latest_json, payload)
-    _write_text_atomic(snapshot_json, payload)
-    _write_text_atomic(latest_markdown, render_manifest_markdown(manifest))
+    # the contract entry point torn until the next manifest pass. (No fsync: the
+    # manifest is rebuilt every pass, so a power-cut loss is self-healing.)
+    write_text_atomic(latest_json, payload)
+    write_text_atomic(snapshot_json, payload)
+    write_text_atomic(latest_markdown, render_manifest_markdown(manifest))
     return manifest
-
-
-def _write_text_atomic(path: Path, text: str) -> None:
-    tmp = path.with_name(f"{path.name}.tmp")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.replace(path)
 
 
 def build_manifest(*, archive_root: Path, current_date: date | None = None) -> dict[str, Any]:
@@ -337,18 +333,9 @@ def read_promotion_index_by_lane(path: Path) -> dict[str, dict[str, dict[str, An
     )
     if not path.exists():
         return {}
+    rows, _corrupt = _parse_promotion_index_lines(path)
     latest_by_run: dict[str, dict[str, Any]] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        try:
-            row = json.loads(line)
-        except ValueError:
-            # The index is appended concurrently by promote jobs; one torn line
-            # must not crash-loop the manifest job and freeze "latest" forever.
-            continue
-        if not isinstance(row, dict):
-            continue
+    for row in rows:
         run_path = str(row.get("run_path") or "")
         if not run_path:
             continue
@@ -386,18 +373,8 @@ def read_promotion_index_with_stats(path: Path) -> tuple[dict[str, dict[str, Any
         }
     latest_by_run: dict[str, dict[str, Any]] = {}
     seen_counts: Counter[str] = Counter()
-    corrupt_line_count = 0
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        try:
-            row = json.loads(line)
-        except ValueError:
-            corrupt_line_count += 1
-            continue
-        if not isinstance(row, dict):
-            corrupt_line_count += 1
-            continue
+    rows, corrupt_line_count = _parse_promotion_index_lines(path)
+    for row in rows:
         run_path = str(row.get("run_path") or "")
         if not run_path:
             continue
@@ -425,6 +402,28 @@ def read_promotion_index_with_stats(path: Path) -> tuple[dict[str, dict[str, Any
         "duplicate_promoted_run_count": duplicate_run_count,
         "corrupt_index_line_count": corrupt_line_count,
     }
+
+
+def _parse_promotion_index_lines(path: Path) -> tuple[list[dict[str, Any]], int]:
+    """Parse a promotion index, skipping torn/garbage lines (the file is appended
+    concurrently by promote jobs; one bad line must not crash-loop the manifest
+    job and freeze "latest" forever). Single tolerance policy for both the
+    by-day and by-lane readers. Returns (rows, corrupt_line_count)."""
+    rows: list[dict[str, Any]] = []
+    corrupt_line_count = 0
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            corrupt_line_count += 1
+            continue
+        if not isinstance(row, dict):
+            corrupt_line_count += 1
+            continue
+        rows.append(row)
+    return rows, corrupt_line_count
 
 
 def read_replay_summaries(root: Path) -> dict[str, dict[str, Any]]:

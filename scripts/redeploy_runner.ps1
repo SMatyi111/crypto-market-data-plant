@@ -152,13 +152,24 @@ if ($unreadable.Count -gt 0) {
 # No plant process is alive past this point: if a lock file remains (e.g. step 1
 # killed the runner, or it died earlier), it is stale by definition -- clear it and
 # proceed. Unrelated python.exe processes no longer block this.
+# One LAST instantaneous re-check right before the destructive clears: the boot
+# task (SYSTEM, PT0S) can start a runner in the seconds since the poll loop's
+# final query -- e.g. an operator redeploying right after a reboot -- and
+# deleting a LIVE runner's locks would let two collectors per lane double-write
+# and double-promote.
+$pythons = @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue)
+if ((Select-PlantPython $pythons).Count -gt 0 -or (Select-UnreadablePython $pythons).Count -gt 0) {
+    Write-Warning "A plant (or unreadable) python appeared after the kill sweep -- likely the boot task. Aborting without touching locks."
+    exit 1
+}
 Remove-Item $lockPath -Force -ErrorAction SilentlyContinue
 # Same logic for the per-lane worker locks: zero plant pythons means every one of
 # them is stale. Clearing them here (and ONLY here, after the gate) saves each lane
 # the up-to-600s lock-freshness self-heal wait after every redeploy, and removes any
-# torn lock file a kill mid-acquire left behind. Heartbeat *.json files stay --
-# health/history read them.
+# torn lock file a kill mid-acquire left behind (including leftover *.lock.stale-*
+# rename residue). Heartbeat *.json files stay -- health/history read them.
 Remove-Item (Join-Path $OpsRoot "standalone_workers\*.lock") -Force -ErrorAction SilentlyContinue
+Remove-Item (Join-Path $OpsRoot "standalone_workers\*.lock.stale-*") -Force -ErrorAction SilentlyContinue
 
 # 3. Relaunch directly (no wrapper mutex), loading this repo's src via PYTHONPATH.
 $env:PYTHONPATH = Join-Path $repo "src"

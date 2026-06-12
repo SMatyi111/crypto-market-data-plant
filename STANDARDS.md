@@ -1,7 +1,20 @@
 # Data Standards
 
-`STANDARDS_VERSION = 6`
+`STANDARDS_VERSION = 7`
 
+> **v7 (2026-06-12):** baseline-audit fixes that widen contract-visible surfaces
+> (no change to Parquet schemas or partition layout). (1) The manifest `lanes`
+> view now covers **perp lanes** (venue `<venue>_perp`) and the **`funding`**
+> dataset — previously absent — and its lane-level `gap_detection` vocabulary
+> gains **`checksum`** (Kraken depth was mislabeled `sequence`) and **`unknown`**
+> (no replay evidence; never assume provable), latched to the WORST class the
+> lane has produced (§6). (2) The live quality gate gains reasons
+> `invalid_trade_price` / `invalid_trade_size` (trades-channel prints mirroring
+> the §4.2 promotion bar; the generic `non_positive_price`/`negative_size` now
+> apply to non-trades channels only) and `subscribe_replay` (venue-replayed
+> prints quarantined unless the run's sequence cursor proves them new — §5).
+> (3) Raw durability text corrected to the deployed batched-fsync posture
+> (§2.1: process-kill-proof; power loss can cost ≤1 batch and a torn tail).
 > **v6 (2026-06-11):** catches the contract up to the lanes that went live 2026-06-09/10.
 > (1) **OKX** spot + linear-perp lanes: `books` depth proves continuity via a **linked
 > chain** — `prevSeqId(N) == seqId(N-1)`, validated by equality instead of `delta == 1`
@@ -556,16 +569,22 @@ perp lanes poll REST (`binance-futures-rest-worker`), one lane per stream:
 Applied per event during collection; failures go to `quarantine/events.jsonl`
 with a `reasons` list and are excluded from the normalized/clean stream:
 
-`parse_errors` (any), `invalid_side`, `non_positive_price`, `negative_size`,
-`stale_or_clock_skew` (delay `> max_delay_ms` or `< -max_future_skew_ms`),
-`non_monotonic_sequence` (strictly decreasing `sequence`), `unknown_event_type`,
+`parse_errors` (any), `invalid_side`, `non_positive_price` / `negative_size`
+(non-trades channels), `stale_or_clock_skew` (delay `> max_delay_ms` or
+`< -max_future_skew_ms`), `non_monotonic_sequence` (strictly decreasing
+`sequence`), `unknown_event_type`,
 `invalid_trade_price` / `invalid_trade_size` (trades-channel events whose price or
 size is missing or not finite-positive — mirrors the §4.2 promotion bar, so one odd
-print quarantines alone instead of failing its whole segment at scoring),
+print quarantines alone instead of failing its whole segment at scoring; these
+subsume the generic price/size checks on the trades channel so a bad print yields
+exactly one reason),
 `subscribe_replay` (prints a venue re-delivers at subscribe time — Kraken's
-trade-channel `snapshot` frame, Coinbase's `last_match`. The previous segment
-already captured them and promotion has no cross-run row dedup, so they must not
-re-enter clean; they remain in raw and in quarantine).
+trade-channel `snapshot` frame, Coinbase's `last_match`. Promotion has no
+cross-run row dedup, so a replayed print re-entering clean would duplicate in
+curated. A tagged print passes ONLY when the run's sequence cursor proves it new
+— i.e. it covers a mid-run reconnect window; everything else, including all
+segment-start replays, is quarantined. Replayed prints always remain in raw and
+in quarantine. Health excludes this reason from the high-quarantine-ratio alarm).
 
 The gate is a fast online filter; §4 replay is the authoritative, whole-run
 verdict that gates promotion.

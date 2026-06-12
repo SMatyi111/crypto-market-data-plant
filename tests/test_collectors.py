@@ -3114,3 +3114,49 @@ def test_dict_shaped_depth_levels_quarantine_instead_of_crashing() -> None:
     bids, asks = _split_l2_changes([{"side": "buy"}], errors)
     assert (bids, asks) == ([], [])
     assert errors == ["invalid_changes"]
+
+
+def test_depth_stream_segment_honors_normalized_parquet_toggle(tmp_path, monkeypatch) -> None:
+    """Regression on the regression: the first central-threading fix delivered
+    `normalized_parquet` to the depth segments, which then ignored it — the toggle
+    stayed inert on every depth lane while a comment (and a dispatch-level test)
+    claimed it worked. The segment body must actually honor it."""
+    import crypto_collector.cli as cli
+
+    captured: dict[str, object] = {}
+
+    class _FakePipeline:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+        async def run(self, limit=None, deadline_utc=None):
+            return SimpleNamespace(
+                raw_messages=0, clean_events=0, quarantined_events=0, deadline_reached=False
+            )
+
+    monkeypatch.setattr(cli, "CollectorPipeline", _FakePipeline)
+
+    from crypto_collector.market_normalizers import BybitDepthNormalizer
+
+    args = SimpleNamespace(
+        symbol="BTCUSDT",
+        channel="orderbook.50",
+        count=1,
+        output_root=tmp_path,
+        normalized_parquet=False,
+        source_suffix="",
+        deadline_utc=None,
+    )
+    asyncio.run(
+        cli._collect_depth_stream_segment(
+            args,
+            source="bybit",
+            websocket_url="wss://example.invalid/ws",
+            subscription_style="bybit",
+            normalizer=BybitDepthNormalizer(),
+            source_base="bybit_depth",
+            **cli._stream_depth_replay_kwargs("bybit"),
+        )
+    )
+
+    assert captured["normalized_root"] is None

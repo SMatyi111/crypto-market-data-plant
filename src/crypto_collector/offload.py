@@ -376,6 +376,23 @@ def _move_run_dir(
 
         partial_target.rename(final_target)
         size = sum(source_manifest.values())
+        # Defense-in-depth re-verify BEFORE the index write and the destructive
+        # step: a writer appending to the source AFTER the copy completed (a zombie
+        # worker writing into an aged segment) would otherwise lose the appended
+        # tail silently — and indexing first would record a move that didn't
+        # complete, wedging the run in cold_target_mismatch on every later pass.
+        # On abort the just-renamed cold copy is removed too (nothing references
+        # it: no index row, source kept), so the next pass re-copies the grown
+        # source cleanly. One stat pass per moved run.
+        if _file_manifest(run_dir) != source_manifest:
+            shutil.rmtree(final_target, ignore_errors=True)
+            return OffloadRunStatus(
+                run_path=run_key,
+                lane=lane,
+                action="source_changed_during_move",
+                cold_path=str(final_target),
+                error="source changed between copy and delete; source kept",
+            )
         # Index BEFORE deleting the source: an index entry must imply the cold copy is
         # in place, and a crash between index and delete resumes safely above.
         index_sink.write(
@@ -388,18 +405,6 @@ def _move_run_dir(
                 "file_count": len(source_manifest),
             }
         )
-        # Defense-in-depth re-verify before the destructive step: a writer appending
-        # to the source AFTER the copy completed (a zombie worker writing into an
-        # aged segment) would otherwise lose the appended tail silently. One stat
-        # pass per moved run.
-        if _file_manifest(run_dir) != source_manifest:
-            return OffloadRunStatus(
-                run_path=run_key,
-                lane=lane,
-                action="source_changed_during_move",
-                cold_path=str(final_target),
-                error="source changed between copy and delete; source kept",
-            )
         shutil.rmtree(run_dir)
         return OffloadRunStatus(
             run_path=run_key,

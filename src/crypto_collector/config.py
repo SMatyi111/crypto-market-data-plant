@@ -19,7 +19,7 @@ DEFAULT_ARCHIVE_ROOT = Path(r"G:\market_archive")
 # in STANDARDS.md (repo root); bump both together when the schema, partition
 # layout, or the definition of "replayable" changes. The research manifest tags
 # its output with this so downstream readers can pin to a known contract.
-STANDARDS_VERSION = 6
+STANDARDS_VERSION = 7
 
 _FALLBACK_WARNED: set[str] = set()
 

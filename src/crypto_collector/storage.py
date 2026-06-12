@@ -14,6 +14,25 @@ from uuid import uuid4
 _MISSING = object()
 
 
+def write_text_atomic(path: Path, text: str, *, fsync: bool = False) -> None:
+    """Write `text` to `path` via tmp + os.replace, so readers never see a torn or
+    truncated file. The pid-suffixed tmp name keeps concurrent writers of the same
+    target from colliding on Windows (a shared fixed `.tmp` makes the loser's open
+    handle fail the winner's replace).
+
+    `fsync=True` syncs the tmp file BEFORE the rename — required for files whose
+    garbage promotion is worse than losing the write (replay anchors, cursors): a
+    power cut can otherwise atomically promote a zero-length tmp into place."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        handle.write(text)
+        if fsync:
+            handle.flush()
+            os.fsync(handle.fileno())
+    tmp.replace(path)
+
+
 @dataclass(slots=True)
 class RunPaths:
     base: Path

@@ -61,7 +61,9 @@ def test_collector_job_types_match_ps1_preflight_patterns() -> None:
     # preflight matches is a maintenance type — a kalshi-* wildcard used to also
     # match kalshi-summarize-crypto-quotes (scheduler-side), so adding that valid
     # job to the config would have tripped the lane count and refused a boot.
-    kalshi_pool_types = {"kalshi-collect-crypto-quotes", "kalshi-discover-crypto"}
+    # Derived, not hardcoded: a new pooled non-worker type automatically widens
+    # this set and fails the script-pin assertions below until both scripts learn it.
+    kalshi_pool_types = {t for t in COLLECTOR_JOB_TYPES if not t.endswith("-worker")}
 
     def ps1_preflight_matches(job_type: str) -> bool:
         return job_type.endswith("-worker") or job_type in kalshi_pool_types

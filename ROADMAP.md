@@ -89,6 +89,15 @@ see `CLAUDE.md` "Quality gates & review protocol".
     rows/day). The 2026-06-12 audit made health tail-read the run log (cost
     contained), but the files themselves still need a rotation or retention policy
     — fold into `run_cleanup`.
+11. **Verify OKX/Bybit trades subscribe-replay behavior over live frames.** The
+    audit fixed subscribe-time print replays for Kraken (`snapshot` frame) and
+    Coinbase (`last_match`); review suggested OKX may push the latest historical
+    trade on subscribe and Bybit's first `publicTrade` push may carry recent
+    trades. Both lanes are `none_native` with run-keyed promotion, so untagged
+    replays would accumulate small duplicate counts at every reconnect. Capture a
+    few live (re)subscribes for each, check whether the first data frame
+    re-delivers pre-subscription prints, and if so tag them `subscribe_replay`
+    like Kraken/Coinbase.
 
 ## Decision queue (owner)
 

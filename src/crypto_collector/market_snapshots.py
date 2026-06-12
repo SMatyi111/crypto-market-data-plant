@@ -7,6 +7,7 @@ from typing import Any
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from .storage import write_text_atomic
 
 DEFAULT_HTTP_TIMEOUT = 30
 
@@ -49,9 +50,6 @@ def write_snapshot_file(
         "received_at": (received_at or datetime.now(tz=UTC)).isoformat(),
         "snapshot": snapshot,
     }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # Atomic (tmp + replace): a hard kill mid-write must not leave a torn anchor
-    # sidecar — replay reads it back and a torn one fails the run at scoring time.
-    tmp = path.with_name(f"{path.name}.tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-    tmp.replace(path)
+    # Atomic + fsynced: this sidecar is the run's replay anchor — a torn file (hard
+    # kill mid-write) or a power-cut-promoted empty tmp fails the run at scoring.
+    write_text_atomic(path, json.dumps(payload, indent=2, sort_keys=True), fsync=True)

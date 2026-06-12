@@ -1098,7 +1098,13 @@ async def collect_binance_depth_segment(args: argparse.Namespace) -> dict[str, o
     clean_sink = JsonlSink(run_paths.clean, "events.jsonl")
     quarantine_sink = JsonlSink(run_paths.quarantine, "events.jsonl")
     metrics_sink = JsonlSink(run_paths.metrics, "summary.jsonl")
-    parquet_sink = ParquetDatasetSink(_resolve_normalized_root(args, "market"))
+    # None when the lane opts out of normalized parquet — the toggle used to be
+    # threaded here and then ignored (the depth segments never read it).
+    parquet_sink = (
+        ParquetDatasetSink(_resolve_normalized_root(args, "market"))
+        if bool(getattr(args, "normalized_parquet", True))
+        else None
+    )
     normalizer = BinanceDepthNormalizer()
     quality_gate = MetadataQualityGate()
 
@@ -1152,7 +1158,8 @@ async def collect_binance_depth_segment(args: argparse.Namespace) -> dict[str, o
         received_at=utc_now(),
     )
     clean_sink.write(snapshot_clean_row)
-    parquet_sink.write(snapshot_clean_row)
+    if parquet_sink is not None:
+        parquet_sink.write(snapshot_clean_row)
     clean_count += 1
 
     deadline_utc: datetime | None = getattr(args, "deadline_utc", None)
@@ -1360,11 +1367,12 @@ def _finalize_depth_segment(
     clean_count: int,
     quarantined_count: int,
     quality_gate: MetadataQualityGate,
-    parquet_sink: ParquetDatasetSink,
+    parquet_sink: ParquetDatasetSink | None,
     metrics_sink: JsonlSink,
     deadline_reached: bool = False,
 ) -> dict[str, object]:
-    parquet_sink.flush()
+    if parquet_sink is not None:
+        parquet_sink.flush()
     events_path = run_paths.base / "clean" / "events.jsonl"
     if events_path.exists():
         replay_summary = replay_depth_run(run_paths.base, write_summary=True)
@@ -1901,7 +1909,11 @@ async def _collect_depth_stream_segment(
         # for sequence feeds), which is the right bar for a depth diff stream.
         quality_gate=MetadataQualityGate(),
         run_paths=run_paths,
-        normalized_root=_resolve_normalized_root(args, "market"),
+        normalized_root=(
+            _resolve_normalized_root(args, "market")
+            if bool(getattr(args, "normalized_parquet", True))
+            else None
+        ),
         jsonl_fsync=bool(getattr(args, "jsonl_fsync", True)),
         fsync_interval_events=fsync_events,
         fsync_interval_ms=fsync_ms,
@@ -2018,8 +2030,11 @@ async def collect_binance_futures_rest_segment(args: argparse.Namespace) -> dict
         disk_high = max_agg_id_in_recent_runs(
             args.output_root,
             source_name,
+            symbol=symbol,
             now=resume_now,
             max_age_seconds=max_resume_gap_seconds,
+            # prepare_run_paths already created THIS segment's (empty) run dir.
+            exclude_run_name=run_paths.base.name,
         )
         if disk_high is not None and (initial_from_id is None or disk_high + 1 > initial_from_id):
             initial_from_id = disk_high + 1
@@ -3291,7 +3306,16 @@ def run_health(args: argparse.Namespace) -> None:
     # lanes like Kalshi never appear in standalone_workers), so auto-discover the
     # runner's config and report on the same job set the runner runs.
     config_path = args.config or _default_ops_config_path()
-    jobs = load_ops_config(config_path) if config_path and config_path.exists() else None
+    # The diagnostic surface must SURVIVE the config error that just took the
+    # runner down (load_ops_config fails loudly on e.g. duplicate job names) —
+    # health is the documented first-response tool, so report what we can
+    # instead of stack-tracing on the same problem.
+    jobs = None
+    if config_path and config_path.exists():
+        try:
+            jobs = load_ops_config(config_path)
+        except ValueError as exc:
+            print(f"warning: ops config invalid, reporting without job context: {exc}", file=sys.stderr)
     # When --ops-root is omitted, follow the discovered config's live root instead of the
     # env/default fallback, so a bare `health` reports on the running collection rather
     # than a stale pre-migration root.
@@ -3392,7 +3416,15 @@ def run_archive_offload(args: argparse.Namespace) -> None:
 
 
 def run_ops_prune_stale_workers(args: argparse.Namespace) -> None:
-    jobs = load_ops_config(args.config) if args.config and args.config.exists() else None
+    jobs = None
+    if args.config and args.config.exists():
+        try:
+            jobs = load_ops_config(args.config)
+        except ValueError as exc:
+            # An invalid config means we can't know the managed set — pruning with
+            # an empty managed list would classify every lane as unmanaged, so
+            # refuse rather than degrade.
+            raise SystemExit(f"ops config invalid; fix it before pruning: {exc}") from exc
     managed_names: set[str] = set()
     # Every collector lane in the config is managed — the worker name defaults to
     # the job type (each run_*_worker's default_worker_name). The old version
@@ -4048,7 +4080,7 @@ def _process_binance_depth_raw(
     raw_sink: JsonlSink,
     clean_sink: JsonlSink,
     quarantine_sink: JsonlSink,
-    parquet_sink: ParquetDatasetSink,
+    parquet_sink: ParquetDatasetSink | None,
     normalizer: BinanceDepthNormalizer,
     quality_gate: MetadataQualityGate,
     message_count: int,
@@ -4063,7 +4095,8 @@ def _process_binance_depth_raw(
         clean_count += 1
         row = normalized.to_dict()
         clean_sink.write(row)
-        parquet_sink.write(row)
+        if parquet_sink is not None:
+            parquet_sink.write(row)
     else:
         quarantined_count += 1
         row = normalized.to_dict()
