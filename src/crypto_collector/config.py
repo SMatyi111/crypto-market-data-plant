@@ -19,7 +19,7 @@ DEFAULT_ARCHIVE_ROOT = Path(r"G:\market_archive")
 # in STANDARDS.md (repo root); bump both together when the schema, partition
 # layout, or the definition of "replayable" changes. The research manifest tags
 # its output with this so downstream readers can pin to a known contract.
-STANDARDS_VERSION = 6
+STANDARDS_VERSION = 7
 
 _FALLBACK_WARNED: set[str] = set()
 
@@ -111,17 +111,25 @@ _CURATED_ENV = ("MARKET_DATA_CURATED_ROOT", "CRYPTO_COLLECTOR_CURATED_ROOT")
 _OPS_ENV = ("MARKET_DATA_OPS_ROOT", "CRYPTO_COLLECTOR_OPS_ROOT")
 
 
+def _configured_archive_root() -> Path | None:
+    configured = os.environ.get("MARKET_DATA_ARCHIVE_ROOT") or os.environ.get("CRYPTO_COLLECTOR_ARCHIVE_ROOT")
+    return Path(configured) if configured else None
+
+
 def default_output_root() -> Path:
     configured = os.environ.get(_OUTPUT_ENV[0]) or os.environ.get(_OUTPUT_ENV[1])
     if configured:
         return Path(configured)
-    archive_root = default_archive_root()
-    if archive_root.exists():
-        chosen = archive_root / "raw" / "market"
-    elif DEFAULT_ARCHIVE_ROOT.exists():
-        chosen = DEFAULT_MARKET_OUTPUT_ROOT
-    else:
-        chosen = Path("data")
+    # An EXPLICIT archive-root env var is honored unconditionally — no existence
+    # probe. Probing meant a drive that wasn't mounted yet at SYSTEM-boot time
+    # silently re-routed writes to the default disk while default_archive_root()
+    # (research-manifest et al.) kept returning the configured path: a split-brain
+    # of exactly the wrong-disk class this file's header documents. A missing
+    # configured drive now fails loudly at first write (mkdir raises).
+    archive_root = _configured_archive_root()
+    if archive_root is not None:
+        return archive_root / "raw" / "market"
+    chosen = DEFAULT_MARKET_OUTPUT_ROOT if DEFAULT_ARCHIVE_ROOT.exists() else Path("data")
     _warn_implicit_fallback(_OUTPUT_ENV, chosen)
     return chosen
 
@@ -130,13 +138,14 @@ def default_normalized_root(dataset: str) -> Path:
     configured = os.environ.get(_NORMALIZED_ENV[0]) or os.environ.get(_NORMALIZED_ENV[1])
     if configured:
         return Path(configured) / dataset
-    archive_root = default_archive_root()
-    if archive_root.exists():
-        chosen = archive_root / "normalized" / dataset
-    elif DEFAULT_ARCHIVE_ROOT.exists():
-        chosen = DEFAULT_NORMALIZED_ROOT / dataset
-    else:
-        chosen = Path("normalized") / dataset
+    archive_root = _configured_archive_root()
+    if archive_root is not None:
+        return archive_root / "normalized" / dataset
+    chosen = (
+        DEFAULT_NORMALIZED_ROOT / dataset
+        if DEFAULT_ARCHIVE_ROOT.exists()
+        else Path("normalized") / dataset
+    )
     _warn_implicit_fallback(_NORMALIZED_ENV, chosen)
     return chosen
 
@@ -145,13 +154,14 @@ def default_curated_root(dataset: str) -> Path:
     configured = os.environ.get(_CURATED_ENV[0]) or os.environ.get(_CURATED_ENV[1])
     if configured:
         return Path(configured) / dataset
-    archive_root = default_archive_root()
-    if archive_root.exists():
-        chosen = archive_root / "curated" / "research" / dataset
-    elif DEFAULT_ARCHIVE_ROOT.exists():
-        chosen = DEFAULT_CURATED_ROOT / dataset
-    else:
-        chosen = Path("curated") / dataset
+    archive_root = _configured_archive_root()
+    if archive_root is not None:
+        return archive_root / "curated" / "research" / dataset
+    chosen = (
+        DEFAULT_CURATED_ROOT / dataset
+        if DEFAULT_ARCHIVE_ROOT.exists()
+        else Path("curated") / dataset
+    )
     _warn_implicit_fallback(_CURATED_ENV, chosen)
     return chosen
 
@@ -160,19 +170,13 @@ def default_ops_root() -> Path:
     configured = os.environ.get(_OPS_ENV[0]) or os.environ.get(_OPS_ENV[1])
     if configured:
         return Path(configured)
-    archive_root = default_archive_root()
-    if archive_root.exists():
-        chosen = archive_root / "ops"
-    elif DEFAULT_ARCHIVE_ROOT.exists():
-        chosen = DEFAULT_OPS_ROOT
-    else:
-        chosen = Path("ops")
+    archive_root = _configured_archive_root()
+    if archive_root is not None:
+        return archive_root / "ops"
+    chosen = DEFAULT_OPS_ROOT if DEFAULT_ARCHIVE_ROOT.exists() else Path("ops")
     _warn_implicit_fallback(_OPS_ENV, chosen)
     return chosen
 
 
 def default_archive_root() -> Path:
-    configured = os.environ.get("MARKET_DATA_ARCHIVE_ROOT") or os.environ.get("CRYPTO_COLLECTOR_ARCHIVE_ROOT")
-    if configured:
-        return Path(configured)
-    return DEFAULT_ARCHIVE_ROOT
+    return _configured_archive_root() or DEFAULT_ARCHIVE_ROOT

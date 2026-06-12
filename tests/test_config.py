@@ -57,3 +57,21 @@ def test_default_ops_root_prefers_archive_root_when_available(tmp_path: Path, mo
     monkeypatch.setattr(config, "DEFAULT_ARCHIVE_ROOT", archive_root)
     monkeypatch.setattr(config, "DEFAULT_OPS_ROOT", archive_root / "ops")
     assert config.default_ops_root() == archive_root / "ops"
+
+
+def test_configured_archive_root_is_honored_even_when_missing(tmp_path: Path, monkeypatch) -> None:
+    """Regression: a configured-but-not-yet-mounted archive root used to silently
+    re-route every derived root to the default disk (existence probe), while
+    default_archive_root() kept returning the configured path — a split-brain where
+    collectors wrote one tree and the manifest read another. An EXPLICIT env root is
+    honored unconditionally; a missing drive fails loudly at first write instead."""
+    missing = tmp_path / "not-mounted-yet" / "archive"
+    monkeypatch.setenv("MARKET_DATA_ARCHIVE_ROOT", str(missing))
+    monkeypatch.delenv("MARKET_DATA_OUTPUT_ROOT", raising=False)
+    monkeypatch.delenv("CRYPTO_COLLECTOR_OUTPUT_ROOT", raising=False)
+
+    assert config.default_archive_root() == missing
+    assert config.default_output_root() == missing / "raw" / "market"
+    assert config.default_normalized_root("market") == missing / "normalized" / "market"
+    assert config.default_curated_root("trades") == missing / "curated" / "research" / "trades"
+    assert config.default_ops_root() == missing / "ops"

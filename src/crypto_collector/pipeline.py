@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -9,6 +11,8 @@ from .models import RawMessage, utc_now
 from .normalizer import GenericL3Normalizer
 from .quality import QualityGate
 from .storage import JsonlSink, ParquetDatasetSink, RotatingJsonlSink, RunPaths
+
+logger = logging.getLogger(__name__)
 
 
 # Batched-fsync defaults for the raw/clean/quarantine JSONL sinks. Per-event fsync is
@@ -136,29 +140,51 @@ class CollectorPipeline:
                             **summary.to_dict(),
                             "reject_counts": self.quality_gate.metrics(),
                             "idle_timeout_count": getattr(self.collector, "idle_timeout_count", 0),
+                            "decode_error_count": getattr(self.collector, "decode_error_count", 0),
                             "partial": True,
                         }
                     )
         finally:
             # Always flush, even on cancellation / exception, so buffered Parquet rows
-            # and the summary metrics are persisted instead of lost on shutdown.
-            self.metrics_sink.write(
-                {
-                    **summary.to_dict(),
-                    "reject_counts": self.quality_gate.metrics(),
-                    # Surface the data-arrival watchdog count so the health report can
-                    # see a feed that went silent-but-connected (0 when disabled / never
-                    # tripped). getattr keeps non-WS collectors (mock) working.
-                    "idle_timeout_count": getattr(self.collector, "idle_timeout_count", 0),
-                    "partial": False,
-                }
-            )
-            if self.parquet_sink is not None:
-                self.parquet_sink.flush()
+            # and the summary metrics are persisted instead of lost on shutdown. Each
+            # cleanup step is isolated: a failing metrics write (disk full) must not
+            # skip the parquet flush, and neither may skip the JSONL closes — the raw
+            # sink's final fsync is the durability promise this shutdown path exists
+            # for. The first cleanup failure is re-raised only when no exception is
+            # already propagating, so the original error is never masked.
+            cleanup_error: BaseException | None = None
+            try:
+                self.metrics_sink.write(
+                    {
+                        **summary.to_dict(),
+                        "reject_counts": self.quality_gate.metrics(),
+                        # Surface the data-arrival watchdog count so the health report can
+                        # see a feed that went silent-but-connected (0 when disabled / never
+                        # tripped). getattr keeps non-WS collectors (mock) working.
+                        "idle_timeout_count": getattr(self.collector, "idle_timeout_count", 0),
+                        "decode_error_count": getattr(self.collector, "decode_error_count", 0),
+                        "partial": False,
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001
+                cleanup_error = exc
+                logger.exception("pipeline shutdown: metrics write failed")
+            try:
+                if self.parquet_sink is not None:
+                    self.parquet_sink.flush()
+            except Exception as exc:  # noqa: BLE001
+                cleanup_error = cleanup_error or exc
+                logger.exception("pipeline shutdown: parquet flush failed")
             for sink in (self.raw_sink, self.clean_sink, self.quarantine_sink):
                 close = getattr(sink, "close", None)
                 if callable(close):
-                    close()
+                    try:
+                        close()
+                    except Exception as exc:  # noqa: BLE001
+                        cleanup_error = cleanup_error or exc
+                        logger.exception("pipeline shutdown: sink close failed")
+            if cleanup_error is not None and sys.exc_info()[0] is None:
+                raise cleanup_error
         return summary
 
 

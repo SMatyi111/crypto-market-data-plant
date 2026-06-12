@@ -139,3 +139,78 @@ def test_normalizer_quarantines_parse_errors_instead_of_crashing() -> None:
     assert "invalid_time" in result.reasons
     assert "invalid_price" in result.reasons
     assert "invalid_sequence" in result.reasons
+
+
+def test_quality_gate_quarantines_subscribe_replay_tagged_events() -> None:
+    """Prints a venue re-delivers at subscribe time (Kraken's trade snapshot frame,
+    Coinbase's last_match) are tagged by the normalizers; the gate must keep them out
+    of clean — promotion has no cross-run row dedup, so letting them through landed
+    duplicate prints in curated trades_replayable on every segment boundary."""
+    gate = QualityGate()
+    event = make_event(channel="trades", event_type="trade", metadata={"subscribe_replay": True})
+    result = gate.validate(event)
+    assert result.accepted is False
+    assert "subscribe_replay" in result.reasons
+    # Untagged (live) prints are unaffected.
+    assert gate.validate(make_event(channel="trades", event_type="trade", sequence=2)).accepted
+
+
+def test_quality_gate_rejects_zero_or_missing_price_size_on_trades_channel() -> None:
+    """The promotion bar (replay_trades_run) fails a WHOLE run when any clean print has
+    a missing or non-positive price/size; the live gate must quarantine those per-event
+    so one odd print doesn't cost the full segment at scoring time."""
+    gate = QualityGate()
+    assert "invalid_trade_size" in gate.validate(
+        make_event(channel="trades", event_type="trade", size=0.0)
+    ).reasons
+    assert "invalid_trade_size" in gate.validate(
+        make_event(channel="trades", event_type="trade", size=None)
+    ).reasons
+    assert "invalid_trade_price" in gate.validate(
+        make_event(channel="trades", event_type="trade", price=None)
+    ).reasons
+    # Coinbase's event types count as prints too (channel is the discriminator).
+    assert "invalid_trade_size" in gate.validate(
+        make_event(channel="trades", event_type="match", size=0.0)
+    ).reasons
+    # Non-trades channels keep the old semantics: size 0 / None price stay acceptable
+    # (L3 lifecycle events legitimately carry them).
+    assert gate.validate(make_event(channel="full", event_type="done", size=0.0)).accepted
+    assert gate.validate(
+        make_event(channel="full", event_type="open", price=None, sequence=2)
+    ).accepted
+
+
+def test_subscribe_replay_above_run_high_water_heals_reconnect_gap() -> None:
+    """A replayed print ABOVE the run's sequence cursor is genuinely new data (it
+    covers a mid-run reconnect window). Quarantining it would punch a provable id
+    gap into clean and fail the WHOLE run at scoring — so it must pass, while
+    replays at/below the cursor (and all segment-start replays, cursor empty)
+    stay quarantined."""
+    gate = QualityGate(session_id="run-1")
+    # Live capture up to id 100.
+    assert gate.validate(make_event(channel="trades", event_type="trade", sequence=100)).accepted
+    # Mid-run reconnect: the venue replays ids 99-102 in its snapshot frame.
+    replay = {"subscribe_replay": True}
+    assert "subscribe_replay" in gate.validate(
+        make_event(channel="trades", event_type="trade", sequence=99, metadata=dict(replay))
+    ).reasons
+    assert "subscribe_replay" in gate.validate(
+        make_event(channel="trades", event_type="trade", sequence=100, metadata=dict(replay))
+    ).reasons
+    # 101-102 printed while disconnected — only the replay carries them.
+    assert gate.validate(
+        make_event(channel="trades", event_type="trade", sequence=101, metadata=dict(replay))
+    ).accepted
+    assert gate.validate(
+        make_event(channel="trades", event_type="trade", sequence=102, metadata=dict(replay))
+    ).accepted
+    # Cursor advanced through the replayed prints: live stream resumes seamlessly.
+    assert gate.validate(make_event(channel="trades", event_type="trade", sequence=103)).accepted
+
+    # Segment start (fresh gate, no cursor): replays quarantine wholesale — their
+    # originals live in the previous run and promotion has no cross-run dedup.
+    fresh = QualityGate(session_id="run-2")
+    assert "subscribe_replay" in fresh.validate(
+        make_event(channel="trades", event_type="trade", sequence=50, metadata=dict(replay))
+    ).reasons

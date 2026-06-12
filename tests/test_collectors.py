@@ -191,6 +191,29 @@ def test_generic_collector_retryable_errors_include_connection_closed() -> None:
     assert _generic_is_retryable_connect_error(ValueError("config bug")) is False
 
 
+def test_generic_collector_retryable_errors_cover_websockets13_handshake_classes() -> None:
+    """Regression: websockets >= 13 raises InvalidStatus (not the legacy
+    InvalidStatusCode) for a non-101 handshake response. The old name-only
+    allowlist classified a routine 429/503 during venue maintenance as
+    non-retryable and crashed the worker lane on the FIRST attempt. Any
+    InvalidHandshake subclass must be retryable — verified against the real
+    installed library, plus a structural fake so the test outlives renames."""
+    from websockets.exceptions import InvalidMessage, InvalidStatus
+
+    real_status = InvalidStatus(SimpleNamespace(status_code=429))
+    assert _generic_is_retryable_connect_error(real_status) is True
+    assert _generic_is_retryable_connect_error(InvalidMessage("malformed handshake")) is True
+
+    class InvalidHandshake(Exception):
+        pass
+
+    class SomeFutureHandshakeError(InvalidHandshake):
+        def __str__(self) -> str:
+            return "server rejected WebSocket connection: HTTP 503"
+
+    assert _generic_is_retryable_connect_error(SomeFutureHandshakeError()) is True
+
+
 def _depth_payload(*, first: int, final: int, symbol: str = "BTCUSDT") -> dict:
     return {"e": "depthUpdate", "s": symbol, "U": first, "u": final, "b": [], "a": []}
 
@@ -2194,9 +2217,13 @@ def test_collect_kraken_trades_segment_writes_sequence_replay_summary(
     tmp_path, monkeypatch
 ) -> None:
     """End-to-end: a Kraken v2 trade stream (snapshot + update frames, batched data)
-    lands in kraken_trades/<ts>/ as clean events and gets a sequence-bearing trades
-    replay summary (gap_detection='sequence'), because Kraken's dense per-pair trade_id
-    makes gaplessness provable."""
+    lands in kraken_trades/<ts>/ with the UPDATE-frame trades clean and the
+    SNAPSHOT-frame trades quarantined as `subscribe_replay` — Kraken replays the
+    last ~50 historical prints on every subscribe, the previous segment already
+    captured them, and promotion has no cross-run row dedup (letting them into
+    clean landed duplicate prints in curated trades_replayable). The clean run
+    still gets a sequence-bearing replay summary (gap_detection='sequence')
+    because Kraken's dense per-pair trade_id makes gaplessness provable."""
     now = utc_now()
     t1 = now.isoformat().replace("+00:00", "Z")
     t2 = (now + timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
@@ -2235,18 +2262,27 @@ def test_collect_kraken_trades_segment_writes_sequence_replay_summary(
     result = asyncio.run(collect_kraken_trades_segment(args))
 
     assert result["raw_messages"] == 2, result
-    assert result["clean_events"] == 3, result
-    assert result["quarantined_events"] == 0
+    assert result["clean_events"] == 1, result
+    assert result["quarantined_events"] == 2, result
     assert result["replayable"] is True, result["replay_findings"]
 
     run_path = Path(result["run_path"])
     assert run_path.parent.name == "kraken_trades"
     events = (run_path / "clean" / "events.jsonl").read_text(encoding="utf-8").splitlines()
-    assert len(events) == 3
+    assert len(events) == 1
     first = json.loads(events[0])
     assert first["source"] == "kraken"
     assert first["side"] == "buy"
-    assert first["sequence"] == 1001  # dense per-pair counter
+    assert first["sequence"] == 1003  # dense per-pair counter; update frame only
+    quarantined = [
+        json.loads(line)
+        for line in (run_path / "quarantine" / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert [row["sequence"] for row in quarantined] == [1001, 1002]
+    assert all(row["reasons"] == ["subscribe_replay"] for row in quarantined)
+    assert all(row["metadata"]["subscribe_replay"] is True for row in quarantined)
     summary = json.loads(
         (run_path / "metrics" / "replay_summary.json").read_text(encoding="utf-8")
     )
@@ -2725,3 +2761,402 @@ def test_binance_rest_snapshot_clean_row_builds_snapshot_event() -> None:
     assert len(row["bids"]) == 2 and len(row["asks"]) == 1
     assert row["bids"][0][0] == 100.0 and row["bids"][1][0] == 99.0
     assert row["asks"][0][0] == 101.0
+    # No exchange event time: the REST snapshot carries none, and stamping local
+    # wall clock here put a row whose event_time POSTDATED the buffered deltas
+    # written after it (head-of-segment event-time inversion).
+    assert row["event_time"] is None
+
+
+class _RawStr(str):
+    """Marker: deliver this frame as a RAW string (no json.dumps) — an undecodable wire frame."""
+
+
+class _RawCapableWebsocket(_ScriptedDepthWebsocket):
+    async def __anext__(self) -> str:
+        if self._frames and isinstance(self._frames[0], _RawStr):
+            return str(self._frames.pop(0))
+        return await super().__anext__()
+
+    async def recv(self) -> str:
+        if self._frames and isinstance(self._frames[0], _RawStr):
+            return str(self._frames.pop(0))
+        return await super().recv()
+
+
+def test_one_undecodable_frame_is_skipped_and_counted_not_fatal(tmp_path, monkeypatch) -> None:
+    """Regression: a single non-JSON frame mid-stream used to propagate out of the
+    receive loop as a non-retryable error and kill the whole worker process. It must
+    be skipped, counted (decode_error_count in metrics), and collection continue."""
+    now = utc_now()
+    t1 = now.isoformat().replace("+00:00", "Z")
+    ws = _RawCapableWebsocket(
+        frames=[
+            {"method": "subscribe", "success": True, "result": {"channel": "trade", "symbol": "BTC/USD"}},
+            _RawStr("this is { not json"),
+            _kraken_trade_frame(
+                trades=[
+                    _kraken_trade(trade_id=2001, price=50000.0, qty=0.1, side="buy", timestamp_iso=t1),
+                ],
+                msg_type="update",
+            ),
+        ]
+    )
+    _install_fake_trades_runtime(monkeypatch, ws)
+
+    args = SimpleNamespace(
+        symbol="BTC/USD",
+        channel="trade",
+        count=1,
+        output_root=tmp_path,
+        max_delay_ms=60_000,
+        max_future_skew_ms=5_000,
+        max_clock_skew_ms=60_000.0,
+        source_suffix="",
+        deadline_utc=None,
+    )
+
+    result = asyncio.run(collect_kraken_trades_segment(args))
+
+    assert result["clean_events"] == 1, result
+    summary_rows = [
+        json.loads(line)
+        for line in (Path(result["run_path"]) / "metrics" / "summary.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert summary_rows[-1]["decode_error_count"] == 1
+
+
+def test_persistent_decode_failure_ends_segment_cleanly(tmp_path, monkeypatch) -> None:
+    """A sustained run of undecodable frames (wire-format drift) must end the segment
+    cleanly — finalized metrics, no exception, worker free to reconnect fresh — not
+    crash the process and not spin collecting garbage forever."""
+    ws = _RawCapableWebsocket(
+        frames=[
+            {"method": "subscribe", "success": True, "result": {"channel": "trade", "symbol": "BTC/USD"}},
+            *[_RawStr(f"garbage frame {i} {{") for i in range(25)],
+        ]
+    )
+    _install_fake_trades_runtime(monkeypatch, ws)
+
+    args = SimpleNamespace(
+        symbol="BTC/USD",
+        channel="trade",
+        count=100,  # never reached: every data frame is garbage
+        output_root=tmp_path,
+        max_delay_ms=60_000,
+        max_future_skew_ms=5_000,
+        max_clock_skew_ms=60_000.0,
+        source_suffix="",
+        deadline_utc=None,
+    )
+
+    result = asyncio.run(collect_kraken_trades_segment(args))
+
+    assert result["clean_events"] == 0
+    summary_rows = [
+        json.loads(line)
+        for line in (Path(result["run_path"]) / "metrics" / "summary.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    # Ends at the consecutive-failure cap (20), leaving the remaining frames unread.
+    assert summary_rows[-1]["decode_error_count"] == 20
+
+
+def test_workers_thread_normalized_parquet_and_anchor_timeout_centrally(tmp_path, monkeypatch) -> None:
+    """Regression for two more lambda-drop instances: `normalized_parquet` (enumerated by
+    only ONE build_segment_args lambda, so --no-normalized-parquet was silently inert on
+    every other lane) and binance-depth's `snapshot_anchor_timeout_seconds` (configured
+    values never reached the collector; anchoring was pinned at 10.0s). Both are now
+    threaded centrally in _run_segmented_worker."""
+    import crypto_collector.cli as cli
+
+    captured: dict[str, dict[str, object]] = {}
+
+    def make_fake(key):
+        async def fake(segment_args):
+            captured[key] = {
+                "normalized_parquet": getattr(segment_args, "normalized_parquet", "MISSING"),
+                "snapshot_anchor_timeout_seconds": getattr(
+                    segment_args, "snapshot_anchor_timeout_seconds", "MISSING"
+                ),
+            }
+            return {
+                "run_path": str(tmp_path / key),
+                "clean_events": 0,
+                "replayable": True,
+                "connect_attempts": 1,  # read by the depth worker's progress message
+            }
+
+        return fake
+
+    monkeypatch.setattr(cli, "collect_binance_trades_segment", make_fake("binance_trades"))
+    monkeypatch.setattr(cli, "collect_binance_depth_segment", make_fake("binance_depth"))
+
+    def drive(job_type, runner, extra_args):
+        args = _job_args(
+            SimpleNamespace(
+                job_type=job_type,
+                args={
+                    "symbol": "BTCUSDT",
+                    "max_segments": 1,
+                    "cooldown_seconds": 0.0,
+                    "heartbeat_interval_seconds": 0.1,
+                    "worker_name": f"{job_type}-centraltest",
+                    "output_root": str(tmp_path),
+                    "ops_root": str(tmp_path),
+                    **extra_args,
+                },
+            )
+        )
+        # Mirror the dispatcher's central injection for config-only keys.
+        if "normalized_parquet" in extra_args:
+            args.normalized_parquet = bool(extra_args["normalized_parquet"])
+        runner(args)
+
+    drive(
+        "binance-trades-worker",
+        cli.run_binance_trades_worker,
+        {"normalized_parquet": False},
+    )
+    drive(
+        "binance-depth-worker",
+        cli.run_binance_depth_worker,
+        {"snapshot_anchor_timeout_seconds": 30.0},
+    )
+
+    assert captured["binance_trades"]["normalized_parquet"] is False
+    assert captured["binance_depth"]["snapshot_anchor_timeout_seconds"] == 30.0
+    # And the defaults still flow when nothing is configured.
+    assert captured["binance_depth"]["normalized_parquet"] is True
+
+
+def test_binance_futures_rest_segment_threads_fsync_cadence_to_pipeline(tmp_path, monkeypatch) -> None:
+    """Regression: collect_binance_futures_rest_segment built its CollectorPipeline
+    without the fsync cadence knobs, so a per-lane durability tune on any of the three
+    REST lanes was silently ignored (pipeline fell back to the 64/200 defaults)."""
+    import crypto_collector.cli as cli
+
+    captured: dict[str, object] = {}
+
+    class _FakePipeline:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+        async def run(self, limit=None, deadline_utc=None):
+            return SimpleNamespace(
+                raw_messages=0, clean_events=0, quarantined_events=0, deadline_reached=False
+            )
+
+    monkeypatch.setattr(cli, "CollectorPipeline", _FakePipeline)
+
+    args = SimpleNamespace(
+        symbol="BTCUSDT",
+        stream="funding",  # stateless: no cursor, no aggtrades scan
+        output_root=tmp_path,
+        count=1,
+        jsonl_fsync=True,
+        fsync_interval_events=7,
+        fsync_interval_ms=55.0,
+        normalized_parquet=False,  # keep the test off the real normalized root
+        source_suffix="",
+        deadline_utc=None,
+    )
+    result = asyncio.run(cli.collect_binance_futures_rest_segment(args))
+
+    assert captured["fsync_interval_events"] == 7
+    assert captured["fsync_interval_ms"] == 55.0
+    assert captured["jsonl_fsync"] is True
+    assert captured["normalized_root"] is None
+    assert result["replayable"] is False  # no clean events written by the fake
+
+
+def test_run_mock_does_not_write_normalized_parquet_by_default(tmp_path, monkeypatch) -> None:
+    """Regression: a bare `mock` invocation used to write synthetic rows into the LIVE
+    normalized `market` dataset via the default-root fallback (the durability test had
+    been doing exactly that on the plant box). Normalized output is now opt-in."""
+    import crypto_collector.cli as cli
+
+    captured: dict[str, object] = {"called": False}
+
+    class _FakePipeline:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+            captured["called"] = True
+
+        async def run(self, limit=None, deadline_utc=None):
+            return SimpleNamespace(
+                raw_messages=0,
+                clean_events=0,
+                quarantined_events=0,
+                deadline_reached=False,
+                to_dict=lambda: {},
+            )
+
+    monkeypatch.setattr(cli, "CollectorPipeline", _FakePipeline)
+    args = SimpleNamespace(count=1, output_root=tmp_path, product="BTC-USD")
+    asyncio.run(cli.run_mock(args))
+
+    assert captured["called"] is True
+    assert captured["normalized_root"] is None
+
+    # An explicit normalized_root (ops job arg) still opts in.
+    args = SimpleNamespace(
+        count=1, output_root=tmp_path, product="BTC-USD", normalized_root=str(tmp_path / "norm")
+    )
+    asyncio.run(cli.run_mock(args))
+    assert captured["normalized_root"] == Path(tmp_path / "norm")
+
+
+def test_collector_subprocess_timeout_scales_for_poll_jobs() -> None:
+    """A hung 60s-cadence kalshi pool job must be reaped on a cadence-scaled timeout,
+    not hold its slot (and gap its lane) for the full 7200s segment-sized default."""
+    from crypto_collector.cli import (
+        _COLLECTOR_SUBPROCESS_TIMEOUT_SECONDS,
+        _collector_subprocess_timeout_seconds,
+    )
+    from crypto_collector.ops import JobSpec
+
+    kalshi = JobSpec(name="k", job_type="kalshi-collect-crypto-quotes", interval_seconds=60)
+    assert _collector_subprocess_timeout_seconds(kalshi) == 300.0  # max(300, 4*60)
+
+    worker = JobSpec(name="w", job_type="bybit-trades-worker", interval_seconds=60)
+    assert _collector_subprocess_timeout_seconds(worker) == _COLLECTOR_SUBPROCESS_TIMEOUT_SECONDS
+
+    pinned = JobSpec(
+        name="p",
+        job_type="kalshi-collect-crypto-quotes",
+        interval_seconds=60,
+        args={"subprocess_timeout_seconds": 42.0},
+    )
+    assert _collector_subprocess_timeout_seconds(pinned) == 42.0
+
+
+def test_coinbase_last_match_is_tagged_subscribe_replay() -> None:
+    """`last_match` is always the most recent print from BEFORE the subscription — a
+    replay the previous segment already captured. The normalizer tags it so the gate
+    quarantines it instead of letting it duplicate into curated."""
+    raw = RawMessage(
+        source="coinbase",
+        received_at=utc_now(),
+        payload=_coinbase_match(
+            trade_id=99,
+            price="50000",
+            size="0.1",
+            maker_side="sell",
+            time_iso="2026-05-28T12:00:00Z",
+            event_type="last_match",
+        ),
+    )
+
+    event = CoinbaseTradeNormalizer().normalize(raw)
+
+    assert event.event_type == "last_match"
+    assert event.metadata["subscribe_replay"] is True
+    from crypto_collector.quality import QualityGate
+
+    assert "subscribe_replay" in QualityGate().validate(event).reasons
+
+    # A live match is NOT tagged.
+    live = CoinbaseTradeNormalizer().normalize(
+        RawMessage(
+            source="coinbase",
+            received_at=utc_now(),
+            payload=_coinbase_match(
+                trade_id=100,
+                price="50000",
+                size="0.1",
+                maker_side="sell",
+                time_iso="2026-05-28T12:00:00Z",
+            ),
+        )
+    )
+    assert "subscribe_replay" not in live.metadata
+
+
+def test_kraken_snapshot_frame_trades_are_tagged_subscribe_replay() -> None:
+    """Kraken's trade-channel `snapshot` frame replays the last ~50 historical prints
+    on every subscribe; the normalizer tags them per-trade so the gate quarantines
+    them. Update-frame trades stay untagged."""
+    snapshot_frame = _kraken_trade_frame(
+        trades=[_kraken_trade(trade_id=1, price=100.0, qty=0.1, side="buy", timestamp_iso="2026-05-28T12:00:00Z")],
+        msg_type="snapshot",
+    )
+    update_frame = _kraken_trade_frame(
+        trades=[_kraken_trade(trade_id=2, price=101.0, qty=0.1, side="sell", timestamp_iso="2026-05-28T12:00:01Z")],
+        msg_type="update",
+    )
+    normalizer = KrakenTradeNormalizer()
+
+    replayed = normalizer.normalize_many(
+        RawMessage(source="kraken", received_at=utc_now(), payload=snapshot_frame)
+    )
+    live = normalizer.normalize_many(
+        RawMessage(source="kraken", received_at=utc_now(), payload=update_frame)
+    )
+
+    assert replayed[0].metadata["subscribe_replay"] is True
+    assert "subscribe_replay" not in live[0].metadata
+
+
+def test_dict_shaped_depth_levels_quarantine_instead_of_crashing() -> None:
+    """Regression: a dict-shaped level item made `item[0]` a KeyError, which the parse
+    helpers didn't catch — one malformed frame crashed the whole lane instead of
+    quarantining the event with invalid_bids/invalid_asks."""
+    from crypto_collector.market_normalizers import _parse_levels, _split_l2_changes
+
+    errors: list[str] = []
+    assert _parse_levels([{"price": "1", "size": "2"}], "bids", errors) == []
+    assert errors == ["invalid_bids"]
+
+    errors = []
+    bids, asks = _split_l2_changes([{"side": "buy"}], errors)
+    assert (bids, asks) == ([], [])
+    assert errors == ["invalid_changes"]
+
+
+def test_depth_stream_segment_honors_normalized_parquet_toggle(tmp_path, monkeypatch) -> None:
+    """Regression on the regression: the first central-threading fix delivered
+    `normalized_parquet` to the depth segments, which then ignored it — the toggle
+    stayed inert on every depth lane while a comment (and a dispatch-level test)
+    claimed it worked. The segment body must actually honor it."""
+    import crypto_collector.cli as cli
+
+    captured: dict[str, object] = {}
+
+    class _FakePipeline:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+        async def run(self, limit=None, deadline_utc=None):
+            return SimpleNamespace(
+                raw_messages=0, clean_events=0, quarantined_events=0, deadline_reached=False
+            )
+
+    monkeypatch.setattr(cli, "CollectorPipeline", _FakePipeline)
+
+    from crypto_collector.market_normalizers import BybitDepthNormalizer
+
+    args = SimpleNamespace(
+        symbol="BTCUSDT",
+        channel="orderbook.50",
+        count=1,
+        output_root=tmp_path,
+        normalized_parquet=False,
+        source_suffix="",
+        deadline_utc=None,
+    )
+    asyncio.run(
+        cli._collect_depth_stream_segment(
+            args,
+            source="bybit",
+            websocket_url="wss://example.invalid/ws",
+            subscription_style="bybit",
+            normalizer=BybitDepthNormalizer(),
+            source_base="bybit_depth",
+            **cli._stream_depth_replay_kwargs("bybit"),
+        )
+    )
+
+    assert captured["normalized_root"] is None

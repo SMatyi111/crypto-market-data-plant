@@ -225,14 +225,22 @@ def test_manifest_tags_standards_version() -> None:
 def test_manifest_lanes_are_venue_instrument_dataset_aware(tmp_path: Path) -> None:
     archive = tmp_path / "archive"
     # depth + trades for Binance BTC, Coinbase BTC trades, and a separate
-    # Binance ETH trades lane — all promoted & replayable on the same day.
-    _write_replay_summary(archive, "binance_depth", "20260418_000000")
+    # Binance ETH trades lane — all promoted & replayable on the same day. The
+    # summaries declare their gap class explicitly, as live replay summaries do;
+    # an undeclared class reports "unknown", never a provable default.
+    _write_replay_summary(archive, "binance_depth", "20260418_000000", gap_detection="sequence")
     _promote(archive, "market_replayable", "binance_depth", "20260418_000000")
-    _write_replay_summary(archive, "binance_trades", "20260418_000000")
+    _write_replay_summary(archive, "binance_trades", "20260418_000000", gap_detection="sequence")
     _promote(archive, "trades_replayable", "binance_trades", "20260418_000000")
-    _write_replay_summary(archive, "coinbase_trades", "20260418_000000")
+    _write_replay_summary(archive, "coinbase_trades", "20260418_000000", gap_detection="sequence")
     _promote(archive, "trades_replayable", "coinbase_trades", "20260418_000000")
-    _write_replay_summary(archive, "binance_trades_ethusdt", "20260418_000000", promoted_rows=70)
+    _write_replay_summary(
+        archive,
+        "binance_trades_ethusdt",
+        "20260418_000000",
+        promoted_rows=70,
+        gap_detection="sequence",
+    )
     _promote(archive, "trades_replayable", "binance_trades_ethusdt", "20260418_000000", rows=70)
 
     manifest = build_manifest(archive_root=archive, current_date=date(2026, 4, 19))
@@ -305,3 +313,133 @@ def test_manifest_lane_flags_none_native_gap_detection(tmp_path: Path) -> None:
 
     assert coinbase_depth["gap_detection"] == "none_native"
     assert manifest["lanes_summary"]["none_native_lane_count"] == 1
+
+
+# The full live lane inventory: every one of these MUST be discoverable, or the
+# manifest silently under-reports coverage to research consumers. The perp lanes
+# (and funding with them) were invisible until parse_lane learned the `_perp`
+# marker — 7 of ~21 live lanes missing from the canonical readiness view.
+_LIVE_LANE_INVENTORY = {
+    "binance_depth": ("binance", "depth", None),
+    "binance_trades": ("binance", "trades", None),
+    "binance_depth_btcusdc": ("binance", "depth", "btcusdc"),
+    "binance_trades_btcusdc": ("binance", "trades", "btcusdc"),
+    "coinbase_depth": ("coinbase", "depth", None),
+    "coinbase_trades": ("coinbase", "trades", None),
+    "kraken_depth": ("kraken", "depth", None),
+    "kraken_trades": ("kraken", "trades", None),
+    "bybit_depth": ("bybit", "depth", None),
+    "bybit_trades": ("bybit", "trades", None),
+    "bybit_perp_depth": ("bybit_perp", "depth", None),
+    "bybit_perp_trades": ("bybit_perp", "trades", None),
+    "mexc_depth": ("mexc", "depth", None),
+    "mexc_trades": ("mexc", "trades", None),
+    "okx_depth": ("okx", "depth", None),
+    "okx_trades": ("okx", "trades", None),
+    "okx_perp_depth": ("okx_perp", "depth", None),
+    "okx_perp_trades": ("okx_perp", "trades", None),
+    "binance_perp_depth": ("binance_perp", "depth", None),
+    "binance_perp_trades": ("binance_perp", "trades", None),
+    "binance_perp_funding": ("binance_perp", "funding", None),
+}
+
+
+def test_parse_lane_covers_the_full_live_lane_inventory() -> None:
+    from crypto_collector.research_manifest import parse_lane
+
+    for dirname, expected in _LIVE_LANE_INVENTORY.items():
+        assert parse_lane(dirname) == expected, dirname
+    # Non-lanes are still rejected.
+    assert parse_lane("_cursors") is None
+    assert parse_lane("binance") is None
+    assert parse_lane("binance_perp") is None  # marker with no dataset
+    assert parse_lane("kalshi_crypto_quotes") is None  # outside the contract
+
+
+def test_manifest_includes_perp_and_funding_lanes(tmp_path: Path) -> None:
+    archive = tmp_path / "archive"
+    _write_replay_summary(archive, "bybit_perp_depth", "20260418_000000", gap_detection="sequence")
+    _promote(archive, "market_replayable", "bybit_perp_depth", "20260418_000000")
+    _write_replay_summary(
+        archive, "binance_perp_funding", "20260418_000000", gap_detection="none_native"
+    )
+    _promote(archive, "funding", "binance_perp_funding", "20260418_000000")
+
+    manifest = build_manifest(archive_root=archive, current_date=date(2026, 4, 19))
+    lanes = {lane["lane"]: lane for lane in manifest["lanes"]}
+
+    perp_depth = lanes["bybit_perp_depth"]
+    assert perp_depth["venue"] == "bybit_perp"
+    assert perp_depth["dataset"] == "depth"
+    assert perp_depth["curated_dataset"] == "market_replayable"
+    assert perp_depth["gap_detection"] == "sequence"
+    assert perp_depth["total_curated_rows"] == 50
+    assert perp_depth["days"][0]["readiness"] == "ready"
+
+    funding = lanes["binance_perp_funding"]
+    assert funding["venue"] == "binance_perp"
+    assert funding["dataset"] == "funding"
+    assert funding["curated_dataset"] == "funding"
+    assert funding["total_curated_rows"] == 50
+    assert funding["days"][0]["readiness"] == "ready"
+
+
+def test_manifest_lane_gap_detection_latches_worst_class_and_defaults_unknown(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "archive"
+    # Kraken depth declares checksum — must surface as checksum, not "sequence"
+    # (the old latch could only downgrade on a literal none_native).
+    _write_replay_summary(archive, "kraken_depth", "20260418_000000", gap_detection="checksum")
+    _promote(archive, "market_replayable", "kraken_depth", "20260418_000000")
+    # A lane that produced checksum once and none_native once reports the worst.
+    _write_replay_summary(archive, "kraken_depth", "20260419_000000", gap_detection="none_native")
+    _promote(archive, "market_replayable", "kraken_depth", "20260419_000000")
+    # A lane whose summaries never declared a class reports unknown, not provable.
+    _write_replay_summary(archive, "mexc_depth", "20260418_000000")
+    _promote(archive, "market_replayable", "mexc_depth", "20260418_000000")
+
+    manifest = build_manifest(archive_root=archive, current_date=date(2026, 4, 20))
+    lanes = {lane["lane"]: lane for lane in manifest["lanes"]}
+
+    assert lanes["kraken_depth"]["gap_detection"] == "none_native"
+    assert lanes["mexc_depth"]["gap_detection"] == "unknown"
+
+
+def test_manifest_tolerates_torn_index_lines_and_garbage_run_names(tmp_path: Path) -> None:
+    archive = tmp_path / "archive"
+    _write_replay_summary(archive, "binance_depth", "20260418_000000", gap_detection="sequence")
+    _promote(archive, "market_replayable", "binance_depth", "20260418_000000")
+    index = archive / "curated" / "research" / "market_replayable" / "_promotion_index.jsonl"
+    # A torn final line (concurrent append / crash) and a garbage 8-digit run name
+    # used to crash the whole manifest build, freezing "latest" forever.
+    index.write_text(
+        index.read_text(encoding="utf-8") + '{"run_path": "' ,
+        encoding="utf-8",
+    )
+    bogus_run = archive / "raw" / "market" / "binance_depth" / "20269999_000000"
+    (bogus_run / "metrics").mkdir(parents=True)
+
+    manifest = build_manifest(archive_root=archive, current_date=date(2026, 4, 19))
+
+    assert manifest["summary"]["corrupt_index_line_count"] == 1
+    depth = next(lane for lane in manifest["lanes"] if lane["lane"] == "binance_depth")
+    assert depth["days"][0]["readiness"] == "ready"
+
+
+def test_manifest_torn_replay_summary_counts_as_missing(tmp_path: Path) -> None:
+    archive = tmp_path / "archive"
+    _write_replay_summary(archive, "binance_depth", "20260418_000000", gap_detection="sequence")
+    _promote(archive, "market_replayable", "binance_depth", "20260418_000000")
+    torn = (
+        archive / "raw" / "market" / "binance_depth" / "20260418_001000" / "metrics"
+        / "replay_summary.json"
+    )
+    torn.parent.mkdir(parents=True)
+    torn.write_text('{"replayable": tr', encoding="utf-8")
+
+    manifest = build_manifest(archive_root=archive, current_date=date(2026, 4, 19))
+    depth = next(lane for lane in manifest["lanes"] if lane["lane"] == "binance_depth")
+
+    assert depth["days"][0]["raw_quality"]["missing_summaries"] == 1
+    assert depth["days"][0]["readiness"] == "ready_with_quarantine"

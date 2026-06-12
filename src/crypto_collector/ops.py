@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import socket
 import sys
@@ -16,10 +17,14 @@ from typing import Any, Callable
 from .config import default_normalized_root
 from .storage import JsonlSink
 
+logger = logging.getLogger(__name__)
+
 # Job types treated as long-running *collector* jobs by the ops runner. These may run
 # concurrently with one another (up to --collector-concurrency); every other job type
-# is a maintenance job and stays serialized in the scheduler loop. Keep this in sync
-# with the worker dispatch table in cli.py::_execute_ops_job.
+# is a maintenance job, serialized with itself on a dedicated single-slot executor so
+# a long pass (archive-offload moving tens of GB) never blocks collector dispatch or
+# freezes the scheduler tick. Keep this in sync with the worker dispatch table in
+# cli.py::_execute_ops_job.
 COLLECTOR_JOB_TYPES: frozenset[str] = frozenset(
     {
         "binance-depth-worker",
@@ -95,7 +100,20 @@ class JobExecutionResult:
 def load_ops_config(path: Path) -> list[JobSpec]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     jobs = [JobSpec.from_dict(row) for row in payload.get("jobs", [])]
-    return [job for job in jobs if job.enabled]
+    enabled = [job for job in jobs if job.enabled]
+    # The scheduler keys every piece of per-job state (next-run time, active set,
+    # counters) by job name, so a copy-pasted lane block that kept its name would
+    # silently collapse two jobs into one schedule slot — one of them never runs.
+    # The 80+-job configs are hand-edited; fail loudly instead.
+    seen: dict[str, int] = {}
+    for job in enabled:
+        seen[job.name] = seen.get(job.name, 0) + 1
+    duplicates = sorted(name for name, count in seen.items() if count > 1)
+    if duplicates:
+        raise ValueError(
+            f"duplicate enabled job names in ops config {path}: {', '.join(duplicates)}"
+        )
+    return enabled
 
 
 # Collector lanes that poll a REST/HTTP API on an interval instead of holding a
@@ -211,6 +229,7 @@ class OpsRunnerLock:
 
     def acquire(self) -> None:
         self.ops_root.mkdir(parents=True, exist_ok=True)
+        started_monotonic = time.monotonic()
         while True:
             try:
                 fd = os.open(
@@ -220,7 +239,16 @@ class OpsRunnerLock:
             except FileExistsError:
                 owner = _read_json_file(self.lock_path)
                 owner_pid = _read_pid(owner)
-                if owner_pid is not None and _pid_exists(owner_pid) and self._heartbeat_is_fresh():
+                if (
+                    owner_pid is not None
+                    and _pid_exists(owner_pid)
+                    and (self._heartbeat_is_fresh() or _lock_created_recently(owner))
+                ):
+                    # The created_at grace covers the startup window: a runner that
+                    # just won the lock hasn't written its first heartbeat yet, and
+                    # a SECOND launcher (boot task + manual redeploy) judging by the
+                    # old heartbeat alone would break the live lock — two runners,
+                    # duplicate promoters plant-wide.
                     raise RuntimeError(
                         f"ops runner already active for {self.ops_root} "
                         f"(pid={owner_pid}, runner={owner.get('runner_name', 'unknown')})"
@@ -232,7 +260,23 @@ class OpsRunnerLock:
                 # runner is dead — reclaim the lock instead of refusing to start. Without
                 # this, a crash or Stop+Start strands collection on a phantom lock until a
                 # manual unlink.
-                self.lock_path.unlink(missing_ok=True)
+                if owner is None and _lock_possibly_mid_write(self.lock_path):
+                    # Unreadable but very young: probably another process between its
+                    # O_EXCL create and its json.dump — re-read shortly rather than
+                    # breaking a lock that's about to become valid.
+                    time.sleep(0.1)
+                elif not _break_stale_lock(self.lock_path):
+                    # Another process broke (and possibly re-acquired) it first; loop
+                    # and re-evaluate against the new state instead of unlinking what
+                    # may now be a live owner's fresh lock.
+                    time.sleep(0.05)
+                if time.monotonic() - started_monotonic > _LOCK_ACQUIRE_DEADLINE_SECONDS:
+                    # E.g. AV/backup holding the stale file so every rename fails:
+                    # fail loudly instead of spinning invisibly forever.
+                    raise RuntimeError(
+                        f"could not acquire or break ops-runner lock {self.lock_path} "
+                        f"within {_LOCK_ACQUIRE_DEADLINE_SECONDS:.0f}s"
+                    ) from None
                 continue
             payload = {
                 "runner_name": self.runner_name,
@@ -276,6 +320,7 @@ class StandaloneWorkerLock:
 
     def acquire(self) -> None:
         self.lock_root.mkdir(parents=True, exist_ok=True)
+        started_monotonic = time.monotonic()
         while True:
             try:
                 fd = os.open(
@@ -294,7 +339,18 @@ class StandaloneWorkerLock:
                         f"standalone worker already active for {self.worker_name} "
                         f"(pid={owner_pid})"
                     ) from None
-                self.lock_path.unlink(missing_ok=True)
+                if owner is None and _lock_possibly_mid_write(self.lock_path):
+                    # Unreadable but very young: probably another process between its
+                    # O_EXCL create and its json.dump — re-read shortly rather than
+                    # breaking a lock that's about to become valid.
+                    time.sleep(0.1)
+                elif not _break_stale_lock(self.lock_path):
+                    time.sleep(0.05)
+                if time.monotonic() - started_monotonic > _LOCK_ACQUIRE_DEADLINE_SECONDS:
+                    raise RuntimeError(
+                        f"could not acquire or break worker lock {self.lock_path} "
+                        f"within {_LOCK_ACQUIRE_DEADLINE_SECONDS:.0f}s"
+                    ) from None
                 continue
             payload = {
                 "worker_name": self.worker_name,
@@ -525,6 +581,15 @@ class OpsRunner:
 
         pool = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="ops-collector")
         futures: dict[Future, JobSpec] = {}
+        # Maintenance runs on its own single-slot executor: serialized with itself
+        # (max_workers=1 plus the one-in-flight guard below), but never blocking the
+        # scheduler thread. Running it inline froze the tick and ALL collector
+        # re-dispatch for the duration of a long pass — the scheduler-stall class
+        # PR #17 fixed one instance of; archive-offload (tens of GB per pass once
+        # candidates age in) would have re-triggered it.
+        maintenance_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ops-maintenance")
+        maintenance_future: Future | None = None
+        maintenance_job: JobSpec | None = None
         pending_error: BaseException | None = None
         try:
             while True:
@@ -546,11 +611,29 @@ class OpsRunner:
                     self._finalize_run(job, result)
                     self._write_heartbeat_snapshot()
                     if result.status == "error" and stop_on_error:
+                        # Surface "error" NOW: the finally-drain below can block on
+                        # in-flight collectors for a long time, and monitoring must
+                        # not read a healthy heartbeat for that whole window.
+                        self._write_heartbeat_snapshot(status="error")
                         pending_error = RuntimeError(
                             f"collector job {job.name} failed: {result.message}"
                         )
                         stop_now = True
                         break
+                # 1b. Reap the in-flight maintenance job the same way.
+                if maintenance_future is not None and maintenance_future.done():
+                    finished_job = maintenance_job
+                    result = maintenance_future.result()
+                    maintenance_future = None
+                    maintenance_job = None
+                    self._finalize_run(finished_job, result)
+                    self._write_heartbeat_snapshot()
+                    if result.status == "error" and stop_on_error:
+                        self._write_heartbeat_snapshot(status="error")
+                        pending_error = RuntimeError(
+                            f"maintenance job {finished_job.name} failed: {result.message}"
+                        )
+                        stop_now = True
                 if stop_now:
                     break
 
@@ -577,7 +660,7 @@ class OpsRunner:
 
                 # `started` counts runs already finished plus runs in flight, so a bounded
                 # (max_runs) run never launches more work than it will eventually report.
-                started = run_count + len(futures)
+                started = run_count + len(futures) + (1 if maintenance_future is not None else 0)
 
                 # 2. Dispatch collector jobs up to the concurrency budget; never launch a
                 #    second instance of a job that is already active.
@@ -602,21 +685,36 @@ class OpsRunner:
                 if dispatched:
                     self._write_heartbeat_snapshot()
 
-                # 3. Run at most one maintenance job per tick. Synchronous execution in the
-                #    scheduler thread keeps maintenance strictly serialized with itself
-                #    while collectors keep running in the pool.
+                # 3. Dispatch at most one maintenance job at a time onto the dedicated
+                #    executor. The single in-flight future keeps maintenance strictly
+                #    serialized with itself while the scheduler keeps ticking — so
+                #    collector lanes re-dispatch (and the liveness tick advances)
+                #    even during a long offload/cleanup pass.
                 ran_maintenance = False
-                if maintenance_due and not (max_runs is not None and started >= max_runs):
-                    self._run_maintenance_job(
-                        maintenance_due[0], execute_job, stop_on_error=stop_on_error
+                if (
+                    maintenance_future is None
+                    and maintenance_due
+                    and not (max_runs is not None and started >= max_runs)
+                ):
+                    maintenance_job = maintenance_due[0]
+                    job_started_at = datetime.now(tz=UTC)
+                    with self._run_lock:
+                        self._sched_active[maintenance_job.name] = {
+                            "name": maintenance_job.name,
+                            "job_type": maintenance_job.job_type,
+                            "started_at": job_started_at,
+                        }
+                    maintenance_future = maintenance_pool.submit(
+                        self._run_collector_job, maintenance_job, execute_job, job_started_at
                     )
+                    self._write_heartbeat_snapshot()
                     ran_maintenance = True
 
                 if dispatched or ran_maintenance:
                     # Did real work this tick; loop immediately to keep latency low.
                     continue
-                if futures:
-                    # Collectors are in flight but nothing new is due — poll for completion
+                if futures or maintenance_future is not None:
+                    # Jobs are in flight but nothing new is due — poll for completion
                     # without pegging a core.
                     time.sleep(self.poll_seconds if self.poll_seconds > 0 else 0.05)
                     continue
@@ -626,8 +724,13 @@ class OpsRunner:
         finally:
             heartbeat_stop.set()
             heartbeat_thread.join(timeout=heartbeat_interval + 1.0)
-            # Drain any still-running collectors so their results are not lost.
+            # Drain any still-running collectors + maintenance so their results are
+            # not lost. Both executors are shut down before reaping so every future
+            # is final.
             pool.shutdown(wait=True)
+            maintenance_pool.shutdown(wait=True)
+            if maintenance_future is not None and maintenance_job is not None:
+                futures[maintenance_future] = maintenance_job
             for future in [f for f in list(futures) if f.done()]:
                 job = futures.pop(future)
                 try:
@@ -658,8 +761,9 @@ class OpsRunner:
         execute_job: Callable[[JobSpec], JobExecutionResult | str | None],
         started_at: datetime,
     ) -> JobRunResult:
-        """Run one collector job on a pool thread. Never raises — a failure is captured
-        into an error JobRunResult so the scheduler always reaps a result."""
+        """Run one job on an executor thread (collector pool or the single-slot
+        maintenance executor). Never raises — a failure is captured into an error
+        JobRunResult so the scheduler always reaps a result."""
         status = "success"
         message: str | None = None
         retry_count = 0
@@ -681,52 +785,11 @@ class OpsRunner:
             retry_count=retry_count,
         )
 
-    def _run_maintenance_job(
-        self,
-        job: JobSpec,
-        execute_job: Callable[[JobSpec], JobExecutionResult | str | None],
-        *,
-        stop_on_error: bool,
-    ) -> None:
-        started_at = datetime.now(tz=UTC)
-        with self._run_lock:
-            self._sched_active[job.name] = {
-                "name": job.name,
-                "job_type": job.job_type,
-                "started_at": started_at,
-            }
-        self._write_heartbeat_snapshot()
-        status = "success"
-        message: str | None = None
-        retry_count = 0
-        try:
-            execution = _normalize_job_execution_result(execute_job(job))
-            message = execution.message
-            retry_count = execution.retry_count
-        except Exception as exc:  # noqa: BLE001
-            status = "error"
-            message = str(exc)
-        finished_at = datetime.now(tz=UTC)
-        result = JobRunResult(
-            job_name=job.name,
-            job_type=job.job_type,
-            started_at=started_at,
-            finished_at=finished_at,
-            status=status,
-            message=message,
-            retry_count=retry_count,
-        )
-        self._finalize_run(job, result)
-        if status == "error" and stop_on_error:
-            self._write_heartbeat_snapshot(status="error")
-            raise RuntimeError(f"maintenance job {job.name} failed: {message}")
-        self._write_heartbeat_snapshot()
-
     def _finalize_run(self, job: JobSpec, result: JobRunResult) -> None:
         """Record a completed run: drop it from the active set, update counters, advance
-        its next-run time, and append to job_runs.jsonl. Safe to call for either a
-        collector (from the scheduler thread after the future completes) or a maintenance
-        job (inline)."""
+        its next-run time, and append to job_runs.jsonl. Always called from the
+        scheduler thread (collector and maintenance futures are both reaped there),
+        so the runs sink has a single writer."""
         with self._run_lock:
             self._sched_active.pop(job.name, None)
             self._update_job_counters(result)
@@ -735,7 +798,13 @@ class OpsRunner:
                 seconds=job.interval_seconds
             )
             self._sched_last_result = result
-        self.runs_sink.write(result.to_dict())
+        try:
+            self.runs_sink.write(result.to_dict())
+        except OSError:
+            # ENOSPC/permission trouble on the run log must not kill the scheduler —
+            # the in-memory counters above already advanced, and a dead runner would
+            # also take down the cleanup/offload jobs that could free the disk.
+            logger.exception("failed to append job run record for %s", job.name)
 
     def _heartbeat_refresher(self, stop_event: threading.Event, interval_seconds: float) -> None:
         while not stop_event.wait(interval_seconds):
@@ -790,19 +859,28 @@ class OpsRunner:
         }
 
     def _emit_heartbeat(self, payload: dict[str, Any]) -> None:
-        with self._heartbeat_lock:
-            _write_json_atomic(self.heartbeat_path, payload)
-            now = datetime.now(tz=UTC)
-            status = payload["status"]
-            should_append_history = (
-                self._last_heartbeat_status != status
-                or self._last_heartbeat_write is None
-                or (now - self._last_heartbeat_write).total_seconds() >= 30
-            )
-            if should_append_history:
-                self.heartbeat_history.write(payload)
-                self._last_heartbeat_status = status
-                self._last_heartbeat_write = now
+        # A heartbeat write can fail transiently on Windows (AV/backup holding the
+        # file past _write_json_atomic's retries) or on a full disk. A missed
+        # heartbeat is recoverable — the next snapshot lands ~30s later — but
+        # letting the exception out of the scheduler loop (or silently killing the
+        # refresher thread) converts filesystem contention into a plant-wide
+        # runner death. Swallow + log.
+        try:
+            with self._heartbeat_lock:
+                _write_json_atomic(self.heartbeat_path, payload)
+                now = datetime.now(tz=UTC)
+                status = payload["status"]
+                should_append_history = (
+                    self._last_heartbeat_status != status
+                    or self._last_heartbeat_write is None
+                    or (now - self._last_heartbeat_write).total_seconds() >= 30
+                )
+                if should_append_history:
+                    self.heartbeat_history.write(payload)
+                    self._last_heartbeat_status = status
+                    self._last_heartbeat_write = now
+        except OSError:
+            logger.exception("heartbeat write failed; continuing")
 
     def _update_job_counters(self, result: JobRunResult) -> None:
         counters = self._job_counters.setdefault(
@@ -879,7 +957,7 @@ def build_health_report(
         active_started_by_name[str(current_job["name"])] = _parse_dt(current_job.get("started_at"))
     heartbeat_is_fresh = heartbeat_age_seconds is not None and heartbeat_age_seconds <= stale_after_seconds
 
-    run_rows = _read_jsonl(job_runs_path)
+    run_rows = _read_jsonl(job_runs_path, tail_bytes=64 * 1024 * 1024)
     recent_failures = []
     for row in run_rows[-200:]:
         if row.get("status") == "success":
@@ -1057,7 +1135,17 @@ def build_health_report(
         status = "warn"
     if any(
         item in findings
-        for item in ["missing_heartbeat", "stale_heartbeat", "runner_error_state", "recent_job_failures", "low_disk_free_space"]
+        for item in [
+            "missing_heartbeat",
+            "stale_heartbeat",
+            "runner_error_state",
+            "recent_job_failures",
+            "low_disk_free_space",
+            # A wedged scheduler is a 100%-outage condition (nothing dispatches or
+            # promotes while every surface looks alive) — it must rank at least as
+            # high as a single failing job, not below it.
+            "scheduler_stalled",
+        ]
     ):
         status = "error"
     if any(item.startswith("long_running_job:") for item in findings):
@@ -1191,10 +1279,74 @@ def prune_stale_worker_artifacts(
     )
 
 
+# Bounded patience for lock acquisition: long enough to ride out a mid-write
+# grace wait or a transient AV hold on the stale file, short enough that a lane
+# stuck on an unbreakable lock fails LOUDLY (job error -> re-dispatch) instead of
+# spinning invisibly inside acquire() while looking active.
+_LOCK_ACQUIRE_DEADLINE_SECONDS = 30.0
+
+# An unreadable lock file younger than this is treated as another process mid-way
+# between its O_EXCL create and its json.dump — wait for it to finish writing
+# rather than breaking a lock that is about to become valid.
+_LOCK_MID_WRITE_GRACE_SECONDS = 5.0
+
+# A readable lock younger than this blocks a second launcher even when the
+# heartbeat is stale: the new owner hasn't written its first heartbeat yet.
+_LOCK_CREATED_GRACE_SECONDS = 180.0
+
+
+def _break_stale_lock(lock_path: Path) -> bool:
+    """Atomically claim-and-remove a lock file judged stale. Returns True when this
+    process removed it.
+
+    Two processes can judge the same lock stale concurrently (boot task + manual
+    redeploy both hitting a dead runner's lock). A plain unlink lets the loser
+    delete the winner's freshly-created NEW lock — a classic unlink/create TOCTOU
+    ending with two live owners of one lane (double promoter). Rename is atomic on
+    the same directory, so exactly one process wins the rename; the loser loops and
+    re-evaluates the winner's fresh lock instead of deleting it.
+
+    `replace` (not `rename`): a crash between a previous break's rename and its
+    unlink leaves a `.stale-<pid>` file behind, and Windows `rename` refuses to
+    overwrite an existing target — with pid reuse that turned into an infinite
+    acquire() livelock. `replace` overwrites the leftover."""
+    stale_path = lock_path.with_name(f"{lock_path.name}.stale-{os.getpid()}")
+    try:
+        lock_path.replace(stale_path)
+    except OSError:
+        return False
+    stale_path.unlink(missing_ok=True)
+    return True
+
+
+def _lock_possibly_mid_write(lock_path: Path) -> bool:
+    try:
+        age_seconds = time.time() - lock_path.stat().st_mtime
+    except OSError:
+        return False  # vanished or unreadable — let the acquire loop re-evaluate
+    return age_seconds < _LOCK_MID_WRITE_GRACE_SECONDS
+
+
+def _lock_created_recently(owner: dict[str, Any] | None) -> bool:
+    created = _parse_dt((owner or {}).get("created_at"))
+    if created is None:
+        return False
+    return (datetime.now(tz=UTC) - created).total_seconds() <= _LOCK_CREATED_GRACE_SECONDS
+
+
 def _read_json_file(path: Path) -> dict[str, Any] | None:
-    if not path.exists():
+    """Best-effort JSON read: a missing, torn, or garbage file reads as None.
+
+    The lock/heartbeat callers depend on this NEVER raising. A 0-byte lock file
+    (process killed between the O_EXCL create and the json.dump completing —
+    exactly what a redeploy kill-tree or a full disk produces) used to raise
+    JSONDecodeError straight out of acquire(), bypassing the stale-lock unlink
+    self-heal and crash-looping the lane until a manual unlink."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
         return None
-    return json.loads(path.read_text(encoding="utf-8"))
+    return payload if isinstance(payload, dict) else None
 
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
@@ -1258,13 +1410,42 @@ def _normalize_job_execution_result(value: JobExecutionResult | str | None) -> J
     raise TypeError(f"unsupported job execution result: {type(value)!r}")
 
 
-def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+def _read_jsonl(path: Path, *, tail_bytes: int | None = None) -> list[dict[str, Any]]:
+    """Read a JSONL file, skipping unparseable lines (a torn final line from a
+    crash/full disk must not wedge the health report forever — mirror the
+    tolerance `_promoted_rows_by_run` already has).
+
+    With `tail_bytes`, only the last N bytes are read (job_runs.jsonl grows
+    unbounded; health only needs the recent-failure window plus latest-run-per-job).
+    Size the window against the LARGEST configured job interval: at the live rate
+    (~3 MB/day, growing with lane count) 64 MiB covers ~3 weeks, comfortably above
+    the hourly/daily cadences in use — a job with no run inside the window reports
+    stale, which for those cadences it genuinely is. Rotation (ROADMAP item) is the
+    durable fix."""
     if not path.exists():
         return []
+    if tail_bytes is None:
+        text = path.read_text(encoding="utf-8")
+    else:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - tail_bytes))
+            data = handle.read()
+        text = data.decode("utf-8", errors="replace")
+        if size > tail_bytes:
+            # Drop the (likely partial) first line of the window.
+            text = text.split("\n", 1)[1] if "\n" in text else ""
     rows: list[dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if line.strip():
-            rows.append(json.loads(line))
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict):
+            rows.append(row)
     return rows
 
 
@@ -1327,6 +1508,20 @@ def _standalone_worker_rows(
                 raw_messages = partial_metrics.get("raw_messages")
                 clean_events = partial_metrics.get("clean_events")
                 quarantined_events = partial_metrics.get("quarantined_events")
+                # Subscribe-replay rejects are BY DESIGN (a venue re-delivering
+                # recent history at subscribe time; the gate quarantines exactly
+                # one reason per such event), not stream loss — Kraken's per-
+                # subscribe ~50-print snapshot would otherwise trip the ratio on
+                # every quiet segment. Exclude them from the alarm numerator.
+                if isinstance(quarantined_events, (int, float)):
+                    reject_counts = partial_metrics.get("reject_counts")
+                    by_design = (
+                        reject_counts.get("subscribe_replay", 0)
+                        if isinstance(reject_counts, dict)
+                        else 0
+                    )
+                    if isinstance(by_design, (int, float)) and by_design > 0:
+                        quarantined_events = max(0.0, float(quarantined_events) - float(by_design))
                 if (
                     isinstance(raw_messages, (int, float))
                     and raw_messages > 0

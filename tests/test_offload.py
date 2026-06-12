@@ -167,6 +167,15 @@ def test_resume_deletes_source_when_cold_copy_already_matches(tmp_path: Path) ->
     assert report.runs[0].action == "resumed_delete"
     assert not run_dir.exists()
     assert (cold_root / "binance_trades" / OLD_RUN).exists()
+    # Regression: the resume path used to delete the hot copy WITHOUT writing an
+    # index row — a crash between the rename and the index write on the previous
+    # cycle left the run cold-only and permanently unlocatable via the index.
+    index_rows = [
+        json.loads(line)
+        for line in (cold_root / OFFLOAD_INDEX_FILENAME).read_text(encoding="utf-8").splitlines()
+    ]
+    assert index_rows[-1]["run_path"] == str(run_dir)
+    assert index_rows[-1]["resumed"] is True
 
 
 def test_cold_collision_with_different_content_keeps_source_and_fails(tmp_path: Path) -> None:
@@ -382,4 +391,82 @@ def test_run_archive_offload_raises_on_failed_moves(tmp_path: Path) -> None:
     )
     with pytest.raises(RuntimeError, match="failed moves"):
         run_archive_offload(args)
+    assert run_dir.exists()
+
+
+def test_resume_finishes_partially_deleted_source(tmp_path: Path) -> None:
+    """Regression: a crash mid-rmtree leaves the source a strict subset of the verified
+    cold copy. That used to wedge the run in a permanent cold_target_mismatch erroring
+    every later offload pass; it must be recognized as a resumable partial delete."""
+    raw_root = tmp_path / "raw"
+    cold_root = tmp_path / "cold"
+    run_dir = _make_run(raw_root, "binance_trades", OLD_RUN, payload="same-bytes")
+    _make_run(cold_root, "binance_trades", OLD_RUN, payload="same-bytes")
+    # Simulate the interrupted delete: one of the two source files already gone.
+    (run_dir / "metrics" / "replay_summary.json").unlink()
+    spec = _lane_spec(tmp_path, "binance_trades")
+    _write_index(spec.promotion_index, [run_dir])
+
+    report = offload_accounted_runs(
+        raw_root=raw_root, cold_root=cold_root, lanes=[spec], apply=True
+    )
+
+    assert report.status == "ok"
+    assert report.runs[0].action == "resumed_delete"
+    assert not run_dir.exists()
+    # The cold copy keeps BOTH files.
+    assert (cold_root / "binance_trades" / OLD_RUN / "metrics" / "replay_summary.json").exists()
+
+
+def test_source_with_extra_content_vs_cold_copy_still_fails_safe(tmp_path: Path) -> None:
+    """The partial-delete recovery must not weaken the collision guard: a source file
+    LARGER than (or absent from) the cold copy is real divergence — hot copy kept."""
+    raw_root = tmp_path / "raw"
+    cold_root = tmp_path / "cold"
+    run_dir = _make_run(raw_root, "binance_trades", OLD_RUN, payload="same-bytes-plus-extra-tail")
+    _make_run(cold_root, "binance_trades", OLD_RUN, payload="same-bytes")
+    spec = _lane_spec(tmp_path, "binance_trades")
+    _write_index(spec.promotion_index, [run_dir])
+
+    report = offload_accounted_runs(
+        raw_root=raw_root, cold_root=cold_root, lanes=[spec], apply=True
+    )
+
+    assert report.status == "error"
+    assert report.runs[0].action == "cold_target_mismatch"
+    assert run_dir.exists()
+
+
+def test_source_grown_between_copy_and_delete_is_kept(tmp_path: Path, monkeypatch) -> None:
+    """Defense-in-depth: bytes appended to the source AFTER the verified copy (zombie
+    writer) must not be silently lost by the rmtree — the source is kept and the run
+    reports source_changed_during_move."""
+    import crypto_collector.offload as offload_mod
+
+    raw_root = tmp_path / "raw"
+    cold_root = tmp_path / "cold"
+    run_dir = _make_run(raw_root, "binance_trades", OLD_RUN, payload="original")
+    spec = _lane_spec(tmp_path, "binance_trades")
+    _write_index(spec.promotion_index, [run_dir])
+
+    real_manifest = offload_mod._file_manifest
+    calls = {"count": 0}
+
+    def growing_manifest(root: Path):
+        manifest = real_manifest(root)
+        calls["count"] += 1
+        # Grow the SOURCE just before its pre-delete re-verify (the last manifest
+        # call against run_dir in the fresh-move path).
+        if root == run_dir and calls["count"] >= 3:
+            (run_dir / "clean" / "late-append.jsonl").write_text("tail", encoding="utf-8")
+            return real_manifest(root)
+        return manifest
+
+    monkeypatch.setattr(offload_mod, "_file_manifest", growing_manifest)
+
+    report = offload_accounted_runs(
+        raw_root=raw_root, cold_root=cold_root, lanes=[spec], apply=True
+    )
+
+    assert report.runs[0].action == "source_changed_during_move"
     assert run_dir.exists()

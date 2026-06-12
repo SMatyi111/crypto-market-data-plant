@@ -14,6 +14,25 @@ from uuid import uuid4
 _MISSING = object()
 
 
+def write_text_atomic(path: Path, text: str, *, fsync: bool = False) -> None:
+    """Write `text` to `path` via tmp + os.replace, so readers never see a torn or
+    truncated file. The pid-suffixed tmp name keeps concurrent writers of the same
+    target from colliding on Windows (a shared fixed `.tmp` makes the loser's open
+    handle fail the winner's replace).
+
+    `fsync=True` syncs the tmp file BEFORE the rename — required for files whose
+    garbage promotion is worse than losing the write (replay anchors, cursors): a
+    power cut can otherwise atomically promote a zero-length tmp into place."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        handle.write(text)
+        if fsync:
+            handle.flush()
+            os.fsync(handle.fileno())
+    tmp.replace(path)
+
+
 @dataclass(slots=True)
 class RunPaths:
     base: Path
@@ -45,10 +64,15 @@ class JsonlSink:
       what caps a hot lane's sustainable events/sec.
     * Batched fsync (`fsync=True`, a >1 event interval and/or a >0 ms interval): one
       handle stays open and EVERY line is flushed (so the OS always holds whole lines and
-      a hard kill can't leave a torn tail), while the disk-blocking fsync is amortized to
-      once per `fsync_interval_events` events OR `fsync_interval_ms` milliseconds,
-      whichever comes first. Raises the throughput ceiling; a clean close still fsyncs
-      (no loss on shutdown) and a hard kill loses at most one un-fsynced batch.
+      a hard PROCESS kill loses nothing and can't leave a torn tail), while the
+      disk-blocking fsync is amortized to once per `fsync_interval_events` events OR
+      `fsync_interval_ms` milliseconds, whichever comes first. Raises the throughput
+      ceiling; a clean close still fsyncs (no loss on shutdown). The weaker guarantee is
+      POWER LOSS / OS crash: up to one un-fsynced batch can vanish and the page-cache
+      writeback may persist a torn final line — readers of raw must tolerate a torn tail
+      (STANDARDS §2.1 documents this posture). Note the ms bound is evaluated on the
+      next write, so an idle lane holds its last flushed-but-unfsynced batch until
+      traffic resumes or close().
     * Buffered, no fsync (`fsync=False`): one handle, flushed every `flush_every` rows,
       never fsynced. Fastest, least durable.
     """

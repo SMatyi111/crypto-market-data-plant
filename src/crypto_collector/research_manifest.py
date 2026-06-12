@@ -7,17 +7,25 @@ from pathlib import Path
 from typing import Any
 
 from .config import STANDARDS_VERSION, default_archive_root
+from .storage import write_text_atomic
 
 
 DEFAULT_MANIFEST_ROOT = default_archive_root() / "curated" / "research" / "manifests"
 
 # How each dataset maps onto the on-disk layout (STANDARDS.md §1/§2). The raw
-# lane directory name is `<venue>_<dataset>[_<instrument>]`; depth promotes into
-# market_replayable, trades into trades_replayable.
+# lane directory name is `<venue>[_perp]_<dataset>[_<instrument>]`; depth promotes
+# into market_replayable, trades into trades_replayable, funding into funding.
+# (Kalshi quote lanes are deliberately absent: kalshi sits outside the STANDARDS
+# market-data contract and has its own summaries.)
 DATASET_CONFIG: dict[str, dict[str, str]] = {
     "depth": {"curated_dataset": "market_replayable", "normalized_dataset": "market"},
     "trades": {"curated_dataset": "trades_replayable", "normalized_dataset": "trades"},
+    "funding": {"curated_dataset": "funding", "normalized_dataset": "funding"},
 }
+
+# Worst-first precedence for a lane's gap-detection class: a lane that has EVER
+# produced a non-provable day must not present itself as provable.
+_GAP_DETECTION_PRECEDENCE = ("none_native", "checksum", "sequence")
 
 
 def generate_research_manifest(
@@ -41,9 +49,14 @@ def generate_research_manifest(
         "snapshot_json": str(snapshot_json),
     }
     payload = json.dumps(manifest, indent=2, sort_keys=True)
-    latest_json.write_text(payload, encoding="utf-8")
-    snapshot_json.write_text(payload, encoding="utf-8")
-    latest_markdown.write_text(render_manifest_markdown(manifest), encoding="utf-8")
+    # Atomic writes (tmp + replace): research consumers read latest_json at
+    # arbitrary times while this runs as a scheduled job — a truncate-then-write
+    # would hand them an empty/partial document, and a crash mid-write would leave
+    # the contract entry point torn until the next manifest pass. (No fsync: the
+    # manifest is rebuilt every pass, so a power-cut loss is self-healing.)
+    write_text_atomic(latest_json, payload)
+    write_text_atomic(snapshot_json, payload)
+    write_text_atomic(latest_markdown, render_manifest_markdown(manifest))
     return manifest
 
 
@@ -112,6 +125,7 @@ def build_manifest(*, archive_root: Path, current_date: date | None = None) -> d
         "duplicate_promotion_entry_count": promotion_stats["duplicate_promotion_entry_count"],
         "duplicate_promoted_run_count": promotion_stats["duplicate_promoted_run_count"],
         "raw_promotion_index_entry_count": promotion_stats["raw_promotion_index_entry_count"],
+        "corrupt_index_line_count": promotion_stats["corrupt_index_line_count"],
         "missing_replay_summary_count": sum(item["raw_depth_quality"]["missing_summaries"] for item in days),
         "total_raw_depth_unreplayable_runs": sum(item["raw_depth_quality"]["unreplayable_runs"] for item in days),
     }
@@ -145,7 +159,13 @@ def compute_readiness(
     status = "missing"
     if has_promoted:
         status = "ready_with_quarantine" if has_bad_raw else "ready"
-    if date.fromisoformat(day_value) == current:
+    # day_value can come from an on-disk partition name (event_date=...), so a
+    # stray malformed partition must not crash the whole manifest build.
+    try:
+        is_current = date.fromisoformat(day_value) == current
+    except ValueError:
+        is_current = False
+    if is_current:
         status = "building"
     return status
 
@@ -173,7 +193,7 @@ def build_lane_views(*, archive_root: Path, current: date) -> list[dict[str, Any
     for meta in discover_lanes(raw_market_root):
         replay = read_replay_summaries(raw_market_root / meta["lane"])
         promoted = promo_by_lane.get(meta["lane"], {})
-        gap_detection = "sequence"
+        observed_gap_detection: set[str] = set()
         readiness_counts: Counter[str] = Counter()
         total_rows = 0
         total_runs = 0
@@ -183,8 +203,11 @@ def build_lane_views(*, archive_root: Path, current: date) -> list[dict[str, Any
             promoted_day = promoted.get(day_value, empty_promoted_day())
             replay_day = replay.get(day_value, empty_replay_day())
             status = compute_readiness(promoted_day, replay_day, day_value, current)
-            if replay_day.get("gap_detection") == "none_native":
-                gap_detection = "none_native"
+            # Only days with an actually-read summary contribute evidence; the
+            # empty-day default must not let a lane claim a provable class.
+            day_gap = replay_day.get("gap_detection")
+            if day_gap and day_gap != "unknown":
+                observed_gap_detection.add(str(day_gap))
             notes: list[str] = []
             if replay_day["unreplayable_runs"]:
                 notes.append("raw_has_unreplayable_runs")
@@ -206,6 +229,14 @@ def build_lane_views(*, archive_root: Path, current: date) -> list[dict[str, Any
                     "notes": notes,
                 }
             )
+        # Worst class ever observed wins (none_native > checksum > sequence): the
+        # old version could only downgrade FROM "sequence" on a literal
+        # "none_native", so Kraken's checksum lane was published as "sequence" and
+        # a lane with zero evidence defaulted to provable. No evidence -> "unknown".
+        gap_detection = next(
+            (value for value in _GAP_DETECTION_PRECEDENCE if value in observed_gap_detection),
+            "unknown",
+        )
         lanes.append(
             {
                 "lane": meta["lane"],
@@ -264,19 +295,28 @@ def discover_lanes(raw_market_root: Path) -> list[dict[str, Any]]:
 def parse_lane(dirname: str) -> tuple[str, str, str | None] | None:
     """Split a raw lane directory name into (venue, dataset, instrument).
 
-    Names follow `<venue>_<dataset>[_<instrument>]` (STANDARDS §2.1), e.g.
-    `binance_depth`, `coinbase_trades`, `binance_trades_ethusdt`. Venue is the
-    first token, dataset is the second (must be a known dataset), and any
-    remaining tokens are the per-instrument lane suffix (None for legacy
-    single-symbol lanes).
+    Names follow `<venue>[_perp]_<dataset>[_<instrument>]` (STANDARDS §2.1), e.g.
+    `binance_depth`, `coinbase_trades`, `binance_trades_ethusdt`,
+    `bybit_perp_depth`, `binance_perp_funding`. A perp lane keeps the `_perp`
+    marker in its venue (`bybit_perp`) so spot and perp lanes stay distinct rows
+    in the lanes view — they are different instruments. Remaining tokens are the
+    per-instrument lane suffix (None for legacy single-symbol lanes).
+
+    The pre-perp version required token[1] to be the dataset, so every
+    `<venue>_perp_<dataset>` lane parsed as dataset="perp" -> None: all 7 perp
+    lanes (and funding with it) were silently absent from the manifest.
     """
     parts = dirname.split("_")
     if len(parts) < 2:
         return None
-    venue, dataset = parts[0], parts[1]
+    venue, rest = parts[0], parts[1:]
+    if rest[0] == "perp" and len(rest) >= 2:
+        venue = f"{venue}_perp"
+        rest = rest[1:]
+    dataset = rest[0]
     if not venue or dataset not in DATASET_CONFIG:
         return None
-    instrument = "_".join(parts[2:]) or None
+    instrument = "_".join(rest[1:]) or None
     return venue, dataset, instrument
 
 
@@ -293,11 +333,9 @@ def read_promotion_index_by_lane(path: Path) -> dict[str, dict[str, dict[str, An
     )
     if not path.exists():
         return {}
+    rows, _corrupt = _parse_promotion_index_lines(path)
     latest_by_run: dict[str, dict[str, Any]] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        row = json.loads(line)
+    for row in rows:
         run_path = str(row.get("run_path") or "")
         if not run_path:
             continue
@@ -331,13 +369,12 @@ def read_promotion_index_with_stats(path: Path) -> tuple[dict[str, dict[str, Any
             "deduped_promoted_run_count": 0,
             "duplicate_promotion_entry_count": 0,
             "duplicate_promoted_run_count": 0,
+            "corrupt_index_line_count": 0,
         }
     latest_by_run: dict[str, dict[str, Any]] = {}
     seen_counts: Counter[str] = Counter()
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        row = json.loads(line)
+    rows, corrupt_line_count = _parse_promotion_index_lines(path)
+    for row in rows:
         run_path = str(row.get("run_path") or "")
         if not run_path:
             continue
@@ -363,7 +400,30 @@ def read_promotion_index_with_stats(path: Path) -> tuple[dict[str, dict[str, Any
         "deduped_promoted_run_count": len(latest_by_run),
         "duplicate_promotion_entry_count": duplicate_entry_count,
         "duplicate_promoted_run_count": duplicate_run_count,
+        "corrupt_index_line_count": corrupt_line_count,
     }
+
+
+def _parse_promotion_index_lines(path: Path) -> tuple[list[dict[str, Any]], int]:
+    """Parse a promotion index, skipping torn/garbage lines (the file is appended
+    concurrently by promote jobs; one bad line must not crash-loop the manifest
+    job and freeze "latest" forever). Single tolerance policy for both the
+    by-day and by-lane readers. Returns (rows, corrupt_line_count)."""
+    rows: list[dict[str, Any]] = []
+    corrupt_line_count = 0
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            corrupt_line_count += 1
+            continue
+        if not isinstance(row, dict):
+            corrupt_line_count += 1
+            continue
+        rows.append(row)
+    return rows, corrupt_line_count
 
 
 def read_replay_summaries(root: Path) -> dict[str, dict[str, Any]]:
@@ -380,14 +440,24 @@ def read_replay_summaries(root: Path) -> dict[str, dict[str, Any]]:
         if not summary_path.exists():
             item["missing_summaries"] += 1
             continue
-        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            # A torn summary reads as missing (same posture as replay/health) rather
+            # than crashing the manifest build forever.
+            item["missing_summaries"] += 1
+            continue
+        if not isinstance(summary, dict):
+            item["missing_summaries"] += 1
+            continue
         replayable = bool(summary.get("replayable"))
         item["replayable_runs" if replayable else "unreplayable_runs"] += 1
         item["gap_runs"] += 1 if summary.get("gap_count", 0) else 0
         item["snapshot_gap_runs"] += 1 if summary.get("snapshot_gap_count", 0) else 0
         item["crossed_book_runs"] += 1 if summary.get("crossed_book_count", 0) else 0
         # Non-sequence feeds tag themselves so consumers don't assume gaplessness
-        # (STANDARDS §4.3). Default stays "sequence" (provable) when unset.
+        # (STANDARDS §4.3). Days with no read summary stay "unknown" — never
+        # default to a provable class without evidence.
         if summary.get("gap_detection"):
             item["gap_detection"] = summary["gap_detection"]
         item["latest_run"] = max_optional(item["latest_run"], run_dir.name)
@@ -472,7 +542,7 @@ def empty_replay_day() -> dict[str, Any]:
         "gap_runs": 0,
         "snapshot_gap_runs": 0,
         "crossed_book_runs": 0,
-        "gap_detection": "sequence",
+        "gap_detection": "unknown",
         "latest_run": None,
     }
 
@@ -480,7 +550,14 @@ def empty_replay_day() -> dict[str, Any]:
 def run_name_to_day(name: str) -> str | None:
     if len(name) < 8 or not name[:8].isdigit():
         return None
-    return f"{name[:4]}-{name[4:6]}-{name[6:8]}"
+    day = f"{name[:4]}-{name[4:6]}-{name[6:8]}"
+    try:
+        # 8 leading digits is not enough — a stray dir like 20269999_x would
+        # later crash date.fromisoformat inside compute_readiness.
+        date.fromisoformat(day)
+    except ValueError:
+        return None
+    return day
 
 
 def partition_value(path: Path, key: str) -> str | None:

@@ -55,14 +55,28 @@ def test_ps1_scripts_are_ascii(script: Path) -> None:
 
 
 def test_collector_job_types_match_ps1_preflight_patterns() -> None:
-    # The .ps1 preflights count pooled lanes with
-    # `job_type -like "*-worker" -or job_type -like "kalshi-*"`. That heuristic is
-    # only correct while every pool-dispatched job type matches one of the two
-    # patterns; if this fails, update both runner scripts' preflight match too.
-    assert all(
-        job_type.endswith("-worker") or job_type.startswith("kalshi-")
-        for job_type in COLLECTOR_JOB_TYPES
-    )
+    # The .ps1 preflights count pooled lanes with `job_type -like "*-worker"` plus an
+    # explicit list of the pooled kalshi job types. Both directions must hold:
+    # (a) every pool-dispatched job type matches the preflight, and (b) nothing the
+    # preflight matches is a maintenance type — a kalshi-* wildcard used to also
+    # match kalshi-summarize-crypto-quotes (scheduler-side), so adding that valid
+    # job to the config would have tripped the lane count and refused a boot.
+    # Derived, not hardcoded: a new pooled non-worker type automatically widens
+    # this set and fails the script-pin assertions below until both scripts learn it.
+    kalshi_pool_types = {t for t in COLLECTOR_JOB_TYPES if not t.endswith("-worker")}
+
+    def ps1_preflight_matches(job_type: str) -> bool:
+        return job_type.endswith("-worker") or job_type in kalshi_pool_types
+
+    assert all(ps1_preflight_matches(job_type) for job_type in COLLECTOR_JOB_TYPES)
+    # Converse: the maintenance kalshi job must NOT count as a pooled lane.
+    assert not ps1_preflight_matches("kalshi-summarize-crypto-quotes")
+    # Pin the explicit list in BOTH runner scripts so it can't drift from the code.
+    for script in ("run_ops_runner.ps1", "redeploy_runner.ps1"):
+        body = (REPO_ROOT / "scripts" / script).read_text(encoding="ascii")
+        for job_type in sorted(kalshi_pool_types):
+            assert f'"{job_type}"' in body, f"{script} preflight is missing {job_type}"
+        assert 'kalshi-*' not in body, f"{script} still uses the over-broad kalshi-* wildcard"
 
 
 def test_runner_scripts_concurrency_defaults_match() -> None:

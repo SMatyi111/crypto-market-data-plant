@@ -49,6 +49,7 @@ from .collectors.binance_futures_rest import (
     make_depth_poll,
     make_funding_poll,
     max_agg_id_in_events,
+    max_agg_id_in_recent_runs,
     read_aggtrades_cursor,
     write_aggtrades_cursor,
 )
@@ -1004,12 +1005,17 @@ async def run_mock(args: argparse.Namespace) -> None:
         delay_ms=float(getattr(args, "delay_ms", 0.0)),
     )
     run_paths = prepare_run_paths(output_root=args.output_root, source="mock")
+    # Synthetic rows must never land in the live normalized `market` dataset (the
+    # one the real depth lanes write): a bare `mock` invocation on the plant box
+    # used to do exactly that via the default-root fallback. Normalized parquet is
+    # opt-in via an explicit normalized_root (ops job arg); default is none.
+    configured_normalized_root = getattr(args, "normalized_root", None)
     pipeline = CollectorPipeline(
         collector=collector,
         normalizer=GenericL3Normalizer(),
         quality_gate=QualityGate(session_id=run_paths.base.name),
         run_paths=run_paths,
-        normalized_root=_resolve_normalized_root(args, "market"),
+        normalized_root=Path(configured_normalized_root) if configured_normalized_root else None,
     )
     summary = await pipeline.run(limit=args.count)
     print(f"mock run finished: {summary.to_dict()} -> {run_paths.base}")
@@ -1051,7 +1057,15 @@ def _binance_rest_snapshot_clean_row(
             received_at=received_at,
             payload={
                 "e": "snapshot",
-                "E": int(received_at.timestamp() * 1000),
+                # No exchange event time: the REST snapshot carries none, and
+                # stamping local wall-clock here put a row whose "exchange time"
+                # POSTDATES the buffered deltas written after it (event-time
+                # inversion at the head of every segment; a stream-mode rescore
+                # would flag non_monotonic_event_time). event_time=None matches the
+                # other venues' in-stream snapshots; replay's monotonicity check
+                # skips null times and event_date partitioning falls back to
+                # received_at, so placement is unchanged.
+                "E": None,
                 "s": str(product).upper(),
                 "U": snapshot_last_update_id,
                 "u": snapshot_last_update_id,
@@ -1084,7 +1098,13 @@ async def collect_binance_depth_segment(args: argparse.Namespace) -> dict[str, o
     clean_sink = JsonlSink(run_paths.clean, "events.jsonl")
     quarantine_sink = JsonlSink(run_paths.quarantine, "events.jsonl")
     metrics_sink = JsonlSink(run_paths.metrics, "summary.jsonl")
-    parquet_sink = ParquetDatasetSink(_resolve_normalized_root(args, "market"))
+    # None when the lane opts out of normalized parquet — the toggle used to be
+    # threaded here and then ignored (the depth segments never read it).
+    parquet_sink = (
+        ParquetDatasetSink(_resolve_normalized_root(args, "market"))
+        if bool(getattr(args, "normalized_parquet", True))
+        else None
+    )
     normalizer = BinanceDepthNormalizer()
     quality_gate = MetadataQualityGate()
 
@@ -1138,7 +1158,8 @@ async def collect_binance_depth_segment(args: argparse.Namespace) -> dict[str, o
         received_at=utc_now(),
     )
     clean_sink.write(snapshot_clean_row)
-    parquet_sink.write(snapshot_clean_row)
+    if parquet_sink is not None:
+        parquet_sink.write(snapshot_clean_row)
     clean_count += 1
 
     deadline_utc: datetime | None = getattr(args, "deadline_utc", None)
@@ -1210,8 +1231,14 @@ async def collect_binance_depth_segment(args: argparse.Namespace) -> dict[str, o
                     if _process_batch([raw]):
                         break
                     reconnect_attempts = 0  # any successful frame resets the retry budget
-                # Stream returned (or break above). If count reached, exit outer loop.
-                if message_count >= args.count:
+                # Stream returned (or break above). If the segment is done — count
+                # reached OR day/segment deadline crossed — exit the outer loop; the
+                # finally block closes the socket. Falling through on deadline used
+                # to run a pointless reconnect-in-place for an already-finished
+                # segment, recording a spurious reconnect + alignment break on EVERY
+                # rotation (constant 1-per-segment noise in book-sync-health) and, if
+                # that reconnect failed, erroring a perfectly complete segment.
+                if message_count >= args.count or deadline_reached:
                     break
                 # Clean close — try to reconnect-in-place reusing the existing snapshot anchor.
                 await connection.__aexit__(None, None, None)
@@ -1340,11 +1367,12 @@ def _finalize_depth_segment(
     clean_count: int,
     quarantined_count: int,
     quality_gate: MetadataQualityGate,
-    parquet_sink: ParquetDatasetSink,
+    parquet_sink: ParquetDatasetSink | None,
     metrics_sink: JsonlSink,
     deadline_reached: bool = False,
 ) -> dict[str, object]:
-    parquet_sink.flush()
+    if parquet_sink is not None:
+        parquet_sink.flush()
     events_path = run_paths.base / "clean" / "events.jsonl"
     if events_path.exists():
         replay_summary = replay_depth_run(run_paths.base, write_summary=True)
@@ -1881,7 +1909,11 @@ async def _collect_depth_stream_segment(
         # for sequence feeds), which is the right bar for a depth diff stream.
         quality_gate=MetadataQualityGate(),
         run_paths=run_paths,
-        normalized_root=_resolve_normalized_root(args, "market"),
+        normalized_root=(
+            _resolve_normalized_root(args, "market")
+            if bool(getattr(args, "normalized_parquet", True))
+            else None
+        ),
         jsonl_fsync=bool(getattr(args, "jsonl_fsync", True)),
         fsync_interval_events=fsync_events,
         fsync_interval_ms=fsync_ms,
@@ -1979,14 +2011,34 @@ async def collect_binance_futures_rest_segment(args: argparse.Namespace) -> dict
     cursor_path = aggtrades_cursor_path(args.output_root, source_name)
     cursor_findings: list[str] = []
     if stream == "trades":
+        resume_now = datetime.now(tz=UTC)
+        max_resume_gap_seconds = float(getattr(args, "max_resume_gap_seconds", 21_600.0))
         initial_from_id, reset_finding = aggtrades_resume_from_id(
             read_aggtrades_cursor(cursor_path),
             symbol=symbol,
-            now=datetime.now(tz=UTC),
-            max_resume_gap_seconds=float(getattr(args, "max_resume_gap_seconds", 21_600.0)),
+            now=resume_now,
+            max_resume_gap_seconds=max_resume_gap_seconds,
         )
         if reset_finding:
             cursor_findings.append(reset_finding)
+        # Crash-resume duplicate guard: the cursor only advances when a segment
+        # completes normally, so after a hard kill the durable high-water on disk
+        # can run AHEAD of the cursor — resuming from the cursor would re-fetch
+        # that range into a new run and promotion (run-keyed, no row dedup) would
+        # curate it twice. Raise the floor to the highest id already written in
+        # the lane's recent runs (age-bounded by the same resume-gap rule).
+        disk_high = max_agg_id_in_recent_runs(
+            args.output_root,
+            source_name,
+            symbol=symbol,
+            now=resume_now,
+            max_age_seconds=max_resume_gap_seconds,
+            # prepare_run_paths already created THIS segment's (empty) run dir.
+            exclude_run_name=run_paths.base.name,
+        )
+        if disk_high is not None and (initial_from_id is None or disk_high + 1 > initial_from_id):
+            initial_from_id = disk_high + 1
+            cursor_findings.append("resume_floor_raised_from_disk")
         poll = make_aggtrades_poll(
             symbol,
             page_limit=int(getattr(args, "page_limit", 1000)),
@@ -2007,6 +2059,7 @@ async def collect_binance_futures_rest_segment(args: argparse.Namespace) -> dict
         # gate doesn't apply — MetadataQualityGate gates on parse errors, the right bar.
         quality_gate = MetadataQualityGate()
 
+    fsync_events, fsync_ms = _fsync_intervals(args)
     pipeline = CollectorPipeline(
         collector=collector,
         normalizer=normalizer,
@@ -2018,6 +2071,8 @@ async def collect_binance_futures_rest_segment(args: argparse.Namespace) -> dict
             else None
         ),
         jsonl_fsync=bool(getattr(args, "jsonl_fsync", True)),
+        fsync_interval_events=fsync_events,
+        fsync_interval_ms=fsync_ms,
     )
     pipeline_summary = await pipeline.run(
         limit=args.count, deadline_utc=getattr(args, "deadline_utc", None)
@@ -2139,6 +2194,9 @@ def run_binance_trades_worker(args: argparse.Namespace) -> None:
         args=args,
         default_worker_name="binance-trades-worker",
         worker_type="binance-trades-worker",
+        # A --market futures run captures perp:binance-futures:* data; its heartbeat
+        # must group under that venue (the REST worker already does), not "binance".
+        venue="binance-futures" if _binance_trades_market(args) == "futures" else "binance",
         build_segment_args=lambda source_args: SimpleNamespace(
             symbol=source_args.symbol,
             channel=source_args.channel,
@@ -2509,6 +2567,17 @@ def _run_segmented_worker(
                     # migration missed it and workers kept writing normalized parquet to
                     # the retired drive via the env/default fallback.
                     segment_args.normalized_root = getattr(args, "normalized_root", None)
+                    # And the normalized-parquet on/off toggle: it was enumerated by
+                    # only one build_segment_args lambda, so --no-normalized-parquet
+                    # (and the config key) was silently inert on every other lane.
+                    segment_args.normalized_parquet = bool(
+                        getattr(args, "normalized_parquet", True)
+                    )
+                    # Binance-depth-only snapshot-anchor budget, threaded centrally per
+                    # the repo rule (lambdas drop fields); other segments ignore it.
+                    segment_args.snapshot_anchor_timeout_seconds = float(
+                        getattr(args, "snapshot_anchor_timeout_seconds", 10.0)
+                    )
                     summary = asyncio.run(collect_segment(segment_args))
                 except Exception as exc:
                     runtime.record_event("segment_error", details={"segment_index": segment_index, "error": str(exc)})
@@ -2574,6 +2643,21 @@ def _execute_ops_job(job: JobSpec) -> JobExecutionResult | str | None:
     return _execute_ops_job_inprocess(job)
 
 
+def _collector_subprocess_timeout_seconds(job: JobSpec) -> float:
+    """Per-job subprocess timeout. The 7200s default is sized for 1800s WS segments;
+    a short-interval poll job (kalshi quote sampling runs every ~60s) hanging for two
+    hours would silently gap its lane while holding a pool slot, so non-segmented
+    jobs get a timeout scaled to their cadence instead. An explicit
+    `subprocess_timeout_seconds` job arg wins either way."""
+    configured = job.args.get("subprocess_timeout_seconds")
+    if configured is not None:
+        return float(configured)
+    if job.args.get("max_segment_seconds") or job.job_type.endswith("-worker"):
+        return _COLLECTOR_SUBPROCESS_TIMEOUT_SECONDS
+    interval = max(0, int(job.interval_seconds))
+    return min(_COLLECTOR_SUBPROCESS_TIMEOUT_SECONDS, max(300.0, 4.0 * interval))
+
+
 def _run_collector_in_subprocess(job: JobSpec) -> str:
     """Run one collector segment in a fresh `crypto_collector.cli run-job` process so
     concurrent collectors don't contend on the GIL. Raises on non-zero exit / timeout so
@@ -2586,17 +2670,18 @@ def _run_collector_in_subprocess(job: JobSpec) -> str:
             "args": job.args,
         }
     )
+    timeout_seconds = _collector_subprocess_timeout_seconds(job)
     try:
         proc = subprocess.run(
             [sys.executable, "-m", "crypto_collector.cli", "run-job", "--job-json", payload],
             capture_output=True,
             text=True,
-            timeout=_COLLECTOR_SUBPROCESS_TIMEOUT_SECONDS,
+            timeout=timeout_seconds,
         )
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(
             f"collector subprocess for {job.name} timed out after "
-            f"{_COLLECTOR_SUBPROCESS_TIMEOUT_SECONDS:.0f}s"
+            f"{timeout_seconds:.0f}s"
         ) from exc
     if proc.returncode != 0:
         tail = (proc.stderr or proc.stdout or "").strip()[-800:]
@@ -2633,6 +2718,16 @@ def _execute_ops_job_inprocess(job: JobSpec) -> JobExecutionResult | str | None:
     # them.
     args.fsync_interval_events = job.args.get("fsync_interval_events")
     args.fsync_interval_ms = job.args.get("fsync_interval_ms")
+    # Same uniform injection for the fsync ON/OFF switch and the normalized-parquet
+    # toggle. These existed in the parsers and in SOME _job_args builders (trades yes,
+    # depth no), so a config `jsonl_fsync: false` on a depth lane silently stayed
+    # durable and `normalized_parquet: false` was dropped entirely — the per-job-type
+    # enumeration trap, killed centrally like the cadence knobs above. Only override
+    # when the config actually sets the key, so _job_args/parser defaults still win.
+    if "jsonl_fsync" in job.args:
+        args.jsonl_fsync = bool(job.args["jsonl_fsync"])
+    if "normalized_parquet" in job.args:
+        args.normalized_parquet = bool(job.args["normalized_parquet"])
     if job.job_type == "mock":
         asyncio.run(run_mock(args))
         return "mock completed"
@@ -3094,9 +3189,15 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
         # Non-binance depth scorer. Defaults to score_only so the live catch-up job
         # writes replay summaries without promoting — promotion stays in the
         # quarantine-aware promote-replayable jobs (single promoter, no dup rows).
+        # A config that sets `source` to a bare string (instead of a list) would
+        # char-iterate downstream — each letter "lane" skipped, job green, scorer
+        # silently dead. Coerce to a one-element list.
+        configured_source = raw_args.get("source", ["coinbase_depth", "bybit_depth", "kraken_depth"])
+        if isinstance(configured_source, str):
+            configured_source = [configured_source]
         return SimpleNamespace(
             raw_root=Path(raw_args.get("raw_root", default_output_root())),
-            source=raw_args.get("source", ["coinbase_depth", "bybit_depth", "kraken_depth"]),
+            source=configured_source,
             target_root=Path(raw_args.get("target_root", default_curated_root("market_replayable"))),
             limit=raw_args.get("limit", 200),
             max_age_hours=raw_args.get("max_age_hours", 720.0),
@@ -3205,7 +3306,16 @@ def run_health(args: argparse.Namespace) -> None:
     # lanes like Kalshi never appear in standalone_workers), so auto-discover the
     # runner's config and report on the same job set the runner runs.
     config_path = args.config or _default_ops_config_path()
-    jobs = load_ops_config(config_path) if config_path and config_path.exists() else None
+    # The diagnostic surface must SURVIVE the config error that just took the
+    # runner down (load_ops_config fails loudly on e.g. duplicate job names) —
+    # health is the documented first-response tool, so report what we can
+    # instead of stack-tracing on the same problem.
+    jobs = None
+    if config_path and config_path.exists():
+        try:
+            jobs = load_ops_config(config_path)
+        except ValueError as exc:
+            print(f"warning: ops config invalid, reporting without job context: {exc}", file=sys.stderr)
     # When --ops-root is omitted, follow the discovered config's live root instead of the
     # env/default fallback, so a bare `health` reports on the running collection rather
     # than a stale pre-migration root.
@@ -3306,13 +3416,23 @@ def run_archive_offload(args: argparse.Namespace) -> None:
 
 
 def run_ops_prune_stale_workers(args: argparse.Namespace) -> None:
-    jobs = load_ops_config(args.config) if args.config and args.config.exists() else None
+    jobs = None
+    if args.config and args.config.exists():
+        try:
+            jobs = load_ops_config(args.config)
+        except ValueError as exc:
+            # An invalid config means we can't know the managed set — pruning with
+            # an empty managed list would classify every lane as unmanaged, so
+            # refuse rather than degrade.
+            raise SystemExit(f"ops config invalid; fix it before pruning: {exc}") from exc
     managed_names: set[str] = set()
+    # Every collector lane in the config is managed — the worker name defaults to
+    # the job type (each run_*_worker's default_worker_name). The old version
+    # enumerated only the two Binance types (it predated the multi-venue
+    # expansion), so 19 of 21 live lanes were prunable as "unmanaged".
     for job in jobs or []:
-        if job.job_type == "binance-depth-worker":
-            managed_names.add(str(job.args.get("worker_name") or "binance-depth-worker"))
-        elif job.job_type == "binance-trades-worker":
-            managed_names.add(str(job.args.get("worker_name") or "binance-trades-worker"))
+        if job.job_type in COLLECTOR_JOB_TYPES:
+            managed_names.add(str(job.args.get("worker_name") or job.job_type))
     report = prune_stale_worker_artifacts(
         ops_root=args.ops_root,
         stale_after_days=args.stale_after_days,
@@ -3437,18 +3557,14 @@ def run_backfill_stream_depth(args: argparse.Namespace) -> None:
     mode = "score_only" if score_only else ("apply" if apply else "dry_run")
     summary_rows: list[dict[str, object]] = []
     for source_dir_name in args.source:
-        venue = (
-            source_dir_name[: -len("_depth")]
-            if source_dir_name.endswith("_depth")
-            else source_dir_name
-        )
-        # A perp lane dir is "<venue>_perp_depth"; strip the "_perp" so the venue maps
-        # to the same `_stream_depth_replay_kwargs` branch the LIVE collector uses
-        # (which hardcodes the bare venue regardless of market). Without this, e.g.
-        # "bybit_perp_depth" -> "bybit_perp" -> none_native, drifting from the live
-        # collector's provable `sequence` summary and overwriting it on re-score.
-        if venue.endswith("_perp"):
-            venue = venue[: -len("_perp")]
+        # Lane dirs are "<venue>[_perp]_depth[_<instrument-suffix>]" and the replay
+        # kwargs are keyed by the BARE venue regardless of market (the live
+        # collector hardcodes it). The first underscore token IS the venue for
+        # every such name — including per-instrument suffixed lanes like
+        # "bybit_depth_ethusdt", which the old strip-trailing-"_depth" logic missed
+        # entirely (the whole dir name fell through to the none_native default,
+        # silently downgrading a provable-sequence lane on re-score).
+        venue = source_dir_name.split("_", 1)[0]
         source_root = raw_root / source_dir_name
         scanned = 0
         replayable = 0
@@ -3964,7 +4080,7 @@ def _process_binance_depth_raw(
     raw_sink: JsonlSink,
     clean_sink: JsonlSink,
     quarantine_sink: JsonlSink,
-    parquet_sink: ParquetDatasetSink,
+    parquet_sink: ParquetDatasetSink | None,
     normalizer: BinanceDepthNormalizer,
     quality_gate: MetadataQualityGate,
     message_count: int,
@@ -3979,7 +4095,8 @@ def _process_binance_depth_raw(
         clean_count += 1
         row = normalized.to_dict()
         clean_sink.write(row)
-        parquet_sink.write(row)
+        if parquet_sink is not None:
+            parquet_sink.write(row)
     else:
         quarantined_count += 1
         row = normalized.to_dict()
