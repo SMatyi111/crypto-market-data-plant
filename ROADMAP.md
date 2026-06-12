@@ -8,7 +8,7 @@ changes scope or state. Companion docs:
 - [`STANDARDS.md`](STANDARDS.md) — the data contract (schemas, replayability, retention)
 - [`docs/HISTORY.md`](docs/HISTORY.md) — resolved-work narrative (what was fixed, and why)
 
-Last updated: **2026-06-12**.
+Last updated: **2026-06-13**.
 
 ---
 
@@ -110,6 +110,28 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   `(product, trade_id)` at read time in research consumers, or (b) re-promote the
   affected lanes from raw on the fixed code (touches curated data — owner call).
   New capture is clean once the fix PR deploys.
+- **Kalshi raw retention at continuous volume (queued 2026-06-13).** The continuous
+  quote lane writes ~16 GB/day raw — the archive's heaviest writer (plant total
+  ~38 GB/day). With offload `min_age_days=14`, steady-state raw-in-flight on G: is
+  ~530 GB against ~548 GB currently free, and `D:\market_archive_cold` (7.3 TB free)
+  absorbs total raw for roughly 6 months before filling. Options: (a) keep defaults,
+  revisit when D: passes ~50%; (b) give the Kalshi lane a shorter offload age
+  (14 -> 3-7 days) to cut the G: steady-state by ~100-180 GB; (c) post-offload
+  retention cap — delete aged Kalshi raw after verified offload + curation
+  (deletion = owner); (d) compress raw at offload time (JSONL gzips well; cuts
+  cold-tier growth for all lanes). Deciding by the 2026-06-22 offload spot-check
+  would let any config change ride that check's verification pass.
+- **2026-06-13 modelling-side collection request (strategy-sensitive venue —
+  details in the gitignored local request doc).** Two new-capture proposals,
+  triaged by the manager: (i) a continuous WS order-book + reference-price lane
+  whose data is **perishable — every day before go-live is unrecoverable**, so
+  the go/no-go has real cost-of-delay; (ii) a low-volume daily on-chain
+  reconciliation sweep (dual-RPC cross-checked, re-fetchable, no urgency). Each
+  needs two owner calls: go/no-go, and build placement — native public-repo lane
+  (CI/review coverage, venue name becomes public) vs. local-only artifact
+  (private, outside the quality gates). A third requested item turned out
+  already satisfied by live capture, and a fourth is moot after the continuous
+  Kalshi switch; both recorded in the request doc.
 
 Decided 2026-06-11 (recorded, closed):
 - Incident-fix PR #17 merged + deployed same day; kalshi re-enabled as pool jobs,
