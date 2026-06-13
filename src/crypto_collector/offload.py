@@ -25,6 +25,7 @@ import json
 import shutil
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
+from math import isfinite
 from pathlib import Path
 from typing import Any
 
@@ -59,12 +60,19 @@ class OffloadLaneSpec:
     or the lane is dead (delisted venue) and nothing will ever promote it. Offload
     verifies the cold copy before deleting either way, so age_only relocates data,
     it cannot lose it.
+
+    min_age_days overrides the job-level age for this lane only (e.g. the Kalshi
+    quote lane rotates to cold after 3 days because its curation is inline and
+    nothing downstream needs the raw hot). A per-lane override keeps a single job
+    owning the whole raw_root — a second job over the same root would warn
+    `unconfigured_lane` for every dir it doesn't own, forever.
     """
 
     source: str
     promotion_index: Path | None = None
     quarantine_index: Path | None = None
     gate: str = "indexed"
+    min_age_days: float | None = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> OffloadLaneSpec:
@@ -77,12 +85,26 @@ class OffloadLaneSpec:
             raise ValueError(
                 f"offload lane needs 'source' (and 'promotion_index' unless gate=age_only): {raw!r}"
             )
+        raw_age = raw.get("min_age_days")
+        min_age_days: float | None = None
+        if raw_age is not None:
+            if (
+                isinstance(raw_age, bool)
+                or not isinstance(raw_age, (int, float))
+                or not isfinite(raw_age)
+                or raw_age <= 0
+            ):
+                raise ValueError(
+                    f"offload lane min_age_days must be a positive number: {raw!r}"
+                )
+            min_age_days = float(raw_age)
         quarantine_index = raw.get("quarantine_index")
         return cls(
             source=source,
             promotion_index=Path(promotion_index) if promotion_index else None,
             quarantine_index=Path(quarantine_index) if quarantine_index else None,
             gate=gate,
+            min_age_days=min_age_days,
         )
 
 
@@ -103,6 +125,7 @@ class OffloadRunStatus:
 @dataclass(slots=True)
 class OffloadLaneStatus:
     source: str
+    min_age_days: float | None = None  # effective age for this lane (override or job default)
     scanned_count: int = 0
     eligible_count: int = 0
     moved_count: int = 0
@@ -161,7 +184,6 @@ def offload_accounted_runs(
     apply: bool = False,
 ) -> OffloadReport:
     checked_at = datetime.now(tz=UTC)
-    cutoff = checked_at - timedelta(days=min_age_days)
 
     findings: list[str] = []
     lane_statuses: list[OffloadLaneStatus] = []
@@ -189,7 +211,9 @@ def offload_accounted_runs(
     index_sink: JsonlSink | None = None
 
     for lane in lanes:
-        lane_status = OffloadLaneStatus(source=lane.source)
+        lane_age_days = lane.min_age_days if lane.min_age_days is not None else min_age_days
+        lane_cutoff = checked_at - timedelta(days=lane_age_days)
+        lane_status = OffloadLaneStatus(source=lane.source, min_age_days=lane_age_days)
         lane_statuses.append(lane_status)
         lane_raw = raw_root / lane.source
         if not lane_raw.exists():
@@ -209,7 +233,7 @@ def offload_accounted_runs(
         # Oldest first so a backlog drains deterministically from the far end.
         for run_dir in sorted(path for path in lane_raw.iterdir() if path.is_dir()):
             started_at = _parse_run_started_at(run_dir)
-            if started_at is None or started_at >= cutoff:
+            if started_at is None or started_at >= lane_cutoff:
                 continue
             scanned_run_count += 1
             lane_status.scanned_count += 1
