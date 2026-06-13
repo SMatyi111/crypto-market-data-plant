@@ -516,7 +516,7 @@ def test_lane_spec_parses_min_age_override() -> None:
     ).min_age_days is None
 
 
-@pytest.mark.parametrize("bad_age", [0, -1, "soon", True])
+@pytest.mark.parametrize("bad_age", [0, -1, "soon", True, float("nan"), float("inf")])
 def test_lane_spec_rejects_non_positive_min_age(bad_age) -> None:
     with pytest.raises(ValueError, match="min_age_days"):
         OffloadLaneSpec.from_dict(

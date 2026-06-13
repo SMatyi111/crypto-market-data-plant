@@ -638,12 +638,15 @@ verdict that gates promotion.
   the cleanup job's `raw_policy` (`market/<src>=<days>`). Raw is the rebuild
   source; keep it long enough to re-promote after a logic fix.
 - **Raw cold tier**: aged raw runs are **verify-moved** (not deleted) to
-  `D:\market_archive_cold` by the `archive-offload` ops job. A run is offloaded
-  only after it appears in its lane's promotion index (the curated copy is
-  durably on disk) or quarantine index (known-bad); runs in neither index are
-  never touched and are surfaced as `unindexed`. Every move is recorded in the
-  lane's `_offload_index.jsonl`, so raw remains a locatable rebuild source after
-  offload.
+  `D:\market_archive_cold` by the `archive-offload` ops job. The job-level
+  offload age defaults to 14 days and may be overridden per lane; the live
+  Kalshi quote lane uses 3 days because its curation is inline. Indexed lanes
+  move only after a run appears in the lane's promotion index (the curated copy
+  is durably on disk) or quarantine index (known-bad); runs in neither index are
+  never touched and are surfaced as `unindexed`. `age_only` lanes may move once
+  old enough when curation is inline or the source is retired. Every move is
+  recorded in `_offload_index.jsonl`, so raw remains a locatable rebuild source
+  after offload.
 - **Normalized / curated / quarantine / manifests**: retained indefinitely (no
   auto-prune today). Curated is the long-lived research artifact.
 - Cleanup runs in **dry-run by default** (`--apply` to act).
