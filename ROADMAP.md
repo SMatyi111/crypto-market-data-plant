@@ -31,7 +31,7 @@ the Kalshi quote lane from ~50%-duty burst sampling to continuous back-to-back
 
 | Due | Check |
 | --- | --- |
-| **2026-06-22** | First `archive-offload` candidates reach offload age (indexed lanes; Kalshi already offloads via its dedicated 3-day job once the 2026-06-13 config deploys — watched by a daily scheduled check). Spot-check the lane `_offload_index.jsonl` entries against the `D:\market_archive_cold` tree: files verified-moved, counts match, no `unindexed` pile-up. |
+| **2026-06-22** | First `archive-offload` candidates reach offload age (indexed lanes; Kalshi already offloads via its 3-day per-lane override once the 2026-06-13 change deploys — watched by a daily scheduled check). Spot-check the lane `_offload_index.jsonl` entries against the `D:\market_archive_cold` tree: files verified-moved, counts match, no `unindexed` pile-up. |
 
 **Last ops audit:** 2026-06-11 (scheduler-stall incident response — see
 `docs/HISTORY.md` 2026-06-11 entry; plant verified stable post-mitigation: 21
@@ -111,17 +111,20 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   affected lanes from raw on the fixed code (touches curated data — owner call).
   New capture is clean once the fix PR deploys.
 Decided 2026-06-13 (recorded, closed):
-- **Kalshi raw retention at continuous volume: option (b) — dedicated
-  `archive-offload-kalshi` job at `min_age_days=3`** (main offload job stays at
-  14 for the indexed lanes; Kalshi is `age_only` because its curation is inline,
-  so nothing downstream needs the raw). Cuts G: steady-state raw-in-flight from
-  ~530 GB to ~355 GB (~190 GB headroom vs ~548 GB free). D: inflow is unchanged
-  (~38 GB/day, ~6-month horizon) — the delete-or-compress question returns when
-  D: passes ~50%. Config-only; **deploys at the next runner restart**. First
-  pass drains a ~1,500-run burst-era backlog at the 200-runs/hour limit
-  (~8 h, verify-staged). A repo-hygiene test now pins "each lane has at most
-  one archive-offload job" (double-move race guard); a daily scheduled check
-  watches the rotation until proven.
+- **Kalshi raw retention at continuous volume: option (b) — per-lane
+  `min_age_days: 3` override on the Kalshi lane** inside the single
+  archive-offload job (job default stays 14 for the indexed lanes; Kalshi is
+  `age_only` because its curation is inline, so nothing downstream needs the
+  raw hot). Cuts G: steady-state raw-in-flight from ~530 GB to ~355 GB
+  (~190 GB headroom vs ~548 GB free). D: inflow is unchanged (~38 GB/day,
+  ~6-month horizon) — the delete-or-compress question returns when D: passes
+  ~50%. Code + config; **deploys at the next runner restart**. First pass
+  drains a ~1,500-run burst-era backlog at the 200-runs/hour limit (~8 h,
+  verify-staged). Review note: the first cut used a second offload job, which
+  the /code-review pass killed — every offload job warns `unconfigured_lane`
+  for raw dirs it doesn't own, so overlapping jobs are permanent warn-noise; a
+  repo-hygiene test now pins "each lane appears in at most one offload job".
+  A daily scheduled check watches the rotation until proven.
 - **2026-06-13 modelling-side collection request — all four items closed**
   (strategy-sensitive venue — details in the gitignored local request doc):
   (i) the perishable continuous WS order-book + reference-price capture was
