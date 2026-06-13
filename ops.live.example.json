@@ -1252,9 +1252,23 @@
           {"source": "okx_trades", "promotion_index": "G:\\market_archive\\curated\\research\\trades_replayable\\_promotion_index.jsonl", "quarantine_index": "G:\\market_archive\\quarantine\\market\\okx_trades\\_quarantine_index.jsonl"},
           {"source": "okx_perp_trades", "promotion_index": "G:\\market_archive\\curated\\research\\trades_replayable\\_promotion_index.jsonl", "quarantine_index": "G:\\market_archive\\quarantine\\market\\okx_perp_trades\\_quarantine_index.jsonl"},
           {"source": "binance_perp_funding", "promotion_index": "G:\\market_archive\\curated\\research\\funding\\_promotion_index.jsonl", "quarantine_index": "G:\\market_archive\\quarantine\\market\\binance_perp_funding\\_quarantine_index.jsonl"},
-          {"source": "kalshi_crypto_quotes", "gate": "age_only"},
           {"source": "coinbase_trades_usdc", "gate": "age_only"},
           {"source": "coinbase_depth_usdc", "gate": "age_only"}
+        ]
+      }
+    },
+    {
+      "name": "archive-offload-kalshi",
+      "job_type": "archive-offload",
+      "interval_seconds": 3600,
+      "args": {
+        "raw_root": "G:\\market_archive\\raw\\market",
+        "cold_root": "D:\\market_archive_cold\\raw\\market",
+        "min_age_days": 3,
+        "limit": 200,
+        "apply": false,
+        "lanes": [
+          {"source": "kalshi_crypto_quotes", "gate": "age_only"}
         ]
       }
     }
