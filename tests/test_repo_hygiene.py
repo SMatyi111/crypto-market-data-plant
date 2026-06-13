@@ -8,6 +8,8 @@ repository itself so CI turns known footguns into red X's:
 - Enabled collector lanes must fit inside the runner scripts' default
   -CollectorConcurrency pool, or the lanes sorting last in the config are silently
   never dispatched (starved lanes shipped twice: 12<17 and 17<21).
+- Each raw lane may appear in at most one archive-offload job: two jobs owning
+  the same lane is a double-move race on aged run dirs.
 """
 
 from __future__ import annotations
@@ -108,4 +110,36 @@ def test_collector_concurrency_covers_enabled_lanes(config_name: str) -> None:
         f"{config_name} enables {lanes} collector lanes but the runner default pool is "
         f"{cap}; the lanes sorting last would be silently starved. Raise "
         f"CollectorConcurrency in run_ops_runner.ps1 AND redeploy_runner.ps1."
+    )
+
+
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "ops.live.example.json",
+        pytest.param(
+            "ops.live.local.json",
+            marks=pytest.mark.skipif(
+                not (REPO_ROOT / "ops.live.local.json").exists(),
+                reason="local ops config only exists on the live box",
+            ),
+        ),
+    ],
+)
+def test_each_lane_has_at_most_one_offload_job(config_name: str) -> None:
+    """Two archive-offload jobs owning the same lane is a double-move race: both
+    can pick the same aged run dir and the loser verify-fails against a
+    half-removed source. Pinned when the Kalshi lane got its own shorter-age
+    offload job (2026-06-13)."""
+    config = json.loads((REPO_ROOT / config_name).read_text(encoding="utf-8"))
+    owners: dict[str, list[str]] = {}
+    for job in config["jobs"]:
+        if job["job_type"] != "archive-offload" or not job.get("enabled", True):
+            continue
+        for lane in job["args"]["lanes"]:
+            owners.setdefault(lane["source"], []).append(job["name"])
+    duplicates = {src: names for src, names in owners.items() if len(names) > 1}
+    assert not duplicates, (
+        f"{config_name}: lanes offloaded by more than one archive-offload job "
+        f"(double-move race): {duplicates}"
     )

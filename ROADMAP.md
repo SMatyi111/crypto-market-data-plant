@@ -31,7 +31,7 @@ the Kalshi quote lane from ~50%-duty burst sampling to continuous back-to-back
 
 | Due | Check |
 | --- | --- |
-| **2026-06-22** | First `archive-offload` candidates reach offload age. Spot-check the lane `_offload_index.jsonl` entries against the `D:\market_archive_cold` tree: files verified-moved, counts match, no `unindexed` pile-up. |
+| **2026-06-22** | First `archive-offload` candidates reach offload age (indexed lanes; Kalshi already offloads via its dedicated 3-day job once the 2026-06-13 config deploys — watched by a daily scheduled check). Spot-check the lane `_offload_index.jsonl` entries against the `D:\market_archive_cold` tree: files verified-moved, counts match, no `unindexed` pile-up. |
 
 **Last ops audit:** 2026-06-11 (scheduler-stall incident response — see
 `docs/HISTORY.md` 2026-06-11 entry; plant verified stable post-mitigation: 21
@@ -110,29 +110,29 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   `(product, trade_id)` at read time in research consumers, or (b) re-promote the
   affected lanes from raw on the fixed code (touches curated data — owner call).
   New capture is clean once the fix PR deploys.
-- **Kalshi raw retention at continuous volume (queued 2026-06-13).** The continuous
-  quote lane writes ~16 GB/day raw — the archive's heaviest writer (plant total
-  ~38 GB/day). With offload `min_age_days=14`, steady-state raw-in-flight on G: is
-  ~530 GB against ~548 GB currently free, and `D:\market_archive_cold` (7.3 TB free)
-  absorbs total raw for roughly 6 months before filling. Options: (a) keep defaults,
-  revisit when D: passes ~50%; (b) give the Kalshi lane a shorter offload age
-  (14 -> 3-7 days) to cut the G: steady-state by ~100-180 GB; (c) post-offload
-  retention cap — delete aged Kalshi raw after verified offload + curation
-  (deletion = owner); (d) compress raw at offload time (JSONL gzips well; cuts
-  cold-tier growth for all lanes). Deciding by the 2026-06-22 offload spot-check
-  would let any config change ride that check's verification pass.
-- **2026-06-13 modelling-side collection request (strategy-sensitive venue —
-  details in the gitignored local request doc).** Triaged by the manager;
-  status: (i) **decided 2026-06-13** — the perishable continuous WS order-book
-  + reference-price capture was approved by the owner as a **local-only
-  artifact** and is live on a per-user scheduled task since 2026-06-12
-  ~23:42 UTC (build, smoke test, and live verification recorded in the local
-  request doc; runs only while the owner is logged on — folds into the pending
-  service-conversion decision there). (ii) Still pending: a low-volume daily
-  on-chain reconciliation sweep (dual-RPC cross-checked, re-fetchable, no
-  urgency) — needs go/no-go + the same placement call. A third requested item
-  turned out already satisfied by live capture, and a fourth is moot after the
-  continuous Kalshi switch; both recorded in the request doc.
+Decided 2026-06-13 (recorded, closed):
+- **Kalshi raw retention at continuous volume: option (b) — dedicated
+  `archive-offload-kalshi` job at `min_age_days=3`** (main offload job stays at
+  14 for the indexed lanes; Kalshi is `age_only` because its curation is inline,
+  so nothing downstream needs the raw). Cuts G: steady-state raw-in-flight from
+  ~530 GB to ~355 GB (~190 GB headroom vs ~548 GB free). D: inflow is unchanged
+  (~38 GB/day, ~6-month horizon) — the delete-or-compress question returns when
+  D: passes ~50%. Config-only; **deploys at the next runner restart**. First
+  pass drains a ~1,500-run burst-era backlog at the 200-runs/hour limit
+  (~8 h, verify-staged). A repo-hygiene test now pins "each lane has at most
+  one archive-offload job" (double-move race guard); a daily scheduled check
+  watches the rotation until proven.
+- **2026-06-13 modelling-side collection request — all four items closed**
+  (strategy-sensitive venue — details in the gitignored local request doc):
+  (i) the perishable continuous WS order-book + reference-price capture was
+  approved as a **local-only artifact**, deployed 2026-06-12 ~23:42 UTC, and
+  converted to a SYSTEM task 2026-06-13 ~00:53 UTC (boot-resilient; verified
+  3.2 s max capture gap across the conversion). (ii) The on-chain
+  reconciliation sweep: catch-up backfill executed 2026-06-13 (gapless,
+  checkpointed); a **recurring daily task was declined for now** (data is
+  re-fetchable; no execution or real-time monitoring need yet) — manual
+  catch-up runs from the checkpoint. (iii) was already satisfied by live
+  capture; (iv) moot after the continuous Kalshi switch.
 
 Decided 2026-06-11 (recorded, closed):
 - Incident-fix PR #17 merged + deployed same day; kalshi re-enabled as pool jobs,
