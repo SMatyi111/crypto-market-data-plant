@@ -25,6 +25,7 @@ import json
 import shutil
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
+from math import isfinite
 from pathlib import Path
 from typing import Any
 
@@ -87,7 +88,12 @@ class OffloadLaneSpec:
         raw_age = raw.get("min_age_days")
         min_age_days: float | None = None
         if raw_age is not None:
-            if isinstance(raw_age, bool) or not isinstance(raw_age, (int, float)) or raw_age <= 0:
+            if (
+                isinstance(raw_age, bool)
+                or not isinstance(raw_age, (int, float))
+                or not isfinite(raw_age)
+                or raw_age <= 0
+            ):
                 raise ValueError(
                     f"offload lane min_age_days must be a positive number: {raw!r}"
                 )
