@@ -8,7 +8,7 @@ changes scope or state. Companion docs:
 - [`STANDARDS.md`](STANDARDS.md) — the data contract (schemas, replayability, retention)
 - [`docs/HISTORY.md`](docs/HISTORY.md) — resolved-work narrative (what was fixed, and why)
 
-Last updated: **2026-06-12**.
+Last updated: **2026-06-13**.
 
 ---
 
@@ -110,6 +110,29 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   `(product, trade_id)` at read time in research consumers, or (b) re-promote the
   affected lanes from raw on the fixed code (touches curated data — owner call).
   New capture is clean once the fix PR deploys.
+- **Kalshi raw retention at continuous volume (queued 2026-06-13).** The continuous
+  quote lane writes ~16 GB/day raw — the archive's heaviest writer (plant total
+  ~38 GB/day). With offload `min_age_days=14`, steady-state raw-in-flight on G: is
+  ~530 GB against ~548 GB currently free, and `D:\market_archive_cold` (7.3 TB free)
+  absorbs total raw for roughly 6 months before filling. Options: (a) keep defaults,
+  revisit when D: passes ~50%; (b) give the Kalshi lane a shorter offload age
+  (14 -> 3-7 days) to cut the G: steady-state by ~100-180 GB; (c) post-offload
+  retention cap — delete aged Kalshi raw after verified offload + curation
+  (deletion = owner); (d) compress raw at offload time (JSONL gzips well; cuts
+  cold-tier growth for all lanes). Deciding by the 2026-06-22 offload spot-check
+  would let any config change ride that check's verification pass.
+- **2026-06-13 modelling-side collection request (strategy-sensitive venue —
+  details in the gitignored local request doc).** Triaged by the manager;
+  status: (i) **decided 2026-06-13** — the perishable continuous WS order-book
+  + reference-price capture was approved by the owner as a **local-only
+  artifact** and is live on a per-user scheduled task since 2026-06-12
+  ~23:42 UTC (build, smoke test, and live verification recorded in the local
+  request doc; runs only while the owner is logged on — folds into the pending
+  service-conversion decision there). (ii) Still pending: a low-volume daily
+  on-chain reconciliation sweep (dual-RPC cross-checked, re-fetchable, no
+  urgency) — needs go/no-go + the same placement call. A third requested item
+  turned out already satisfied by live capture, and a fourth is moot after the
+  continuous Kalshi switch; both recorded in the request doc.
 
 Decided 2026-06-11 (recorded, closed):
 - Incident-fix PR #17 merged + deployed same day; kalshi re-enabled as pool jobs,
