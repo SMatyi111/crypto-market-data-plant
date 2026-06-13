@@ -470,3 +470,55 @@ def test_source_grown_between_copy_and_delete_is_kept(tmp_path: Path, monkeypatc
 
     assert report.runs[0].action == "source_changed_during_move"
     assert run_dir.exists()
+
+
+def test_per_lane_min_age_overrides_job_default(tmp_path: Path) -> None:
+    """A lane-level min_age_days beats the job default for that lane only: a
+    7-day-old run is offload-eligible on the 3-day Kalshi lane while the same
+    age stays hot on a default-14-day lane."""
+    from datetime import UTC, datetime, timedelta
+
+    raw_root = tmp_path / "raw"
+    cold_root = tmp_path / "cold"
+    mid_aged = (datetime.now(tz=UTC) - timedelta(days=7)).strftime("%Y%m%d_%H%M%S")
+    _make_run(raw_root, "kalshi_crypto_quotes", mid_aged)
+    _make_run(raw_root, "coinbase_trades_usdc", mid_aged)
+
+    report = offload_accounted_runs(
+        raw_root=raw_root,
+        cold_root=cold_root,
+        lanes=[
+            OffloadLaneSpec(
+                source="kalshi_crypto_quotes", gate="age_only", min_age_days=3.0
+            ),
+            OffloadLaneSpec(source="coinbase_trades_usdc", gate="age_only"),
+        ],
+        min_age_days=14.0,
+        apply=False,
+    )
+
+    assert [run.lane for run in report.runs] == ["kalshi_crypto_quotes"]
+    assert report.runs[0].action == "would_move"
+    by_source = {lane.source: lane for lane in report.lanes}
+    assert by_source["kalshi_crypto_quotes"].min_age_days == 3.0
+    assert by_source["kalshi_crypto_quotes"].eligible_count == 1
+    assert by_source["coinbase_trades_usdc"].min_age_days == 14.0
+    assert by_source["coinbase_trades_usdc"].eligible_count == 0
+
+
+def test_lane_spec_parses_min_age_override() -> None:
+    spec = OffloadLaneSpec.from_dict(
+        {"source": "kalshi_crypto_quotes", "gate": "age_only", "min_age_days": 3}
+    )
+    assert spec.min_age_days == 3.0
+    assert OffloadLaneSpec.from_dict(
+        {"source": "x", "gate": "age_only"}
+    ).min_age_days is None
+
+
+@pytest.mark.parametrize("bad_age", [0, -1, "soon", True])
+def test_lane_spec_rejects_non_positive_min_age(bad_age) -> None:
+    with pytest.raises(ValueError, match="min_age_days"):
+        OffloadLaneSpec.from_dict(
+            {"source": "x", "gate": "age_only", "min_age_days": bad_age}
+        )

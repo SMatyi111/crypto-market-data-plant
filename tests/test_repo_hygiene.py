@@ -26,6 +26,19 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = sorted((REPO_ROOT / "scripts").glob("*.ps1"))
 _CAP_PATTERN = re.compile(r"\[int\]\$CollectorConcurrency\s*=\s*(\d+)")
 
+# Config-level invariants run against the template in CI and additionally against
+# the live config on the collection box.
+OPS_CONFIGS = [
+    "ops.live.example.json",
+    pytest.param(
+        "ops.live.local.json",
+        marks=pytest.mark.skipif(
+            not (REPO_ROOT / "ops.live.local.json").exists(),
+            reason="local ops config only exists on the live box",
+        ),
+    ),
+]
+
 
 def _concurrency_default(script: Path) -> int:
     match = _CAP_PATTERN.search(script.read_text(encoding="utf-8"))
@@ -90,19 +103,7 @@ def test_runner_scripts_concurrency_defaults_match() -> None:
     )
 
 
-@pytest.mark.parametrize(
-    "config_name",
-    [
-        "ops.live.example.json",
-        pytest.param(
-            "ops.live.local.json",
-            marks=pytest.mark.skipif(
-                not (REPO_ROOT / "ops.live.local.json").exists(),
-                reason="local ops config only exists on the live box",
-            ),
-        ),
-    ],
-)
+@pytest.mark.parametrize("config_name", OPS_CONFIGS)
 def test_collector_concurrency_covers_enabled_lanes(config_name: str) -> None:
     cap = _concurrency_default(REPO_ROOT / "scripts" / "run_ops_runner.ps1")
     lanes = _enabled_collector_lanes(REPO_ROOT / config_name)
@@ -113,33 +114,31 @@ def test_collector_concurrency_covers_enabled_lanes(config_name: str) -> None:
     )
 
 
-@pytest.mark.parametrize(
-    "config_name",
-    [
-        "ops.live.example.json",
-        pytest.param(
-            "ops.live.local.json",
-            marks=pytest.mark.skipif(
-                not (REPO_ROOT / "ops.live.local.json").exists(),
-                reason="local ops config only exists on the live box",
-            ),
-        ),
-    ],
-)
+@pytest.mark.parametrize("config_name", OPS_CONFIGS)
 def test_each_lane_has_at_most_one_offload_job(config_name: str) -> None:
-    """Two archive-offload jobs owning the same lane is a double-move race: both
-    can pick the same aged run dir and the loser verify-fails against a
-    half-removed source. Pinned when the Kalshi lane got its own shorter-age
-    offload job (2026-06-13)."""
+    """A lane owned by two archive-offload jobs is double-handled: in-runner
+    maintenance jobs are serialized, so the second job re-scans dirs the first
+    just moved and reports missing/verify-fail noise every hour — and a manual
+    `archive-offload` CLI run alongside the runner can race the same run dir
+    for real. Per-lane retention belongs on the lane spec (`min_age_days`
+    override), never on a second job: each job also warns `unconfigured_lane`
+    for every raw dir it doesn't own, so overlapping jobs bury that signal.
+    Pinned 2026-06-13 when the Kalshi 3-day rotation almost shipped as a
+    second job."""
     config = json.loads((REPO_ROOT / config_name).read_text(encoding="utf-8"))
     owners: dict[str, list[str]] = {}
     for job in config["jobs"]:
-        if job["job_type"] != "archive-offload" or not job.get("enabled", True):
+        if job.get("job_type") != "archive-offload" or not job.get("enabled", True):
             continue
-        for lane in job["args"]["lanes"]:
-            owners.setdefault(lane["source"], []).append(job["name"])
+        name = job.get("name", "<unnamed>")
+        lanes = job.get("args", {}).get("lanes")
+        assert isinstance(lanes, list) and lanes, (
+            f"{config_name}: archive-offload job {name!r} declares no lanes"
+        )
+        for lane in lanes:
+            owners.setdefault(lane["source"], []).append(name)
     duplicates = {src: names for src, names in owners.items() if len(names) > 1}
     assert not duplicates, (
         f"{config_name}: lanes offloaded by more than one archive-offload job "
-        f"(double-move race): {duplicates}"
+        f"(double-handling): {duplicates}"
     )
