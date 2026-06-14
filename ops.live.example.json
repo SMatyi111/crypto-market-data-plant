@@ -1192,35 +1192,6 @@
       }
     },
     {
-      "name": "cleanup-dry-run",
-      "job_type": "cleanup",
-      "interval_seconds": 3600,
-      "args": {
-        "archive_root": "G:\\market_archive",
-        "raw_days": 14,
-        "raw_policy": [
-          "market/binance_depth=14",
-          "market/binance_trades=14",
-          "market/coinbase_trades=14",
-          "market/coinbase_depth=14",
-          "market/kraken_trades=14",
-          "market/bybit_trades=14",
-          "market/bybit_depth=14",
-          "market/kraken_depth=14",
-          "market/mexc_trades=14",
-          "market/mexc_depth=14",
-          "market/binance_depth_usdc=14",
-          "market/binance_trades_usdc=14",
-          "market/bybit_perp_trades=14",
-          "market/bybit_perp_depth=14",
-          "market/binance_perp_trades=14",
-          "market/binance_perp_depth=14",
-          "market/binance_perp_funding=14"
-        ],
-        "apply": false
-      }
-    },
-    {
       "name": "archive-offload-cold",
       "job_type": "archive-offload",
       "interval_seconds": 3600,
@@ -1256,6 +1227,35 @@
           {"source": "coinbase_trades_usdc", "gate": "age_only"},
           {"source": "coinbase_depth_usdc", "gate": "age_only"}
         ]
+      }
+    },
+    {
+      "name": "cleanup-dry-run",
+      "job_type": "cleanup",
+      "interval_seconds": 3600,
+      "args": {
+        "archive_root": "G:\\market_archive",
+        "raw_days": 14,
+        "raw_policy": [
+          "market/binance_depth=14",
+          "market/binance_trades=14",
+          "market/coinbase_trades=14",
+          "market/coinbase_depth=14",
+          "market/kraken_trades=14",
+          "market/bybit_trades=14",
+          "market/bybit_depth=14",
+          "market/kraken_depth=14",
+          "market/mexc_trades=14",
+          "market/mexc_depth=14",
+          "market/binance_depth_usdc=14",
+          "market/binance_trades_usdc=14",
+          "market/bybit_perp_trades=14",
+          "market/bybit_perp_depth=14",
+          "market/binance_perp_trades=14",
+          "market/binance_perp_depth=14",
+          "market/binance_perp_funding=14"
+        ],
+        "apply": false
       }
     }
   ]

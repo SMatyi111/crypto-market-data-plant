@@ -33,11 +33,23 @@ the Kalshi quote lane from ~50%-duty burst sampling to continuous back-to-back
 | --- | --- |
 | **2026-06-22** | First `archive-offload` candidates reach offload age (indexed lanes; Kalshi already offloads via its 3-day per-lane override once the 2026-06-13 change deploys — watched by a daily scheduled check). Spot-check the lane `_offload_index.jsonl` entries against the `D:\market_archive_cold` tree: files verified-moved, counts match, no `unindexed` pile-up. |
 
-**Last ops audit:** 2026-06-11 (scheduler-stall incident response — see
-`docs/HISTORY.md` 2026-06-11 entry; plant verified stable post-mitigation: 21
-lanes collecting, full maintenance cycle 122s, zero errors). Ritual: if this
-stamp is more than ~3 days old at session start, audit the live plant first —
-see `CLAUDE.md` "Quality gates & review protocol".
+**Last ops audit:** 2026-06-14 (runner `running`, **0 failures / 24 h**; all
+lanes fresh). **G: capacity — RESOLVED this session:** was 91% used (178 GB
+free) with zero offload relief (14-day offload finds nothing until 06-22; oldest
+raw 06-08). Deployed PR #23 (owner-approved restart): the **3-day Kalshi offload
+is now live and validated draining** — moving aged Kalshi raw G:->D: oldest-first
+(verify-then-delete, D: copies confirmed intact), ~200 runs/cycle hourly,
+~1,265-run backlog clearing over ~7 cycles, then Kalshi raw settles at ~3 days
+(~48 GB). **Incident found + fixed mid-deploy:** the first post-restart offload
+was starved for ~30 min by a `cleanup-dry-run` (apply:false no-op) that
+monopolized the single-slot maintenance executor on a cold full-disk scan;
+the executor runs `maintenance_due[0]` in config order, so **reordered
+`archive-offload-cold` ahead of `cleanup-dry-run` (moved cleanup last) in BOTH
+configs** + redeployed -> offload fires before cleanup every cycle. D: cold 2%
+(7.8 TB free). Follow-up (non-urgent): `cleanup-dry-run` does a slow full-tree
+scan on a full disk and has never deleted a byte — consider making its scan
+incremental or retiring it. Ritual: if this stamp is more than ~3 days old at
+session start, audit the live plant first — see `CLAUDE.md` "Quality gates".
 
 ---
 
@@ -102,6 +114,13 @@ Decisions waiting on the owner; agents must not act on these without an explicit
 
 - **D:\market_archive legacy history** — retention vs. merge (open item 1 above).
   Owner deferred 2026-06-11: stays read-only until research needs pre-cutover dates.
+- **2026-06-13 modelling data-collection handoff (strategy-sensitive — ALL
+  specifics in the gitignored local request doc).** A read-only, re-fetchable
+  historical backfill feeding a frozen modelling study. Triaged: prior coverage
+  was short, so a backfill was warranted; manager built + validated the pipeline
+  (autonomous zone: re-fetchable public data, no money, no live lane, no auth).
+  Owner nod was wanted only on the full pull's scale. Source, fields, volumes,
+  and every other specific stay in the local doc — not here.
 - **Historical curated duplicates (2026-06-12 audit residue).** Until the audit
   fixes deploy+age in, curated data carries known duplicates: kraken trades (up to
   ~50 subscribe-replay prints per segment boundary since the lane went live),
@@ -127,15 +146,17 @@ Decided 2026-06-13 (recorded, closed):
   A daily scheduled check watches the rotation until proven.
 - **2026-06-13 modelling-side collection request — all four items closed**
   (strategy-sensitive venue — details in the gitignored local request doc):
-  (i) the perishable continuous WS order-book + reference-price capture was
-  approved as a **local-only artifact**, deployed 2026-06-12 ~23:42 UTC, and
-  converted to a SYSTEM task 2026-06-13 ~00:53 UTC (boot-resilient; verified
-  3.2 s max capture gap across the conversion). (ii) The external
-  data sweep: catch-up backfill executed 2026-06-13 (gapless,
-  checkpointed); a **recurring daily task was declined for now** (data is
-  re-fetchable; no execution or real-time monitoring need yet) — manual
-  catch-up runs from the checkpoint. (iii) was already satisfied by live
-  capture; (iv) moot after the continuous Kalshi switch.
+  (i) a perishable local-only capture lane was approved as a **local-only
+  artifact**, deployed 2026-06-12 ~23:42 UTC, and converted to a SYSTEM task
+  2026-06-13 ~00:53 UTC (boot-resilient; verified 3.2 s max capture gap across
+  the conversion). (ii) A strategy-sensitive historical backfill (read-only,
+  re-fetchable) completed to the **D: cold tier** with a breadcrumb in the G:
+  tree; a recurring task was declined 2026-06-13 then **REVERSED 2026-06-14 —
+  owner now wants the live collector**, re-registered as a dedicated
+  forward-collector scheduled task (now SYSTEM / boot-resilient). All source,
+  field, and volume detail stays in the gitignored local doc — not here.
+  (iii) was already satisfied by live capture; (iv) moot after the continuous
+  Kalshi switch.
 
 Decided 2026-06-11 (recorded, closed):
 - Incident-fix PR #17 merged + deployed same day; kalshi re-enabled as pool jobs,
