@@ -1198,7 +1198,7 @@
       "args": {
         "raw_root": "G:\\market_archive\\raw\\market",
         "cold_root": "D:\\market_archive_cold\\raw\\market",
-        "min_age_days": 14,
+        "min_age_days": 10,
         "limit": 200,
         "apply": false,
         "lanes": [

@@ -31,7 +31,7 @@ the Kalshi quote lane from ~50%-duty burst sampling to continuous back-to-back
 
 | Due | Check |
 | --- | --- |
-| **2026-06-22** | First `archive-offload` candidates reach offload age (indexed lanes; Kalshi already offloads via its 3-day per-lane override once the 2026-06-13 change deploys — watched by a daily scheduled check). Spot-check the lane `_offload_index.jsonl` entries against the `D:\market_archive_cold` tree: files verified-moved, counts match, no `unindexed` pile-up. |
+| **2026-06-18** | Indexed lanes reach the offload age (dropped 14->10 days on 2026-06-15 for G: headroom; oldest indexed raw is 06-08). Spot-check `_offload_index.jsonl` entries against the `D:\market_archive_cold` tree: files verified-moved, counts match, no `unindexed` pile-up. Confirm G: free climbs toward the ~110 GB plateau as the indexed backlog drains. |
 
 **Last ops audit:** 2026-06-14 (runner `running`, **0 failures / 24 h**; all
 lanes fresh). **G: capacity — RESOLVED this session:** was 91% used (178 GB
@@ -46,9 +46,17 @@ monopolized the single-slot maintenance executor on a cold full-disk scan;
 the executor runs `maintenance_due[0]` in config order, so **reordered
 `archive-offload-cold` ahead of `cleanup-dry-run` (moved cleanup last) in BOTH
 configs** + redeployed -> offload fires before cleanup every cycle. D: cold 2%
-(7.8 TB free). Follow-up (non-urgent): `cleanup-dry-run` does a slow full-tree
-scan on a full disk and has never deleted a byte — consider making its scan
-incremental or retiring it. Ritual: if this stamp is more than ~3 days old at
+(7.8 TB free). **2026-06-15 — indexed-lane offload age 14->10 days** (config +
+redeploy, runner pid 29176): measured raw was heading to a ~344 GB plateau
+(~20-40 GB G: free, too tight) because the 20 indexed lanes (~21 GB/day) fill to
+14 days; 10 days cuts steady-state raw to ~258 GB and lifts the plateau to
+**~110 GB free**, with indexed lanes starting to offload ~06-18 instead of 06-22.
+10 keeps a 3-day margin over the 168 h (7-day) score/promote self-heal window.
+NOTE: this is a RAW plateau, not a true floor — curated/normalized parquet grow
+forever on G: (cleanup is dry-run, never deletes), so free still creeps down
+slowly; revisit curated/normalized retention if G: tightens again. Follow-up
+(non-urgent): `cleanup-dry-run` scans the full tree slowly and never deletes —
+make incremental or retire. Ritual: if this stamp is more than ~3 days old at
 session start, audit the live plant first — see `CLAUDE.md` "Quality gates".
 
 ---
