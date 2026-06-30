@@ -1385,6 +1385,138 @@ def test_health_flags_no_recent_replayable_binance_trades(tmp_path: Path) -> Non
     assert report.status == "warn"
 
 
+def _binance_spot_trades_job(max_segment_seconds: int = 1800) -> JobSpec:
+    """The spot binance_trades lane job (no source_suffix; 30-min segments)."""
+    return JobSpec(
+        name="binance-btc-trades",
+        job_type="binance-trades-worker",
+        interval_seconds=5,
+        args={"symbol": "btcusdt", "channel": "trade", "max_segment_seconds": max_segment_seconds},
+    )
+
+
+def test_health_segment_aware_healthy_replayable_started_46m_ago(tmp_path: Path) -> None:
+    # On a 30-min-segment lane, a run that STARTED ~46 min ago closed/promoted only
+    # ~16 min ago, so a fresh replayable run's start-age is naturally ~1 segment +
+    # promote lag old. With segment_seconds=1800 the effective threshold is 3600s,
+    # so this healthy lane must NOT raise the finding (it wrongly did before the fix,
+    # because the raw 1800s threshold equalled the segment length).
+    archive_root = tmp_path
+    ops_root = archive_root / "ops"
+    ops_root.mkdir()
+    now = datetime.now(tz=UTC)
+    (ops_root / "heartbeat.json").write_text(
+        json.dumps({"status": "running", "last_seen": now.isoformat(), "job_counters": {}}),
+        encoding="utf-8",
+    )
+    _write_binance_trade_run(
+        archive_root,
+        _run_name_at(now - timedelta(minutes=46)),
+        promoted_rows=300,
+    )
+
+    report = build_health_report(
+        ops_root=ops_root,
+        jobs=[_binance_spot_trades_job(1800)],
+        stale_after_seconds=300,
+    )
+
+    assert "binance_trades_no_replayable_30m" not in report.findings
+    assert report.binance_trades["segment_seconds"] == 1800
+    assert report.binance_trades["effective_no_replayable_threshold_seconds"] == 1800 + 1800
+
+
+def test_health_segment_aware_genuine_stall_still_flags(tmp_path: Path) -> None:
+    # A real promotion stall: newest replayable run started older than
+    # no_replayable_after_seconds + segment_seconds (1800 + 1800 = 3600s), i.e. >1h
+    # / ~2 missed segments. Must STILL raise the finding even with the segment-aware
+    # grace.
+    archive_root = tmp_path
+    ops_root = archive_root / "ops"
+    ops_root.mkdir()
+    now = datetime.now(tz=UTC)
+    (ops_root / "heartbeat.json").write_text(
+        json.dumps({"status": "running", "last_seen": now.isoformat(), "job_counters": {}}),
+        encoding="utf-8",
+    )
+    _write_binance_trade_run(
+        archive_root,
+        _run_name_at(now - timedelta(minutes=70)),
+        promoted_rows=300,
+    )
+
+    report = build_health_report(
+        ops_root=ops_root,
+        jobs=[_binance_spot_trades_job(1800)],
+        stale_after_seconds=300,
+    )
+
+    assert "binance_trades_no_replayable_30m" in report.findings
+    assert report.status == "warn"
+
+
+def test_health_segment_seconds_zero_keeps_legacy_threshold(tmp_path: Path) -> None:
+    # With segment_seconds=0 (lane unidentifiable / non-segmented) the effective
+    # threshold reduces to the legacy 1800s, so a replayable run started ~46 min ago
+    # (>1800s) still fires exactly as before.
+    archive_root = tmp_path
+    ops_root = archive_root / "ops"
+    ops_root.mkdir()
+    now = datetime.now(tz=UTC)
+    (ops_root / "heartbeat.json").write_text(
+        json.dumps({"status": "running", "last_seen": now.isoformat(), "job_counters": {}}),
+        encoding="utf-8",
+    )
+    _write_binance_trade_run(
+        archive_root,
+        _run_name_at(now - timedelta(minutes=46)),
+        promoted_rows=300,
+    )
+
+    report = build_health_report(
+        ops_root=ops_root,
+        jobs=[_binance_spot_trades_job(0)],
+        stale_after_seconds=300,
+    )
+
+    assert "binance_trades_no_replayable_30m" in report.findings
+    assert report.binance_trades["segment_seconds"] == 0
+    assert report.binance_trades["effective_no_replayable_threshold_seconds"] == 1800
+
+
+def test_health_segment_aware_ignores_usdc_suffixed_lane(tmp_path: Path) -> None:
+    # The _usdc lane carries a source_suffix and writes to binance_trades_usdc, NOT
+    # the spot binance_trades lane that _binance_trades_quality reads. Only the
+    # suffix-less spot job's max_segment_seconds may govern the threshold; if only a
+    # suffixed job is present, segment_seconds stays 0 (legacy threshold).
+    archive_root = tmp_path
+    ops_root = archive_root / "ops"
+    ops_root.mkdir()
+    now = datetime.now(tz=UTC)
+    (ops_root / "heartbeat.json").write_text(
+        json.dumps({"status": "running", "last_seen": now.isoformat(), "job_counters": {}}),
+        encoding="utf-8",
+    )
+    _write_binance_trade_run(
+        archive_root,
+        _run_name_at(now - timedelta(minutes=46)),
+        promoted_rows=300,
+    )
+    usdc_job = JobSpec(
+        name="binance-btcusdc-trades",
+        job_type="binance-trades-worker",
+        interval_seconds=5,
+        args={"symbol": "btcusdc", "channel": "trade", "source_suffix": "usdc", "max_segment_seconds": 1800},
+    )
+
+    report = build_health_report(ops_root=ops_root, jobs=[usdc_job], stale_after_seconds=300)
+
+    # Only the suffixed lane is present, so segment_seconds is unknown (0) and the
+    # legacy 1800s threshold applies -> a 46-min-old replayable run still fires.
+    assert report.binance_trades["segment_seconds"] == 0
+    assert "binance_trades_no_replayable_30m" in report.findings
+
+
 def test_health_flags_three_low_clean_ratio_binance_trade_runs(tmp_path: Path) -> None:
     archive_root = tmp_path
     ops_root = archive_root / "ops"

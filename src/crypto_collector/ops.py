@@ -1159,6 +1159,7 @@ def build_health_report(
     binance_trades, binance_trade_findings = _binance_trades_quality(
         ops_root=ops_root,
         checked_at=checked_at,
+        segment_seconds=_binance_trades_segment_seconds(jobs),
     )
     findings.extend(binance_trade_findings)
 
@@ -1684,12 +1685,38 @@ def _standalone_worker_rows(
     return rows, findings
 
 
+def _binance_trades_segment_seconds(jobs: list[JobSpec] | None) -> float:
+    """Segment length (s) of the spot ``binance_trades`` lane, or 0.0 if unknown.
+
+    ``_binance_trades_quality`` reads ``raw/market/binance_trades`` specifically —
+    the spot BTC-USDT lane, NOT the ``_usdc`` variant (which carries a
+    ``source_suffix`` and writes to ``binance_trades_usdc``). That lane is captured
+    by the ``binance-trades-worker`` job whose ``source_suffix`` is empty/absent, so
+    its ``max_segment_seconds`` governs how long a run must exist before it can
+    become replayable. Returning 0.0 when the lane can't be confidently identified
+    preserves the legacy (non-segment-aware) threshold.
+    """
+    if not jobs:
+        return 0.0
+    for job in jobs:
+        if job.job_type != "binance-trades-worker":
+            continue
+        if str(job.args.get("source_suffix") or ""):
+            continue  # a suffixed lane (e.g. _usdc), not the spot binance_trades lane
+        try:
+            return float(job.args.get("max_segment_seconds") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+    return 0.0
+
+
 def _binance_trades_quality(
     *,
     ops_root: Path,
     checked_at: datetime,
     recent_run_limit: int = 10,
     no_replayable_after_seconds: float = 30 * 60,
+    segment_seconds: float = 0.0,
     low_clean_ratio_threshold: float = 0.25,
     low_clean_ratio_consecutive_runs: int = 3,
 ) -> tuple[dict[str, Any], list[str]]:
@@ -1768,6 +1795,16 @@ def _binance_trades_quality(
     if run_rows and run_rows[0]["replayable"] is False:
         findings.append("binance_trades_latest_unreplayable")
 
+    # A run only becomes replayable AFTER its segment closes (~segment_seconds
+    # after started_at) and is then promoted, so the newest replayable run's
+    # *start* age is expected to be at least one segment-length old the moment it
+    # can possibly count. Comparing that start-age against the raw threshold makes
+    # a threshold equal to the segment length (1800s here) fire continuously on a
+    # perfectly healthy lane. Grant a full extra segment's grace: only staleness
+    # BEYOND segment_seconds + the threshold (>=2 missed segments at 1800s) is a
+    # genuine promotion stall. segment_seconds<=0 (lane unknown / non-segmented)
+    # reduces to the legacy threshold, preserving old behavior.
+    effective_threshold = no_replayable_after_seconds + max(0.0, segment_seconds)
     latest_replayable_age_seconds: float | None = None
     if run_rows and latest_replayable_started_at is None:
         findings.append("binance_trades_no_replayable_30m")
@@ -1775,7 +1812,7 @@ def _binance_trades_quality(
         latest_replayable_age_seconds = max(
             0.0, (checked_at - latest_replayable_started_at).total_seconds()
         )
-        if latest_replayable_age_seconds > no_replayable_after_seconds:
+        if latest_replayable_age_seconds > effective_threshold:
             findings.append("binance_trades_no_replayable_30m")
 
     ratio_candidates = [
@@ -1802,6 +1839,9 @@ def _binance_trades_quality(
             "latest_run_replayable": run_rows[0]["replayable"] if run_rows else None,
             "latest_replayable_run": latest_replayable_run,
             "latest_replayable_age_seconds": latest_replayable_age_seconds,
+            "no_replayable_after_seconds": no_replayable_after_seconds,
+            "segment_seconds": segment_seconds,
+            "effective_no_replayable_threshold_seconds": effective_threshold,
             "total_clean_events": int(sum(row.get("clean_events") or 0 for row in run_rows)),
             "total_quarantined_events": int(
                 sum(row.get("quarantined_events") or 0 for row in run_rows)
