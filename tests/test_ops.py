@@ -26,6 +26,7 @@ from crypto_collector.cli import (
     run_single_job,
 )
 from crypto_collector.models import utc_now
+from crypto_collector.offload import OffloadReport, write_offload_report_latest
 from crypto_collector.ops import (
     COLLECTOR_JOB_TYPES,
     JobExecutionResult,
@@ -2842,21 +2843,29 @@ def _write_offload_report(
     findings: list[str] | None = None,
     checked_at: datetime | None = None,
 ) -> None:
-    ops_root.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "status": "warn" if stuck else "ok",
-        "mode": "apply",
-        "checked_at": (checked_at or datetime.now(tz=UTC)).isoformat(),
-        "moved_count": moved,
-        "failed_count": failed,
-        "stuck_unaccounted_count": stuck,
-        "findings": findings if findings is not None else (
-            [f"stuck_unaccounted_runs:{stuck}"] if stuck else []
-        ),
-    }
-    (ops_root / "offload_report_latest.json").write_text(
-        json.dumps(payload), encoding="utf-8"
+    # Persist through the REAL writer so these tests break if the report schema
+    # or file layout drifts; only the malformed-payload tests below hand-write
+    # raw JSON (there, drift is the point).
+    report = OffloadReport(
+        status="warn" if stuck else "ok",
+        mode="apply",
+        checked_at=(checked_at or datetime.now(tz=UTC)).isoformat(),
+        raw_root="raw",
+        cold_root="cold",
+        min_age_days=10.0,
+        scanned_run_count=stuck + moved,
+        eligible_count=moved,
+        moved_count=moved,
+        moved_bytes=0,
+        failed_count=failed,
+        stuck_unaccounted_count=stuck,
+        findings=findings
+        if findings is not None
+        else ([f"stuck_unaccounted_runs:{stuck}"] if stuck else []),
+        lanes=[],
+        runs=[],
     )
+    write_offload_report_latest(report, ops_root)
 
 
 def test_health_offload_finding_fires_only_above_baseline(tmp_path: Path) -> None:

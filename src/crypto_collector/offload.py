@@ -22,16 +22,14 @@ age-based cleanup has).
 from __future__ import annotations
 
 import json
-import os
 import shutil
-import time
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from math import isfinite
 from pathlib import Path
 from typing import Any
 
-from .storage import JsonlSink
+from .storage import JsonlSink, write_text_atomic
 
 # Cap how many stuck (old-but-unaccounted) run paths are listed per lane in the
 # report. The COUNT is always exact; this only bounds the example paths so a
@@ -185,25 +183,12 @@ class OffloadReport:
 def write_offload_report_latest(report: OffloadReport, ops_root: Path) -> Path:
     """Atomically persist ``report`` as ``<ops_root>/offload_report_latest.json``.
 
-    Temp-file + rename (the ops-root convention, mirroring the runner's heartbeat
-    writer): the health check may read this file at any moment, so a torn or
-    half-written JSON must be impossible. The rename is retried briefly because
-    AV/backup tooling on Windows can hold the target open transiently.
+    The health check may read this file at any moment, so a torn or half-written
+    JSON must be impossible. No fsync: losing the write to a power cut just means
+    the next hourly run rewrites it.
     """
     path = ops_root / OFFLOAD_REPORT_FILENAME
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    temp_path.write_text(
-        json.dumps(report.to_dict(), indent=2, sort_keys=True), encoding="utf-8"
-    )
-    for attempt in range(5):
-        try:
-            temp_path.replace(path)
-            break
-        except PermissionError:
-            if attempt == 4:
-                raise
-            time.sleep(0.02 * (attempt + 1))
+    write_text_atomic(path, json.dumps(report.to_dict(), indent=2, sort_keys=True))
     return path
 
 

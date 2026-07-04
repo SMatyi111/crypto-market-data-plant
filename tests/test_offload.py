@@ -381,6 +381,9 @@ def test_job_args_archive_offload_defaults_ops_root() -> None:
         )
     )
     assert args.ops_root == default_ops_root()
+    # The runner job owns the "latest" report slot, so it writes by default
+    # (manual CLI runs are opt-in via --write-report instead).
+    assert args.write_report is True
 
 
 def test_job_args_archive_offload_requires_cold_root_and_lanes() -> None:
@@ -415,9 +418,14 @@ def test_run_archive_offload_raises_on_failed_moves(tmp_path: Path) -> None:
             "--lanes-file", str(lanes_file),
             "--ops-root", str(ops_root),
             "--apply",
+            "--write-report",
         ]
     )
-    with pytest.raises(RuntimeError, match="failed moves"):
+    # The error message carries the headline counts: on this path the caller
+    # never gets the report object back.
+    with pytest.raises(
+        RuntimeError, match=r"failed moves \(moved=0 stuck_unaccounted=0\)"
+    ):
         run_archive_offload(args)
     assert run_dir.exists()
     # The report must be persisted BEFORE the raise — a failing offload is exactly
@@ -582,10 +590,11 @@ def test_write_offload_report_latest_atomic_and_overwrites(tmp_path: Path) -> No
     assert list(ops_root.glob("*.tmp")) == []
 
 
-def test_run_archive_offload_persists_report_on_cli_path(tmp_path: Path, capsys) -> None:
-    # Manual `archive-offload` CLI invocations must persist the same latest-report
-    # file the runner job path does, so health never reads a stale runner report
-    # after a manual pass.
+def test_run_archive_offload_cli_report_write_is_opt_in(tmp_path: Path, capsys) -> None:
+    # Manual `archive-offload` CLI invocations are side-effect-free by default: a
+    # dry-run probe or single-lane experiment must not clobber the runner's live
+    # report (health would read the experiment's partial-scan counts for up to an
+    # hour). --write-report opts in for deliberate full-config passes.
     raw_root = tmp_path / "raw"
     ops_root = tmp_path / "ops"
     run_dir = _make_run(raw_root, "binance_trades", OLD_RUN)
@@ -598,18 +607,19 @@ def test_run_archive_offload_persists_report_on_cli_path(tmp_path: Path, capsys)
     lanes_file.write_text(json.dumps([spec_dict]), encoding="utf-8")
 
     parser = build_parser()
-    args = parser.parse_args(
-        [
-            "archive-offload",
-            "--raw-root", str(raw_root),
-            "--cold-root", str(tmp_path / "cold"),
-            "--lanes-file", str(lanes_file),
-            "--ops-root", str(ops_root),
-        ]
-    )
-    report = run_archive_offload(args)
+    base_argv = [
+        "archive-offload",
+        "--raw-root", str(raw_root),
+        "--cold-root", str(tmp_path / "cold"),
+        "--lanes-file", str(lanes_file),
+        "--ops-root", str(ops_root),
+    ]
+    run_archive_offload(parser.parse_args(base_argv))
     capsys.readouterr()
+    assert not (ops_root / OFFLOAD_REPORT_FILENAME).exists()
 
+    report = run_archive_offload(parser.parse_args([*base_argv, "--write-report"]))
+    capsys.readouterr()
     payload = json.loads(
         (ops_root / OFFLOAD_REPORT_FILENAME).read_text(encoding="utf-8")
     )
