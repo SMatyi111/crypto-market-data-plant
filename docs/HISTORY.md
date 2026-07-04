@@ -18,9 +18,11 @@ offload job only on `failed_count` (so job status stayed `success`), the
 `OffloadReport` object was discarded after a bare "archive offload completed"
 job-log line, and `health` never read offload state at all. The safety surface
 worked; nothing was watching it. Fix (pure observability, no data touched, no
-STANDARDS bump): every offload execution now persists its full report atomically
-(temp + rename) to `<ops_root>/offload_report_latest.json` — on the runner job
-path and the manual CLI path, and *before* the failed-moves raise; the
+STANDARDS bump): the runner's offload job now persists its full report
+atomically (temp + rename, via `write_text_atomic`) to
+`<ops_root>/offload_report_latest.json`, *before* the failed-moves raise —
+manual CLI runs opt in with `--write-report`, so a dry-run probe or single-lane
+experiment cannot clobber the live report health reads; the
 job_runs.jsonl message carries the headline counts
 (`... moved=N failed=N stuck_unaccounted=N`); and `build_health_report` reads
 the persisted report into an `offload` section (counts, report age, findings)
