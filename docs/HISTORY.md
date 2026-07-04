@@ -7,6 +7,34 @@ git log + the merged PR descriptions; this file keeps the *why*.
 
 ---
 
+## 2026-07-04 — offload stuck-cohort observability (PR #27)
+
+The 2026-07-04 audit found a 14,211-run / ~95 GB cohort of never-scored raw
+run-dirs that had aged past the scoring window — permanent orphans the offload
+job correctly refuses to move (its designed safety surface) and reports as
+`stuck_unaccounted_runs:N` with `status=warn` on every pass. Nobody saw it for a
+week, because all three monitoring hops dropped the signal: the runner fails the
+offload job only on `failed_count` (so job status stayed `success`), the
+`OffloadReport` object was discarded after a bare "archive offload completed"
+job-log line, and `health` never read offload state at all. The safety surface
+worked; nothing was watching it. Fix (pure observability, no data touched, no
+STANDARDS bump): every offload execution now persists its full report atomically
+(temp + rename) to `<ops_root>/offload_report_latest.json` — on the runner job
+path and the manual CLI path, and *before* the failed-moves raise; the
+job_runs.jsonl message carries the headline counts
+(`... moved=N failed=N stuck_unaccounted=N`); and `build_health_report` reads
+the persisted report into an `offload` section (counts, report age, findings)
+with a growth-gated advisory finding — `offload_stuck_above_baseline:N` fires
+only when the current stuck count exceeds `--stuck-unaccounted-baseline`
+(default 0), so the known owner-gated cohort is carried as the baseline instead
+of shouting forever, and only NEW orphans (a promoter/scorer stalling again)
+alert. A missing or unreadable report file is silent by design (pre-deploy
+compatibility; the PR #20 alert-noise lesson), and a stale report surfaces as
+`report_age_seconds` data, not a finding. Deploys at the next runner restart;
+after the owner's cohort cleanup the baseline goes back to 0.
+
+---
+
 ## 2026-06-12 — Kalshi quote lane switched to continuous sampling (config-only)
 
 Owner request. Since first light (2026-06-08) the `kalshi-crypto-quotes` lane ran
