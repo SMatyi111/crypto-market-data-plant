@@ -7,7 +7,7 @@ git log + the merged PR descriptions; this file keeps the *why*.
 
 ---
 
-## 2026-07-04 — offload stuck-cohort observability (PR #27)
+## 2026-07-04 — offload stuck-cohort observability (PR #28)
 
 The 2026-07-04 audit found a 14,211-run / ~95 GB cohort of never-scored raw
 run-dirs that had aged past the scoring window — permanent orphans the offload

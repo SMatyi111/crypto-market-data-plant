@@ -134,7 +134,7 @@ session start, audit the live plant first — see `CLAUDE.md` "Quality gates".
    as the Kalshi normalized tree that caused the 06-17 G:-full incident, just
    ~20x slower. Needs an offload/retention policy (code change; data-lifecycle
    -> owner sign-off on the policy, implementation is autonomous).
-3. ~~Surface `stuck_unaccounted_count` in monitoring~~ **DONE — PR #27**
+3. ~~Surface `stuck_unaccounted_count` in monitoring~~ **DONE — PR #28**
    (offload report persisted + growth-gated `health` finding; root-cause
    narrative in `docs/HISTORY.md` 2026-07-04). Merged ≠ deployed: activates at
    the next runner restart; audit with `--stuck-unaccounted-baseline 14211`
@@ -231,7 +231,7 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   per-day) and curated coverage through the window held 34-49 promoted
   segments/day (intraday holes of order hours on 06-17/06-21/06-22 only). Latent
   gap: nothing back-stops runs that age out unscored, so a future multi-day
-  incident will mint new orphans (observability half DONE — PR #27: persisted
+  incident will mint new orphans (observability half DONE — PR #28: persisted
   offload report + growth-gated health finding, active at next runner restart;
   run health with `--stuck-unaccounted-baseline 14211` until this cohort is
   cleaned up, then reset to 0). Options:
