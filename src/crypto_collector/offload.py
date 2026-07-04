@@ -29,7 +29,7 @@ from math import isfinite
 from pathlib import Path
 from typing import Any
 
-from .storage import JsonlSink
+from .storage import JsonlSink, write_text_atomic
 
 # Cap how many stuck (old-but-unaccounted) run paths are listed per lane in the
 # report. The COUNT is always exact; this only bounds the example paths so a
@@ -42,6 +42,12 @@ _STUCK_EXAMPLE_CAP = 5
 _PARTIAL_DIRNAME = ".offload_partial"
 
 OFFLOAD_INDEX_FILENAME = "_offload_index.jsonl"
+
+# Latest offload report, persisted to the ops root after every execution so the
+# health surface can read offload state. The report object itself used to be
+# discarded after a one-line job log entry, which hid a 14k-run stuck cohort
+# behind "all jobs success" for a week (2026-07-04 audit).
+OFFLOAD_REPORT_FILENAME = "offload_report_latest.json"
 
 
 @dataclass(slots=True)
@@ -172,6 +178,18 @@ class OffloadReport:
             "lanes": [lane.to_dict() for lane in self.lanes],
             "runs": [run.to_dict() for run in self.runs],
         }
+
+
+def write_offload_report_latest(report: OffloadReport, ops_root: Path) -> Path:
+    """Atomically persist ``report`` as ``<ops_root>/offload_report_latest.json``.
+
+    The health check may read this file at any moment, so a torn or half-written
+    JSON must be impossible. No fsync: losing the write to a power cut just means
+    the next hourly run rewrites it.
+    """
+    path = ops_root / OFFLOAD_REPORT_FILENAME
+    write_text_atomic(path, json.dumps(report.to_dict(), indent=2, sort_keys=True))
+    return path
 
 
 def offload_accounted_runs(

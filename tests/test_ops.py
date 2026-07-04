@@ -26,6 +26,7 @@ from crypto_collector.cli import (
     run_single_job,
 )
 from crypto_collector.models import utc_now
+from crypto_collector.offload import OffloadReport, write_offload_report_latest
 from crypto_collector.ops import (
     COLLECTOR_JOB_TYPES,
     JobExecutionResult,
@@ -2831,3 +2832,168 @@ def test_maintenance_jobs_queued_behind_the_slot_are_not_flagged_stale(tmp_path:
     (tmp_path / "heartbeat.json").write_text(json_mod.dumps(heartbeat), encoding="utf-8")
     report = build_health_report(ops_root=tmp_path, jobs=load_ops_config(config))
     assert "stale_job:promote-kraken-depth" in report.findings
+
+
+def _write_offload_report(
+    ops_root: Path,
+    *,
+    stuck: int = 0,
+    moved: int = 0,
+    failed: int = 0,
+    findings: list[str] | None = None,
+    checked_at: datetime | None = None,
+) -> None:
+    # Persist through the REAL writer so these tests break if the report schema
+    # or file layout drifts; only the malformed-payload tests below hand-write
+    # raw JSON (there, drift is the point).
+    report = OffloadReport(
+        status="warn" if stuck else "ok",
+        mode="apply",
+        checked_at=(checked_at or datetime.now(tz=UTC)).isoformat(),
+        raw_root="raw",
+        cold_root="cold",
+        min_age_days=10.0,
+        scanned_run_count=stuck + moved,
+        eligible_count=moved,
+        moved_count=moved,
+        moved_bytes=0,
+        failed_count=failed,
+        stuck_unaccounted_count=stuck,
+        findings=findings
+        if findings is not None
+        else ([f"stuck_unaccounted_runs:{stuck}"] if stuck else []),
+        lanes=[],
+        runs=[],
+    )
+    write_offload_report_latest(report, ops_root)
+
+
+def test_health_offload_finding_fires_only_above_baseline(tmp_path: Path) -> None:
+    """The stuck-cohort finding gates on GROWTH: the known owner-gated cohort is
+    carried as the baseline, so only NEW orphans (a promoter/scorer stalling
+    again) alert. At or below baseline the counts stay visible as data only."""
+    ops_root = tmp_path / "ops"
+    _write_offload_report(ops_root, stuck=5, moved=3)
+    # Fresh heartbeat => the offload finding is the ONLY finding, pinning its
+    # severity: advisory warn, never error.
+    (ops_root / "heartbeat.json").write_text(
+        json.dumps({"status": "running", "last_seen": datetime.now(tz=UTC).isoformat()}),
+        encoding="utf-8",
+    )
+
+    report = build_health_report(ops_root=ops_root, jobs=None, stale_after_seconds=300)
+    assert "offload_stuck_above_baseline:5" in report.findings
+    assert report.offload is not None
+    assert report.offload["stuck_unaccounted_count"] == 5
+    assert report.offload["stuck_unaccounted_baseline"] == 0
+    assert report.offload["moved_count"] == 3
+    assert report.offload["failed_count"] == 0
+    assert report.offload["findings"] == ["stuck_unaccounted_runs:5"]
+    age = report.offload["report_age_seconds"]
+    assert isinstance(age, float) and 0 <= age < 300
+    assert report.findings == ["offload_stuck_above_baseline:5"]
+    assert report.status == "warn"
+
+    at_baseline = build_health_report(
+        ops_root=ops_root, jobs=None, stale_after_seconds=300,
+        stuck_unaccounted_baseline=5,
+    )
+    assert not any(f.startswith("offload_") for f in at_baseline.findings)
+    assert at_baseline.offload is not None
+    assert at_baseline.offload["stuck_unaccounted_count"] == 5
+    assert at_baseline.offload["stuck_unaccounted_baseline"] == 5
+
+    above_baseline = build_health_report(
+        ops_root=ops_root, jobs=None, stale_after_seconds=300,
+        stuck_unaccounted_baseline=4,
+    )
+    assert "offload_stuck_above_baseline:5" in above_baseline.findings
+
+
+def test_health_missing_or_garbage_offload_report_is_silent(tmp_path: Path) -> None:
+    """Pre-deploy (no report file yet) and torn/garbage files must not alert:
+    absence is not a failure signal, and the offload writer is atomic anyway."""
+    ops_root = tmp_path / "ops"
+    ops_root.mkdir(parents=True)
+
+    report = build_health_report(ops_root=ops_root, jobs=None, stale_after_seconds=300)
+    assert report.offload is None
+    assert not any(f.startswith("offload_") for f in report.findings)
+    assert report.to_dict()["offload"] is None
+
+    (ops_root / "offload_report_latest.json").write_text("{ torn", encoding="utf-8")
+    garbage = build_health_report(ops_root=ops_root, jobs=None, stale_after_seconds=300)
+    assert garbage.offload is None
+    assert not any(f.startswith("offload_") for f in garbage.findings)
+
+
+def test_health_offload_stale_report_is_data_not_finding(tmp_path: Path) -> None:
+    """A report much older than the hourly job cadence surfaces as
+    report_age_seconds only — the offload job can be legitimately delayed behind
+    a long maintenance pass, and stale_job already covers a dead job."""
+    ops_root = tmp_path / "ops"
+    _write_offload_report(
+        ops_root, stuck=0, checked_at=datetime.now(tz=UTC) - timedelta(hours=13)
+    )
+
+    report = build_health_report(ops_root=ops_root, jobs=None, stale_after_seconds=300)
+    assert report.offload is not None
+    assert report.offload["report_age_seconds"] > 12 * 3600
+    assert not any(f.startswith("offload_") for f in report.findings)
+
+
+def test_health_offload_non_numeric_stuck_count_does_not_alert(tmp_path: Path) -> None:
+    # A malformed count (schema drift) is surfaced verbatim in the section but
+    # can't be compared against the baseline — no finding, no crash.
+    ops_root = tmp_path / "ops"
+    ops_root.mkdir(parents=True)
+    (ops_root / "offload_report_latest.json").write_text(
+        json.dumps(
+            {
+                "status": "ok",
+                "checked_at": datetime.now(tz=UTC).isoformat(),
+                "stuck_unaccounted_count": "many",
+                "moved_count": 0,
+                "failed_count": 0,
+                "findings": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = build_health_report(ops_root=ops_root, jobs=None, stale_after_seconds=300)
+    assert report.offload is not None
+    assert report.offload["stuck_unaccounted_count"] == "many"
+    assert not any(f.startswith("offload_") for f in report.findings)
+
+
+def test_health_cli_threads_baseline_and_renders_offload(tmp_path: Path, capsys) -> None:
+    """End-to-end through the `health` subcommand: --stuck-unaccounted-baseline
+    reaches build_health_report and the text output renders the offload line."""
+    ops_root = tmp_path / "ops"
+    (ops_root / "standalone_workers").mkdir(parents=True)
+    _write_offload_report(ops_root, stuck=7, moved=2)
+    # Empty-jobs config pins the discovery path — without it run_health would
+    # auto-discover the repo's live/example config and report on real roots.
+    config_path = tmp_path / "ops.json"
+    config_path.write_text(json.dumps({"jobs": []}), encoding="utf-8")
+
+    args = build_parser().parse_args(
+        [
+            "health",
+            "--ops-root", str(ops_root),
+            "--config", str(config_path),
+            "--stuck-unaccounted-baseline", "7",
+        ]
+    )
+    run_health(args)
+    out = capsys.readouterr().out
+    assert "offload: stuck_unaccounted=7 baseline=7 moved=2 failed=0" in out
+    assert "offload_stuck_above_baseline" not in out
+
+    args = build_parser().parse_args(
+        ["health", "--ops-root", str(ops_root), "--config", str(config_path)]
+    )
+    run_health(args)
+    out = capsys.readouterr().out
+    assert "offload_stuck_above_baseline:7" in out

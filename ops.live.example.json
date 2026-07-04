@@ -1201,6 +1201,7 @@
         "min_age_days": 10,
         "limit": 200,
         "apply": false,
+        "ops_root": "G:\\market_archive\\ops",
         "lanes": [
           {"source": "binance_depth", "promotion_index": "G:\\market_archive\\curated\\research\\market_replayable\\_promotion_index.jsonl", "quarantine_index": "G:\\market_archive\\quarantine\\market\\binance_depth\\_quarantine_index.jsonl"},
           {"source": "coinbase_depth", "promotion_index": "G:\\market_archive\\curated\\research\\market_replayable\\_promotion_index.jsonl", "quarantine_index": "G:\\market_archive\\quarantine\\market\\coinbase_depth\\_quarantine_index.jsonl"},

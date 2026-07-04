@@ -15,6 +15,7 @@ import time
 from typing import Any, Callable
 
 from .config import default_normalized_root
+from .offload import OFFLOAD_REPORT_FILENAME
 from .storage import JsonlSink
 
 logger = logging.getLogger(__name__)
@@ -136,6 +137,9 @@ class HealthReport:
     standalone_workers: list[dict[str, Any]]
     binance_trades: dict[str, Any] | None = None
     poll_lanes: list[dict[str, Any]] = field(default_factory=list)
+    # Summary of the persisted latest archive-offload report (None when no report
+    # file exists yet — e.g. pre-deploy — or it is unreadable).
+    offload: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -149,6 +153,7 @@ class HealthReport:
             "standalone_workers": self.standalone_workers,
             "binance_trades": self.binance_trades,
             "poll_lanes": self.poll_lanes,
+            "offload": self.offload,
         }
 
 
@@ -919,6 +924,7 @@ def build_health_report(
     min_disk_free_gb: float = 100.0,
     quarantine_ratio_threshold: float = 0.20,
     normalized_root: Path | None = None,
+    stuck_unaccounted_baseline: int = 0,
 ) -> HealthReport:
     checked_at = datetime.now(tz=UTC)
     heartbeat_path = ops_root / "heartbeat.json"
@@ -1163,6 +1169,47 @@ def build_health_report(
     )
     findings.extend(binance_trade_findings)
 
+    # Latest archive-offload report (persisted by write_offload_report_latest —
+    # the incident rationale lives at OFFLOAD_REPORT_FILENAME's definition). A
+    # missing or unreadable file is NOT a finding: the file only exists once an
+    # offload has run on post-deploy code, and alerting on absence would recreate
+    # the alert-noise class PR #20 killed. Staleness is surfaced as
+    # report_age_seconds data, not a finding: the offload job is hourly but a
+    # long maintenance queue can legitimately delay it.
+    offload_summary: dict[str, Any] | None = None
+    offload_payload = _read_json_file(ops_root / OFFLOAD_REPORT_FILENAME)
+    if offload_payload is not None:
+        offload_checked_at = _parse_dt(offload_payload.get("checked_at"))
+        report_age_seconds = (
+            (checked_at - offload_checked_at).total_seconds()
+            if offload_checked_at is not None
+            else None
+        )
+        stuck_count = offload_payload.get("stuck_unaccounted_count")
+        offload_findings = offload_payload.get("findings")
+        offload_summary = {
+            "status": offload_payload.get("status"),
+            "mode": offload_payload.get("mode"),
+            "checked_at": offload_payload.get("checked_at"),
+            "report_age_seconds": report_age_seconds,
+            "moved_count": offload_payload.get("moved_count"),
+            "failed_count": offload_payload.get("failed_count"),
+            "stuck_unaccounted_count": stuck_count,
+            "stuck_unaccounted_baseline": stuck_unaccounted_baseline,
+            "findings": offload_findings if isinstance(offload_findings, list) else [],
+        }
+        # Alert on GROWTH, not existence: the known owner-gated cohort is carried
+        # as the baseline, so only NEW orphans — a promoter/scorer stalling again
+        # — fire the advisory finding. Reset the baseline to 0 once the owner
+        # clears the cohort. A non-int count (schema drift) stays visible as
+        # data but cannot alert.
+        if (
+            isinstance(stuck_count, int)
+            and not isinstance(stuck_count, bool)
+            and stuck_count > stuck_unaccounted_baseline
+        ):
+            findings.append(f"offload_stuck_above_baseline:{stuck_count}")
+
     disk_free_gb: float | None = None
     disk_free_pct: float | None = None
     anchor = ops_root.drive or ops_root.anchor or str(ops_root)
@@ -1214,6 +1261,7 @@ def build_health_report(
         standalone_workers=standalone_workers,
         binance_trades=binance_trades,
         poll_lanes=poll_lanes,
+        offload=offload_summary,
     )
 
 

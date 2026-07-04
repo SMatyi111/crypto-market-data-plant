@@ -98,7 +98,12 @@ from .pipeline import (
     DEFAULT_FSYNC_INTERVAL_MS,
     CollectorPipeline,
 )
-from .offload import OffloadLaneSpec, offload_accounted_runs
+from .offload import (
+    OffloadLaneSpec,
+    OffloadReport,
+    offload_accounted_runs,
+    write_offload_report_latest,
+)
 from .promotion import promote_replayable_runs
 from .quality import MetadataQualityGate, QualityGate
 from .quarantine import quarantine_bad_runs
@@ -852,6 +857,16 @@ def build_parser() -> argparse.ArgumentParser:
         "quarantined_events / raw_messages exceeds this fraction in the latest "
         "summary.jsonl row of the active run.",
     )
+    health_parser.add_argument(
+        "--stuck-unaccounted-baseline",
+        type=int,
+        default=0,
+        help="Accepted stuck_unaccounted_count in the latest offload report. The "
+        "offload_stuck_above_baseline finding fires only when the current count "
+        "EXCEEDS this (alert on growth, not existence): set it to the size of a "
+        "known owner-gated orphan cohort, and reset to 0 once that cohort is "
+        "cleaned up.",
+    )
     health_parser.add_argument("--format", choices=["json", "text"], default="text")
 
     cleanup_parser = subparsers.add_parser("cleanup", help="Report or apply archive cleanup")
@@ -878,6 +893,20 @@ def build_parser() -> argparse.ArgumentParser:
     offload_parser.add_argument("--min-age-days", type=float, default=14.0)
     offload_parser.add_argument("--limit", type=int, default=200)
     offload_parser.add_argument("--apply", action="store_true")
+    offload_parser.add_argument(
+        "--ops-root",
+        type=Path,
+        default=default_ops_root(),
+        help="Ops root where offload_report_latest.json is persisted for the "
+        "health report (same root the ops runner writes heartbeat/job logs to).",
+    )
+    offload_parser.add_argument(
+        "--write-report",
+        action="store_true",
+        help="Persist offload_report_latest.json to --ops-root. The ops-runner "
+        "job always does this; manual runs must opt in so a dry-run probe or "
+        "single-lane experiment cannot clobber the live report health reads.",
+    )
     offload_parser.add_argument("--format", choices=["json", "text"], default="text")
 
     prune_parser = subparsers.add_parser("ops-prune-stale-workers", help="Archive stale unmanaged worker metadata")
@@ -2804,8 +2833,14 @@ def _execute_ops_job_inprocess(job: JobSpec) -> JobExecutionResult | str | None:
         run_cleanup_command(args)
         return "cleanup completed"
     if job.job_type == "archive-offload":
-        run_archive_offload(args)
-        return "archive offload completed"
+        # Headline counts go into the job_runs.jsonl message so the log line is
+        # self-describing — "completed" alone hid a growing stuck cohort.
+        report = run_archive_offload(args)
+        return (
+            f"archive offload completed; status={report.status}"
+            f" moved={report.moved_count} failed={report.failed_count}"
+            f" stuck_unaccounted={report.stuck_unaccounted_count}"
+        )
     raise ValueError(f"Unsupported job_type: {job.job_type}")
 
 
@@ -3251,6 +3286,12 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             min_age_days=raw_args.get("min_age_days", 14.0),
             limit=raw_args.get("limit", 200),
             apply=raw_args.get("apply", False),
+            # Where offload_report_latest.json lands for the health report; same
+            # config key + default the collector lanes use for their ops_root.
+            # The runner job owns the "latest" slot, so it always writes;
+            # manual CLI runs opt in via --write-report instead.
+            ops_root=Path(raw_args.get("ops_root", default_ops_root())),
+            write_report=raw_args.get("write_report", True),
             format=raw_args.get("format", "text"),
         )
     raise ValueError(f"Unsupported job_type: {job.job_type}")
@@ -3333,6 +3374,7 @@ def run_health(args: argparse.Namespace) -> None:
         min_disk_free_gb=args.min_disk_free_gb,
         quarantine_ratio_threshold=float(getattr(args, "quarantine_ratio_threshold", 0.20)),
         normalized_root=normalized_root,
+        stuck_unaccounted_baseline=int(getattr(args, "stuck_unaccounted_baseline", 0)),
     )
     if args.format == "json":
         print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
@@ -3355,6 +3397,25 @@ def run_health(args: argparse.Namespace) -> None:
             )
     else:
         print("poll_lanes=none")
+    if report.offload:
+        offload = report.offload
+        # build_health_report guarantees the keys: age is float|None, findings
+        # is always a list.
+        age = offload["report_age_seconds"]
+        age_str = f"{age:.0f}s" if age is not None else "n/a"
+        offload_findings = offload["findings"]
+        print(
+            "offload:"
+            f" stuck_unaccounted={offload.get('stuck_unaccounted_count')}"
+            f" baseline={offload.get('stuck_unaccounted_baseline')}"
+            f" moved={offload.get('moved_count')}"
+            f" failed={offload.get('failed_count')}"
+            f" status={offload.get('status')}"
+            f" report_age={age_str}"
+            f" findings={','.join(str(item) for item in offload_findings) or 'none'}"
+        )
+    else:
+        print("offload=none")
 
 
 def run_cleanup_command(args: argparse.Namespace) -> None:
@@ -3374,7 +3435,7 @@ def run_cleanup_command(args: argparse.Namespace) -> None:
     print(f"removed_bytes={report.removed_bytes}")
 
 
-def run_archive_offload(args: argparse.Namespace) -> None:
+def run_archive_offload(args: argparse.Namespace) -> OffloadReport:
     # Lanes arrive either inline (ops-runner job args) or as a JSON file (manual CLI).
     raw_lanes = getattr(args, "lanes", None)
     if raw_lanes is None:
@@ -3389,6 +3450,15 @@ def run_archive_offload(args: argparse.Namespace) -> None:
         limit=args.limit,
         apply=args.apply,
     )
+    # Persist BEFORE printing or the failed-moves raise below: the report must be
+    # health-readable even (especially) when this execution fails. A write
+    # failure raises => job error, the correct loudness for a full/locked ops
+    # root. Gated: the runner job always writes (its config owns the "latest"
+    # slot health reads); manual CLI runs must opt in with --write-report so a
+    # dry-run probe or single-lane experiment stays side-effect-free and cannot
+    # clobber the live report with partial-scan counts.
+    if getattr(args, "write_report", False):
+        write_offload_report_latest(report, args.ops_root)
     if args.format == "json":
         print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
     else:
@@ -3412,7 +3482,15 @@ def run_archive_offload(args: argparse.Namespace) -> None:
     # verification — a verify/copy failure must register as a job failure in the
     # runner (and thus in health's recent_job_failures), not scroll by in a log.
     if report.failed_count:
-        raise RuntimeError(f"archive-offload had {report.failed_count} failed moves")
+        # Carry the headline counts too: on this path the caller never gets the
+        # report back, so without them the job log would again record a line
+        # with no stuck count.
+        raise RuntimeError(
+            f"archive-offload had {report.failed_count} failed moves"
+            f" (moved={report.moved_count}"
+            f" stuck_unaccounted={report.stuck_unaccounted_count})"
+        )
+    return report
 
 
 def run_ops_prune_stale_workers(args: argparse.Namespace) -> None:
