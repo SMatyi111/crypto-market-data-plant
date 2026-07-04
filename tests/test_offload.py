@@ -12,11 +12,19 @@ from pathlib import Path
 
 import pytest
 
-from crypto_collector.cli import _job_args, build_parser, run_archive_offload
+from crypto_collector.cli import (
+    _execute_ops_job_inprocess,
+    _job_args,
+    build_parser,
+    run_archive_offload,
+)
+from crypto_collector.config import default_ops_root
 from crypto_collector.offload import (
     OFFLOAD_INDEX_FILENAME,
+    OFFLOAD_REPORT_FILENAME,
     OffloadLaneSpec,
     offload_accounted_runs,
+    write_offload_report_latest,
 )
 from crypto_collector.ops import COLLECTOR_JOB_TYPES, JobSpec
 
@@ -309,6 +317,7 @@ def test_cli_parser_accepts_archive_offload() -> None:
             "--cold-root", r"D:\market_archive_cold\raw\market",
             "--lanes-file", "lanes.json",
             "--min-age-days", "14",
+            "--ops-root", r"G:\market_archive\ops",
             "--apply",
         ]
     )
@@ -316,6 +325,7 @@ def test_cli_parser_accepts_archive_offload() -> None:
     assert args.apply is True
     assert args.min_age_days == 14.0
     assert args.limit == 200
+    assert args.ops_root == Path(r"G:\market_archive\ops")
 
 
 def test_archive_offload_is_not_a_collector_job_type() -> None:
@@ -346,6 +356,7 @@ def test_job_args_archive_offload_passes_every_config_arg() -> None:
                 "min_age_days": 21.0,
                 "limit": 50,
                 "apply": True,
+                "ops_root": r"G:\market_archive\ops",
             },
         )
     )
@@ -355,6 +366,21 @@ def test_job_args_archive_offload_passes_every_config_arg() -> None:
     assert args.min_age_days == 21.0
     assert args.limit == 50
     assert args.apply is True
+    assert args.ops_root == Path(r"G:\market_archive\ops")
+
+
+def test_job_args_archive_offload_defaults_ops_root() -> None:
+    # An offload job config that predates report persistence carries no ops_root;
+    # it must fall back to the same default the collector lanes use, not crash.
+    args = _job_args(
+        JobSpec(
+            name="archive-offload-cold",
+            job_type="archive-offload",
+            interval_seconds=3600,
+            args={"cold_root": r"D:\cold", "lanes": []},
+        )
+    )
+    assert args.ops_root == default_ops_root()
 
 
 def test_job_args_archive_offload_requires_cold_root_and_lanes() -> None:
@@ -369,6 +395,7 @@ def test_run_archive_offload_raises_on_failed_moves(tmp_path: Path) -> None:
     # surface as a raised error (=> runner job failure), not a quiet log line.
     raw_root = tmp_path / "raw"
     cold_root = tmp_path / "cold"
+    ops_root = tmp_path / "ops"
     run_dir = _make_run(raw_root, "binance_trades", OLD_RUN, payload="hot")
     _make_run(cold_root, "binance_trades", OLD_RUN, payload="cold-mismatch")
     spec_dict = {
@@ -386,12 +413,18 @@ def test_run_archive_offload_raises_on_failed_moves(tmp_path: Path) -> None:
             "--raw-root", str(raw_root),
             "--cold-root", str(cold_root),
             "--lanes-file", str(lanes_file),
+            "--ops-root", str(ops_root),
             "--apply",
         ]
     )
     with pytest.raises(RuntimeError, match="failed moves"):
         run_archive_offload(args)
     assert run_dir.exists()
+    # The report must be persisted BEFORE the raise — a failing offload is exactly
+    # when the health surface needs to see the counts.
+    persisted = json.loads((ops_root / OFFLOAD_REPORT_FILENAME).read_text(encoding="utf-8"))
+    assert persisted["failed_count"] == 1
+    assert persisted["status"] == "error"
 
 
 def test_resume_finishes_partially_deleted_source(tmp_path: Path) -> None:
@@ -522,3 +555,104 @@ def test_lane_spec_rejects_non_positive_min_age(bad_age) -> None:
         OffloadLaneSpec.from_dict(
             {"source": "x", "gate": "age_only", "min_age_days": bad_age}
         )
+
+
+def test_write_offload_report_latest_atomic_and_overwrites(tmp_path: Path) -> None:
+    """The persisted report follows the ops-root temp+rename convention: readers
+    never see a torn file and no *.tmp residue is left behind, including when a
+    previous report is being replaced."""
+    raw_root = tmp_path / "raw"
+    ops_root = tmp_path / "ops"
+    _make_run(raw_root, "okx_trades", OLD_RUN)  # stuck (no index)
+    spec = _lane_spec(tmp_path, "okx_trades")
+
+    first = offload_accounted_runs(
+        raw_root=raw_root, cold_root=tmp_path / "cold", lanes=[spec], apply=False
+    )
+    path = write_offload_report_latest(first, ops_root)
+    assert path == ops_root / OFFLOAD_REPORT_FILENAME
+    assert json.loads(path.read_text(encoding="utf-8"))["stuck_unaccounted_count"] == 1
+
+    second = offload_accounted_runs(
+        raw_root=raw_root, cold_root=tmp_path / "cold", lanes=[spec], apply=False
+    )
+    write_offload_report_latest(second, ops_root)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["checked_at"] == second.checked_at
+    assert list(ops_root.glob("*.tmp")) == []
+
+
+def test_run_archive_offload_persists_report_on_cli_path(tmp_path: Path, capsys) -> None:
+    # Manual `archive-offload` CLI invocations must persist the same latest-report
+    # file the runner job path does, so health never reads a stale runner report
+    # after a manual pass.
+    raw_root = tmp_path / "raw"
+    ops_root = tmp_path / "ops"
+    run_dir = _make_run(raw_root, "binance_trades", OLD_RUN)
+    spec_dict = {
+        "source": "binance_trades",
+        "promotion_index": str(tmp_path / "curated" / "_promotion_index.jsonl"),
+    }
+    _write_index(Path(spec_dict["promotion_index"]), [run_dir])
+    lanes_file = tmp_path / "lanes.json"
+    lanes_file.write_text(json.dumps([spec_dict]), encoding="utf-8")
+
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "archive-offload",
+            "--raw-root", str(raw_root),
+            "--cold-root", str(tmp_path / "cold"),
+            "--lanes-file", str(lanes_file),
+            "--ops-root", str(ops_root),
+        ]
+    )
+    report = run_archive_offload(args)
+    capsys.readouterr()
+
+    payload = json.loads(
+        (ops_root / OFFLOAD_REPORT_FILENAME).read_text(encoding="utf-8")
+    )
+    assert payload["mode"] == "dry-run"
+    assert payload["eligible_count"] == 1
+    assert payload["stuck_unaccounted_count"] == 0
+    assert payload["checked_at"] == report.checked_at
+    assert list(ops_root.glob("*.tmp")) == []
+
+
+def test_ops_job_archive_offload_persists_report_and_reports_counts(tmp_path: Path, capsys) -> None:
+    # The runner job path: the job_runs.jsonl message must carry the headline
+    # counts ("completed" alone hid a growing stuck cohort for a week), and the
+    # report must land in the job's ops_root for health to read.
+    raw_root = tmp_path / "raw"
+    ops_root = tmp_path / "ops"
+    _make_run(raw_root, "okx_trades", OLD_RUN)  # in NO index => stuck
+    job = JobSpec(
+        name="archive-offload-cold",
+        job_type="archive-offload",
+        interval_seconds=3600,
+        args={
+            "raw_root": str(raw_root),
+            "cold_root": str(tmp_path / "cold"),
+            "lanes": [
+                {
+                    "source": "okx_trades",
+                    "promotion_index": str(tmp_path / "curated" / "_promotion_index.jsonl"),
+                }
+            ],
+            "apply": True,
+            "ops_root": str(ops_root),
+        },
+    )
+
+    message = _execute_ops_job_inprocess(job)
+    capsys.readouterr()
+
+    assert message == (
+        "archive offload completed; status=warn moved=0 failed=0 stuck_unaccounted=1"
+    )
+    payload = json.loads(
+        (ops_root / OFFLOAD_REPORT_FILENAME).read_text(encoding="utf-8")
+    )
+    assert payload["stuck_unaccounted_count"] == 1
+    assert "stuck_unaccounted_runs:1" in payload["findings"]

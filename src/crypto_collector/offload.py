@@ -22,7 +22,9 @@ age-based cleanup has).
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from math import isfinite
@@ -42,6 +44,12 @@ _STUCK_EXAMPLE_CAP = 5
 _PARTIAL_DIRNAME = ".offload_partial"
 
 OFFLOAD_INDEX_FILENAME = "_offload_index.jsonl"
+
+# Latest offload report, persisted to the ops root after every execution so the
+# health surface can read offload state. The report object itself used to be
+# discarded after a one-line job log entry, which hid a 14k-run stuck cohort
+# behind "all jobs success" for a week (2026-07-04 audit).
+OFFLOAD_REPORT_FILENAME = "offload_report_latest.json"
 
 
 @dataclass(slots=True)
@@ -172,6 +180,31 @@ class OffloadReport:
             "lanes": [lane.to_dict() for lane in self.lanes],
             "runs": [run.to_dict() for run in self.runs],
         }
+
+
+def write_offload_report_latest(report: OffloadReport, ops_root: Path) -> Path:
+    """Atomically persist ``report`` as ``<ops_root>/offload_report_latest.json``.
+
+    Temp-file + rename (the ops-root convention, mirroring the runner's heartbeat
+    writer): the health check may read this file at any moment, so a torn or
+    half-written JSON must be impossible. The rename is retried briefly because
+    AV/backup tooling on Windows can hold the target open transiently.
+    """
+    path = ops_root / OFFLOAD_REPORT_FILENAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    temp_path.write_text(
+        json.dumps(report.to_dict(), indent=2, sort_keys=True), encoding="utf-8"
+    )
+    for attempt in range(5):
+        try:
+            temp_path.replace(path)
+            break
+        except PermissionError:
+            if attempt == 4:
+                raise
+            time.sleep(0.02 * (attempt + 1))
+    return path
 
 
 def offload_accounted_runs(
