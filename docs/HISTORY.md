@@ -37,6 +37,56 @@ after the owner's cohort cleanup the baseline goes back to 0.
 
 ---
 
+## 2026-06-17 → 06-24 — G:-full incident: unmanaged Kalshi normalized filled the drive; Kalshi turned off
+
+**Incident (2026-06-17).** G: hit 0 bytes free. Every collector crash-looped on
+`OSError [Errno 28] No space left on device` (lock creation) from ~11:15 to
+~12:17 UTC; the runner (pid 29176) stayed alive but wedged — it could not write
+heartbeat, locks, or the job log — costing **~1 h of data loss across every
+lane**. Root cause: `G:\market_archive\normalized\binary_options` (Kalshi) had
+grown to **624 GB / 53.6 M files / 112,692 per-strike `instrument=` partitions**
+and was completely unmanaged — `archive-offload` only handles raw run-dirs, and
+`cleanup` only removes zero-byte parquet under `normalized` (and was dry-run).
+The 2026-06-15 capacity model tracked RAW only; normalized was the real grower
+at ~60-68 GB/day (~4x the 16 GB/day Kalshi raw — normalization *inflated* the
+data via one tiny parquet per strike-market per 30-min run, ~6 M files/day). At
+the time market_archive was ~834 GB (normalized 624, raw 201, curated 8.8) on a
+shared 1.9 TB volume carrying ~635 GB of non-plant data.
+
+**Emergency relief (same day, both reversible moves):** (1) a manual
+`archive-offload --min-age-days 7.5` freed 18 GB (872 runs to D:) — the plant
+resumed at 12:17 UTC; (2) a `robocopy /MOVE /MINAGE:3` of normalized
+G:->`D:\market_archive_cold\normalized\binary_options` started draining ~408 GB
+/ 35.7 M files older than 3 days.
+
+**Resolution (owner decision, 2026-06-17): Kalshi collection turned off.** Both
+Kalshi jobs set `enabled:false` in the local config, runner redeployed (pid
+42916, all 21 remaining lanes green). This stopped ~76 GB/day (~78% of plant
+write volume) at the source and made the normalizer-fix + normalized-offload
+PRs unnecessary. The existing ~611 GB normalized was **preserved** to D: (owner
+chose preserve over delete; Kalshi raw on D: remains the re-normalizable
+source). Reversible: re-enable the lanes to resume — ideally only after fixing
+the per-strike partitioning that made the data near-unusable at 53 M files.
+
+**Completion (2026-06-22..24).** The preservation move had silently stalled at
+~88% remaining, dropping G: back to 3.9 GB free; a retry inside a Bash tool call
+was killed by its 10-min timeout. Relaunched **detached** via `Start-Process` ->
+completed 2026-06-24 16:19, **0 failures, 45.29 M files / 555 GB moved**; G:
+back to 489 GB free; the offload-index spot-check the same session PASSED
+(4,509 rows == cold run-dirs 1:1). Lesson recorded: long-running moves must run
+detached, never inside a tool call with a timeout.
+
+**Aftermath.** The incident's crash-loop windows (06-17 ENOSPC, 06-21..22
+robocopy I/O contention) minted one run-dir per collector restart; those
+partials aged past the 168 h scoring window unseen and became the
+**14,211-run / ~95 GB `stuck_unaccounted_runs` cohort** the 2026-07-04 audit
+surfaced (first measured as "16" on 06-22, before the cohort crossed the 10-day
+offload fence). See the 2026-07-04 entry above for the observability fix;
+cohort cleanup and a durable `normalized/{market,trades}` retention policy
+remain open in ROADMAP.
+
+---
+
 ## 2026-06-12 — Kalshi quote lane switched to continuous sampling (config-only)
 
 Owner request. Since first light (2026-06-08) the `kalshi-crypto-quotes` lane ran

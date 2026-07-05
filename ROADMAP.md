@@ -10,29 +10,21 @@ changes scope or state. Companion docs:
 
 Last updated: **2026-07-04**.
 
-> **2026-06-22..24 session note:** Ran the due 06-18 offload-index spot-check (PASS,
-> see dated table). Discovered G: had fallen back to **3.9 GB free** because the
-> 06-17 Kalshi-normalized preservation move never finished; completed the final
-> `robocopy /MOVE` G:->D: (owner-approved, detached) -> **G: now 489 GB free,
-> 0 FAILED** (see 06-19 row). Kalshi normalized is now fully off G:.
-> **STILL DUE: a full ops audit** (health report, per-lane freshness/backlog, job
-> success rate since last restart, quarantine ratios) — the 06-17 stamp is now
-> >7 days old; this session only covered offload + disk headroom. Also open: the
-> **16 `stuck_unaccounted_runs`** promotion gap surfaced by the offload dry-run.
-
 ---
 
-## Current state (2026-06-17)
+## Current state (2026-07-04)
 
 **21 enabled collector lanes** across Binance (spot USDT + USDC, USDT-M perp via
 REST), Coinbase, Kraken, Bybit (spot + linear perp), MEXC, OKX (spot + linear
 perp) — all BTC. **Kalshi crypto-binary collection is TURNED OFF as of
 2026-06-17** (both Kalshi jobs `enabled:false`; it was the G:-full root cause —
-see the audit note + Decision queue). Full quarantine → promote curation chain per
-lane, hourly score catch-up self-heal, research manifest, cleanup retention, and
-cold-tier archive offload. Live runner restarted at boot 2026-07-02 ~17:20 UTC
-(machine reboot; SYSTEM task, `ops.live.local.json`) on current `main`, so the
-PR #24 health fix is deployed; all 21 lanes green. CI green on `main`.
+see `docs/HISTORY.md` 2026-06-17 + Decision queue). Full quarantine → promote
+curation chain per lane, hourly score catch-up self-heal, research manifest,
+cleanup retention, and cold-tier archive offload. Live runner restarted at boot
+2026-07-02 ~17:20 UTC (machine reboot; SYSTEM task, `ops.live.local.json`) on
+then-current `main`, so the PR #24 health fix is deployed; PRs #26/#28 (audit
+docs + offload observability) merged 07-04 and **await the next runner restart**
+to take effect in the runner. All 21 lanes green. CI green on `main`.
 
 ---
 
@@ -71,51 +63,21 @@ held 34-49 through the window (intraday holes of order hours on
 Detection gap: the hourly offload job reports `status=warn` +
 `stuck_unaccounted_runs:14211` but the runner fails jobs only on
 `failed_count` and `health` never reads offload reports, so this hid behind
-"all jobs success" (new open item 3). Decision-queue item updated with the
-true scale. Cosmetic: one stale 0-byte `bybit-depth-worker-perp.json.*.tmp`
+"all jobs success" — **fixed same day, PR #28** (see open item 3; deploys at
+the next runner restart; until the cohort cleanup, audit with
+`health --stuck-unaccounted-baseline 14211`). Decision-queue item updated with
+the true scale. Cosmetic: one stale 0-byte `bybit-depth-worker-perp.json.*.tmp`
 heartbeat artifact from the 06-17 redeploy (inert).
 
-(Previous audit 2026-06-30: green, 81/81 jobs, false-alarm
-`binance_trades_no_replayable_30m` diagnosed -> fixed in PR #24, now deployed.)
+**Ritual:** if this stamp is more than ~3 days old at session start, audit the
+live plant first — see `CLAUDE.md` "Quality gates".
 
-**Resolved 2026-06-17 incident (kept for reference):** G:-FULL INCIDENT (0 bytes
-free). All collectors crash-looped on `OSError [Errno 28] No space left on device` (lock
-creation) from ~11:15 to ~12:17 UTC; the runner (pid 29176) stayed alive but
-wedged (could not write heartbeat/locks/job log) — ~1 h of data loss across every
-lane. **Root cause: `G:\market_archive\normalized\binary_options` (Kalshi) was
-624 GB / 53.6 M files / 112,692 per-strike `instrument=` partitions and is
-COMPLETELY UNMANAGED** — `archive-offload` only handles raw run-dirs, and
-`cleanup` only removes *zero-byte* parquet under `normalized` (and is dry-run).
-The 2026-06-15 capacity model tracked RAW only and never accounted for
-normalized, which is the real grower: ~60-68 GB/day (≈4x the 16 GB/day Kalshi
-*raw* — normalization is *inflating* via one tiny parquet per strike-market per
-run, ~6 M files/day; see Decision queue P0). Plant footprint: market_archive
-~834 GB (normalized 624, raw 201, curated 8.8, quarantine ~0). G: is a SHARED
-1.9 TB volume — non-plant ~635 GB (01-active 73.5, 03-archive 267.7, 04-archive
-267.7, Binance_IV_V1 26.7). **Emergency relief applied this session (both
-reversible — moves, not deletes; data also reconstructable from Kalshi raw on
-D:):** (1) manual `archive-offload --min-age-days 7.5` → freed 18 GB (872 runs to
-D:), plant resumed 12:17 UTC; (2) `robocopy /MOVE /MINAGE:3` of normalized
-G:->`D:\market_archive_cold\normalized\binary_options` (keeps last 3 days hot,
-~204 GB; moves ~408 GB / 35.7 M files older than 3 days). **No durable recurring
-normalized retention exists yet — owner decision queued below; the one-time move
-buys ~1 week of headroom.** Earlier raw-side work still holds: 3-day Kalshi raw
-offload (PR #23) + indexed lanes at 10-day offload age (start draining ~06-18) +
-`archive-offload-cold` ordered ahead of `cleanup-dry-run`. D: cold ~2% used
-(~7.18 TB free). **RESOLUTION (owner decision, 2026-06-17): KALSHI COLLECTION
-TURNED OFF.** Both Kalshi jobs (`kalshi-crypto-discovery`,
-`kalshi-crypto-quotes`) set `enabled:false` in `ops.live.local.json` and the
-runner redeployed (`redeploy_runner.ps1`, new pid 42916, all 21 worker lanes
-green, 0 Kalshi procs). This stops ~76 GB/day (≈78% of plant write volume) at the
-source and makes the normalizer-fix + normalized-offload PRs unnecessary for now.
-Existing ~611 GB Kalshi normalized is being PRESERVED to
-`D:\market_archive_cold\normalized\binary_options` (owner chose preserve over
-delete) — the `robocopy /MINAGE:3` move handles 3+ day partitions; a final sweep
-of the last 3 days is the only remaining step now that writes have stopped. With
-Kalshi off, plant write volume drops to ~22 GB/day raw (bounded by the existing
-10-day offload) + a trickle of `normalized/{market,trades}` (~12 GB, slow-growing,
-still unmanaged — minor). Ritual: if this stamp is more than ~3 days old at
-session start, audit the live plant first — see `CLAUDE.md` "Quality gates".
+(Previous audit 2026-06-30: green, 81/81 jobs, false-alarm
+`binance_trades_no_replayable_30m` diagnosed -> fixed in PR #24, now deployed.
+The resolved 2026-06-17 G:-full incident — Kalshi normalized blind spot, ~1 h
+data loss, Kalshi turned off — now lives in `docs/HISTORY.md` 2026-06-17;
+its live remnants are the Kalshi-off state above, the stuck-cohort +
+normalized-retention items below, and Kalshi raw preserved on D:.)
 
 ---
 
