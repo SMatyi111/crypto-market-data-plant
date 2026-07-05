@@ -10,6 +10,13 @@ changes scope or state. Companion docs:
 
 Last updated: **2026-07-04**.
 
+> **Operating mode — safe shaping (owner directive, 2026-07-04).** No extended
+> building on Claude's initiative: no new venues, lanes, or instruments, no big
+> refactors, no new subsystems. Active work is plant health and audits,
+> observability, retention and hygiene, small low-risk fixes, and clean
+> documentation. Expansion items below are tagged **PARKED** and need an
+> explicit owner ask to start.
+
 ---
 
 ## Current state (2026-07-04)
@@ -83,6 +90,9 @@ normalized-retention items below, and Kalshi raw preserved on D:.)
 
 ## Open work items (rough value order)
 
+**PARKED** items are extended building — not picked up without an explicit
+owner ask (safe-shaping directive above).
+
 1. **D:\market_archive legacy history — decide retention or merge.** The pre-2026-06-08
    D: archive is kept read-only as history. Decide: backfill/merge its runs into the
    G: curated dataset (score with `backfill-trades-replay` / `backfill-stream-depth
@@ -101,26 +111,28 @@ normalized-retention items below, and Kalshi raw preserved on D:.)
    narrative in `docs/HISTORY.md` 2026-07-04). Merged ≠ deployed: activates at
    the next runner restart; audit with `--stuck-unaccounted-baseline 14211`
    until the cohort cleanup lands, then reset the baseline to 0.
-4. **Phase 6 candidate — inverse (coin-margined) BTCUSD perps.** Natural next
+4. **PARKED — Phase 6 candidate: inverse (coin-margined) BTCUSD perps.** Natural next
    instrument-expansion step after the linear-perp triangle. Note: Binance USDT-M
    *websocket* is jurisdiction-blocked from this box (REST works — see Constraints),
    so plan venue choice accordingly (Bybit/OKX inverse WS, or Binance dapi REST
    mirroring the fapi REST lanes).
-5. **OKX funding channel.** Deferred from Phase 5. Would mirror the
+5. **PARKED — OKX funding channel.** Deferred from Phase 5. Would mirror the
    `binance-futures-rest-funding` lane (`funding-rate` channel or REST poll) so both
    perp venues carry funding context.
-6. **MEXC depth → provable `sequence` upgrade.** The pushed `version` is already
+6. **PARKED — MEXC depth → provable `sequence` upgrade.** The pushed `version` is already
    captured as `metadata.mexc_version`; if live frames prove it dense per symbol,
    upgrade the lane the way Bybit depth was upgraded (`data.u` +1). Until then depth
    stays `none_native`.
-7. **Re-promote pre-fix Binance depth history (optional).** Binance depth partitions
+7. **PARKED (touches curated data — owner-gated anyway) — re-promote pre-fix
+   Binance depth history.** Binance depth partitions
    collected before commit `084f8c9` (2026-06-09) lack the leading synthesized
    `snapshot` row, so self-contained replay of those dates needs re-promotion from
    raw. Only matters if historical self-contained replay is wanted.
-8. **Kraken checksum precision table for non-BTC/USD pairs.** `_KRAKEN_BOOK_PRECISION`
+8. **PARKED (moot until a non-BTC Kraken pair exists) — Kraken checksum precision
+   table for non-BTC/USD pairs.** `_KRAKEN_BOOK_PRECISION`
    covers BTC/USD only; other pairs fall back to `none_native`. Moot until a non-BTC
    Kraken pair is actually collected; could auto-fetch from REST `AssetPairs`.
-9. **Day-bounded rotation as the default run model.** `--rotate-at-midnight` exists
+9. **PARKED — day-bounded rotation as the default run model.** `--rotate-at-midnight` exists
    and works; the live model is 30-min wall-clock segments (`max_segment_seconds=1800`).
    Parked — analysts pull by `event_date` partition, so per-run boundaries rarely matter.
 10. **fapi REST 429 handling — honor Retry-After / pace cold-start bursts.** Audit
@@ -128,7 +140,7 @@ normalized-retention items below, and Kalshi raw preserved on D:.)
    (self-heals by restart, seen once at boot 2026-06-09) and a seeded resume fires
    up to 5 unpaced catch-up pages; repeated 429s risk escalation to a fapi 418 IP
    ban. Add Retry-After-aware backoff in `_get_json` / pacing between catch-up pages.
-11. **Zero-gap segment rotation.** The ~5–8s WS reconnect between segments costs
+11. **PARKED (real refactor) — zero-gap segment rotation.** The ~5–8s WS reconnect between segments costs
    ~0.3–0.4% per segment. Eliminating it means separating connection lifecycle from
    file lifecycle in the collector core — a real refactor, parked unless that loss
    starts to matter.
