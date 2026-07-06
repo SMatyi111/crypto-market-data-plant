@@ -81,10 +81,12 @@ def _get_json(path: str, params: dict) -> Any:
                     f"fapi 418 IP-ban escalation (Retry-After={retry_after}); "
                     "not retried - hammering a ban extends it",
                     error.headers,
-                    None,
+                    error.fp,  # keep the response body (ban diagnostics) readable
                 ) from error
+            if error.code != 429:
+                raise  # anything but a rate-limit propagates unchanged
             attempts_left -= 1
-            if error.code != 429 or attempts_left <= 0:
+            if attempts_left <= 0:
                 raise
             _sleep(_retry_after_seconds(error))
 
@@ -125,9 +127,11 @@ def make_aggtrades_poll(
         for page_index in range(max_pages_per_poll):
             if page_index:
                 # Only reached while catching up (previous page came back full):
-                # pace the extra pages so a seeded resume is not a 429-shaped burst.
-                # The first page of every poll stays immediate — steady state is
-                # one page per poll and never sleeps here.
+                # pace the extra pages WITHIN this poll to spread a seeded resume's
+                # burst. The first page of every poll stays immediate — steady state
+                # is one page per poll and never sleeps here — so a catch-up longer
+                # than max_pages_per_poll still has one unpaced request per poll
+                # boundary (more_pending re-poll); the 429 retry absorbs that seam.
                 await asyncio.sleep(_CATCHUP_PAGE_PAUSE_SECONDS)
             params: dict[str, Any] = {"symbol": sym, "limit": page_limit}
             if state["from_id"] is not None:
