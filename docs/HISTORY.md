@@ -29,7 +29,7 @@ restart.
 
 ---
 
-## 2026-07-04 — OKX/Bybit subscribe-replay hypothesis closed: no duplicates (verification only)
+## 2026-07-06 — OKX/Bybit subscribe-replay hypothesis closed: no duplicates (verification only)
 
 The 2026-06-12 baseline audit fixed subscribe-time print replays on Kraken
 (re-sends the last ~50 trades in a `snapshot` frame on every subscribe) and
@@ -37,7 +37,7 @@ Coinbase (`last_match`), and its review flagged the same risk for OKX and
 Bybit: both trades lanes are `none_native` with run-keyed promotion, so any
 untagged re-delivery would curate small duplicate counts at every 30-min
 segment reconnect — a slow, permanent integrity leak. Verified live
-2026-07-04 with a read-only probe: two back-to-back connections per stream
+2026-07-06 with a read-only probe: two back-to-back connections per stream
 (subscribe, capture ~8 s, disconnect, resubscribe, capture the first frames),
 two independent runs, across OKX spot `BTC-USDT`, OKX swap `BTC-USDT-SWAP`,
 Bybit spot and Bybit linear `BTCUSDT`. Result: **zero trade-ID overlap between

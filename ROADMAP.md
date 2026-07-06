@@ -8,7 +8,7 @@ changes scope or state. Companion docs:
 - [`STANDARDS.md`](STANDARDS.md) — the data contract (schemas, replayability, retention)
 - [`docs/HISTORY.md`](docs/HISTORY.md) — resolved-work narrative (what was fixed, and why)
 
-Last updated: **2026-07-04**.
+Last updated: **2026-07-06**.
 
 > **Operating mode — safe shaping (owner directive, 2026-07-04).** No extended
 > building on Claude's initiative: no new venues, lanes, or instruments, no big
@@ -152,7 +152,7 @@ owner ask (safe-shaping directive above).
     contained), but the files themselves still need a rotation or retention policy
     — fold into `run_cleanup`.
 13. ~~Verify OKX/Bybit trades subscribe-replay behavior over live frames~~
-    **DONE — verified 2026-07-04, no code change needed.** Live probe (2
+    **DONE — verified 2026-07-06, no code change needed.** Live probe (2
     independent runs, 8 connections: OKX spot + swap, Bybit spot + linear,
     BTC): **zero trade-ID re-delivery** across back-to-back resubscribes —
     neither venue replays prior prints on subscribe, unlike Kraken (last-50
@@ -161,7 +161,7 @@ owner ask (safe-shaping directive above).
     prints <=21 ms old that the previous connection never received — they
     shrink the rotation gap, they don't duplicate). No `subscribe_replay`
     tagging needed; curated OKX/Bybit trades carry no reconnect duplicates
-    from this mechanism. Method + numbers in `docs/HISTORY.md` 2026-07-04.
+    from this mechanism. Method + numbers in `docs/HISTORY.md` 2026-07-06.
 14. **Local-only modelling raw lanes are unconfigured in `archive-offload`.**
     A few raw lanes that exist only in the gitignored local config surface as
     benign `unconfigured_lane` warnings every offload pass and have no retention
