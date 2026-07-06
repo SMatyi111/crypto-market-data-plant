@@ -135,11 +135,13 @@ owner ask (safe-shaping directive above).
 9. **PARKED — day-bounded rotation as the default run model.** `--rotate-at-midnight` exists
    and works; the live model is 30-min wall-clock segments (`max_segment_seconds=1800`).
    Parked — analysts pull by `event_date` partition, so per-run boundaries rarely matter.
-10. **fapi REST 429 handling — honor Retry-After / pace cold-start bursts.** Audit
-   finding (real, deferred as a design change): a 429 currently crashes the segment
-   (self-heals by restart, seen once at boot 2026-06-09) and a seeded resume fires
-   up to 5 unpaced catch-up pages; repeated 429s risk escalation to a fapi 418 IP
-   ban. Add Retry-After-aware backoff in `_get_json` / pacing between catch-up pages.
+10. ~~fapi REST 429 handling — honor Retry-After / pace cold-start bursts~~
+    **DONE — PR #31.** The default fetch path now honors `Retry-After` on 429
+    (bounded: 3 attempts, 2 s default / 60 s cap; a 418 IP-ban raises
+    immediately, never retried) and seeded aggTrades catch-up polls pace 0.25 s
+    between pages (first page of every poll stays immediate — steady state
+    unchanged). Merged ≠ deployed: the runner reads code at startup, so this
+    activates at the next runner restart.
 11. **PARKED (real refactor) — zero-gap segment rotation.** The ~5–8s WS reconnect between segments costs
    ~0.3–0.4% per segment. Eliminating it means separating connection lifecycle from
    file lifecycle in the collector core — a real refactor, parked unless that loss
