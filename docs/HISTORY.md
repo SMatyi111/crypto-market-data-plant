@@ -7,6 +7,33 @@ git log + the merged PR descriptions; this file keeps the *why*.
 
 ---
 
+## 2026-07-04 — OKX/Bybit subscribe-replay hypothesis closed: no duplicates (verification only)
+
+The 2026-06-12 baseline audit fixed subscribe-time print replays on Kraken
+(re-sends the last ~50 trades in a `snapshot` frame on every subscribe) and
+Coinbase (`last_match`), and its review flagged the same risk for OKX and
+Bybit: both trades lanes are `none_native` with run-keyed promotion, so any
+untagged re-delivery would curate small duplicate counts at every 30-min
+segment reconnect — a slow, permanent integrity leak. Verified live
+2026-07-04 with a read-only probe: two back-to-back connections per stream
+(subscribe, capture ~8 s, disconnect, resubscribe, capture the first frames),
+two independent runs, across OKX spot `BTC-USDT`, OKX swap `BTC-USDT-SWAP`,
+Bybit spot and Bybit linear `BTCUSDT`. Result: **zero trade-ID overlap between
+a connection's capture and the next connection's first frames, on all eight
+connections** — neither venue re-delivers prior prints on subscribe. Two
+sub-findings worth keeping: Bybit stamps every first `publicTrade` push
+`type:"snapshot"`, but the content is fresh trades, so the label alone is not
+evidence of replay; and the first push can contain boundary prints a few ms
+older than the subscribe call — trades that occurred in-flight during
+connection setup, which the *previous* connection never received, so they
+shrink the segment-rotation gap rather than duplicate anything. Conclusion:
+no `subscribe_replay` tagging needed for OKX/Bybit; ROADMAP item 13 closed
+with no code change. The historical-duplicates decision-queue item stays
+scoped to Kraken/Coinbase (+ possibly Binance perp crash-window re-fetches,
+fixed forward separately).
+
+---
+
 ## 2026-07-04 — offload stuck-cohort observability (PR #28)
 
 The 2026-07-04 audit found a 14,211-run / ~95 GB cohort of never-scored raw

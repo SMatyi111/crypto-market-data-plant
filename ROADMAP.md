@@ -149,15 +149,17 @@ owner ask (safe-shaping directive above).
     rows/day). The 2026-06-12 audit made health tail-read the run log (cost
     contained), but the files themselves still need a rotation or retention policy
     — fold into `run_cleanup`.
-13. **Verify OKX/Bybit trades subscribe-replay behavior over live frames.** The
-    audit fixed subscribe-time print replays for Kraken (`snapshot` frame) and
-    Coinbase (`last_match`); review suggested OKX may push the latest historical
-    trade on subscribe and Bybit's first `publicTrade` push may carry recent
-    trades. Both lanes are `none_native` with run-keyed promotion, so untagged
-    replays would accumulate small duplicate counts at every reconnect. Capture a
-    few live (re)subscribes for each, check whether the first data frame
-    re-delivers pre-subscription prints, and if so tag them `subscribe_replay`
-    like Kraken/Coinbase.
+13. ~~Verify OKX/Bybit trades subscribe-replay behavior over live frames~~
+    **DONE — verified 2026-07-04, no code change needed.** Live probe (2
+    independent runs, 8 connections: OKX spot + swap, Bybit spot + linear,
+    BTC): **zero trade-ID re-delivery** across back-to-back resubscribes —
+    neither venue replays prior prints on subscribe, unlike Kraken (last-50
+    `snapshot`) and Coinbase (`last_match`). Bybit labels every first
+    `publicTrade` push `type:"snapshot"` but its content is fresh (boundary
+    prints <=21 ms old that the previous connection never received — they
+    shrink the rotation gap, they don't duplicate). No `subscribe_replay`
+    tagging needed; curated OKX/Bybit trades carry no reconnect duplicates
+    from this mechanism. Method + numbers in `docs/HISTORY.md` 2026-07-04.
 14. **Local-only modelling raw lanes are unconfigured in `archive-offload`.**
     A few raw lanes that exist only in the gitignored local config surface as
     benign `unconfigured_lane` warnings every offload pass and have no retention
