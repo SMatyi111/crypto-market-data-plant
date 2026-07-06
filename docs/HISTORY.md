@@ -7,7 +7,29 @@ git log + the merged PR descriptions; this file keeps the *why*.
 
 ---
 
-## 2026-07-04 — OKX/Bybit subscribe-replay hypothesis closed: no duplicates (verification only)
+## 2026-07-06 — fapi REST 429 backoff + catch-up pacing (PR #31)
+
+The three Binance USDT-M REST-polling lanes (trades/depth/funding — the
+futures WS is jurisdiction-blocked here) fetched through a bare `urlopen`, so
+an HTTP 429 crashed the whole segment; that actually happened once at cold
+boot 2026-06-09, when all three REST workers fired simultaneously and the
+burst tripped the per-IP weight limit. Worse, the seeded aggTrades resume
+fired up to 5 full catch-up pages back-to-back with zero pacing — exactly the
+burst shape that draws a 429 — and repeatedly polling through 429s is what
+fapi escalates to a 418 IP ban. Fix (ROADMAP item 10, no new config knobs):
+the default fetch is now a raw opener plus a retry wrapper that honors the
+integer-seconds `Retry-After` header on 429 (2 s default when missing, 60 s
+cap, 3 attempts total, blocking sleep is fine since all callers fetch via
+`asyncio.to_thread`), raises a 418 immediately with the ban's Retry-After in
+the message (retrying a ban extends it), and passes every other error through
+unchanged; catch-up polls pause 0.25 s before each *subsequent* page, first
+page always immediate so steady state is untouched. The `FetchFn` injection
+seam is preserved — test fakes bypass the retry. Activates at the next runner
+restart.
+
+---
+
+## 2026-07-06 — OKX/Bybit subscribe-replay hypothesis closed: no duplicates (verification only)
 
 The 2026-06-12 baseline audit fixed subscribe-time print replays on Kraken
 (re-sends the last ~50 trades in a `snapshot` frame on every subscribe) and
@@ -15,7 +37,7 @@ Coinbase (`last_match`), and its review flagged the same risk for OKX and
 Bybit: both trades lanes are `none_native` with run-keyed promotion, so any
 untagged re-delivery would curate small duplicate counts at every 30-min
 segment reconnect — a slow, permanent integrity leak. Verified live
-2026-07-04 with a read-only probe: two back-to-back connections per stream
+2026-07-06 with a read-only probe: two back-to-back connections per stream
 (subscribe, capture ~8 s, disconnect, resubscribe, capture the first frames),
 two independent runs, across OKX spot `BTC-USDT`, OKX swap `BTC-USDT-SWAP`,
 Bybit spot and Bybit linear `BTCUSDT`. Result: **zero trade-ID overlap between

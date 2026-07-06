@@ -8,7 +8,7 @@ changes scope or state. Companion docs:
 - [`STANDARDS.md`](STANDARDS.md) — the data contract (schemas, replayability, retention)
 - [`docs/HISTORY.md`](docs/HISTORY.md) — resolved-work narrative (what was fixed, and why)
 
-Last updated: **2026-07-04**.
+Last updated: **2026-07-06**.
 
 > **Operating mode — safe shaping (owner directive, 2026-07-04).** No extended
 > building on Claude's initiative: no new venues, lanes, or instruments, no big
@@ -135,11 +135,13 @@ owner ask (safe-shaping directive above).
 9. **PARKED — day-bounded rotation as the default run model.** `--rotate-at-midnight` exists
    and works; the live model is 30-min wall-clock segments (`max_segment_seconds=1800`).
    Parked — analysts pull by `event_date` partition, so per-run boundaries rarely matter.
-10. **fapi REST 429 handling — honor Retry-After / pace cold-start bursts.** Audit
-   finding (real, deferred as a design change): a 429 currently crashes the segment
-   (self-heals by restart, seen once at boot 2026-06-09) and a seeded resume fires
-   up to 5 unpaced catch-up pages; repeated 429s risk escalation to a fapi 418 IP
-   ban. Add Retry-After-aware backoff in `_get_json` / pacing between catch-up pages.
+10. ~~fapi REST 429 handling — honor Retry-After / pace cold-start bursts~~
+    **DONE — PR #31.** The default fetch path now honors `Retry-After` on 429
+    (bounded: 3 attempts, 2 s default / 60 s cap; a 418 IP-ban raises
+    immediately, never retried) and seeded aggTrades catch-up polls pace 0.25 s
+    between pages (first page of every poll stays immediate — steady state
+    unchanged). Merged ≠ deployed: the runner reads code at startup, so this
+    activates at the next runner restart.
 11. **PARKED (real refactor) — zero-gap segment rotation.** The ~5–8s WS reconnect between segments costs
    ~0.3–0.4% per segment. Eliminating it means separating connection lifecycle from
    file lifecycle in the collector core — a real refactor, parked unless that loss
@@ -150,7 +152,7 @@ owner ask (safe-shaping directive above).
     contained), but the files themselves still need a rotation or retention policy
     — fold into `run_cleanup`.
 13. ~~Verify OKX/Bybit trades subscribe-replay behavior over live frames~~
-    **DONE — verified 2026-07-04, no code change needed.** Live probe (2
+    **DONE — verified 2026-07-06, no code change needed.** Live probe (2
     independent runs, 8 connections: OKX spot + swap, Bybit spot + linear,
     BTC): **zero trade-ID re-delivery** across back-to-back resubscribes —
     neither venue replays prior prints on subscribe, unlike Kraken (last-50
@@ -159,7 +161,7 @@ owner ask (safe-shaping directive above).
     prints <=21 ms old that the previous connection never received — they
     shrink the rotation gap, they don't duplicate). No `subscribe_replay`
     tagging needed; curated OKX/Bybit trades carry no reconnect duplicates
-    from this mechanism. Method + numbers in `docs/HISTORY.md` 2026-07-04.
+    from this mechanism. Method + numbers in `docs/HISTORY.md` 2026-07-06.
 14. **Local-only modelling raw lanes are unconfigured in `archive-offload`.**
     A few raw lanes that exist only in the gitignored local config surface as
     benign `unconfigured_lane` warnings every offload pass and have no retention

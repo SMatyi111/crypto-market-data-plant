@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
+from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -18,15 +20,75 @@ FAPI_BASE = "https://fapi.binance.com"
 _HTTP_TIMEOUT_SECONDS = 15
 _USER_AGENT = "crypto-market-data-plant/0.1.0"
 
+# 429 backoff for the default fetch path. A cold boot fires all three REST lanes at
+# once; that burst tripped the per-IP weight limit once (2026-06-09) and the bare
+# urlopen turned the 429 into a whole-segment crash. Honor Retry-After and retry a
+# bounded number of times; NEVER retry a 418 — that is fapi's escalation of hammered
+# 429s into an IP ban, and continuing to poll extends the ban.
+_RETRY_MAX_ATTEMPTS = 3  # total tries per request, including the first
+_RETRY_DEFAULT_SLEEP_SECONDS = 2.0  # when Retry-After is missing or unparseable
+_RETRY_MAX_SLEEP_SECONDS = 60.0  # cap a huge Retry-After; beyond this let the segment fail
+_sleep = time.sleep  # module-level seam so tests can record instead of really sleeping
+
+# Pause between CONSECUTIVE catch-up pages within one aggTrades poll: a seeded resume
+# after downtime fires up to max_pages_per_poll full pages back-to-back, exactly the
+# burst shape that draws a 429. Steady state (one page per poll) never pays this.
+_CATCHUP_PAGE_PAUSE_SECONDS = 0.25
+
 # Type of the (injectable, for tests) blocking HTTP-GET-JSON callable.
 FetchFn = Callable[[str, dict], Any]
 
 
-def _get_json(path: str, params: dict) -> Any:
+def _open_json(path: str, params: dict) -> Any:
+    """Raw single-shot HTTP GET -> parsed JSON. No retry here; see `_get_json`."""
     url = f"{FAPI_BASE}{path}?{urlencode(params)}"
     request = Request(url, headers={"User-Agent": _USER_AGENT})
     with urlopen(request, timeout=_HTTP_TIMEOUT_SECONDS) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def _retry_after_seconds(error: HTTPError) -> float:
+    """Sleep budget for one 429 retry: the integer-seconds Retry-After header when
+    present and parseable, else a small default; always capped."""
+    raw = error.headers.get("Retry-After") if error.headers is not None else None
+    try:
+        seconds = float(int(raw))
+    except (TypeError, ValueError):
+        return _RETRY_DEFAULT_SLEEP_SECONDS
+    return min(max(seconds, 0.0), _RETRY_MAX_SLEEP_SECONDS)
+
+
+def _get_json(path: str, params: dict) -> Any:
+    """Default FetchFn: `_open_json` plus bounded, Retry-After-honoring backoff on
+    HTTP 429. Blocking sleep is fine — every caller invokes the fetch via
+    `asyncio.to_thread`. Injected test fakes bypass this wrapper entirely, so the
+    retry lives only in the live fetch path. Any non-429 error propagates unchanged,
+    except 418 which is re-raised with an explicit do-not-retry message."""
+    attempts_left = _RETRY_MAX_ATTEMPTS
+    while True:
+        try:
+            return _open_json(path, params)
+        except HTTPError as error:
+            if error.code == 418:
+                # fapi escalates hammered 429s to a 418 IP ban; polling through it
+                # extends the ban, so fail the segment loudly and immediately.
+                retry_after = (
+                    error.headers.get("Retry-After") if error.headers is not None else None
+                )
+                raise HTTPError(
+                    error.url,
+                    error.code,
+                    f"fapi 418 IP-ban escalation (Retry-After={retry_after}); "
+                    "not retried - hammering a ban extends it",
+                    error.headers,
+                    error.fp,  # keep the response body (ban diagnostics) readable
+                ) from error
+            if error.code != 429:
+                raise  # anything but a rate-limit propagates unchanged
+            attempts_left -= 1
+            if attempts_left <= 0:
+                raise
+            _sleep(_retry_after_seconds(error))
 
 
 def make_aggtrades_poll(
@@ -62,7 +124,15 @@ def make_aggtrades_poll(
     async def poll() -> tuple[list[dict], bool]:
         rows: list[dict] = []
         last_full = False
-        for _ in range(max_pages_per_poll):
+        for page_index in range(max_pages_per_poll):
+            if page_index:
+                # Only reached while catching up (previous page came back full):
+                # pace the extra pages WITHIN this poll to spread a seeded resume's
+                # burst. The first page of every poll stays immediate — steady state
+                # is one page per poll and never sleeps here — so a catch-up longer
+                # than max_pages_per_poll still has one unpaced request per poll
+                # boundary (more_pending re-poll); the 429 retry absorbs that seam.
+                await asyncio.sleep(_CATCHUP_PAGE_PAUSE_SECONDS)
             params: dict[str, Any] = {"symbol": sym, "limit": page_limit}
             if state["from_id"] is not None:
                 params["fromId"] = state["from_id"]
