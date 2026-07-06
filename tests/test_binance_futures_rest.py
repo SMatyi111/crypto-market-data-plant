@@ -5,8 +5,12 @@ import json
 import time
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from urllib.error import HTTPError
+
+import pytest
 
 import crypto_collector.cli as cli
+import crypto_collector.collectors.binance_futures_rest as bfr
 from crypto_collector.collectors.binance_futures_rest import (
     aggtrades_cursor_path,
     aggtrades_resume_from_id,
@@ -123,6 +127,151 @@ def test_aggtrades_poll_seeds_from_initial_from_id() -> None:
     poll = make_aggtrades_poll("btcusdt", page_limit=2, initial_from_id=500, fetch=fetch)
     _run(poll())
     assert seen_from_ids == [500]
+
+
+def test_aggtrades_catch_up_paces_between_pages_only(monkeypatch) -> None:
+    # A seeded resume fires multiple full pages in one poll — the exact burst shape
+    # that drew the 2026-06-09 cold-boot 429. The pause must run BEFORE every
+    # subsequent page but never before the first fetch of a poll.
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(
+        "crypto_collector.collectors.binance_futures_rest.asyncio.sleep", fake_sleep
+    )
+    pages = [
+        [{"a": 1}, {"a": 2}],  # full (limit=2) -> keep paging
+        [{"a": 3}, {"a": 4}],  # full -> keep paging
+        [{"a": 5}],            # partial -> stop
+    ]
+    seq = iter(pages)
+
+    def fetch(path, params):
+        return next(seq, [])
+
+    poll = make_aggtrades_poll("btcusdt", page_limit=2, max_pages_per_poll=5, fetch=fetch)
+    rows, more = _run(poll())
+    assert [r["a"] for r in rows] == [1, 2, 3, 4, 5]
+    assert more is False
+    # Paced before pages 2 and 3 only — one fewer sleep than pages fetched.
+    assert sleeps == [bfr._CATCHUP_PAGE_PAUSE_SECONDS] * 2
+
+
+def test_aggtrades_steady_state_single_page_never_paces(monkeypatch) -> None:
+    # Steady state = one (partial) page per poll: behavior must be completely
+    # unchanged by the catch-up pacing — zero sleeps, poll after poll.
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(
+        "crypto_collector.collectors.binance_futures_rest.asyncio.sleep", fake_sleep
+    )
+
+    def fetch(path, params):
+        return [{"a": params.get("fromId", 7)}]  # partial page (limit=2) -> stop
+
+    poll = make_aggtrades_poll("btcusdt", page_limit=2, max_pages_per_poll=5, fetch=fetch)
+    rows, more = _run(poll())
+    assert len(rows) == 1 and more is False
+    rows2, _ = _run(poll())
+    assert len(rows2) == 1
+    assert sleeps == []
+
+
+# --- default fetch: 429 backoff / 418 ban -------------------------------------
+
+
+def _scripted_open(monkeypatch, responses):
+    """Patch the raw opener with a scripted sequence (exceptions raise, values
+    return) and the retry sleep with a recorder. Returns (sleeps, calls)."""
+    sleeps: list[float] = []
+    calls = {"n": 0}
+    seq = iter(responses)
+
+    def fake_open(path, params):
+        calls["n"] += 1
+        item = next(seq)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    monkeypatch.setattr(bfr, "_open_json", fake_open)
+    monkeypatch.setattr(bfr, "_sleep", sleeps.append)
+    return sleeps, calls
+
+
+def _http_error(code: int, headers: dict | None = None) -> HTTPError:
+    return HTTPError("https://fapi.binance.com/fapi/v1/aggTrades", code, "err", headers, None)
+
+
+def test_get_json_retries_429_honoring_retry_after(monkeypatch) -> None:
+    payload = [{"a": 1}]
+    sleeps, calls = _scripted_open(
+        monkeypatch, [_http_error(429, {"Retry-After": "2"}), payload]
+    )
+    assert bfr._get_json("/fapi/v1/aggTrades", {"symbol": "BTCUSDT"}) == payload
+    assert sleeps == [2.0]
+    assert calls["n"] == 2
+
+
+def test_get_json_429_past_max_attempts_raises(monkeypatch) -> None:
+    sleeps, calls = _scripted_open(
+        monkeypatch, [_http_error(429, {"Retry-After": "1"}) for _ in range(5)]
+    )
+    with pytest.raises(HTTPError) as exc_info:
+        bfr._get_json("/fapi/v1/depth", {"symbol": "BTCUSDT"})
+    assert exc_info.value.code == 429
+    assert calls["n"] == 3  # bounded: 3 total attempts, then the 429 surfaces
+    assert sleeps == [1.0, 1.0]  # slept between attempts, never after the last
+
+
+def test_get_json_missing_retry_after_uses_default_sleep(monkeypatch) -> None:
+    sleeps, _ = _scripted_open(monkeypatch, [_http_error(429), [{"a": 1}]])
+    bfr._get_json("/fapi/v1/aggTrades", {})
+    assert sleeps == [bfr._RETRY_DEFAULT_SLEEP_SECONDS]
+
+
+def test_get_json_unparseable_retry_after_uses_default_sleep(monkeypatch) -> None:
+    sleeps, _ = _scripted_open(
+        monkeypatch, [_http_error(429, {"Retry-After": "soon"}), [{"a": 1}]]
+    )
+    bfr._get_json("/fapi/v1/aggTrades", {})
+    assert sleeps == [bfr._RETRY_DEFAULT_SLEEP_SECONDS]
+
+
+def test_get_json_huge_retry_after_is_capped(monkeypatch) -> None:
+    sleeps, _ = _scripted_open(
+        monkeypatch, [_http_error(429, {"Retry-After": "100000"}), [{"a": 1}]]
+    )
+    bfr._get_json("/fapi/v1/aggTrades", {})
+    assert sleeps == [bfr._RETRY_MAX_SLEEP_SECONDS]
+
+
+def test_get_json_418_ban_raises_immediately_no_retry(monkeypatch) -> None:
+    # 418 = fapi's IP-ban escalation of hammered 429s; retrying extends the ban.
+    sleeps, calls = _scripted_open(
+        monkeypatch, [_http_error(418, {"Retry-After": "300"}), [{"a": 1}]]
+    )
+    with pytest.raises(HTTPError) as exc_info:
+        bfr._get_json("/fapi/v1/aggTrades", {})
+    assert exc_info.value.code == 418
+    assert "300" in str(exc_info.value)  # message surfaces the ban's Retry-After
+    assert sleeps == []
+    assert calls["n"] == 1
+
+
+def test_get_json_other_http_errors_propagate_unchanged(monkeypatch) -> None:
+    original = _http_error(500)
+    sleeps, calls = _scripted_open(monkeypatch, [original, [{"a": 1}]])
+    with pytest.raises(HTTPError) as exc_info:
+        bfr._get_json("/fapi/v1/aggTrades", {})
+    assert exc_info.value is original  # same object, no wrapping, no retry
+    assert sleeps == []
+    assert calls["n"] == 1
 
 
 # --- aggTrades cross-segment cursor ------------------------------------------
