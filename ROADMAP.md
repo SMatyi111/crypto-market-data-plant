@@ -8,7 +8,7 @@ changes scope or state. Companion docs:
 - [`STANDARDS.md`](STANDARDS.md) — the data contract (schemas, replayability, retention)
 - [`docs/HISTORY.md`](docs/HISTORY.md) — resolved-work narrative (what was fixed, and why)
 
-Last updated: **2026-07-06**.
+Last updated: **2026-07-12**.
 
 > **Operating mode — safe shaping (owner directive, 2026-07-04).** No extended
 > building on Claude's initiative: no new venues, lanes, or instruments, no big
@@ -19,7 +19,7 @@ Last updated: **2026-07-06**.
 
 ---
 
-## Current state (2026-07-04)
+## Current state (2026-07-12)
 
 **21 enabled collector lanes** across Binance (spot USDT + USDC, USDT-M perp via
 REST), Coinbase, Kraken, Bybit (spot + linear perp), MEXC, OKX (spot + linear
@@ -28,10 +28,9 @@ perp) — all BTC. **Kalshi crypto-binary collection is TURNED OFF as of
 see `docs/HISTORY.md` 2026-06-17 + Decision queue). Full quarantine → promote
 curation chain per lane, hourly score catch-up self-heal, research manifest,
 cleanup retention, and cold-tier archive offload. Live runner restarted at boot
-2026-07-02 ~17:20 UTC (machine reboot; SYSTEM task, `ops.live.local.json`) on
-then-current `main`, so the PR #24 health fix is deployed; PRs #26/#28 (audit
-docs + offload observability) merged 07-04 and **await the next runner restart**
-to take effect in the runner. All 21 lanes green. CI green on `main`.
+2026-07-11 ~15:50 UTC (machine reboot; SYSTEM task, `ops.live.local.json`) on
+current `main` (`b3cf669`), so **PRs #24, #26, #28, and #31 are all deployed** —
+nothing merged is awaiting a restart. All 21 lanes green. CI green on `main`.
 
 ---
 
@@ -40,51 +39,56 @@ to take effect in the runner. All 21 lanes green. CI green on `main`.
 | Due | Check |
 | --- | --- |
 | ~~2026-06-18~~ DONE 06-22 | Offload-index spot-check **PASSED**: 4509 index rows == cold run-dirs 1:1 on every lane, 0 duplicates/malformed, 0 unindexed pile-up, 0 missing cold copies, 0 sampled file-count mismatches, 0 indexed runs still hot. Offload live (newest `moved_at` 2026-06-22T09:53Z). Dry-run also flags **16 `stuck_unaccounted_runs`** (raw from 06-09..06-11 never promoted: 8 `binance_perp_funding` + 8 trade/depth) — designed safety surface, but a real promotion gap to investigate. *(Re-measured 2026-07-04: the true cohort is **14,211** — the 06-16..06-23 crash-loop debris had not yet crossed the 10-day offload fence when this check ran. See the 07-04 audit stamp + Decision queue.)* |
+| 2026-07-15 | **Confirm the 07-05 orphan wave crossed the offload fence as predicted**: `stuck_unaccounted` should step from 14,215 to ~17.5k as the ~3.4k unscorable 07-05 crash-loop partials age past 10 days (health `offload_stuck_above_baseline` grows accordingly — expected, not new breakage). Re-measure, update the decision-queue entry with the settled number, and nudge the queued cleanup/backstop decision. |
 | ~~2026-06-19~~ DONE 06-24 | The 06-17 `robocopy /MINAGE:3` move never finished (~88% of partitions still on G:), leaving G: at **3.9 GB free**. First retry (06-22) was killed by the Bash tool's 10-min timeout after freeing ~57 GB. Relaunched **detached via `Start-Process`** (pid 48444) so it survives session/tool teardown -> **COMPLETED 2026-06-24 16:19, FAILED: 0** (45.29 M files / 555 GB moved G:->`D:\market_archive_cold`). **G: now 489 GB free.** D: holds 113,407 normalized partitions (full set). 1 partition / 2 parquet files remain on G: -- robocopy *skipped* them (already byte-present on D: from the 06-17 partial), so redundant not stranded; immaterial (489 GB free). Lesson: long-running moves must be detached, never run inside a Bash call (10-min cap). |
 
-**Last ops audit:** 2026-07-04 — **plant GREEN operationally; one material
-accounting correction.** Health `status=ok`, **0 findings** (heartbeat ~3 s).
-The box **rebooted 2026-07-02 ~17:20 UTC**; the SYSTEM boot task restarted the
-runner on current `main`, so **PR #24 (segment-aware binance_trades freshness)
-is now LIVE** and the 06-30 false-alarm finding is gone. Jobs since restart:
-**21,800/21,853 success (99.76%)**; all 53 errors self-healed (a boot-time
-worker-lock race on okx-perp-depth, 50 errors in 60 s, + 3 transient REST
-blips). 21/21 workers fresh (<=27 s, no ghosts); all 21 lanes raw-fresh <=4 s;
-curated `latest_event_date=2026-07-04` on every lane; quarantine ~11 MB total
-(ppm-level ratios). Disk: **G: 432.5 GB free** (-56 GB since 06-30; drivers:
-`normalized/{market,trades}` now **66.2 GB**, ~3 GB/day, still unmanaged — see
-open item 2 — plus non-plant shared-volume growth), D: cold 6.07 TB free.
-Offload mechanics verified (5/5 spot-checked runs on D: and gone from G:;
-22,784 index rows; moves same-day). **CORRECTION: `stuck_unaccounted_runs` is
-actually 14,211 (~95 GB hot on G:), not 16.** Verified twice (agent + a
-main-session re-run of the dry-run with the exact live job args). The cohort is
-06-09..06-23, dominated by **crash-loop run-dir debris** from the 06-17 ENOSPC
-crash-loop and the 06-21..22 robocopy-contention window (binance_depth alone:
-157 stuck dirs dated 06-17, 172 on 06-21, **1,266 on 06-22** vs ~48 normal
-segments/day — one dir per restart), all aged past the 168 h scoring/quarantine
-window -> permanent orphans by design. The "16" was the 06-22 measurement,
-taken **before this cohort crossed the 10-day offload fence**; 06-30 carried it
-forward without re-measuring. Curated impact bounded: promoted segments/day
-held 34-49 through the window (intraday holes of order hours on
-06-17/06-21/06-22). **Closed population — 0 new orphans post-06-24.**
-Detection gap: the hourly offload job reports `status=warn` +
-`stuck_unaccounted_runs:14211` but the runner fails jobs only on
-`failed_count` and `health` never reads offload reports, so this hid behind
-"all jobs success" — **fixed same day, PR #28** (see open item 3; deploys at
-the next runner restart; until the cohort cleanup, audit with
-`health --stuck-unaccounted-baseline 14211`). Decision-queue item updated with
-the true scale. Cosmetic: one stale 0-byte `bybit-depth-worker-perp.json.*.tmp`
-heartbeat artifact from the 06-17 redeploy (inert).
+**Last ops audit:** 2026-07-12 — **plant GREEN today; two self-healed network
+incidents since 07-04; an orphan wave crosses the offload fence ~07-15.**
+Health `status=warn` with exactly one finding,
+`offload_stuck_above_baseline:14215` (heartbeat ~1.4 s) — **PR #28's growth
+gate working as designed**: the stuck cohort grew **+4** (all
+`binance_perp_funding` restart partials dated 06-27..07-02, ~500 KB total). So
+the 07-04 "closed population" claim is wrong in the small: **the funding lane
+mints one permanent orphan per worker restart** — its replay summary is written
+inline only at clean segment close and it has no hourly catch-up scorer (trades
+and depth do), which is also why funding is the largest historical stuck lane
+(2,465). Box **rebooted 2026-07-11 ~15:50 UTC** -> runner now on `main`
+`b3cf669`, so **PRs #26/#28/#31 all deployed**. Jobs since boot: **8,236/8,262
+success (99.69%)**; all 26 errors were fapi transport failures (timeouts/SSL)
+in the first ~35 min after boot + one 21:27 blip, all self-healed; **0 job
+errors on 07-12**. Incidents: **(1) 07-05 ~11:00-17:00 UTC all-venue network
+outage** — all 21 lanes churned (WS lanes ~42-46 worker restarts each; the 3
+fapi REST lanes crash-looped at ~10 s cycles -> ~600 partial run-dirs each;
+binance spot depth x2 ~404 each); promotions still held 42-45/lane that day, so
+curated holes are intraday, order ~1-2 h. **(2) 07-11 07:00-15:50 UTC
+fapi-reachability degradation** (REST lanes only: 177/66/218 errors; WS lanes
+unaffected), ended by the reboot; funding coverage 32/48 that day; gapless
+aggTrades self-backfilled (240 promotions) and the slow-cycle partials promoted
+(perp depth 203) — so funding is the only lane with a material 07-11 hole
+(~8 h thin), while every lane carries the small 07-05 intraday holes. All 21 lanes now fresh (every promotion index shows promotions within
+minutes of this audit); quarantine ~0; **G: 468.8 GB free** (+36 vs 07-04);
+offload live (index 23,347 rows, +563; newest move same-hour; 0 failures).
+`normalized/{market,trades}` now **83.2 GB / 5.5 M files** (+17 GB in 8 d,
+~2.1 GB/day) — open item 2 remains the main plant-side G: burn. **Inbound:
+~3,417 unaccounted run-dirs dated 07-03+** (dominated by the 07-05 crash
+cohort — fast-loop partials the 168 h catch-up scorers never scored, i.e.
+unscorable debris) start crossing the 10-day offload fence 2026-07-13, bulk
+~07-15 -> `stuck_unaccounted` steps from 14,215 to **~17.5k** and the health
+warn grows daily until the queued cleanup/backstop decision lands (see the
+updated decision-queue entry).
 
 **Ritual:** if this stamp is more than ~3 days old at session start, audit the
 live plant first — see `CLAUDE.md` "Quality gates".
 
-(Previous audit 2026-06-30: green, 81/81 jobs, false-alarm
-`binance_trades_no_replayable_30m` diagnosed -> fixed in PR #24, now deployed.
-The resolved 2026-06-17 G:-full incident — Kalshi normalized blind spot, ~1 h
-data loss, Kalshi turned off — now lives in `docs/HISTORY.md` 2026-06-17;
-its live remnants are the Kalshi-off state above, the stuck-cohort +
-normalized-retention items below, and Kalshi raw preserved on D:.)
+(Previous audit 2026-07-04: green, 99.76% jobs, curated fresh on every lane;
+its material finding was the stuck-cohort re-measure **14,211, not 16** — a
+stale 06-22 count carried forward — plus the detection gap that health never
+read offload reports, fixed same day as PR #28. Full narrative in
+`docs/HISTORY.md` 2026-07-04. The resolved 2026-06-17 G:-full incident —
+Kalshi normalized blind spot, ~1 h data loss, Kalshi turned off — lives in
+`docs/HISTORY.md` 2026-06-17; its live remnants are the Kalshi-off state
+above, the stuck-cohort + normalized-retention items below, and Kalshi raw
+preserved on D:.)
 
 ---
 
@@ -108,9 +112,11 @@ owner ask (safe-shaping directive above).
    -> owner sign-off on the policy, implementation is autonomous).
 3. ~~Surface `stuck_unaccounted_count` in monitoring~~ **DONE — PR #28**
    (offload report persisted + growth-gated `health` finding; root-cause
-   narrative in `docs/HISTORY.md` 2026-07-04). Merged ≠ deployed: activates at
-   the next runner restart; audit with `--stuck-unaccounted-baseline 14211`
-   until the cohort cleanup lands, then reset the baseline to 0.
+   narrative in `docs/HISTORY.md` 2026-07-04). **Deployed at the 07-11 boot and
+   verified live 07-12**: it caught the +4 cohort growth within a day. Audit
+   with `--stuck-unaccounted-baseline 14211` until the cohort cleanup lands
+   (expect the count to step to ~17.5k around 07-15 — see the dated check and
+   decision queue), then reset the baseline to 0.
 4. **PARKED — Phase 6 candidate: inverse (coin-margined) BTCUSD perps.** Natural next
    instrument-expansion step after the linear-perp triangle. Note: Binance USDT-M
    *websocket* is jurisdiction-blocked from this box (REST works — see Constraints),
@@ -140,8 +146,7 @@ owner ask (safe-shaping directive above).
     (bounded: 3 attempts, 2 s default / 60 s cap; a 418 IP-ban raises
     immediately, never retried) and seeded aggTrades catch-up polls pace 0.25 s
     between pages (first page of every poll stays immediate — steady state
-    unchanged). Merged ≠ deployed: the runner reads code at startup, so this
-    activates at the next runner restart.
+    unchanged). **Deployed at the 07-11 boot.**
 11. **PARKED (real refactor) — zero-gap segment rotation.** The ~5–8s WS reconnect between segments costs
    ~0.3–0.4% per segment. Eliminating it means separating connection lifecycle from
    file lifecycle in the collector core — a real refactor, parked unless that loss
@@ -177,6 +182,22 @@ Decisions waiting on the owner; agents must not act on these without an explicit
 (see `CLAUDE.md` Governance):
 
 
+- **2026-07-12 modelling collection request (strategy-sensitive — ALL specifics
+  in the dated gitignored local request doc).** A proposed new low-rate,
+  zero-direct-cost collection lane family; probe-first per shop rule; volume
+  trivially small (well under 1% of plant write volume); dormancy-compatible
+  (data accrues, nothing downstream blocks on it). Triaged 2026-07-12:
+  well-formed, contract-compatible (standard envelope -> quarantine -> promote,
+  one promoter per lane). Owner decisions: **(1) go/no-go on the lane family**
+  (new lanes are the owner's call by contract; the only exposure is source-ToS
+  for rate-limit-respecting read-only polling); **(2) source set** (tiered
+  P1/P2/P3 in the doc; P3 default OFF); **(3) placement** — native public-repo
+  lanes vs local-only artifact; manager recommends **native** (the Limitless
+  precedent: local-only artifacts drift outside CI/review/hygiene gates, and
+  the eventual public lane names are not strategy-revealing); **(4) one
+  free-tier API key sign-up** only if that optional source is wanted
+  (account creation = owner-only). The probe phase and any build are blocked
+  on (1); one P1 probe source also needs an owner-created OAuth app first.
 - **D:\market_archive legacy history** — retention vs. merge (open item 1 above).
   Owner deferred 2026-06-11: stays read-only until research needs pre-cutover dates.
 - **2026-06-13 modelling data-collection handoff (strategy-sensitive — ALL
@@ -222,6 +243,15 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   owner-gated. Note (a)-delete would discard partial raw that could in principle
   be backfill-scored to patch the 06-17/06-21/06-22 intraday curated holes --
   if those hours matter for research, choose quarantine-preserve over delete.
+  **UPDATE 2026-07-12: the population is NOT closed.** +4 funding restart
+  partials (06-27..07-02) crossed the fence (count now 14,215), and a **~3.4k
+  wave of 07-05 network-outage crash-loop partials crosses ~2026-07-15** (->
+  ~17.5k total; small bytes, mostly sub-MB dirs). Root pattern: a fast
+  crash-loop mints run-dirs faster than they can ever be scored, and the
+  funding lane orphans on *every* worker restart (inline scoring at clean
+  segment close only; no catch-up scorer). This materially strengthens option
+  (b) — the drip is ongoing, not historical — with (a) still wanted once to
+  clear the backlog.
 
 Decided 2026-06-17 (recorded, closed):
 - **Kalshi collection TURNED OFF (the G:-full root cause).** The `normalized`
