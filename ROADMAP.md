@@ -186,6 +186,16 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   (autonomous zone: re-fetchable public data, no money, no live lane, no auth).
   Owner nod was wanted only on the full pull's scale. Source, fields, volumes,
   and every other specific stay in the local doc — not here.
+- **2026-07-12 modelling text-feed collection request (strategy-sensitive —
+  specifics in the gitignored local request doc).** A small family of free,
+  read-only public-text polling lanes (rest_poll shape, <100 MB/day total,
+  no auth beyond free app keys, no money). Live-capture-only by contract —
+  backfill is inadmissible for the downstream use, so every day before go-live
+  is gone (cost-of-delay is real but low). Decisions queued: (1) go/no-go on
+  the lane family; (2) source set (two core + two probe-gated + one default-off);
+  (3) placement — native public lanes vs local-only artifact (manager
+  recommends native, per the harvester precedent). Probe phase precedes any
+  lane build. Sources, rationale, and study context stay in the local doc.
 - **Historical curated duplicates (2026-06-12 audit residue).** Until the audit
   fixes deploy+age in, curated data carries known duplicates: kraken trades (up to
   ~50 subscribe-replay prints per segment boundary since the lane went live),
