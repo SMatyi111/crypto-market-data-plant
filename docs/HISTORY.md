@@ -7,6 +7,38 @@ git log + the merged PR descriptions; this file keeps the *why*.
 
 ---
 
+## 2026-07-12 — two self-healed network incidents; pending PRs deployed via reboot; PR #28 gate validated live
+
+Session audit (stamp in `ROADMAP.md`) reconstructed two connectivity incidents
+from `job_runs.jsonl`, neither a code bug and neither needing action. **07-05
+~11:00-17:00 UTC — all-venue outage/degradation:** every one of the 21 lanes
+churned. Websocket collectors restarted ~42-46 times each; the three fapi REST
+lanes crash-looped at ~10 s cycles (a transport error kills the subprocess, the
+runner immediately restarts it, the next poll times out again) minting ~600
+partial run-dirs per lane, and the two binance spot depth workers ~404 each.
+Promotions still held 42-45/lane that day (vs ~47-48 normal), so the curated
+holes are intraday, order 1-2 h. **07-11 07:00-15:50 UTC — fapi-only
+reachability degradation** (177/66/218 errors on the REST trades/depth/funding
+jobs; websocket lanes untouched, so Binance-side or route-specific), ended when
+the box was rebooted at ~15:50 UTC; residual boot-window fapi timeouts
+(SSL/handshake, 25 errors) cleared by 16:26. The gapless aggTrades design
+proved itself: the trades lane re-fetched everything missed (240 promotions on
+07-11); the slow-cycle depth partials promoted too (203). Funding was the only
+material hole (~8 h thin on 07-11; funding polls are point-in-time, nothing to
+re-fetch). Two durable lessons recorded in ROADMAP: (1) the reboot deployed
+PRs #26/#28/#31 (runner reads code at startup — merged became live at boot);
+PR #28's growth-gated `offload_stuck_above_baseline` finding then **caught a
+real +4 cohort growth within a day of activating**, exactly the designed
+behavior. (2) A fast crash-loop mints run-dirs faster than the hourly catch-up
+scorers can ever score them (10 s partials are unscorable debris), and the
+funding lane orphans on *every* restart because its replay summary is written
+only inline at clean segment close — no catch-up scorer exists for it. The
+~3.4k unscorable 07-05 partials cross the 10-day offload fence ~07-15; the
+queued stuck-cohort owner decision was updated with the projection (a dated
+check verifies it lands at ~17.5k).
+
+---
+
 ## 2026-07-06 — fapi REST 429 backoff + catch-up pacing (PR #31)
 
 The three Binance USDT-M REST-polling lanes (trades/depth/funding — the
