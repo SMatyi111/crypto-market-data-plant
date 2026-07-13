@@ -8,7 +8,7 @@ changes scope or state. Companion docs:
 - [`STANDARDS.md`](STANDARDS.md) — the data contract (schemas, replayability, retention)
 - [`docs/HISTORY.md`](docs/HISTORY.md) — resolved-work narrative (what was fixed, and why)
 
-Last updated: **2026-07-12**.
+Last updated: **2026-07-13**.
 
 > **Operating mode — safe shaping (owner directive, 2026-07-04).** No extended
 > building on Claude's initiative: no new venues, lanes, or instruments, no big
@@ -176,28 +176,35 @@ owner ask (safe-shaping directive above).
     G:-full cause, and touching local-only modelling-data lifecycle wants owner
     awareness.
 
+15. **ACTIVE — text-capture P1 lanes (owner-approved 2026-07-13; NOT parked).**
+    Two native lane families: `text-reddit` (fixed sub list, OAuth
+    client-credentials polling of `/new` posts+comments, ~100 QPM budget) and
+    `text-rss` (5 crypto news feeds, 1-5 min conditional-GET polling). Raw
+    text only at capture (no capture-time NLP/filtering); envelope per row:
+    `source`, `source_id`, `source_ts` (platform-claimed), `ingestion_ts`
+    (plant clock, authoritative), poll metadata, untouched raw payload; dedup
+    `(source, source_id, content_hash)`, edits kept as new rows; standard
+    quarantine -> promote, exactly one promoter per lane; archive placement
+    `raw/text/{source}/...`; volume well under 100 MB/day. Sequence:
+    **(a) P0 probe — RSS probe LIVE since 2026-07-13 ~02:19 UTC** (detached
+    scratch script `artifacts/text_probe/rss_probe.py`, 72 h cap, all 5 feeds
+    200-OK on first cycle); Reddit probe blocked on an owner-created OAuth
+    app (client id+secret dropped at `G:\market_archive\ops\reddit_app.json`,
+    outside the repo; no account password involved); **(b)** 24-48 h probe
+    readout (item rates, publish-ts honesty, edit/dedup behavior);
+    **(c)** lane build as a normal code PR (`/code-review` +
+    `/security-review`, new-lane hygiene: `-CollectorConcurrency` bump in
+    BOTH runner scripts, central `_run_segmented_worker` threading, regression
+    test for arg survival); **(d)** deploy at an owner-approved runner
+    restart; **(e)** acceptance = >=2 weeks continuous green capture,
+    `ingestion_ts` monotone, stable dedup ratios — then it accrues silently.
+
 ## Decision queue (owner)
 
 Decisions waiting on the owner; agents must not act on these without an explicit OK
 (see `CLAUDE.md` Governance):
 
 
-- **2026-07-12 modelling collection request (strategy-sensitive — ALL specifics
-  in the dated gitignored local request doc).** A proposed new low-rate,
-  zero-direct-cost collection lane family; probe-first per shop rule; volume
-  trivially small (well under 1% of plant write volume); dormancy-compatible
-  (data accrues, nothing downstream blocks on it). Triaged 2026-07-12:
-  well-formed, contract-compatible (standard envelope -> quarantine -> promote,
-  one promoter per lane). Owner decisions: **(1) go/no-go on the lane family**
-  (new lanes are the owner's call by contract; the only exposure is source-ToS
-  for rate-limit-respecting read-only polling); **(2) source set** (tiered
-  P1/P2/P3 in the doc; P3 default OFF); **(3) placement** — native public-repo
-  lanes vs local-only artifact; manager recommends **native** (the Limitless
-  precedent: local-only artifacts drift outside CI/review/hygiene gates, and
-  the eventual public lane names are not strategy-revealing); **(4) one
-  free-tier API key sign-up** only if that optional source is wanted
-  (account creation = owner-only). The probe phase and any build are blocked
-  on (1); one P1 probe source also needs an owner-created OAuth app first.
 - **D:\market_archive legacy history** — retention vs. merge (open item 1 above).
   Owner deferred 2026-06-11: stays read-only until research needs pre-cutover dates.
 - **2026-06-13 modelling data-collection handoff (strategy-sensitive — ALL
@@ -252,6 +259,18 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   segment close only; no catch-up scorer). This materially strengthens option
   (b) — the drip is ongoing, not historical — with (a) still wanted once to
   clear the backlog.
+
+Decided 2026-07-13 (recorded; build ACTIVE — see open item 15):
+- **2026-07-12 modelling collection request: APPROVED at P1 scope, native
+  public lanes.** (Request rationale stays in the gitignored local doc; the
+  approved capture surface itself is public by design.) Owner decisions
+  resolved: (1) GO on a low-volume raw-text capture lane family — fixed-list
+  crypto subreddits + crypto news RSS; (2) source set = P1 only for now (the
+  P2 aggregator/protocol sources are deferred, revisit only with a passing
+  probe; P3 stays OFF); (3) placement = **native public-repo lanes** (Limitless
+  precedent: local-only artifacts drift outside CI/review/hygiene gates);
+  (4) the optional P2 API key sign-up is moot for now. Probe-first shop rule
+  applies: a 24-72 h scratch feed-reality probe precedes any lane code.
 
 Decided 2026-06-17 (recorded, closed):
 - **Kalshi collection TURNED OFF (the G:-full root cause).** The `normalized`
