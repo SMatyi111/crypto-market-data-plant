@@ -647,7 +647,10 @@ when no clean events file exists), scores unreplayable, and is quarantined —
 nothing is lost, and every text run ends **either promoted or quarantined**, so
 the offload accounting never strands an unaccounted orphan (the funding-lane
 lesson). The hourly `backfill-text-replay` catch-up job scores crash-orphaned runs
-the same way (`require_events=False`).
+the same way (`require_events=False`) but never touches runs younger than its
+`min_age_hours` floor (default 1 h, 2× the live segment length) — scoring a run
+the collector is still writing would mint a premature verdict that the
+quarantine/promote jobs act on permanently.
 
 Text lanes are **not** part of the market research manifest (§6), which discovers
 lanes from `raw/market` only; consumers read `curated/research/text` directly and

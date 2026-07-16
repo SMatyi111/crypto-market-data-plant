@@ -1241,7 +1241,8 @@
       "args": {
         "source_root": "G:\\market_archive\\raw\\text\\text_rss",
         "limit": 1000,
-        "max_age_hours": 168
+        "max_age_hours": 168,
+        "min_age_hours": 1
       }
     },
     {
@@ -1296,7 +1297,8 @@
       "args": {
         "source_root": "G:\\market_archive\\raw\\text\\text_reddit",
         "limit": 1000,
-        "max_age_hours": 168
+        "max_age_hours": 168,
+        "min_age_hours": 1
       }
     },
     {

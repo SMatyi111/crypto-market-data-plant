@@ -20,6 +20,7 @@ from crypto_collector.collectors.text_feeds import (
     DEFAULT_RSS_FEEDS,
     RedditAppAuth,
     TextPollState,
+    durable_seen_snapshot,
     make_reddit_poll,
     make_rss_poll,
     parse_rss_items,
@@ -242,6 +243,87 @@ def test_default_feed_and_subreddit_sets_are_the_approved_p1_scope() -> None:
         "CryptoMarkets",
         "BitcoinMarkets",
     ]
+
+
+def test_rss_parse_failure_preserves_conditional_validators() -> None:
+    """A 200 body that fails to parse must NOT commit its validators: they belong
+    to a revision whose items were never captured, and a stored ETag would 304 that
+    revision away until the feed's next change."""
+    feeds = {"feedx": "https://feedx/rss"}
+    state = TextPollState()
+    fetch = _FakeRssFetch()
+    poll = make_rss_poll(feeds, state, fetch=fetch)
+
+    fetch.responses.append((200, b"<rss><channel><item>torn", "etag-bad", "lm-bad"))
+    payloads, _ = _run_poll(poll)
+    assert payloads == []
+    assert state.error_count == 1
+    # Next poll still carries NO validators -> the revision is re-fetched.
+    good = _rss_body([{"guid": "g1", "title": "T", "link": "l", "desc": "d", "pub": None}])
+    fetch.responses.append((200, good, "etag-good", "lm-good"))
+    payloads, _ = _run_poll(poll)
+    assert fetch.calls[1] == ("https://feedx/rss", None, None)
+    assert len(payloads) == 1
+
+
+def test_rss_zero_item_200_body_counts_as_error_every_poll() -> None:
+    """A well-formed body with zero recognizable items (e.g. an RSS 1.0/RDF feed)
+    must stay loudly visible: error counted per poll, validators not committed."""
+    feeds = {"feedx": "https://feedx/rss"}
+    state = TextPollState()
+    fetch = _FakeRssFetch()
+    poll = make_rss_poll(feeds, state, fetch=fetch)
+    empty = b"<?xml version='1.0'?><rss version='2.0'><channel></channel></rss>"
+    fetch.responses.append((200, empty, "e1", "lm1"))
+    fetch.responses.append((200, empty, "e1", "lm1"))
+    _run_poll(poll)
+    _run_poll(poll)
+    assert state.error_count == 2
+    # Validators never committed -> both calls were unconditional re-fetches.
+    assert fetch.calls == [
+        ("https://feedx/rss", None, None),
+        ("https://feedx/rss", None, None),
+    ]
+
+
+def test_rss_unchanged_sighting_refreshes_recency() -> None:
+    """A still-visible unchanged item must be recency-refreshed (seen + refreshed)
+    so seen-cap eviction can only hit items no longer served by the platform."""
+    feeds = {"feedx": "https://feedx/rss"}
+    state = TextPollState()
+    digest = semantic_content_hash("T", "l", "d")
+    key = "feedx\x1fg-old"
+    state.seen[key] = digest
+    state.seen["feedx\x1fg-newer"] = "otherhash"  # inserted after -> more recent
+    fetch = _FakeRssFetch()
+    body = _rss_body([{"guid": "g-old", "title": "T", "link": "l", "desc": "d", "pub": None}])
+    fetch.responses.append((200, body, None, None))
+    poll = make_rss_poll(feeds, state, fetch=fetch)
+    payloads, _ = _run_poll(poll)
+    assert payloads == []  # unchanged -> no row
+    assert list(state.seen) == ["feedx\x1fg-newer", key]  # moved to the recent end
+    assert state.refreshed == {key: digest}
+
+
+def test_durable_seen_snapshot_only_persists_written_evidence(tmp_path: Path) -> None:
+    """Poll-side seen state can run ahead of the files when a segment ends
+    mid-batch; the persisted cursor must contain only durable evidence, or the
+    promised bounded duplicate becomes a permanent gap."""
+    initial = {"feedx\x1fa": "h-a"}
+    refreshed = {"feedx\x1fa": "h-a"}  # sighted unchanged this segment
+    events = tmp_path / "events.jsonl"
+    events.write_text(
+        json.dumps({"product": "feedx", "source_id": "b", "content_hash": "h-b"}) + "\n"
+        + "not json\n"  # tolerant of a torn line
+        + json.dumps({"product": "feedx", "source_id": "c"}) + "\n",  # no hash -> skipped
+        encoding="utf-8",
+    )
+    # "d" was remembered in-memory by the poll but never written: must NOT persist.
+    snapshot = durable_seen_snapshot(initial, refreshed, events)
+    assert snapshot == {"feedx\x1fa": "h-a", "feedx\x1fb": "h-b"}
+    assert list(snapshot) == ["feedx\x1fa", "feedx\x1fb"]
+    # Missing events file: snapshot is just initial + refreshed.
+    assert durable_seen_snapshot(initial, refreshed, tmp_path / "absent.jsonl") == initial
 
 
 # ---------------------------------------------------------------------------

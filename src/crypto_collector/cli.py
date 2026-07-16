@@ -61,6 +61,7 @@ from .collectors.text_feeds import (
     RedditAppAuth,
     TextPollState,
     default_reddit_credentials_path,
+    durable_seen_snapshot,
     make_reddit_poll,
     make_rss_poll,
     read_reddit_credentials,
@@ -172,6 +173,59 @@ def _fsync_intervals(args: argparse.Namespace) -> tuple[int, float]:
         DEFAULT_FSYNC_INTERVAL_EVENTS if events is None else int(events),
         DEFAULT_FSYNC_INTERVAL_MS if ms is None else float(ms),
     )
+
+
+
+def _add_text_worker_common_args(
+    parser: argparse.ArgumentParser, *, default_worker_name: str
+) -> None:
+    """Shared per-lane knobs of the two text-capture workers. One definition site on
+    purpose: parallel hand-maintained enumerations of the same fields are exactly the
+    drift class that silently dropped `market`/`jsonl_fsync` from the market lanes
+    (CLAUDE.md hard rule). Lane-specific args (--feed / --subreddit / auth / pacing /
+    --poll-interval-seconds defaults) stay on the individual parsers."""
+    parser.add_argument(
+        "--stale-source-lag-seconds",
+        type=float,
+        default=3600.0,
+        help="Freshness diagnostic threshold: items whose platform-claimed source_ts "
+        "trails ingestion_ts by more than this count as stale_source_ts in the "
+        "replay summary. Reported, NEVER gating - the 72h probe saw a ~16h stale "
+        "Cointelegraph outlier on an otherwise-good item; ingestion_ts stays the "
+        "authoritative clock.",
+    )
+    parser.add_argument(
+        "--seen-cap",
+        type=int,
+        default=DEFAULT_SEEN_CAP,
+        help="Max (source_id -> content_hash) dedup entries persisted across segments.",
+    )
+    parser.add_argument("--segment-count", type=int, default=5000)
+    parser.add_argument("--max-segments", type=int)
+    parser.add_argument("--cooldown-seconds", type=float, default=1.0)
+    parser.add_argument("--output-root", type=Path, default=default_text_output_root())
+    parser.add_argument("--ops-root", type=Path, default=default_ops_root())
+    parser.add_argument("--worker-name", default=default_worker_name)
+    parser.add_argument("--heartbeat-interval-seconds", type=float, default=30.0)
+    parser.add_argument(
+        "--source-suffix",
+        default="",
+        help="Optional lane suffix. When non-empty, runs go to "
+        "<output_root>/<lane>_<suffix>/ instead of <lane>/.",
+    )
+    parser.add_argument("--rotate-at-midnight", action="store_true")
+    parser.add_argument(
+        "--no-jsonl-fsync", action="store_false", dest="jsonl_fsync", default=True
+    )
+    parser.add_argument(
+        "--normalized-parquet",
+        action="store_true",
+        default=False,
+        help="Opt IN to hot-path normalized parquet for this lane. Text default is "
+        "OFF: curated parquet comes from the promote job, and an always-on "
+        "normalized tree is an unmanaged-growth surface for zero consumer benefit.",
+    )
+    _add_fsync_batching_args(parser)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -800,48 +854,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Seconds between poll sweeps across all feeds (contract: 1-5 min; "
         "conditional GET keeps an unchanged feed nearly free).",
     )
-    text_rss_parser.add_argument(
-        "--stale-source-lag-seconds",
-        type=float,
-        default=3600.0,
-        help="Freshness diagnostic threshold: items whose platform-claimed source_ts "
-        "trails ingestion_ts by more than this count as stale_source_ts in the "
-        "replay summary. Reported, NEVER gating - the 72h probe saw a ~16h stale "
-        "Cointelegraph outlier on an otherwise-good item; ingestion_ts stays the "
-        "authoritative clock.",
-    )
-    text_rss_parser.add_argument(
-        "--seen-cap",
-        type=int,
-        default=DEFAULT_SEEN_CAP,
-        help="Max (source_id -> content_hash) dedup entries persisted across segments.",
-    )
-    text_rss_parser.add_argument("--segment-count", type=int, default=5000)
-    text_rss_parser.add_argument("--max-segments", type=int)
-    text_rss_parser.add_argument("--cooldown-seconds", type=float, default=1.0)
-    text_rss_parser.add_argument("--output-root", type=Path, default=default_text_output_root())
-    text_rss_parser.add_argument("--ops-root", type=Path, default=default_ops_root())
-    text_rss_parser.add_argument("--worker-name", default="text-rss-worker")
-    text_rss_parser.add_argument("--heartbeat-interval-seconds", type=float, default=30.0)
-    text_rss_parser.add_argument(
-        "--source-suffix",
-        default="",
-        help="Optional lane suffix. When non-empty, runs go to "
-        "<output_root>/text_rss_<suffix>/ instead of text_rss/.",
-    )
-    text_rss_parser.add_argument("--rotate-at-midnight", action="store_true")
-    text_rss_parser.add_argument(
-        "--no-jsonl-fsync", action="store_false", dest="jsonl_fsync", default=True
-    )
-    text_rss_parser.add_argument(
-        "--normalized-parquet",
-        action="store_true",
-        default=False,
-        help="Opt IN to hot-path normalized parquet for this lane. Text default is "
-        "OFF: curated parquet comes from the promote job, and an always-on "
-        "normalized tree is an unmanaged-growth surface for zero consumer benefit.",
-    )
-    _add_fsync_batching_args(text_rss_parser)
+    _add_text_worker_common_args(text_rss_parser, default_worker_name="text-rss-worker")
 
     text_reddit_parser = subparsers.add_parser(
         "text-reddit-worker",
@@ -880,33 +893,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Pause between consecutive listing requests within one sweep.",
     )
     text_reddit_parser.add_argument("--listing-limit", type=int, default=100)
-    text_reddit_parser.add_argument("--stale-source-lag-seconds", type=float, default=3600.0)
-    text_reddit_parser.add_argument("--seen-cap", type=int, default=DEFAULT_SEEN_CAP)
-    text_reddit_parser.add_argument("--segment-count", type=int, default=5000)
-    text_reddit_parser.add_argument("--max-segments", type=int)
-    text_reddit_parser.add_argument("--cooldown-seconds", type=float, default=1.0)
-    text_reddit_parser.add_argument("--output-root", type=Path, default=default_text_output_root())
-    text_reddit_parser.add_argument("--ops-root", type=Path, default=default_ops_root())
-    text_reddit_parser.add_argument("--worker-name", default="text-reddit-worker")
-    text_reddit_parser.add_argument("--heartbeat-interval-seconds", type=float, default=30.0)
-    text_reddit_parser.add_argument(
-        "--source-suffix",
-        default="",
-        help="Optional lane suffix. When non-empty, runs go to "
-        "<output_root>/text_reddit_<suffix>/ instead of text_reddit/.",
-    )
-    text_reddit_parser.add_argument("--rotate-at-midnight", action="store_true")
-    text_reddit_parser.add_argument(
-        "--no-jsonl-fsync", action="store_false", dest="jsonl_fsync", default=True
-    )
-    text_reddit_parser.add_argument(
-        "--normalized-parquet",
-        action="store_true",
-        default=False,
-        help="Opt IN to hot-path normalized parquet (text default OFF - see the "
-        "text-rss-worker help).",
-    )
-    _add_fsync_batching_args(text_reddit_parser)
+    _add_text_worker_common_args(text_reddit_parser, default_worker_name="text-reddit-worker")
 
     kalshi_discover_parser = subparsers.add_parser(
         "kalshi-discover-crypto",
@@ -1116,6 +1103,15 @@ def build_parser() -> argparse.ArgumentParser:
     backfill_text_parser.add_argument("--limit", type=int, default=50)
     backfill_text_parser.add_argument("--max-age-hours", type=float, default=24.0)
     backfill_text_parser.add_argument("--overwrite", action="store_true")
+    backfill_text_parser.add_argument(
+        "--min-age-hours",
+        type=float,
+        default=1.0,
+        help="Skip runs younger than this (the collector may still be writing "
+        "them). Scoring a LIVE run mints a premature summary that the quarantine/"
+        "promote jobs act on - a permanent wrong verdict. Keep comfortably above "
+        "the lane's max_segment_seconds.",
+    )
     backfill_text_parser.add_argument("--stale-source-lag-seconds", type=float, default=3600.0)
     backfill_text_parser.add_argument("--format", choices=["json", "text"], default="text")
 
@@ -2694,7 +2690,8 @@ async def _collect_text_segment(args: argparse.Namespace, *, family: str) -> dic
     source_name = _build_source_name(f"text_{family}", getattr(args, "source_suffix", ""))
     output_root = Path(args.output_root)
     seen_path = text_seen_path(output_root, source_name)
-    state = TextPollState(seen=read_text_seen(seen_path))
+    initial_seen = read_text_seen(seen_path)
+    state = TextPollState(seen=dict(initial_seen))
     if family == "rss":
         poll = make_rss_poll(_text_feeds_mapping(args), state)
     else:
@@ -2749,8 +2746,15 @@ async def _collect_text_segment(args: argparse.Namespace, *, family: str) -> dic
         stale_source_lag_seconds=float(getattr(args, "stale_source_lag_seconds", 3600.0)),
         write_summary=True,
     )
+    # Persist only the DURABLE dedup state: the cursor loaded at segment start,
+    # recency refreshes for unchanged sightings, and the rows actually written to
+    # clean events. The in-memory map can run ahead of the files when a segment
+    # ends mid-batch, and persisting an unwritten hash would turn the promised
+    # bounded duplicate into a permanent gap.
     write_text_seen(
-        seen_path, state.seen, cap=int(getattr(args, "seen_cap", DEFAULT_SEEN_CAP))
+        seen_path,
+        durable_seen_snapshot(initial_seen, state.refreshed, run_paths.clean / "events.jsonl"),
+        cap=int(getattr(args, "seen_cap", DEFAULT_SEEN_CAP)),
     )
     return {
         "raw_messages": pipeline_summary.raw_messages,
@@ -2796,7 +2800,11 @@ def run_text_rss_worker(args: argparse.Namespace) -> None:
         worker_type="text-rss-worker",
         venue="rss",
         build_segment_args=lambda source_args: SimpleNamespace(
-            feeds=_text_feeds_mapping(source_args),
+            # Raw passthrough (config dict and/or CLI NAME=URL pairs); resolved
+            # exactly once, inside the segment, so both entry points share one
+            # resolution path.
+            feeds=getattr(source_args, "feeds", None),
+            feeds_kv=getattr(source_args, "feeds_kv", None),
             poll_interval_seconds=getattr(source_args, "poll_interval_seconds", 120.0),
             stale_source_lag_seconds=getattr(source_args, "stale_source_lag_seconds", 3600.0),
             seen_cap=getattr(source_args, "seen_cap", DEFAULT_SEEN_CAP),
@@ -3199,6 +3207,31 @@ def _execute_ops_job_inprocess(job: JobSpec) -> JobExecutionResult | str | None:
 _TRADES_STALE_WINDOW_MS = 900_000
 
 
+
+def _text_common_job_args(raw_args: dict, *, default_worker_name: str) -> dict:
+    """Shared _job_args fields of the two text-capture workers - single definition
+    site for the same anti-drift reason as _add_text_worker_common_args."""
+    return {
+        "stale_source_lag_seconds": raw_args.get("stale_source_lag_seconds", 3600.0),
+        "seen_cap": raw_args.get("seen_cap", DEFAULT_SEEN_CAP),
+        "segment_count": raw_args.get("segment_count", 5000),
+        "max_segments": raw_args.get("max_segments"),
+        "cooldown_seconds": raw_args.get("cooldown_seconds", 1.0),
+        "output_root": raw_args.get("output_root", default_text_output_root()),
+        "ops_root": Path(raw_args.get("ops_root", default_ops_root())),
+        "normalized_root": raw_args.get("normalized_root"),
+        "worker_name": raw_args.get("worker_name", default_worker_name),
+        "heartbeat_interval_seconds": raw_args.get("heartbeat_interval_seconds", 30.0),
+        "jsonl_fsync": raw_args.get("jsonl_fsync", True),
+        # Text default: NO hot-path normalized parquet - curated comes from the
+        # promote job, and an always-on normalized tree is an unmanaged-growth
+        # surface (the Kalshi lesson) for zero benefit. Config can opt in.
+        "normalized_parquet": raw_args.get("normalized_parquet", False),
+        "source_suffix": raw_args.get("source_suffix", ""),
+        "rotate_at_midnight": raw_args.get("rotate_at_midnight", False),
+    }
+
+
 def _job_args(job: JobSpec) -> SimpleNamespace:
     raw_args = dict(job.args)
     if "output_root" in raw_args:
@@ -3520,23 +3553,7 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             # dict of {name: url}; None -> the fixed probe-validated P1 default set.
             feeds=raw_args.get("feeds"),
             poll_interval_seconds=raw_args.get("poll_interval_seconds", 120.0),
-            stale_source_lag_seconds=raw_args.get("stale_source_lag_seconds", 3600.0),
-            seen_cap=raw_args.get("seen_cap", DEFAULT_SEEN_CAP),
-            segment_count=raw_args.get("segment_count", 5000),
-            max_segments=raw_args.get("max_segments"),
-            cooldown_seconds=raw_args.get("cooldown_seconds", 1.0),
-            output_root=raw_args.get("output_root", default_text_output_root()),
-            ops_root=Path(raw_args.get("ops_root", default_ops_root())),
-            normalized_root=raw_args.get("normalized_root"),
-            worker_name=raw_args.get("worker_name", "text-rss-worker"),
-            heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
-            jsonl_fsync=raw_args.get("jsonl_fsync", True),
-            # Text default: NO hot-path normalized parquet - curated comes from the
-            # promote job, and an always-on normalized tree is an unmanaged-growth
-            # surface (the Kalshi lesson) for zero benefit. Config can opt in.
-            normalized_parquet=raw_args.get("normalized_parquet", False),
-            source_suffix=raw_args.get("source_suffix", ""),
-            rotate_at_midnight=raw_args.get("rotate_at_midnight", False),
+            **_text_common_job_args(raw_args, default_worker_name="text-rss-worker"),
         )
     if job.job_type == "text-reddit-worker":
         return SimpleNamespace(
@@ -3548,20 +3565,7 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             request_pause_seconds=raw_args.get("request_pause_seconds", 1.0),
             listing_limit=raw_args.get("listing_limit", 100),
             poll_interval_seconds=raw_args.get("poll_interval_seconds", 60.0),
-            stale_source_lag_seconds=raw_args.get("stale_source_lag_seconds", 3600.0),
-            seen_cap=raw_args.get("seen_cap", DEFAULT_SEEN_CAP),
-            segment_count=raw_args.get("segment_count", 5000),
-            max_segments=raw_args.get("max_segments"),
-            cooldown_seconds=raw_args.get("cooldown_seconds", 1.0),
-            output_root=raw_args.get("output_root", default_text_output_root()),
-            ops_root=Path(raw_args.get("ops_root", default_ops_root())),
-            normalized_root=raw_args.get("normalized_root"),
-            worker_name=raw_args.get("worker_name", "text-reddit-worker"),
-            heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
-            jsonl_fsync=raw_args.get("jsonl_fsync", True),
-            normalized_parquet=raw_args.get("normalized_parquet", False),
-            source_suffix=raw_args.get("source_suffix", ""),
-            rotate_at_midnight=raw_args.get("rotate_at_midnight", False),
+            **_text_common_job_args(raw_args, default_worker_name="text-reddit-worker"),
         )
     if job.job_type == "kalshi-discover-crypto":
         return SimpleNamespace(
@@ -3622,6 +3626,10 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             limit=raw_args.get("limit", 50),
             max_age_hours=raw_args.get("max_age_hours", 24.0),
             overwrite=raw_args.get("overwrite", False),
+            # Never score the run the collector may still be writing (a premature
+            # summary gets acted on by the 300s quarantine/promote jobs and the
+            # wrong verdict is permanent). 1h floor = 2x the 1800s live segments.
+            min_age_hours=raw_args.get("min_age_hours", 1.0),
             stale_source_lag_seconds=raw_args.get("stale_source_lag_seconds", 3600.0),
             format=raw_args.get("format", "text"),
         )
@@ -4003,6 +4011,7 @@ def run_backfill_text_replay(args: argparse.Namespace) -> None:
         # text run and must end up scored (no_events -> quarantined), not stranded
         # as a permanent unaccounted offload orphan (the funding-lane lesson).
         require_events=False,
+        min_age_hours=float(getattr(args, "min_age_hours", 1.0)),
     )
     if args.format == "json":
         print(json.dumps(report.to_dict(), indent=2, sort_keys=True))

@@ -176,3 +176,31 @@ def test_backfill_text_replay_scores_eventless_runs(tmp_path: Path) -> None:
         replay_fn=lambda run_dir, write_summary=True: scorer(run_dir, write_summary=write_summary),
     )
     assert any(run.action == "skipped_missing_events" for run in report.runs)
+
+
+def test_backfill_min_age_floor_skips_the_live_run(tmp_path: Path) -> None:
+    """The catch-up scorer must never score the run the collector may still be
+    writing: a premature summary gets acted on by the quarantine/promote jobs and
+    the wrong verdict is permanent (quarantine index beats replayability; the
+    promotion index is run-keyed)."""
+    from datetime import datetime as dt
+
+    from crypto_collector.replay import replay_text_run as scorer
+
+    lane_root = tmp_path / "text_rss"
+    live_name = dt.now(tz=UTC).strftime("%Y%m%d_%H%M%S")
+    _write_run(tmp_path, [_row(0)], name=live_name)  # in-flight run, has items so far
+    _write_run(tmp_path, [_row(0)], name="20260715_100000")  # long closed
+
+    report = backfill_replay_summaries(
+        lane_root,
+        limit=10,
+        max_age_hours=24 * 365 * 10,
+        replay_fn=lambda run_dir, write_summary=True: scorer(run_dir, write_summary=write_summary),
+        require_events=False,
+        min_age_hours=1.0,
+    )
+    actions = {run.run_path.split("\\")[-1].split("/")[-1]: run.action for run in report.runs}
+    assert actions[live_name] == "skipped_too_recent"
+    assert actions["20260715_100000"] == "created"
+    assert not (lane_root / live_name / "metrics" / "replay_summary.json").exists()

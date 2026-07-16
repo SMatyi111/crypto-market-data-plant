@@ -6,7 +6,6 @@ import gzip
 import hashlib
 import json
 import logging
-import os
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -16,6 +15,8 @@ from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+from ..storage import write_text_atomic
 
 logger = logging.getLogger(__name__)
 
@@ -97,9 +98,15 @@ _SEP = "\x1f"
 
 def semantic_content_hash(*fields: str | None) -> str:
     """SHA-256 over the semantic content fields (edit detection key). Raw-payload
-    churn that leaves these fields untouched produces the same hash -> no row."""
+    churn that leaves these fields untouched produces the same hash -> no row.
+    Fields are hashed as a JSON array so their boundaries are unambiguous even for
+    content that embeds control characters (a raw separator join would let
+    "a\\x1fb"+"" collide with "a"+"b" - reachable from reddit JSON strings, if not
+    from XML)."""
     return hashlib.sha256(
-        _SEP.join(part or "" for part in fields).encode("utf-8", "replace")
+        json.dumps(
+            [part or "" for part in fields], ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8", "replace")
     ).hexdigest()
 
 
@@ -191,29 +198,71 @@ def write_text_seen(
     Feeds only expose a bounded recent window (RSS ~25 items/feed, reddit 100 per
     listing), so entries older than the cap can never be re-served as "new" by the
     platform - dropping them keeps the cursor O(bounded) forever."""
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
     entries = list(seen.items())[-max(1, int(cap)):]
     payload = {
         "version": 1,
         "updated_at": (now or datetime.now(tz=UTC)).isoformat(),
         "entries": entries,
     }
-    tmp = target.with_name(f"{target.name}.{os.getpid()}.tmp")
-    with tmp.open("w", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, sort_keys=True))
-        handle.flush()
-        # fsync before the atomic rename (same as the aggTrades cursor): a power cut
-        # must not promote a zero-length tmp into place - a corrupt cursor silently
-        # re-emits the whole window as duplicates on every restart.
-        os.fsync(handle.fileno())
-    tmp.replace(target)
+    # fsync=True (same as the aggTrades cursor): a power cut must not promote a
+    # zero-length tmp into place - a corrupt cursor silently re-emits the whole
+    # window as duplicates on every restart.
+    write_text_atomic(Path(path), json.dumps(payload, sort_keys=True), fsync=True)
 
 
 def _remember(seen: dict[str, str], key: str, digest: str) -> None:
     # Re-insert on update so dict insertion order tracks recency for the cap.
     seen.pop(key, None)
     seen[key] = digest
+
+
+def durable_seen_snapshot(
+    initial_seen: dict[str, str],
+    refreshed: dict[str, str],
+    events_path: Path | str,
+) -> dict[str, str]:
+    """The cursor content that is SAFE to persist at segment close.
+
+    The in-memory poll-side map can run ahead of what was durably written: a
+    segment can end mid-batch (deadline/limit lands between yielded frames), so
+    items the poll already remembered may never reach clean/events.jsonl -
+    persisting their hashes would turn the promised bounded duplicate into a
+    permanent gap. The durable snapshot is therefore rebuilt from evidence only:
+
+    - `initial_seen`: the cursor loaded at segment start (all durably captured
+      in earlier segments), in stored recency order;
+    - `refreshed`: keys sighted UNCHANGED this segment (their hash is already
+      durable from a past segment, so re-stamping recency is safe) - this is what
+      keeps still-visible items away from the cap's eviction edge;
+    - the rows actually present in this segment's clean events file, in write
+      order (the only proof a new/edited hash is on disk).
+    """
+    snapshot = dict(initial_seen)
+    for key, digest in refreshed.items():
+        _remember(snapshot, key, digest)
+    events = Path(events_path)
+    if events.exists():
+        try:
+            handle = events.open("r", encoding="utf-8")
+        except OSError:
+            return snapshot
+        with handle:
+            for line in handle:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    row = json.loads(stripped)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                product = row.get("product")
+                source_id = row.get("source_id")
+                content_hash = row.get("content_hash")
+                if product and source_id and content_hash:
+                    _remember(snapshot, _seen_key(str(product), str(source_id)), str(content_hash))
+    return snapshot
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +348,10 @@ class TextPollState:
     and observability counters the segment summary reports."""
 
     seen: dict[str, str] = field(default_factory=dict)
+    # Keys sighted UNCHANGED this segment (hash already durable from a past
+    # segment). Persisted as recency refreshes so a still-visible item can never
+    # drift to the seen-cap's eviction edge and be re-emitted as a duplicate.
+    refreshed: dict[str, str] = field(default_factory=dict)
     conditional: dict[str, dict[str, str | None]] = field(default_factory=dict)
     poll_seq: int = 0
     error_count: int = 0
@@ -336,16 +389,36 @@ def make_rss_poll(
                 logger.warning("text-rss poll failed for %s: %s", feed_name, exc)
                 continue
             latency_ms = round((time_fn() - started) * 1000.0, 1)
-            cond["etag"] = etag
-            cond["last_modified"] = last_modified
             if status == 304 or not body:
                 continue
             try:
                 items = parse_rss_items(body)
             except ET.ParseError as exc:
+                # Do NOT commit the new validators: they belong to a revision whose
+                # items were never captured, and storing them would make every
+                # following poll 304 that revision away (missed items until the
+                # feed's NEXT change, hours-to-days late on the authoritative
+                # ingestion axis). Leaving the old validators re-fetches it.
                 state.error_count += 1
                 logger.warning("text-rss parse failed for %s: %s", feed_name, exc)
                 continue
+            if not items:
+                # A 200 body that parses to zero recognizable items is a dead or
+                # unsupported feed shape (e.g. RSS 1.0/RDF), indistinguishable from
+                # a quiet window without this signal. Count it EVERY poll and do not
+                # commit the validators (a committed ETag would 304 the signal away
+                # after the first hit), so a misconfigured feed stays loudly visible
+                # in the segment summaries' poll_errors instead of capturing
+                # nothing forever.
+                state.error_count += 1
+                logger.warning(
+                    "text-rss feed %s returned HTTP %s with zero recognizable items",
+                    feed_name,
+                    status,
+                )
+                continue
+            cond["etag"] = etag
+            cond["last_modified"] = last_modified
             poll_meta = {
                 "poll_seq": state.poll_seq,
                 "http_status": status,
@@ -368,6 +441,11 @@ def make_rss_poll(
                 key = _seen_key(feed_name, source_id)
                 prior = state.seen.get(key)
                 if prior == digest:
+                    # Unchanged sighting: refresh recency (in-memory AND in the
+                    # durable snapshot) so a long-lived still-visible item never
+                    # ages past the seen cap and re-emits as a duplicate "new".
+                    _remember(state.seen, key, digest)
+                    _remember(state.refreshed, key, digest)
                     continue
                 row_type = "new" if prior is None else "edit"
                 if row_type == "new":
@@ -542,7 +620,12 @@ def make_reddit_poll(
     subs = [str(sub) for sub in subreddits]
 
     async def _get_listing(url: str) -> dict[str, Any]:
-        headers = auth.headers()
+        # auth.headers() can run the blocking token POST (initial fetch / ~hourly
+        # refresh), so it goes through to_thread like every other HTTP call here -
+        # a hung token endpoint (urlopen's timeout does not cover DNS/proxy
+        # resolution: the 2026-06-11 kalshi lesson) must not wedge the event loop
+        # past the collector's own deadline check.
+        headers = await asyncio.to_thread(auth.headers)
         try:
             return await asyncio.to_thread(fetch_listing, url, headers)
         except HTTPError as error:
@@ -550,7 +633,7 @@ def make_reddit_poll(
                 raise
             # Expired/revoked token: refresh once and retry this listing.
             auth.invalidate()
-            headers = auth.headers()
+            headers = await asyncio.to_thread(auth.headers)
             return await asyncio.to_thread(fetch_listing, url, headers)
 
     async def poll() -> tuple[list[dict], bool]:
@@ -622,6 +705,11 @@ def _reddit_payload(
         key = _seen_key(sub, source_id)
         prior = state.seen.get(key)
         if prior == digest:
+            # Unchanged sighting: refresh recency so a slow subreddit's still-
+            # visible post never ages past the seen cap under comment churn and
+            # re-emits as a duplicate "new" (see TextPollState.refreshed).
+            _remember(state.seen, key, digest)
+            _remember(state.refreshed, key, digest)
             return None
         row_type = "new" if prior is None else "edit"
         if row_type == "new":

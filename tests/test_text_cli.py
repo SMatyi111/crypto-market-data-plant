@@ -113,6 +113,7 @@ def test_job_args_backfill_text_replay(tmp_path: Path) -> None:
                 "limit": 111,
                 "max_age_hours": 12.0,
                 "overwrite": True,
+                "min_age_hours": 2.5,
                 "stale_source_lag_seconds": 60.0,
             },
         )
@@ -121,7 +122,11 @@ def test_job_args_backfill_text_replay(tmp_path: Path) -> None:
     assert ns.limit == 111
     assert ns.max_age_hours == 12.0
     assert ns.overwrite is True
+    assert ns.min_age_hours == 2.5
     assert ns.stale_source_lag_seconds == 60.0
+    # Default floor protects the live 1800s segments (2x margin).
+    bare = _job_args(SimpleNamespace(job_type="backfill-text-replay", args={}))
+    assert bare.min_age_hours == 1.0
 
 
 def test_workers_thread_text_config_through_build_segment_args(tmp_path, monkeypatch) -> None:

@@ -785,6 +785,7 @@ def backfill_replay_summaries(
     overwrite: bool = False,
     replay_fn: Callable[..., Any] = replay_depth_run,
     require_events: bool = True,
+    min_age_hours: float = 0.0,
 ) -> ReplayBackfillReport:
     """Re-score archived runs missing a `metrics/replay_summary.json`.
 
@@ -798,9 +799,18 @@ def backfill_replay_summaries(
     skipping those runs is exactly how the funding lane minted a permanent
     unaccounted orphan per restart - the text scorer writes a `no_events` summary
     instead, so quarantine + offload accounting always closes.
+
+    `min_age_hours > 0` skips runs YOUNGER than that floor - i.e. the run the
+    collector is (or may still be) actively writing. Scoring a live run mints a
+    premature summary that the 300s quarantine/promote jobs then act on: a
+    zero-items-so-far run would be quarantined (permanently - promotion checks the
+    quarantine index before replayability), and an items-so-far run would be
+    PARTIALLY promoted and never revisited (the promotion index is run-keyed). Set
+    the floor comfortably above the lane's max_segment_seconds.
     """
     checked_at = datetime.now(tz=UTC)
     cutoff = checked_at - timedelta(hours=max_age_hours)
+    min_age_cutoff = checked_at - timedelta(hours=min_age_hours)
     runs: list[ReplayBackfillRun] = []
     created_count = 0
     updated_count = 0
@@ -810,6 +820,22 @@ def backfill_replay_summaries(
     for run_dir in _recent_run_dirs(source_root, limit=limit):
         started_at = _parse_run_started_at(run_dir)
         if started_at is not None and started_at < cutoff:
+            continue
+        if (
+            min_age_hours > 0
+            and started_at is not None
+            and started_at > min_age_cutoff
+        ):
+            skipped_count += 1
+            runs.append(
+                ReplayBackfillRun(
+                    run_path=str(run_dir),
+                    action="skipped_too_recent",
+                    replay_summary_path=None,
+                    replayable=None,
+                    findings=[],
+                )
+            )
             continue
         replay_summary_path = run_dir / "metrics" / "replay_summary.json"
         events_path = run_dir / "clean" / "events.jsonl"
