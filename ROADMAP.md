@@ -198,7 +198,7 @@ owner ask (safe-shaping directive above).
     outside the repo; no account password involved) — the lane ships
     probe-less on the conservative defaults (~10 QPM vs the ~100 QPM
     budget) since it cannot start without the credentials file anyway;
-    **(b)** probe readout folded into (a); **(c) DONE — lane build PR
+    **(b)** probe readout folded into (a); **(c) DONE — lane build PR #35
     (branch `codex/text-p1-lanes`)**: `text-rss-worker` +
     `text-reddit-worker` job types, envelope normalizer + text quality
     gate, `replay_text_run` verdict (`no_events` quiet segments quarantine
