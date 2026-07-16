@@ -42,18 +42,21 @@ nothing merged is awaiting a restart. All 21 lanes green. CI green on `main`.
 | ~~2026-07-15~~ DONE 07-16 | **The 07-05 orphan wave crossed the offload fence as predicted**: `stuck_unaccounted=17,519` (forecast ~17.5k), `failed=0`. Health's sole finding is the expected `offload_stuck_above_baseline:17519`; the queued cleanup/backstop decision remains open. |
 | ~~2026-06-19~~ DONE 06-24 | The 06-17 `robocopy /MINAGE:3` move never finished (~88% of partitions still on G:), leaving G: at **3.9 GB free**. First retry (06-22) was killed by the Bash tool's 10-min timeout after freeing ~57 GB. Relaunched **detached via `Start-Process`** (pid 48444) so it survives session/tool teardown -> **COMPLETED 2026-06-24 16:19, FAILED: 0** (45.29 M files / 555 GB moved G:->`D:\market_archive_cold`). **G: now 489 GB free.** D: holds 113,407 normalized partitions (full set). 1 partition / 2 parquet files remain on G: -- robocopy *skipped* them (already byte-present on D: from the 06-17 partial), so redundant not stranded; immaterial (489 GB free). Lesson: long-running moves must be detached, never run inside a Bash call (10-min cap). |
 
-**Last ops audit:** 2026-07-16 — **pre-text deploy plant GREEN; expected
-offload-cohort warning only.** Health `status=warn` with sole finding
+**Last ops audit:** 2026-07-16 — **plant GREEN before text deployment; RSS
+initial verification GREEN.** Pre-deploy health's sole finding was the expected
 `offload_stuck_above_baseline:17519`, exactly the forecast 07-05 crash cohort;
 heartbeat 2.3 s, all 81 enabled scheduled jobs' latest rows successful, all 21
 collector workers fresh, quarantine ratios 0 where reported, **G: 436.7 GB
 free**, offload same-hour with 42 moves / 0 failures. PR #35 merged as
-`496075b`; the gitignored local config now enables RSS collector + scorer +
-quarantine + promoter only. **Not deployed yet:** the live runner remains the
-SYSTEM-owned 07-11 process (`pid=13232`) because this session could not cross
-the Windows UAC boundary. An elevated `scripts/redeploy_runner.ps1` run or the
-next reboot is still required. Reddit remains disabled pending the approved
-OAuth credential file.
+`496075b`; owner ran the guarded elevated redeploy at 2026-07-16 11:36 UTC and
+the new runner confirmed healthy as `pid=27212`. RSS collector + scorer +
+quarantine + promoter are enabled; the worker is fresh and the first segment
+captured **121 clean rows across all five feeds** (25 CoinDesk, 30
+Cointelegraph, 20 The Block, 36 Decrypt, 10 Bitcoin Magazine), with zero
+duplicate keys, missing timestamps, or future timestamps. The initial
+maintenance jobs are queued behind the startup research-manifest pass and will
+clear their first-run health warnings as that slot turns over. Reddit remains
+disabled pending the approved OAuth credential file.
 
 **Previous ops audit:** 2026-07-12 — **plant GREEN today; two self-healed network
 incidents since 07-04; an orphan wave crosses the offload fence ~07-15.**
@@ -221,13 +224,12 @@ owner ask (safe-shaping directive above).
     `curated/research/text`, STANDARDS v8 (§4.6), CollectorConcurrency
     23 -> 25 in BOTH runner scripts, example-config job family
     (enabled:false), arg-survival regression tests + mocked-network suite;
-    `/code-review` + `/security-review` run on the PR; **(d) IN PROGRESS —**
-    RSS collector + scorer + quarantine + promoter enabled in
-    `ops.live.local.json`, but the live SYSTEM-owned runner has not restarted
-    (elevated redeploy/UAC or reboot still required). Reddit remains disabled
-    until `reddit_app.json` exists; **(e)** acceptance = >=2 weeks continuous green
-    capture, `ingestion_ts` monotone, stable dedup ratios — then it
-    accrues silently.
+    `/code-review` + `/security-review` run on the PR; **(d) RSS DONE —**
+    collector + scorer + quarantine + promoter enabled and deployed by guarded
+    restart 2026-07-16 11:36 UTC (`pid=27212`). Reddit remains pending and
+    disabled until `reddit_app.json` exists; **(e) IN PROGRESS through
+    2026-07-30** — acceptance = >=2 weeks continuous green capture,
+    `ingestion_ts` monotone, stable dedup ratios; then it accrues silently.
 
 ## Decision queue (owner)
 
