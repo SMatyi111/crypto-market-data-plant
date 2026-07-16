@@ -39,10 +39,23 @@ nothing merged is awaiting a restart. All 21 lanes green. CI green on `main`.
 | Due | Check |
 | --- | --- |
 | ~~2026-06-18~~ DONE 06-22 | Offload-index spot-check **PASSED**: 4509 index rows == cold run-dirs 1:1 on every lane, 0 duplicates/malformed, 0 unindexed pile-up, 0 missing cold copies, 0 sampled file-count mismatches, 0 indexed runs still hot. Offload live (newest `moved_at` 2026-06-22T09:53Z). Dry-run also flags **16 `stuck_unaccounted_runs`** (raw from 06-09..06-11 never promoted: 8 `binance_perp_funding` + 8 trade/depth) — designed safety surface, but a real promotion gap to investigate. *(Re-measured 2026-07-04: the true cohort is **14,211** — the 06-16..06-23 crash-loop debris had not yet crossed the 10-day offload fence when this check ran. See the 07-04 audit stamp + Decision queue.)* |
-| 2026-07-15 | **Confirm the 07-05 orphan wave crossed the offload fence as predicted**: `stuck_unaccounted` should step from 14,215 to ~17.5k as the ~3.4k unscorable 07-05 crash-loop partials age past 10 days (health `offload_stuck_above_baseline` grows accordingly — expected, not new breakage). Re-measure, update the decision-queue entry with the settled number, and nudge the queued cleanup/backstop decision. |
+| ~~2026-07-15~~ DONE 07-16 | **The 07-05 orphan wave crossed the offload fence as predicted**: `stuck_unaccounted=17,519` (forecast ~17.5k), `failed=0`. Health's sole finding is the expected `offload_stuck_above_baseline:17519`; the queued cleanup/backstop decision remains open. |
 | ~~2026-06-19~~ DONE 06-24 | The 06-17 `robocopy /MINAGE:3` move never finished (~88% of partitions still on G:), leaving G: at **3.9 GB free**. First retry (06-22) was killed by the Bash tool's 10-min timeout after freeing ~57 GB. Relaunched **detached via `Start-Process`** (pid 48444) so it survives session/tool teardown -> **COMPLETED 2026-06-24 16:19, FAILED: 0** (45.29 M files / 555 GB moved G:->`D:\market_archive_cold`). **G: now 489 GB free.** D: holds 113,407 normalized partitions (full set). 1 partition / 2 parquet files remain on G: -- robocopy *skipped* them (already byte-present on D: from the 06-17 partial), so redundant not stranded; immaterial (489 GB free). Lesson: long-running moves must be detached, never run inside a Bash call (10-min cap). |
 
-**Last ops audit:** 2026-07-12 — **plant GREEN today; two self-healed network
+**Last ops audit:** 2026-07-16 — **pre-text deploy plant GREEN; expected
+offload-cohort warning only.** Health `status=warn` with sole finding
+`offload_stuck_above_baseline:17519`, exactly the forecast 07-05 crash cohort;
+heartbeat 2.3 s, all 81 enabled scheduled jobs' latest rows successful, all 21
+collector workers fresh, quarantine ratios 0 where reported, **G: 436.7 GB
+free**, offload same-hour with 42 moves / 0 failures. PR #35 merged as
+`496075b`; the gitignored local config now enables RSS collector + scorer +
+quarantine + promoter only. **Not deployed yet:** the live runner remains the
+SYSTEM-owned 07-11 process (`pid=13232`) because this session could not cross
+the Windows UAC boundary. An elevated `scripts/redeploy_runner.ps1` run or the
+next reboot is still required. Reddit remains disabled pending the approved
+OAuth credential file.
+
+**Previous ops audit:** 2026-07-12 — **plant GREEN today; two self-healed network
 incidents since 07-04; an orphan wave crosses the offload fence ~07-15.**
 Health `status=warn` with exactly one finding,
 `offload_stuck_above_baseline:14215` (heartbeat ~1.4 s) — **PR #28's growth
@@ -199,7 +212,7 @@ owner ask (safe-shaping directive above).
     probe-less on the conservative defaults (~10 QPM vs the ~100 QPM
     budget) since it cannot start without the credentials file anyway;
     **(b)** probe readout folded into (a); **(c) DONE — lane build PR #35
-    (branch `codex/text-p1-lanes`)**: `text-rss-worker` +
+    merged 2026-07-16 as `496075b`**: `text-rss-worker` +
     `text-reddit-worker` job types, envelope normalizer + text quality
     gate, `replay_text_run` verdict (`no_events` quiet segments quarantine
     by design so offload accounting closes), `backfill-text-replay`
@@ -208,10 +221,11 @@ owner ask (safe-shaping directive above).
     `curated/research/text`, STANDARDS v8 (§4.6), CollectorConcurrency
     23 -> 25 in BOTH runner scripts, example-config job family
     (enabled:false), arg-survival regression tests + mocked-network suite;
-    `/code-review` + `/security-review` run on the PR; **(d)** deploy at
-    an owner-approved runner restart (enable the text jobs in
-    `ops.live.local.json` at that point; reddit additionally needs the
-    credentials file); **(e)** acceptance = >=2 weeks continuous green
+    `/code-review` + `/security-review` run on the PR; **(d) IN PROGRESS —**
+    RSS collector + scorer + quarantine + promoter enabled in
+    `ops.live.local.json`, but the live SYSTEM-owned runner has not restarted
+    (elevated redeploy/UAC or reboot still required). Reddit remains disabled
+    until `reddit_app.json` exists; **(e)** acceptance = >=2 weeks continuous green
     capture, `ingestion_ts` monotone, stable dedup ratios — then it
     accrues silently.
 
