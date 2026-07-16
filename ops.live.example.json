@@ -1192,6 +1192,136 @@
       }
     },
     {
+      "// text-capture lanes (P1, ROADMAP item 15)": "Two low-volume raw-TEXT lane families (STANDARDS text section): text-rss polls five crypto news RSS/Atom feeds with conditional GET (defaults baked into the worker; override via a 'feeds' {name: url} dict); text-reddit polls a fixed subreddit list's /new posts + comments read-only via an OAuth client-credentials app (NO account password - the app id/secret json lives OUTSIDE the repo at ops_root/reddit_app.json, override via credentials_path). Raw text only at capture; per-row envelope source/source_id/source_ts/ingestion_ts/poll metadata/untouched raw payload; dedup (source, source_id, content_hash) with edits kept as new rows (semantic-field hash, so raw-only feed churn emits no row). ingestion_ts (plant clock) is authoritative; the claimed source_ts is preserved but never gates (the 72h probe saw a ~16h stale publish-ts outlier). Curated target is curated/research/text via the standard quarantine -> promote chain (one promoter per lane); a quiet zero-item segment scores no_events and is quarantined BY DESIGN so offload accounting stays closed. Enable to activate; these are 2 of the 25 CollectorConcurrency slots.",
+      "name": "text-rss",
+      "job_type": "text-rss-worker",
+      "enabled": false,
+      "interval_seconds": 5,
+      "args": {
+        "poll_interval_seconds": 120,
+        "segment_count": 100000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "worker_name": "text-rss-worker",
+        "output_root": "G:\\market_archive\\raw\\text",
+        "ops_root": "G:\\market_archive\\ops",
+        "max_segment_seconds": 1800
+      }
+    },
+    {
+      "name": "quarantine-text-rss",
+      "job_type": "quarantine-runs",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\text\\text_rss",
+        "quarantine_root": "G:\\market_archive\\quarantine\\text\\text_rss",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "promote-text-rss",
+      "job_type": "promote-replayable",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\text\\text_rss",
+        "target_root": "G:\\market_archive\\curated\\research\\text",
+        "quarantine_index": "G:\\market_archive\\quarantine\\text\\text_rss\\_quarantine_index.jsonl",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "score-text-rss",
+      "job_type": "backfill-text-replay",
+      "enabled": false,
+      "interval_seconds": 3600,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\text\\text_rss",
+        "limit": 1000,
+        "max_age_hours": 168,
+        "min_age_hours": 1
+      }
+    },
+    {
+      "name": "text-reddit",
+      "job_type": "text-reddit-worker",
+      "enabled": false,
+      "interval_seconds": 5,
+      "args": {
+        "poll_interval_seconds": 60,
+        "request_pause_seconds": 1.0,
+        "listing_limit": 100,
+        "credentials_path": "G:\\market_archive\\ops\\reddit_app.json",
+        "segment_count": 100000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "worker_name": "text-reddit-worker",
+        "output_root": "G:\\market_archive\\raw\\text",
+        "ops_root": "G:\\market_archive\\ops",
+        "max_segment_seconds": 1800
+      }
+    },
+    {
+      "name": "quarantine-text-reddit",
+      "job_type": "quarantine-runs",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\text\\text_reddit",
+        "quarantine_root": "G:\\market_archive\\quarantine\\text\\text_reddit",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "promote-text-reddit",
+      "job_type": "promote-replayable",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\text\\text_reddit",
+        "target_root": "G:\\market_archive\\curated\\research\\text",
+        "quarantine_index": "G:\\market_archive\\quarantine\\text\\text_reddit\\_quarantine_index.jsonl",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "score-text-reddit",
+      "job_type": "backfill-text-replay",
+      "enabled": false,
+      "interval_seconds": 3600,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\text\\text_reddit",
+        "limit": 1000,
+        "max_age_hours": 168,
+        "min_age_hours": 1
+      }
+    },
+    {
+      "// text raw offload": "Separate offload job because the text lanes live under raw/text (their own raw_root), not raw/market - each offload job warns unconfigured_lane for dirs under ITS root it does not own, so mixing roots is permanent warn-noise. Same indexed gate as the market lanes: a run moves to cold only once it appears in the text promotion index or a text quarantine index. write_report=false so this secondary job never clobbers the market offload job's offload_report_latest.json that health reads.",
+      "name": "archive-offload-text",
+      "job_type": "archive-offload",
+      "enabled": false,
+      "interval_seconds": 3600,
+      "args": {
+        "raw_root": "G:\\market_archive\\raw\\text",
+        "cold_root": "D:\\market_archive_cold\\raw\\text",
+        "min_age_days": 10,
+        "limit": 200,
+        "apply": false,
+        "ops_root": "G:\\market_archive\\ops",
+        "write_report": false,
+        "lanes": [
+          {"source": "text_rss", "promotion_index": "G:\\market_archive\\curated\\research\\text\\_promotion_index.jsonl", "quarantine_index": "G:\\market_archive\\quarantine\\text\\text_rss\\_quarantine_index.jsonl"},
+          {"source": "text_reddit", "promotion_index": "G:\\market_archive\\curated\\research\\text\\_promotion_index.jsonl", "quarantine_index": "G:\\market_archive\\quarantine\\text\\text_reddit\\_quarantine_index.jsonl"}
+        ]
+      }
+    },
+    {
       "name": "archive-offload-cold",
       "job_type": "archive-offload",
       "interval_seconds": 3600,
@@ -1254,7 +1384,9 @@
           "market/bybit_perp_depth=14",
           "market/binance_perp_trades=14",
           "market/binance_perp_depth=14",
-          "market/binance_perp_funding=14"
+          "market/binance_perp_funding=14",
+          "text/text_rss=14",
+          "text/text_reddit=14"
         ],
         "apply": false
       }

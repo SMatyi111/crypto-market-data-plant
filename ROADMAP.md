@@ -8,7 +8,7 @@ changes scope or state. Companion docs:
 - [`STANDARDS.md`](STANDARDS.md) — the data contract (schemas, replayability, retention)
 - [`docs/HISTORY.md`](docs/HISTORY.md) — resolved-work narrative (what was fixed, and why)
 
-Last updated: **2026-07-13**.
+Last updated: **2026-07-16**.
 
 > **Operating mode — safe shaping (owner directive, 2026-07-04).** No extended
 > building on Claude's initiative: no new venues, lanes, or instruments, no big
@@ -186,18 +186,34 @@ owner ask (safe-shaping directive above).
     `(source, source_id, content_hash)`, edits kept as new rows; standard
     quarantine -> promote, exactly one promoter per lane; archive placement
     `raw/text/{source}/...`; volume well under 100 MB/day. Sequence:
-    **(a) P0 probe — RSS probe LIVE since 2026-07-13 ~02:19 UTC** (detached
-    scratch script `artifacts/text_probe/rss_probe.py`, 72 h cap, all 5 feeds
-    200-OK on first cycle); Reddit probe blocked on an owner-created OAuth
-    app (client id+secret dropped at `G:\market_archive\ops\reddit_app.json`,
-    outside the repo; no account password involved); **(b)** 24-48 h probe
-    readout (item rates, publish-ts honesty, edit/dedup behavior);
-    **(c)** lane build as a normal code PR (`/code-review` +
-    `/security-review`, new-lane hygiene: `-CollectorConcurrency` bump in
-    BOTH runner scripts, central `_run_segmented_worker` threading, regression
-    test for arg survival); **(d)** deploy at an owner-approved runner
-    restart; **(e)** acceptance = >=2 weeks continuous green capture,
-    `ingestion_ts` monotone, stable dedup ratios — then it accrues silently.
+    **(a) P0 probe — RSS probe DONE** (72 h, completed ~2026-07-16: 10,740
+    polls, 421 item rows = 384 new + 37 edits, zero duplicate new ids /
+    missing source-ts / future source-ts, 2 transient network errors; one
+    ~16 h stale Cointelegraph publish-ts outlier -> `ingestion_ts` is the
+    authoritative clock, claimed `source_ts` preserved + diagnosed only;
+    of the 37 edits 25 were semantic title changes and 12 raw-only feed
+    churn -> the lane hashes SEMANTIC fields only, so raw churn emits no
+    row); Reddit probe stays blocked on the owner-created OAuth app
+    (client id+secret dropped at `G:\market_archive\ops\reddit_app.json`,
+    outside the repo; no account password involved) — the lane ships
+    probe-less on the conservative defaults (~10 QPM vs the ~100 QPM
+    budget) since it cannot start without the credentials file anyway;
+    **(b)** probe readout folded into (a); **(c) DONE — lane build PR #35
+    (branch `codex/text-p1-lanes`)**: `text-rss-worker` +
+    `text-reddit-worker` job types, envelope normalizer + text quality
+    gate, `replay_text_run` verdict (`no_events` quiet segments quarantine
+    by design so offload accounting closes), `backfill-text-replay`
+    catch-up scorer (also scores event-less crash orphans — the funding
+    lesson), cross-segment dedup cursor, curated target
+    `curated/research/text`, STANDARDS v8 (§4.6), CollectorConcurrency
+    23 -> 25 in BOTH runner scripts, example-config job family
+    (enabled:false), arg-survival regression tests + mocked-network suite;
+    `/code-review` + `/security-review` run on the PR; **(d)** deploy at
+    an owner-approved runner restart (enable the text jobs in
+    `ops.live.local.json` at that point; reddit additionally needs the
+    credentials file); **(e)** acceptance = >=2 weeks continuous green
+    capture, `ingestion_ts` monotone, stable dedup ratios — then it
+    accrues silently.
 
 ## Decision queue (owner)
 

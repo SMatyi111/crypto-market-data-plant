@@ -1,7 +1,17 @@
 # Data Standards
 
-`STANDARDS_VERSION = 7`
+`STANDARDS_VERSION = 8`
 
+> **v8 (2026-07-16):** adds the **text-capture lanes** (`text-rss`, `text-reddit` —
+> ROADMAP item 15, owner-approved 2026-07-13): a new **`text` dataset** with its own
+> raw root (`raw/text/<lane>/…`), curated target (`curated/research/text`), envelope
+> schema, and replay verdict (`replay_text_run`, `mode="text_poll"`,
+> `gap_detection="none_native"`) — see §4.6. Raw text only at capture — no
+> capture-time NLP or filtering; per-row envelope `source`, `source_id`, `source_ts`
+> (platform-claimed), `ingestion_ts` (plant clock, **authoritative**), poll
+> metadata, untouched raw payload; dedup key `(source, source_id, content_hash)`
+> with edits retained as new rows. No change to the existing market/trades/funding
+> schemas, partitions, or replayability semantics.
 > **v7 (2026-06-12):** baseline-audit fixes that widen contract-visible surfaces
 > (no change to Parquet schemas or partition layout). (1) The manifest `lanes`
 > view now covers **perp lanes** (venue `<venue>_perp`) and the **`funding`**
@@ -65,7 +75,8 @@ bump `STANDARDS_VERSION` and update this file in the same change.
 
 ## 1. Datasets
 
-Three normalized datasets, each collected per (venue, market, instrument) lane:
+Three normalized **market** datasets, each collected per (venue, market,
+instrument) lane (a fourth, non-market `text` dataset is specified in §4.6):
 
 | Dataset  | Channel  | Normalizer(s)                                  | Curated target            |
 | -------- | -------- | ---------------------------------------------- | ------------------------- |
@@ -562,6 +573,89 @@ perp lanes poll REST (`binance-futures-rest-worker`), one lane per stream:
   (`none_native`: finite-positive marks, monotonic timestamps — there is no sequence
   to prove).
 
+### 4.6 Text-capture lanes (`text-rss`, `text-reddit`) — the `text` dataset
+
+Two REST-polled lane families capture public **natural-language text** (ROADMAP
+item 15, owner-approved 2026-07-13). They are NOT market data: they have their own
+dataset (`text`), raw root, curated target, and replay verdict, and none of the
+market/trades/funding semantics above apply to them.
+
+- **`text-rss`** — five fixed crypto news RSS/Atom feeds (CoinDesk, Cointelegraph,
+  The Block, Decrypt, Bitcoin Magazine), polled every 1–5 minutes with
+  **conditional GET** (`ETag` / `If-Modified-Since`), gzip tolerated. Validated by
+  the 72 h P0 probe: 10,740 polls, 421 item rows (384 new / 37 edits), zero
+  duplicate new ids, zero missing or future source timestamps, two transient
+  network errors.
+- **`text-reddit`** — a fixed subreddit list, polled read-only via a Reddit **OAuth
+  client-credentials (app-only) token**: `/r/<sub>/new` (posts) + `/r/<sub>/comments`,
+  paced ~1 s between requests (~10 QPM at the default 60 s sweep against the
+  ~100 QPM app budget). **No account password is involved anywhere**; the app
+  id/secret live in an external json outside the repo (`<ops_root>/reddit_app.json`).
+
+**Capture contract.** Raw text only — no capture-time NLP, sentiment, or keyword
+filtering beyond the fixed source list itself. Every clean row carries the
+envelope: `source` (lane family: `rss`/`reddit`), `product` (feed key /
+subreddit), `channel="text"`, `event_type` (`new`/`edit`), `source_id` (guid/link
+or reddit fullname), `source_ts` (**platform-claimed** publish/create time),
+`ingestion_ts` (**plant clock — the authoritative time axis**; mirrored as
+`received_at` so the parquet `event_date` partition derives from ingestion, never
+from the claim and never from promotion time), `content_hash`, `raw_item` (the
+untouched raw payload: the XML item fragment / the reddit child JSON as a string),
+and poll metadata (`metadata.poll`: poll_seq, http_status, latency_ms, feed
+url/listing).
+
+**Dedup & edits.** The dedup key is `(source, source_id, content_hash)`. The
+`content_hash` is computed over the item's **semantic fields only** (RSS: title,
+link, summary; reddit: title+selftext / comment body), so raw-only feed churn
+(attribute noise, whitespace, tracking params outside those fields) emits **no
+row**, while every semantic edit is retained as a new row with `event_type="edit"`
+and the same `source_id` (the probe's 37 edits split 25 semantic vs 12 raw-only).
+A content revert (A→B→A) legitimately re-emits an earlier key; the scorer reports
+it (`duplicate_envelope_keys`, non-gating) and exact-once readers should keep the
+latest `ingestion_ts` per key. The seen-map cursor is persisted OUTSIDE the run-dir
+tree (`raw/text/_cursors/`) and advances only after a segment's clean events are
+durably closed — **at-least-once**: a crash re-emits a bounded window as duplicate
+rows (absorbed by the key at read time), never a gap.
+
+**Layout.** Runs: `raw/text/<lane>/<YYYYMMDD_HHMMSS>/…` with the standard §2.1
+run-dir shape (`text_rss`, `text_reddit`). Curated:
+`curated/research/text/schema_version=v2/source=<rss|reddit>/instrument=<feed-or-subreddit>/event_date=<ingestion date>/`
+— the same v2 partition key set as every other dataset (the `instrument` slot
+carries the feed key / subreddit). Quarantine: `quarantine/text/<lane>/…`. No
+hot-path normalized parquet by default (curated comes from the promote job; config
+can opt in).
+
+**`replayable` (verdict `replay_text_run`, `mode="text_poll"`,
+`gap_detection="none_native"`)** iff **all** hold:
+
+- `event_count > 0`
+- every row carries the full dedup envelope (`source_id`, `content_hash`,
+  parseable `ingestion_ts`) — findings `missing_envelope_fields`
+- `ingestion_ts` is monotonic non-decreasing (it is the plant's own clock, so a
+  violation is a real collector/clock defect) — finding `non_monotonic_ingestion_ts`
+
+Reported, **non-gating** diagnostics: `duplicate_envelope_keys` (reverts),
+`missing_source_ts` / `unparseable_source_ts`, and the source-clock honesty pair
+`stale_source_ts` (ingestion lag > 1 h by default) / `future_source_ts` (claim
+ahead of ingestion by > 5 min), plus `max_source_lag_seconds`. The probe's ~16 h
+stale Cointelegraph publish timestamp is exactly why these never block: the claim
+is preserved verbatim, the plant clock is authoritative.
+
+**Empty segments are quarantined by design.** A quiet poll window legitimately
+captures zero items; the segment still writes a `no_events` replay summary (even
+when no clean events file exists), scores unreplayable, and is quarantined —
+nothing is lost, and every text run ends **either promoted or quarantined**, so
+the offload accounting never strands an unaccounted orphan (the funding-lane
+lesson). The hourly `backfill-text-replay` catch-up job scores crash-orphaned runs
+the same way (`require_events=False`) but never touches runs younger than its
+`min_age_hours` floor (default 1 h, 2× the live segment length) — scoring a run
+the collector is still writing would mint a premature verdict that the
+quarantine/promote jobs act on permanently.
+
+Text lanes are **not** part of the market research manifest (§6), which discovers
+lanes from `raw/market` only; consumers read `curated/research/text` directly and
+join as-of on `ingestion_ts`.
+
 ---
 
 ## 5. Live quality gate (pre-replay)
@@ -587,7 +681,9 @@ segment-start replays, is quarantined. Replayed prints always remain in raw and
 in quarantine. Health excludes this reason from the high-quarantine-ratio alarm).
 
 The gate is a fast online filter; §4 replay is the authoritative, whole-run
-verdict that gates promotion.
+verdict that gates promotion. (The text lanes run their own envelope-integrity
+gate instead — `missing_source_id` / `missing_content_hash` / `missing_raw_item` /
+`unknown_event_type`, and deliberately **no** staleness reason — see §4.6.)
 
 ---
 
@@ -634,9 +730,11 @@ verdict that gates promotion.
 
 ## 7. Retention
 
-- **Raw** (`raw/market/<src>`): default **14 days**, overridable per dataset via
-  the cleanup job's `raw_policy` (`market/<src>=<days>`). Raw is the rebuild
-  source; keep it long enough to re-promote after a logic fix.
+- **Raw** (`raw/market/<src>`, `raw/text/<src>`): default **14 days**, overridable
+  per dataset via the cleanup job's `raw_policy` (`market/<src>=<days>`,
+  `text/<src>=<days>`). Raw is the rebuild source; keep it long enough to
+  re-promote after a logic fix. Text lanes offload through their own
+  `archive-offload` job (own `raw_root`) with the same indexed gate.
 - **Raw cold tier**: aged raw runs are **verify-moved** (not deleted) to
   `D:\market_archive_cold` by the `archive-offload` ops job. The job-level
   offload age defaults to 14 days and may be overridden per lane; the live

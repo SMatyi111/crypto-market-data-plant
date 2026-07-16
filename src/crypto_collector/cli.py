@@ -54,6 +54,21 @@ from .collectors.binance_futures_rest import (
     write_aggtrades_cursor,
 )
 from .collectors.rest_poll import RestPollingCollector
+from .collectors.text_feeds import (
+    DEFAULT_RSS_FEEDS,
+    DEFAULT_SEEN_CAP,
+    DEFAULT_REDDIT_SUBREDDITS,
+    RedditAppAuth,
+    TextPollState,
+    default_reddit_credentials_path,
+    durable_seen_snapshot,
+    make_reddit_poll,
+    make_rss_poll,
+    read_reddit_credentials,
+    read_text_seen,
+    text_seen_path,
+    write_text_seen,
+)
 from .config import (
     CollectorConfig,
     default_archive_root,
@@ -61,6 +76,7 @@ from .config import (
     default_normalized_root,
     default_ops_root,
     default_output_root,
+    default_text_output_root,
 )
 from .market_normalizers import (
     BinanceDepthNormalizer,
@@ -106,6 +122,7 @@ from .offload import (
 )
 from .promotion import promote_replayable_runs
 from .quality import MetadataQualityGate, QualityGate
+from .text_normalizers import TextItemNormalizer, TextQualityGate
 from .quarantine import quarantine_bad_runs
 from .replay import (
     backfill_replay_summaries,
@@ -113,6 +130,7 @@ from .replay import (
     replay_depth_run,
     replay_depth_stream_run,
     replay_funding_run,
+    replay_text_run,
     replay_trades_run,
     replay_trades_stream_run,
 )
@@ -155,6 +173,59 @@ def _fsync_intervals(args: argparse.Namespace) -> tuple[int, float]:
         DEFAULT_FSYNC_INTERVAL_EVENTS if events is None else int(events),
         DEFAULT_FSYNC_INTERVAL_MS if ms is None else float(ms),
     )
+
+
+
+def _add_text_worker_common_args(
+    parser: argparse.ArgumentParser, *, default_worker_name: str
+) -> None:
+    """Shared per-lane knobs of the two text-capture workers. One definition site on
+    purpose: parallel hand-maintained enumerations of the same fields are exactly the
+    drift class that silently dropped `market`/`jsonl_fsync` from the market lanes
+    (CLAUDE.md hard rule). Lane-specific args (--feed / --subreddit / auth / pacing /
+    --poll-interval-seconds defaults) stay on the individual parsers."""
+    parser.add_argument(
+        "--stale-source-lag-seconds",
+        type=float,
+        default=3600.0,
+        help="Freshness diagnostic threshold: items whose platform-claimed source_ts "
+        "trails ingestion_ts by more than this count as stale_source_ts in the "
+        "replay summary. Reported, NEVER gating - the 72h probe saw a ~16h stale "
+        "Cointelegraph outlier on an otherwise-good item; ingestion_ts stays the "
+        "authoritative clock.",
+    )
+    parser.add_argument(
+        "--seen-cap",
+        type=int,
+        default=DEFAULT_SEEN_CAP,
+        help="Max (source_id -> content_hash) dedup entries persisted across segments.",
+    )
+    parser.add_argument("--segment-count", type=int, default=5000)
+    parser.add_argument("--max-segments", type=int)
+    parser.add_argument("--cooldown-seconds", type=float, default=1.0)
+    parser.add_argument("--output-root", type=Path, default=default_text_output_root())
+    parser.add_argument("--ops-root", type=Path, default=default_ops_root())
+    parser.add_argument("--worker-name", default=default_worker_name)
+    parser.add_argument("--heartbeat-interval-seconds", type=float, default=30.0)
+    parser.add_argument(
+        "--source-suffix",
+        default="",
+        help="Optional lane suffix. When non-empty, runs go to "
+        "<output_root>/<lane>_<suffix>/ instead of <lane>/.",
+    )
+    parser.add_argument("--rotate-at-midnight", action="store_true")
+    parser.add_argument(
+        "--no-jsonl-fsync", action="store_false", dest="jsonl_fsync", default=True
+    )
+    parser.add_argument(
+        "--normalized-parquet",
+        action="store_true",
+        default=False,
+        help="Opt IN to hot-path normalized parquet for this lane. Text default is "
+        "OFF: curated parquet comes from the promote job, and an always-on "
+        "normalized tree is an unmanaged-growth surface for zero consumer benefit.",
+    )
+    _add_fsync_batching_args(parser)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -760,6 +831,70 @@ def build_parser() -> argparse.ArgumentParser:
         "messages. See the depth worker's help text for the same flag.",
     )
 
+
+    text_rss_parser = subparsers.add_parser(
+        "text-rss-worker",
+        help="Run segmented crypto-news RSS/Atom text capture (conditional-GET "
+        "polling). Raw text only at capture; per-row envelope + (source, source_id, "
+        "content_hash) dedup per the STANDARDS text section.",
+    )
+    text_rss_parser.add_argument(
+        "--feed",
+        action="append",
+        dest="feeds_kv",
+        metavar="NAME=URL",
+        default=None,
+        help="Feed to poll as name=url; repeat per feed. Default: the five "
+        "probe-validated P1 crypto news feeds (see collectors.text_feeds).",
+    )
+    text_rss_parser.add_argument(
+        "--poll-interval-seconds",
+        type=float,
+        default=120.0,
+        help="Seconds between poll sweeps across all feeds (contract: 1-5 min; "
+        "conditional GET keeps an unchanged feed nearly free).",
+    )
+    _add_text_worker_common_args(text_rss_parser, default_worker_name="text-rss-worker")
+
+    text_reddit_parser = subparsers.add_parser(
+        "text-reddit-worker",
+        help="Run segmented reddit text capture: read-only OAuth client-credentials "
+        "(app-only) polling of /new posts + comments for a fixed subreddit list. "
+        "No account password anywhere; the app id/secret json lives OUTSIDE the repo.",
+    )
+    text_reddit_parser.add_argument(
+        "--subreddit",
+        action="append",
+        dest="subreddits",
+        default=None,
+        help="Subreddit to poll; repeat per subreddit. Default: the owner-approved "
+        "fixed P1 list (see collectors.text_feeds).",
+    )
+    text_reddit_parser.add_argument(
+        "--credentials-path",
+        type=Path,
+        default=None,
+        help="Path to the external OAuth app credentials json (client_id, "
+        "client_secret, optional user_agent). Default: <ops_root>/reddit_app.json. "
+        "The file never lives inside the repo.",
+    )
+    text_reddit_parser.add_argument(
+        "--poll-interval-seconds",
+        type=float,
+        default=60.0,
+        help="Seconds between poll sweeps. 5 subs x 2 listings at the default pause "
+        "is ~10 requests/min against the ~100 QPM app budget - conservative by "
+        "construction.",
+    )
+    text_reddit_parser.add_argument(
+        "--request-pause-seconds",
+        type=float,
+        default=1.0,
+        help="Pause between consecutive listing requests within one sweep.",
+    )
+    text_reddit_parser.add_argument("--listing-limit", type=int, default=100)
+    _add_text_worker_common_args(text_reddit_parser, default_worker_name="text-reddit-worker")
+
     kalshi_discover_parser = subparsers.add_parser(
         "kalshi-discover-crypto",
         help="Discover public Kalshi BTC/ETH crypto binary series and open markets",
@@ -953,6 +1088,32 @@ def build_parser() -> argparse.ArgumentParser:
         "(Binance/Coinbase/Kraken).",
     )
     backfill_trades_parser.add_argument("--format", choices=["json", "text"], default="text")
+
+
+    backfill_text_parser = subparsers.add_parser(
+        "backfill-text-replay",
+        help="Backfill missing replay summaries for a TEXT lane using the text "
+        "scorer. Unlike the market backfills this also scores runs with NO clean "
+        "events (a quiet poll window is legitimate), so no text run can strand as "
+        "a permanent unaccounted offload orphan.",
+    )
+    backfill_text_parser.add_argument(
+        "--source-root", type=Path, default=default_text_output_root() / "text_rss"
+    )
+    backfill_text_parser.add_argument("--limit", type=int, default=50)
+    backfill_text_parser.add_argument("--max-age-hours", type=float, default=24.0)
+    backfill_text_parser.add_argument("--overwrite", action="store_true")
+    backfill_text_parser.add_argument(
+        "--min-age-hours",
+        type=float,
+        default=1.0,
+        help="Skip runs younger than this (the collector may still be writing "
+        "them). Scoring a LIVE run mints a premature summary that the quarantine/"
+        "promote jobs act on - a permanent wrong verdict. Keep comfortably above "
+        "the lane's max_segment_seconds.",
+    )
+    backfill_text_parser.add_argument("--stale-source-lag-seconds", type=float, default=3600.0)
+    backfill_text_parser.add_argument("--format", choices=["json", "text"], default="text")
 
     quarantine_parser = subparsers.add_parser("quarantine-runs", help="Quarantine unreplayable depth runs")
     quarantine_parser.add_argument("--source-root", type=Path, default=default_archive_root() / "raw" / "market" / "binance_depth")
@@ -2500,6 +2661,187 @@ def run_mexc_depth_worker(args: argparse.Namespace) -> None:
     )
 
 
+
+def _text_feeds_mapping(args: argparse.Namespace) -> dict[str, str]:
+    """Resolve the RSS feed set: an ops-config dict (`feeds`), CLI `--feed NAME=URL`
+    pairs (`feeds_kv`), or the fixed probe-validated P1 default set."""
+    configured = getattr(args, "feeds", None)
+    if isinstance(configured, dict) and configured:
+        return {str(name): str(url) for name, url in configured.items()}
+    pairs = getattr(args, "feeds_kv", None)
+    if pairs:
+        feeds: dict[str, str] = {}
+        for pair in pairs:
+            name, sep, url = str(pair).partition("=")
+            if not sep or not name.strip() or not url.strip():
+                raise ValueError(f"--feed must be NAME=URL, got: {pair!r}")
+            feeds[name.strip()] = url.strip()
+        return feeds
+    return dict(DEFAULT_RSS_FEEDS)
+
+
+async def _collect_text_segment(args: argparse.Namespace, *, family: str) -> dict[str, object]:
+    """One text-capture segment (family = "rss" | "reddit"): REST poll loop ->
+    envelope normalization -> envelope-integrity gate -> raw/clean/quarantine JSONL
+    -> inline text replay verdict. The (source_id -> content_hash) dedup cursor is
+    persisted OUTSIDE the run-dir tree and only AFTER the pipeline durably closed
+    the clean sink, so a crash re-emits a bounded window (duplicate rows the dedup
+    key absorbs at read time), never a gap - the aggTrades cursor posture."""
+    source_name = _build_source_name(f"text_{family}", getattr(args, "source_suffix", ""))
+    output_root = Path(args.output_root)
+    seen_path = text_seen_path(output_root, source_name)
+    initial_seen = read_text_seen(seen_path)
+    state = TextPollState(seen=dict(initial_seen))
+    if family == "rss":
+        poll = make_rss_poll(_text_feeds_mapping(args), state)
+    else:
+        credentials_path = getattr(args, "credentials_path", None)
+        credentials = read_reddit_credentials(
+            Path(credentials_path) if credentials_path else default_reddit_credentials_path()
+        )
+        subreddits = list(getattr(args, "subreddits", None) or DEFAULT_REDDIT_SUBREDDITS)
+        poll = make_reddit_poll(
+            subreddits,
+            state,
+            RedditAppAuth(credentials),
+            listing_limit=int(getattr(args, "listing_limit", 100)),
+            request_pause_seconds=float(getattr(args, "request_pause_seconds", 1.0)),
+        )
+    collector = RestPollingCollector(
+        source=family,
+        poll=poll,
+        poll_interval_seconds=float(getattr(args, "poll_interval_seconds", 120.0)),
+        # The collector needs its own deadline: the pipeline checks the segment
+        # deadline only after a yielded frame, and a quiet news window legitimately
+        # yields nothing for whole sweeps - without this the segment never rotates.
+        deadline_utc=getattr(args, "deadline_utc", None),
+    )
+    run_paths = prepare_run_paths(output_root=output_root, source=source_name)
+    fsync_events, fsync_ms = _fsync_intervals(args)
+    # Normalized parquet defaults OFF for text (see the parser help + _job_args):
+    # curated parquet comes from the promote job reading clean events, and an
+    # always-on normalized tree would be a new unmanaged-growth surface (the Kalshi
+    # normalized lesson) for zero consumer benefit at this volume.
+    normalized_parquet = bool(getattr(args, "normalized_parquet", False))
+    pipeline = CollectorPipeline(
+        collector=collector,
+        normalizer=TextItemNormalizer(source=family),
+        quality_gate=TextQualityGate(),
+        run_paths=run_paths,
+        normalized_root=_resolve_normalized_root(args, "text") if normalized_parquet else None,
+        jsonl_fsync=bool(getattr(args, "jsonl_fsync", True)),
+        fsync_interval_events=fsync_events,
+        fsync_interval_ms=fsync_ms,
+    )
+    pipeline_summary = await pipeline.run(
+        limit=args.count, deadline_utc=getattr(args, "deadline_utc", None)
+    )
+    # ALWAYS write the replay verdict, even for a zero-item quiet window: an
+    # unscored run is exactly how the funding lane mints a permanent unaccounted
+    # offload orphan per restart. An empty run scores no_events/unreplayable and is
+    # quarantined (nothing is lost - there is nothing in it), so the promotion /
+    # quarantine / offload accounting always closes.
+    replay_summary = replay_text_run(
+        run_paths.base,
+        stale_source_lag_seconds=float(getattr(args, "stale_source_lag_seconds", 3600.0)),
+        write_summary=True,
+    )
+    # Persist only the DURABLE dedup state: the cursor loaded at segment start,
+    # recency refreshes for unchanged sightings, and the rows actually written to
+    # clean events. The in-memory map can run ahead of the files when a segment
+    # ends mid-batch, and persisting an unwritten hash would turn the promised
+    # bounded duplicate into a permanent gap.
+    write_text_seen(
+        seen_path,
+        durable_seen_snapshot(initial_seen, state.refreshed, run_paths.clean / "events.jsonl"),
+        cap=int(getattr(args, "seen_cap", DEFAULT_SEEN_CAP)),
+    )
+    return {
+        "raw_messages": pipeline_summary.raw_messages,
+        "clean_events": pipeline_summary.clean_events,
+        "quarantined_events": pipeline_summary.quarantined_events,
+        "run_path": str(run_paths.base),
+        "replayable": replay_summary.replayable,
+        "replay_findings": list(replay_summary.findings),
+        "replay_summary_path": replay_summary.summary_path,
+        "new_items": state.new_count,
+        "edit_items": state.edit_count,
+        "poll_errors": state.error_count,
+        "deadline_reached": bool(pipeline_summary.deadline_reached),
+        "idle_timeout_count": collector.idle_timeout_count,
+    }
+
+
+async def collect_text_rss_segment(args: argparse.Namespace) -> dict[str, object]:
+    return await _collect_text_segment(args, family="rss")
+
+
+async def collect_text_reddit_segment(args: argparse.Namespace) -> dict[str, object]:
+    return await _collect_text_segment(args, family="reddit")
+
+
+def _text_progress_message(family: str):
+    def progress(segment_index: int, summary: dict) -> str:
+        return (
+            f"text {family} segment finished: "
+            f"segment={segment_index} clean_events={summary['clean_events']} "
+            f"new={summary.get('new_items')} edits={summary.get('edit_items')} "
+            f"poll_errors={summary.get('poll_errors')} "
+            f"replayable={summary.get('replayable')} run_path={summary['run_path']}"
+        )
+
+    return progress
+
+
+def run_text_rss_worker(args: argparse.Namespace) -> None:
+    _run_segmented_worker(
+        args=args,
+        default_worker_name="text-rss-worker",
+        worker_type="text-rss-worker",
+        venue="rss",
+        build_segment_args=lambda source_args: SimpleNamespace(
+            # Raw passthrough (config dict and/or CLI NAME=URL pairs); resolved
+            # exactly once, inside the segment, so both entry points share one
+            # resolution path.
+            feeds=getattr(source_args, "feeds", None),
+            feeds_kv=getattr(source_args, "feeds_kv", None),
+            poll_interval_seconds=getattr(source_args, "poll_interval_seconds", 120.0),
+            stale_source_lag_seconds=getattr(source_args, "stale_source_lag_seconds", 3600.0),
+            seen_cap=getattr(source_args, "seen_cap", DEFAULT_SEEN_CAP),
+            count=source_args.segment_count,
+            output_root=source_args.output_root,
+            source_suffix=getattr(source_args, "source_suffix", ""),
+            deadline_utc=None,  # _run_segmented_worker overrides this when rotate_at_midnight is set
+        ),
+        collect_segment=collect_text_rss_segment,
+        progress_message=_text_progress_message("rss"),
+    )
+
+
+def run_text_reddit_worker(args: argparse.Namespace) -> None:
+    _run_segmented_worker(
+        args=args,
+        default_worker_name="text-reddit-worker",
+        worker_type="text-reddit-worker",
+        venue="reddit",
+        build_segment_args=lambda source_args: SimpleNamespace(
+            subreddits=getattr(source_args, "subreddits", None),
+            credentials_path=getattr(source_args, "credentials_path", None),
+            request_pause_seconds=getattr(source_args, "request_pause_seconds", 1.0),
+            listing_limit=getattr(source_args, "listing_limit", 100),
+            poll_interval_seconds=getattr(source_args, "poll_interval_seconds", 60.0),
+            stale_source_lag_seconds=getattr(source_args, "stale_source_lag_seconds", 3600.0),
+            seen_cap=getattr(source_args, "seen_cap", DEFAULT_SEEN_CAP),
+            count=source_args.segment_count,
+            output_root=source_args.output_root,
+            source_suffix=getattr(source_args, "source_suffix", ""),
+            deadline_utc=None,  # _run_segmented_worker overrides this when rotate_at_midnight is set
+        ),
+        collect_segment=collect_text_reddit_segment,
+        progress_message=_text_progress_message("reddit"),
+    )
+
+
 def _segment_deadline_utc(
     started_at: datetime,
     *,
@@ -2536,7 +2878,9 @@ def _run_segmented_worker(
         worker_name=worker_name,
         worker_type=worker_type,
         venue=venue,
-        symbol=str(args.symbol).upper(),
+        # Text lanes poll a fixed multi-feed set, so they carry no venue symbol;
+        # "MULTI" keeps the heartbeat shape uniform for health/history readers.
+        symbol=str(getattr(args, "symbol", "MULTI")).upper(),
         heartbeat_interval_seconds=float(getattr(args, "heartbeat_interval_seconds", 30.0)),
     )
     completed_segments = 0
@@ -2799,6 +3143,12 @@ def _execute_ops_job_inprocess(job: JobSpec) -> JobExecutionResult | str | None:
     if job.job_type == "mexc-depth-worker":
         run_mexc_depth_worker(args)
         return "mexc depth worker completed"
+    if job.job_type == "text-rss-worker":
+        run_text_rss_worker(args)
+        return "text rss worker completed"
+    if job.job_type == "text-reddit-worker":
+        run_text_reddit_worker(args)
+        return "text reddit worker completed"
     if job.job_type == "kalshi-discover-crypto":
         run_kalshi_discover_crypto(args)
         return "kalshi crypto discovery completed"
@@ -2817,6 +3167,9 @@ def _execute_ops_job_inprocess(job: JobSpec) -> JobExecutionResult | str | None:
     if job.job_type == "backfill-trades-replay":
         run_backfill_trades_replay(args)
         return "backfill trades replay completed"
+    if job.job_type == "backfill-text-replay":
+        run_backfill_text_replay(args)
+        return "backfill text replay completed"
     if job.job_type == "backfill-stream-depth":
         run_backfill_stream_depth(args)
         return "backfill stream depth completed"
@@ -2852,6 +3205,31 @@ def _execute_ops_job_inprocess(job: JobSpec) -> JobExecutionResult | str | None:
 # catches genuine clock skew. Tighten back toward 60s once on faster storage (NVMe), which
 # removes the backlog at the source. Config can still override per lane via max_delay_ms.
 _TRADES_STALE_WINDOW_MS = 900_000
+
+
+
+def _text_common_job_args(raw_args: dict, *, default_worker_name: str) -> dict:
+    """Shared _job_args fields of the two text-capture workers - single definition
+    site for the same anti-drift reason as _add_text_worker_common_args."""
+    return {
+        "stale_source_lag_seconds": raw_args.get("stale_source_lag_seconds", 3600.0),
+        "seen_cap": raw_args.get("seen_cap", DEFAULT_SEEN_CAP),
+        "segment_count": raw_args.get("segment_count", 5000),
+        "max_segments": raw_args.get("max_segments"),
+        "cooldown_seconds": raw_args.get("cooldown_seconds", 1.0),
+        "output_root": raw_args.get("output_root", default_text_output_root()),
+        "ops_root": Path(raw_args.get("ops_root", default_ops_root())),
+        "normalized_root": raw_args.get("normalized_root"),
+        "worker_name": raw_args.get("worker_name", default_worker_name),
+        "heartbeat_interval_seconds": raw_args.get("heartbeat_interval_seconds", 30.0),
+        "jsonl_fsync": raw_args.get("jsonl_fsync", True),
+        # Text default: NO hot-path normalized parquet - curated comes from the
+        # promote job, and an always-on normalized tree is an unmanaged-growth
+        # surface (the Kalshi lesson) for zero benefit. Config can opt in.
+        "normalized_parquet": raw_args.get("normalized_parquet", False),
+        "source_suffix": raw_args.get("source_suffix", ""),
+        "rotate_at_midnight": raw_args.get("rotate_at_midnight", False),
+    }
 
 
 def _job_args(job: JobSpec) -> SimpleNamespace:
@@ -3170,6 +3548,25 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             # CollectorConfig.idle_timeout_seconds). Honored by the generic-WS lanes.
             idle_timeout_seconds=raw_args.get("idle_timeout_seconds", 0.0),
         )
+    if job.job_type == "text-rss-worker":
+        return SimpleNamespace(
+            # dict of {name: url}; None -> the fixed probe-validated P1 default set.
+            feeds=raw_args.get("feeds"),
+            poll_interval_seconds=raw_args.get("poll_interval_seconds", 120.0),
+            **_text_common_job_args(raw_args, default_worker_name="text-rss-worker"),
+        )
+    if job.job_type == "text-reddit-worker":
+        return SimpleNamespace(
+            # list of subreddit names; None -> the owner-approved fixed P1 list.
+            subreddits=raw_args.get("subreddits"),
+            # External OAuth app credentials json (client_id/client_secret, no
+            # account password); None -> <ops_root>/reddit_app.json.
+            credentials_path=raw_args.get("credentials_path"),
+            request_pause_seconds=raw_args.get("request_pause_seconds", 1.0),
+            listing_limit=raw_args.get("listing_limit", 100),
+            poll_interval_seconds=raw_args.get("poll_interval_seconds", 60.0),
+            **_text_common_job_args(raw_args, default_worker_name="text-reddit-worker"),
+        )
     if job.job_type == "kalshi-discover-crypto":
         return SimpleNamespace(
             category=raw_args.get("category", DEFAULT_KALSHI_CATEGORY),
@@ -3218,6 +3615,22 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             max_age_hours=raw_args.get("max_age_hours", 24.0),
             overwrite=raw_args.get("overwrite", False),
             stream=raw_args.get("stream", False),
+            format=raw_args.get("format", "text"),
+        )
+    if job.job_type == "backfill-text-replay":
+        # Text scorer - write replay summaries only, never promote (single-promoter
+        # rule). require_events=False downstream: quiet zero-item runs get a
+        # no_events summary instead of stranding unaccounted.
+        return SimpleNamespace(
+            source_root=Path(raw_args.get("source_root", default_text_output_root() / "text_rss")),
+            limit=raw_args.get("limit", 50),
+            max_age_hours=raw_args.get("max_age_hours", 24.0),
+            overwrite=raw_args.get("overwrite", False),
+            # Never score the run the collector may still be writing (a premature
+            # summary gets acted on by the 300s quarantine/promote jobs and the
+            # wrong verdict is permanent). 1h floor = 2x the 1800s live segments.
+            min_age_hours=raw_args.get("min_age_hours", 1.0),
+            stale_source_lag_seconds=raw_args.get("stale_source_lag_seconds", 3600.0),
             format=raw_args.get("format", "text"),
         )
     if job.job_type == "backfill-stream-depth":
@@ -3571,6 +3984,34 @@ def run_backfill_trades_replay(args: argparse.Namespace) -> None:
         max_age_hours=args.max_age_hours,
         overwrite=args.overwrite,
         replay_fn=replay_fn,
+    )
+    if args.format == "json":
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+        return
+    print(f"status={report.status}")
+    print(f"created_count={report.created_count}")
+    print(f"updated_count={report.updated_count}")
+    print(f"skipped_count={report.skipped_count}")
+    print(f"failed_count={report.failed_count}")
+    print(f"findings={','.join(report.findings) if report.findings else 'none'}")
+
+
+def run_backfill_text_replay(args: argparse.Namespace) -> None:
+    report = backfill_replay_summaries(
+        args.source_root,
+        limit=args.limit,
+        max_age_hours=args.max_age_hours,
+        overwrite=args.overwrite,
+        replay_fn=lambda run_dir, write_summary=True: replay_text_run(
+            run_dir,
+            stale_source_lag_seconds=float(getattr(args, "stale_source_lag_seconds", 3600.0)),
+            write_summary=write_summary,
+        ),
+        # Also score runs with NO clean events: a quiet poll window is a legitimate
+        # text run and must end up scored (no_events -> quarantined), not stranded
+        # as a permanent unaccounted offload orphan (the funding-lane lesson).
+        require_events=False,
+        min_age_hours=float(getattr(args, "min_age_hours", 1.0)),
     )
     if args.format == "json":
         print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
@@ -4227,6 +4668,10 @@ def main() -> None:
         run_mexc_trades_worker(args)
     elif args.command == "mexc-depth-worker":
         run_mexc_depth_worker(args)
+    elif args.command == "text-rss-worker":
+        run_text_rss_worker(args)
+    elif args.command == "text-reddit-worker":
+        run_text_reddit_worker(args)
     elif args.command == "kalshi-discover-crypto":
         run_kalshi_discover_crypto(args)
     elif args.command == "kalshi-collect-crypto-quotes":
@@ -4253,6 +4698,8 @@ def main() -> None:
         run_backfill_replay(args)
     elif args.command == "backfill-trades-replay":
         run_backfill_trades_replay(args)
+    elif args.command == "backfill-text-replay":
+        run_backfill_text_replay(args)
     elif args.command == "backfill-stream-depth":
         run_backfill_stream_depth(args)
     elif args.command == "quarantine-runs":

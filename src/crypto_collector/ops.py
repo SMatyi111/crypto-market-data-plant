@@ -41,6 +41,11 @@ COLLECTOR_JOB_TYPES: frozenset[str] = frozenset(
         "mexc-trades-worker",
         "mexc-depth-worker",
         "binance-futures-rest-worker",
+        # Text-capture P1 lanes (ROADMAP item 15): REST-polled, low-volume, but
+        # pool-dispatched like every other lane so a hung HTTP call can never block
+        # the scheduler thread (the 2026-06-11 kalshi lesson).
+        "text-rss-worker",
+        "text-reddit-worker",
         # Kalshi REST jobs run in the POOL (subprocess + timeout), NOT the scheduler
         # thread: on 2026-06-11 an in-scheduler kalshi-collect hung inside an HTTP
         # call at boot (urlopen's timeout does not cover DNS/proxy resolution) and
