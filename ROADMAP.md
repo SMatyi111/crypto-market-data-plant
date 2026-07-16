@@ -264,6 +264,22 @@ owner ask (safe-shaping directive above).
     (evidence in the 07-16 audit stamp above). Still unexercised: a quiet
     zero-item segment (`no_events` -> quarantine-by-design) and the
     2026-07-26 text offload wiring (dated check).
+    **(f) P2 source feasibility DONE (docs-only, 2026-07-16)** —
+    [`docs/text_source_p2_feasibility.md`](docs/text_source_p2_feasibility.md):
+    primary-source decision matrix (auth / cost / rate limits / terms /
+    retention-deletion-edit semantics / timestamps incl. `availability_ts` /
+    volume / bounded P0 probes / go-no-go) for Farcaster, official project
+    sources (GitHub releases, Discourse governance, Snapshot, project blogs),
+    YouTube, and X. Evidence revised the hypothesized order: **official
+    sources first** (keyless, $0, terms-clean — probe-ready), **Farcaster
+    second** (no public keyless read endpoint exists; needs an owner unlock:
+    free hosted-API account+key vs ~2 TB dedicated node), **YouTube parked**
+    (third-party transcript text has no permitted path; the API's 30-day
+    refresh-or-delete storage rule conflicts with indefinite accrual),
+    **X standing NO-GO** (pay-per-use $0.005/post read since 2026-02-06, no
+    free read tier, 24 h deletion/edit-propagation duty for stored content).
+    No probe, lane, config, account, or key was created; probes are
+    owner-gated — see Decision queue.
 
 ## Decision queue (owner)
 
@@ -271,6 +287,20 @@ Decisions waiting on the owner; agents must not act on these without an explicit
 (see `CLAUDE.md` Governance):
 
 
+- **Text-capture P2 probes (from the 2026-07-16 feasibility doc — see
+  `docs/text_source_p2_feasibility.md` §7; none urgent, no rationale here per
+  the public-safe contract).** Four calls: (1) approve the 72 h keyless
+  official-sources P0 probe ($0, no accounts — GitHub releases Atom+API,
+  3-5 Discourse governance forums, Snapshot GraphQL, project-blog feeds;
+  recommended yes); (2) Farcaster read-path unlock — free hosted-API
+  account+key for the probe (recommended) vs dedicated ~2 TB node hardware
+  vs defer (no public keyless endpoint exists); (3) YouTube storage-rule
+  posture before any key/probe (30-day refresh-or-delete vs indefinite
+  accrual; recommended default = keyless-feed-metadata-only or defer —
+  transcript text of third-party videos has no permitted path); (4) X —
+  acknowledge the standing NO-GO at current terms (pay-per-read, no free
+  read tier, 24 h deletion propagation; corrects the 2026-07-12 local-doc
+  access summary). Probes run only on explicit OK.
 - **D:\market_archive legacy history** — retention vs. merge (open item 1 above).
   Owner deferred 2026-06-11: stays read-only until research needs pre-cutover dates.
 - **2026-06-13 modelling data-collection handoff (strategy-sensitive — ALL
