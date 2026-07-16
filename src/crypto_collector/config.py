@@ -19,7 +19,10 @@ DEFAULT_ARCHIVE_ROOT = Path(r"G:\market_archive")
 # in STANDARDS.md (repo root); bump both together when the schema, partition
 # layout, or the definition of "replayable" changes. The research manifest tags
 # its output with this so downstream readers can pin to a known contract.
-STANDARDS_VERSION = 7
+# v8 (2026-07-16): text-capture lanes (text-rss / text-reddit) - new `text`
+# dataset under raw/text + curated/research/text with its own envelope schema and
+# `replay_text_run` verdict; existing market/trades/funding surfaces unchanged.
+STANDARDS_VERSION = 8
 
 _FALLBACK_WARNED: set[str] = set()
 
@@ -130,6 +133,27 @@ def default_output_root() -> Path:
     if archive_root is not None:
         return archive_root / "raw" / "market"
     chosen = DEFAULT_MARKET_OUTPUT_ROOT if DEFAULT_ARCHIVE_ROOT.exists() else Path("data")
+    _warn_implicit_fallback(_OUTPUT_ENV, chosen)
+    return chosen
+
+
+def default_text_output_root() -> Path:
+    """Raw root for the text-capture lanes: `<archive>/raw/text` (STANDARDS "text"
+    section), the sibling dataset dir of the market lanes' `<archive>/raw/market`.
+    Follows the same env-override chain as `default_output_root` so a disk
+    migration or test harness moves both together; an explicit OUTPUT_ROOT names
+    the market raw dir, so text is derived as its `raw/text` sibling."""
+    configured = os.environ.get(_OUTPUT_ENV[0]) or os.environ.get(_OUTPUT_ENV[1])
+    if configured:
+        return Path(configured).parent / "text"
+    archive_root = _configured_archive_root()
+    if archive_root is not None:
+        return archive_root / "raw" / "text"
+    chosen = (
+        DEFAULT_ARCHIVE_ROOT / "raw" / "text"
+        if DEFAULT_ARCHIVE_ROOT.exists()
+        else Path("data_text")
+    )
     _warn_implicit_fallback(_OUTPUT_ENV, chosen)
     return chosen
 

@@ -784,6 +784,7 @@ def backfill_replay_summaries(
     max_age_hours: float = 24.0,
     overwrite: bool = False,
     replay_fn: Callable[..., Any] = replay_depth_run,
+    require_events: bool = True,
 ) -> ReplayBackfillReport:
     """Re-score archived runs missing a `metrics/replay_summary.json`.
 
@@ -791,6 +792,12 @@ def backfill_replay_summaries(
     `(run_dir, write_summary=True)` and return an object exposing `.replayable`,
     `.findings`, and `.summary_path`. Defaults to `replay_depth_run` (Binance depth);
     pass `replay_trades_run` / `replay_trades_stream_run` to backfill a trades lane.
+
+    `require_events=False` (text lanes) also scores runs with NO clean/events.jsonl:
+    a quiet poll window or a crash-before-first-item legitimately leaves none, and
+    skipping those runs is exactly how the funding lane minted a permanent
+    unaccounted orphan per restart - the text scorer writes a `no_events` summary
+    instead, so quarantine + offload accounting always closes.
     """
     checked_at = datetime.now(tz=UTC)
     cutoff = checked_at - timedelta(hours=max_age_hours)
@@ -806,7 +813,7 @@ def backfill_replay_summaries(
             continue
         replay_summary_path = run_dir / "metrics" / "replay_summary.json"
         events_path = run_dir / "clean" / "events.jsonl"
-        if not events_path.exists():
+        if require_events and not events_path.exists():
             skipped_count += 1
             runs.append(
                 ReplayBackfillRun(
@@ -1306,6 +1313,211 @@ def replay_funding_run(
         excessive_clock_skew_count=excessive_clock_skew_count,
         max_clock_skew_ms=max_clock_skew_ms_seen,
         duplicate_trade_id_count=0,
+        replayable=replayable,
+        findings=findings,
+        gap_detection="none_native",
+        summary_path=str(summary_path) if summary_path is not None else None,
+    )
+
+    if write_summary and summary_path is not None:
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_json_atomic(summary_path, summary.to_dict())
+
+    return summary
+
+
+@dataclass(slots=True)
+class TextReplaySummary:
+    """Curation verdict for a text-capture run (STANDARDS "text" section). The
+    provable bar is envelope integrity on the AUTHORITATIVE clock: every row carries
+    the (source, source_id, content_hash) dedup key and `ingestion_ts` is monotonic
+    non-decreasing (it is stamped by the plant itself, so a violation is a real
+    collector/clock defect). Everything about the platform-CLAIMED `source_ts` is a
+    reported diagnostic, never a gate - the 72h RSS probe caught a ~16h stale
+    Cointelegraph publish timestamp on an otherwise-good item, so source-clock
+    honesty is surfaced (stale/future/missing counts + max lag) without ever
+    blocking promotion. `gap_detection="none_native"`: polling a bounded recent
+    window can prove no completeness."""
+
+    replay_type: str
+    mode: str
+    run_path: str
+    events_path: str
+    source: str | None
+    event_count: int
+    new_count: int
+    edit_count: int
+    first_ingestion_ts: str | None
+    last_ingestion_ts: str | None
+    non_monotonic_ingestion_count: int
+    missing_envelope_count: int
+    duplicate_key_count: int
+    missing_source_ts_count: int
+    unparseable_source_ts_count: int
+    stale_source_ts_count: int
+    future_source_ts_count: int
+    max_source_lag_seconds: float | None
+    replayable: bool
+    findings: list[str]
+    gap_detection: str = "none_native"
+    summary_path: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def replay_text_run(
+    run_path: Path,
+    *,
+    stale_source_lag_seconds: float = 3600.0,
+    future_source_skew_seconds: float = 300.0,
+    write_summary: bool = True,
+) -> TextReplaySummary:
+    """Replay-validate a text-capture run (text-rss / text-reddit).
+
+    Gating findings (block promotion): `no_events`, `missing_envelope_fields`
+    (a clean row without source_id / content_hash / ingestion_ts - the live gate
+    quarantines these, so one in clean means the gate was bypassed),
+    `non_monotonic_ingestion_ts` (the plant clock ran backwards mid-run).
+
+    Reported, NON-gating diagnostics: `duplicate_envelope_keys` (a content revert
+    A->B->A legitimately re-emits an earlier (source, source_id, content_hash) key;
+    readers needing exact-once dedup on the key should keep the latest ingestion_ts),
+    and the source-clock honesty counters `missing_source_ts`,
+    `unparseable_source_ts`, `stale_source_ts` (ingestion lag beyond
+    `stale_source_lag_seconds`), `future_source_ts` (claim ahead of ingestion by more
+    than `future_source_skew_seconds`), plus `max_source_lag_seconds` as the stable
+    freshness/lag diagnostic.
+
+    Unlike the market scorers this tolerates a MISSING clean/events.jsonl: a quiet
+    poll window legitimately captures zero items, and the run must still get a
+    summary (no_events, unreplayable -> quarantined) so the offload accounting never
+    strands it as a permanent unaccounted orphan (the funding-lane lesson).
+    """
+    if run_path.is_file():
+        events_path = run_path
+        if run_path.parent.name == "clean" and run_path.parent.parent.exists():
+            resolved_run_path = run_path.parent.parent
+            summary_path: Path | None = resolved_run_path / "metrics" / "replay_summary.json"
+        else:
+            resolved_run_path = run_path.parent
+            summary_path = None
+    else:
+        resolved_run_path = run_path
+        events_path = run_path / "clean" / "events.jsonl"
+        summary_path = run_path / "metrics" / "replay_summary.json"
+
+    event_count = 0
+    new_count = 0
+    edit_count = 0
+    non_monotonic_ingestion_count = 0
+    missing_envelope_count = 0
+    duplicate_key_count = 0
+    missing_source_ts_count = 0
+    unparseable_source_ts_count = 0
+    stale_source_ts_count = 0
+    future_source_ts_count = 0
+    max_source_lag_seconds: float | None = None
+    first_ingestion_ts: str | None = None
+    last_ingestion_ts: str | None = None
+    source: str | None = None
+    previous_ingestion_dt: datetime | None = None
+    seen_keys: set[tuple[str, str, str]] = set()
+
+    rows = _read_jsonl(events_path) if events_path.exists() else []
+    for row in rows:
+        event_count += 1
+        source = source or _optional_str(row.get("source"))
+        event_type = _optional_str(row.get("event_type"))
+        if event_type == "new":
+            new_count += 1
+        elif event_type == "edit":
+            edit_count += 1
+
+        ingestion_str = _optional_str(row.get("ingestion_ts")) or _optional_str(
+            row.get("received_at")
+        )
+        ingestion_dt = _parse_iso_dt(ingestion_str)
+        if first_ingestion_ts is None:
+            first_ingestion_ts = ingestion_str
+        last_ingestion_ts = ingestion_str
+
+        source_id = _optional_str(row.get("source_id"))
+        content_hash = _optional_str(row.get("content_hash"))
+        if not source_id or not content_hash or ingestion_dt is None:
+            missing_envelope_count += 1
+        else:
+            key = (str(row.get("source") or ""), source_id, content_hash)
+            if key in seen_keys:
+                duplicate_key_count += 1
+            else:
+                seen_keys.add(key)
+
+        if ingestion_dt is not None:
+            if previous_ingestion_dt is not None and ingestion_dt < previous_ingestion_dt:
+                non_monotonic_ingestion_count += 1
+            if previous_ingestion_dt is None or ingestion_dt >= previous_ingestion_dt:
+                previous_ingestion_dt = ingestion_dt
+
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        source_ts_dt = _parse_iso_dt(_optional_str(row.get("source_ts")))
+        if source_ts_dt is None:
+            if metadata.get("source_ts_unparseable"):
+                unparseable_source_ts_count += 1
+            else:
+                missing_source_ts_count += 1
+        elif ingestion_dt is not None:
+            lag_seconds = (ingestion_dt - source_ts_dt).total_seconds()
+            if max_source_lag_seconds is None or lag_seconds > max_source_lag_seconds:
+                max_source_lag_seconds = lag_seconds
+            if lag_seconds > stale_source_lag_seconds:
+                stale_source_ts_count += 1
+            elif lag_seconds < -future_source_skew_seconds:
+                future_source_ts_count += 1
+
+    findings: list[str] = []
+    if event_count == 0:
+        findings.append("no_events")
+    if missing_envelope_count:
+        findings.append("missing_envelope_fields")
+    if non_monotonic_ingestion_count:
+        findings.append("non_monotonic_ingestion_ts")
+    if duplicate_key_count:
+        findings.append("duplicate_envelope_keys")
+    if missing_source_ts_count:
+        findings.append("missing_source_ts")
+    if unparseable_source_ts_count:
+        findings.append("unparseable_source_ts")
+    if stale_source_ts_count:
+        findings.append("stale_source_ts")
+    if future_source_ts_count:
+        findings.append("future_source_ts")
+
+    replayable = (
+        event_count > 0
+        and missing_envelope_count == 0
+        and non_monotonic_ingestion_count == 0
+    )
+
+    summary = TextReplaySummary(
+        replay_type="text",
+        mode="text_poll",
+        run_path=str(resolved_run_path),
+        events_path=str(events_path),
+        source=source,
+        event_count=event_count,
+        new_count=new_count,
+        edit_count=edit_count,
+        first_ingestion_ts=first_ingestion_ts,
+        last_ingestion_ts=last_ingestion_ts,
+        non_monotonic_ingestion_count=non_monotonic_ingestion_count,
+        missing_envelope_count=missing_envelope_count,
+        duplicate_key_count=duplicate_key_count,
+        missing_source_ts_count=missing_source_ts_count,
+        unparseable_source_ts_count=unparseable_source_ts_count,
+        stale_source_ts_count=stale_source_ts_count,
+        future_source_ts_count=future_source_ts_count,
+        max_source_lag_seconds=max_source_lag_seconds,
         replayable=replayable,
         findings=findings,
         gap_detection="none_native",

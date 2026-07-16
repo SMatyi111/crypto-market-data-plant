@@ -52,6 +52,17 @@ normalizes side-specific `YES`/`NO` quote telemetry. No orders are placed and no
 credentials are required. See
 [`docs/kalshi_crypto_binary_options.md`](docs/kalshi_crypto_binary_options.md).
 
+Two **text-capture lanes** (`text-rss`, `text-reddit` — [`STANDARDS.md`](STANDARDS.md)
+§4.6) capture public natural-language text rather than market data: five crypto
+news RSS/Atom feeds via conditional GET, and a fixed subreddit list's `/new`
+posts + comments via a read-only Reddit OAuth client-credentials app (no account
+password; the app credentials live outside the repo). Raw text only at capture —
+per-row envelope (`source`, `source_id`, platform-claimed `source_ts`,
+authoritative plant-clock `ingestion_ts`, poll metadata, untouched raw payload),
+dedup key `(source, source_id, content_hash)` with edits retained as new rows,
+curated to `curated/research/text` through the standard quarantine → promote
+chain. Shipped `enabled: false` in the example config.
+
 `none_native` lanes are curated as *structurally clean*, **not** gap-proof — see
 [`STANDARDS.md`](STANDARDS.md) §4.3. The mock feed exists only for local smoke
 tests.
