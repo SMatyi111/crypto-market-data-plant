@@ -41,6 +41,7 @@ nothing merged is awaiting a restart. All 21 lanes green. CI green on `main`.
 | ~~2026-06-18~~ DONE 06-22 | Offload-index spot-check **PASSED**: 4509 index rows == cold run-dirs 1:1 on every lane, 0 duplicates/malformed, 0 unindexed pile-up, 0 missing cold copies, 0 sampled file-count mismatches, 0 indexed runs still hot. Offload live (newest `moved_at` 2026-06-22T09:53Z). Dry-run also flags **16 `stuck_unaccounted_runs`** (raw from 06-09..06-11 never promoted: 8 `binance_perp_funding` + 8 trade/depth) — designed safety surface, but a real promotion gap to investigate. *(Re-measured 2026-07-04: the true cohort is **14,211** — the 06-16..06-23 crash-loop debris had not yet crossed the 10-day offload fence when this check ran. See the 07-04 audit stamp + Decision queue.)* |
 | ~~2026-07-15~~ DONE 07-16 | **The 07-05 orphan wave crossed the offload fence as predicted**: `stuck_unaccounted=17,519` (forecast ~17.5k), `failed=0`. Health's sole finding is the expected `offload_stuck_above_baseline:17519`; the queued cleanup/backstop decision remains open. |
 | ~~2026-06-19~~ DONE 06-24 | The 06-17 `robocopy /MINAGE:3` move never finished (~88% of partitions still on G:), leaving G: at **3.9 GB free**. First retry (06-22) was killed by the Bash tool's 10-min timeout after freeing ~57 GB. Relaunched **detached via `Start-Process`** (pid 48444) so it survives session/tool teardown -> **COMPLETED 2026-06-24 16:19, FAILED: 0** (45.29 M files / 555 GB moved G:->`D:\market_archive_cold`). **G: now 489 GB free.** D: holds 113,407 normalized partitions (full set). 1 partition / 2 parquet files remain on G: -- robocopy *skipped* them (already byte-present on D: from the 06-17 partial), so redundant not stranded; immaterial (489 GB free). Lesson: long-running moves must be detached, never run inside a Bash call (10-min cap). |
+| 2026-07-26 | **Text raw offload wiring.** The first `raw/text/text_rss` runs cross the 10-day offload fence 2026-07-26, but the `archive-offload-text` job (shipped `enabled:false` in the example config, PR #35) is **not in the live config** — nothing moves to cold and nothing accounts text runs after that date. Volume is tiny (~2 MB/day), so this is warn-level, not urgent; but it must land **before any future `cleanup` `apply:true`** (cleanup's raw scan covers `raw/text` at the 14-day default, and deleting un-offloaded raw would discard the rebuild source). Owner action: copy the job from the example config into `ops.live.local.json` at the next runner restart opportunity, or defer knowingly. |
 
 **Last ops audit:** 2026-07-16 — **plant GREEN before text deployment; RSS
 initial verification GREEN.** Pre-deploy health's sole finding was the expected
@@ -57,6 +58,33 @@ duplicate keys, missing timestamps, or future timestamps. The initial
 maintenance jobs are queued behind the startup research-manifest pass and will
 clear their first-run health warnings as that slot turns over. Reddit remains
 disabled pending the approved OAuth credential file.
+
+**Same-day RSS acceptance checkpoint (16:35 UTC, ~5 h live) — adversarial
+live audit, NO code defect found.** Full chain verified on live data:
+10/10 closed segments scored `replayable:true` and promoted **exactly once**
+(promotion index: 10 distinct runs, 0 re-promotions; curated 295 rows == index
+sum; per-run parquet counts == `promoted_rows`; layout
+`v2/source=rss/instrument=<feed>/event_date=<ingestion date>` with all envelope
++ provenance columns). The 11:30 pre-redeploy worker was hard-killed mid-segment
+and **self-healed exactly as designed**: `backfill-text-replay` scored it at
+13:07 (the 1 h `min_age` floor correctly deferred the 12:02 pass) and the next
+promote pass promoted its 121 rows at 13:16 — no stranded orphan (the funding
+lesson holds for text). The kill also exercised the at-least-once cursor
+contract live: the first post-restart segment re-emitted the 121-key window
+(curated carries exactly those 121 keys ×2 and **zero other duplicates**), and
+the following segment emitted 1 row — the persisted `_cursors` seen-map dedups
+across segments. `ingestion_ts` monotone in every run; `event_date` ==
+ingestion date on all 295 rows; 0 quarantined events; 0 poll errors across
+~675 conditional GETs; quarantine index empty (no quiet segment yet — that
+path stays unverified until a zero-item window occurs); rotation exactly
+30 min + ~5-6 s redispatch; steady state 1-6 rows/segment (probe-consistent).
+Live churn validated the source-clock design: Decrypt re-served ~20 old items
+in one poll (one claimed publish ts ~199 days old) — captured as new
+sightings, flagged non-gating `stale_source_ts`, `ingestion_ts` stayed the
+axis. Warnings (not defects): the missing live `archive-offload-text` job (see
+the 2026-07-26 dated check) and a cosmetic one — text segment summaries always
+report `deadline_reached=false` because the collector's own deadline ends the
+stream before the pipeline's check; rotation itself is proven by the cadence.
 
 **Previous ops audit:** 2026-07-12 — **plant GREEN today; two self-healed network
 incidents since 07-04; an orphan wave crosses the offload fence ~07-15.**
@@ -230,6 +258,12 @@ owner ask (safe-shaping directive above).
     disabled until `reddit_app.json` exists; **(e) IN PROGRESS through
     2026-07-30** — acceptance = >=2 weeks continuous green capture,
     `ingestion_ts` monotone, stable dedup ratios; then it accrues silently.
+    **First checkpoint 2026-07-16 ~16:35 UTC: GREEN, no code defect** — full
+    raw -> summary -> promote chain verified live incl. exactly-once
+    promotion, the crash-orphan catch-up path, and cross-segment cursor dedup
+    (evidence in the 07-16 audit stamp above). Still unexercised: a quiet
+    zero-item segment (`no_events` -> quarantine-by-design) and the
+    2026-07-26 text offload wiring (dated check).
 
 ## Decision queue (owner)
 
