@@ -8,7 +8,7 @@ changes scope or state. Companion docs:
 - [`STANDARDS.md`](STANDARDS.md) — the data contract (schemas, replayability, retention)
 - [`docs/HISTORY.md`](docs/HISTORY.md) — resolved-work narrative (what was fixed, and why)
 
-Last updated: **2026-07-16**.
+Last updated: **2026-07-20**.
 
 > **Operating mode — safe shaping (owner directive, 2026-07-04).** No extended
 > building on Claude's initiative: no new venues, lanes, or instruments, no big
@@ -43,7 +43,29 @@ nothing merged is awaiting a restart. All 21 lanes green. CI green on `main`.
 | ~~2026-06-19~~ DONE 06-24 | The 06-17 `robocopy /MINAGE:3` move never finished (~88% of partitions still on G:), leaving G: at **3.9 GB free**. First retry (06-22) was killed by the Bash tool's 10-min timeout after freeing ~57 GB. Relaunched **detached via `Start-Process`** (pid 48444) so it survives session/tool teardown -> **COMPLETED 2026-06-24 16:19, FAILED: 0** (45.29 M files / 555 GB moved G:->`D:\market_archive_cold`). **G: now 489 GB free.** D: holds 113,407 normalized partitions (full set). 1 partition / 2 parquet files remain on G: -- robocopy *skipped* them (already byte-present on D: from the 06-17 partial), so redundant not stranded; immaterial (489 GB free). Lesson: long-running moves must be detached, never run inside a Bash call (10-min cap). |
 | 2026-07-26 | **Text raw offload wiring.** The first `raw/text/text_rss` runs cross the 10-day offload fence 2026-07-26, but the `archive-offload-text` job (shipped `enabled:false` in the example config, PR #35) is **not in the live config** — nothing moves to cold and nothing accounts text runs after that date. Volume is tiny (~2 MB/day), so this is warn-level, not urgent; but it must land **before any future `cleanup` `apply:true`** (cleanup's raw scan covers `raw/text` at the 14-day default, and deleting un-offloaded raw would discard the rebuild source). Owner action: copy the job from the example config into `ops.live.local.json` at the next runner restart opportunity, or defer knowingly. |
 
-**Last ops audit:** 2026-07-16 — **plant GREEN before text deployment; RSS
+**Last ops audit:** 2026-07-20 — **plant GREEN; one self-healed fapi incident
+since 07-16; RSS acceptance on track.** Health `status=warn` with the single
+expected finding `offload_stuck_above_baseline:17541` (heartbeat 2.5 s) — the
+stuck cohort grew **+22** vs the 07-16 baseline (17519 -> 17541), the documented
+funding-orphan-per-restart drip, nothing new. **All 22 workers running, 0
+stale**; quarantine ratios ~0 (only coinbase-trades 0.07%). **All 85 scheduled
+jobs' latest run = success.** Jobs since the 07-16 11:36 UTC restart:
+**34,614/34,978 success (98.96%)**; all 364 errors were `binance-futures-rest-*`
+fapi transport failures, **360 of them in one self-healed incident 2026-07-19
+~19:00-21:10 UTC** (REST lanes only: trades 138 / depth 131 / funding 93; WS
+lanes unaffected — the known fapi-degradation signature), **0 errors on 07-20**.
+Coverage impact of that ~2 h window: gapless aggTrades self-backfill on
+recovery; perp depth + funding carry ~2 h intraday holes and funding minted its
+usual restart orphans. **G: 458.3 GB free** (+21.6 vs 07-16 — raw offload
+outpacing normalized growth); offload fresh (~41 min, 49 moves / 0 failures).
+**RSS text acceptance GREEN, 4 days in** (window through 07-30): curated rows
+accruing daily across all five feeds (198 parquet files, newest promotion ~2 min
+before this audit), text-rss worker running, quarantine 0. No new autonomous
+work forced; the sole open finding stays owner-gated (stuck-cohort
+cleanup/backstop + normalized retention). Audit with
+`--stuck-unaccounted-baseline 17519` until the cohort cleanup lands.
+
+**Previous ops audit:** 2026-07-16 — **plant GREEN before text deployment; RSS
 initial verification GREEN.** Pre-deploy health's sole finding was the expected
 `offload_stuck_above_baseline:17519`, exactly the forecast 07-05 crash cohort;
 heartbeat 2.3 s, all 81 enabled scheduled jobs' latest rows successful, all 21
@@ -86,7 +108,7 @@ the 2026-07-26 dated check) and a cosmetic one — text segment summaries always
 report `deadline_reached=false` because the collector's own deadline ends the
 stream before the pipeline's check; rotation itself is proven by the cadence.
 
-**Previous ops audit:** 2026-07-12 — **plant GREEN today; two self-healed network
+**Earlier ops audit:** 2026-07-12 — **plant GREEN today; two self-healed network
 incidents since 07-04; an orphan wave crosses the offload fence ~07-15.**
 Health `status=warn` with exactly one finding,
 `offload_stuck_above_baseline:14215` (heartbeat ~1.4 s) — **PR #28's growth
@@ -157,10 +179,10 @@ owner ask (safe-shaping directive above).
 3. ~~Surface `stuck_unaccounted_count` in monitoring~~ **DONE — PR #28**
    (offload report persisted + growth-gated `health` finding; root-cause
    narrative in `docs/HISTORY.md` 2026-07-04). **Deployed at the 07-11 boot and
-   verified live 07-12**: it caught the +4 cohort growth within a day. Audit
-   with `--stuck-unaccounted-baseline 14211` until the cohort cleanup lands
-   (expect the count to step to ~17.5k around 07-15 — see the dated check and
-   decision queue), then reset the baseline to 0.
+   verified live 07-12**: it caught the +4 cohort growth within a day. The
+   07-05 wave crossed the offload fence as forecast (~17.5k), so audit with
+   `--stuck-unaccounted-baseline 17519` (07-16 measure) until the cohort cleanup
+   lands, then reset the baseline to 0.
 4. **PARKED — Phase 6 candidate: inverse (coin-margined) BTCUSD perps.** Natural next
    instrument-expansion step after the linear-perp triangle. Note: Binance USDT-M
    *websocket* is jurisdiction-blocked from this box (REST works — see Constraints),
