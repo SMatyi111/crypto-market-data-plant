@@ -206,6 +206,76 @@ def test_apply_backstops_then_verify_moves_old_unaccounted_in_same_pass(tmp_path
     ) == "preserve-me"
 
 
+def test_apply_backstop_tolerates_torn_replay_summary_and_continues(tmp_path: Path) -> None:
+    """Regression: one crash-torn replay_summary.json used to raise out of the
+    backstop and abort the whole offload pass (before the report was persisted),
+    wedging every later pass on the same oldest-first run."""
+    raw_root = tmp_path / "raw"
+    torn_run = _make_run(raw_root, "okx_trades", OLD_RUN)
+    (torn_run / "metrics" / "replay_summary.json").write_text("", encoding="utf-8")
+    healthy_run = _make_run(raw_root, "okx_trades", OLD_RUN_2)
+    spec = _lane_spec(tmp_path, "okx_trades")
+
+    report = offload_accounted_runs(
+        raw_root=raw_root,
+        cold_root=tmp_path / "cold",
+        lanes=[spec],
+        min_age_days=10,
+        limit=0,
+        quarantine_unaccounted_after_days=10,
+        quarantine_unaccounted_limit=10,
+        apply=True,
+    )
+
+    assert report.status == "ok"
+    assert report.backstopped_count == 2
+    assert report.backstop_failed_count == 0
+    assert report.stuck_unaccounted_count == 0
+    assert torn_run.exists()
+    assert healthy_run.exists()
+    torn_diagnostics = json.loads(
+        (spec.quarantine_index.parent / OLD_RUN / "diagnostics.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert torn_diagnostics["classification"]["findings"] == [
+        "aged_unaccounted",
+        "missing_replay_summary",
+    ]
+
+
+def test_backstop_failure_errors_the_pass_and_keeps_the_run_stuck(tmp_path: Path) -> None:
+    raw_root = tmp_path / "raw"
+    run_dir = _make_run(raw_root, "okx_trades", OLD_RUN)
+    spec = _lane_spec(tmp_path, "okx_trades")
+    # Occupy the diagnostics dir path with a regular file so the backstop's
+    # mkdir fails after all preflight validation passed.
+    spec.quarantine_index.parent.mkdir(parents=True)
+    (spec.quarantine_index.parent / OLD_RUN).write_text("in the way", encoding="utf-8")
+
+    report = offload_accounted_runs(
+        raw_root=raw_root,
+        cold_root=tmp_path / "cold",
+        lanes=[spec],
+        min_age_days=10,
+        quarantine_unaccounted_after_days=10,
+        quarantine_unaccounted_limit=10,
+        apply=True,
+    )
+
+    assert report.status == "error"
+    assert report.backstop_candidate_count == 1
+    assert report.backstopped_count == 0
+    assert report.backstop_failed_count == 1
+    assert report.stuck_unaccounted_count == 1
+    assert "unaccounted_backstop_failures:1" in report.findings
+    assert report.moved_count == 0
+    assert run_dir.exists()
+    assert not spec.quarantine_index.exists()
+    failed = next(run for run in report.runs if run.action == "failed_aged_unaccounted")
+    assert failed.error
+
+
 def test_dry_run_reports_backstop_candidate_without_writing_accounting(tmp_path: Path) -> None:
     raw_root = tmp_path / "raw"
     run_dir = _make_run(raw_root, "okx_trades", OLD_RUN)
@@ -587,6 +657,49 @@ def test_run_archive_offload_raises_on_failed_moves(tmp_path: Path) -> None:
     # when the health surface needs to see the counts.
     persisted = json.loads((ops_root / OFFLOAD_REPORT_FILENAME).read_text(encoding="utf-8"))
     assert persisted["failed_count"] == 1
+    assert persisted["status"] == "error"
+
+
+def test_run_archive_offload_raises_on_backstop_failures(tmp_path: Path) -> None:
+    # A failed backstop classification must surface as a runner job failure
+    # exactly like a failed move, not scroll by in a log line.
+    raw_root = tmp_path / "raw"
+    ops_root = tmp_path / "ops"
+    run_dir = _make_run(raw_root, "binance_trades", OLD_RUN)
+    quarantine_index = tmp_path / "quarantine" / "binance_trades" / "_quarantine_index.jsonl"
+    quarantine_index.parent.mkdir(parents=True)
+    (quarantine_index.parent / OLD_RUN).write_text("in the way", encoding="utf-8")
+    spec_dict = {
+        "source": "binance_trades",
+        "promotion_index": str(tmp_path / "curated" / "_promotion_index.jsonl"),
+        "quarantine_index": str(quarantine_index),
+    }
+    lanes_file = tmp_path / "lanes.json"
+    lanes_file.write_text(json.dumps([spec_dict]), encoding="utf-8")
+
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "archive-offload",
+            "--raw-root", str(raw_root),
+            "--cold-root", str(tmp_path / "cold"),
+            "--lanes-file", str(lanes_file),
+            "--ops-root", str(ops_root),
+            "--min-age-days", "10",
+            "--quarantine-unaccounted-after-days", "10",
+            "--quarantine-unaccounted-limit", "10",
+            "--apply",
+            "--write-report",
+        ]
+    )
+    with pytest.raises(
+        RuntimeError,
+        match=r"had 0 failed moves and 1 failed backstop classifications",
+    ):
+        run_archive_offload(args)
+    assert run_dir.exists()
+    persisted = json.loads((ops_root / OFFLOAD_REPORT_FILENAME).read_text(encoding="utf-8"))
+    assert persisted["backstop_failed_count"] == 1
     assert persisted["status"] == "error"
 
 

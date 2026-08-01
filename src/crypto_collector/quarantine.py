@@ -207,7 +207,11 @@ def quarantine_aged_unaccounted_run(
     if replay_summary is None:
         findings.append("missing_replay_summary")
     else:
-        findings.extend(str(item) for item in replay_summary.get("findings", []))
+        raw_findings = replay_summary.get("findings")
+        # A damaged summary can carry a scalar here; a string would explode into
+        # per-character rows in the durable quarantine index.
+        if isinstance(raw_findings, list):
+            findings.extend(str(item) for item in raw_findings)
         if replayable:
             findings.append("replayable_but_unpromoted")
 
@@ -298,7 +302,16 @@ def _parse_run_started_at(path: Path) -> datetime | None:
 def _read_json_file(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
-    return json.loads(path.read_text(encoding="utf-8"))
+    # A torn/partial replay_summary.json (killed scorer mid-write, power-cut
+    # zero-length atomic promotion) must read as "missing" for THIS run, not
+    # abort the whole quarantine or offload pass — the aged-unaccounted backstop
+    # targets exactly the crash-interrupted runs that produce such files. Same
+    # posture as promotion.py's reader.
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:

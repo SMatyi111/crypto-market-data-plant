@@ -53,6 +53,49 @@ def test_quarantine_bad_runs_skips_replayable_runs(tmp_path: Path) -> None:
     assert report.runs[0].action == "skipped_replayable"
 
 
+def test_aged_unaccounted_tolerates_torn_replay_summary(tmp_path: Path) -> None:
+    """Regression: an empty/torn replay_summary.json (killed scorer, power-cut
+    zero-length promotion) used to raise JSONDecodeError out of the backstop and
+    abort the caller's whole offload pass. It must classify as missing instead."""
+    run_dir = tmp_path / "raw" / "okx_trades" / "20200101_000000"
+    (run_dir / "metrics").mkdir(parents=True)
+    (run_dir / "metrics" / "replay_summary.json").write_text("", encoding="utf-8")
+    quarantine_index = tmp_path / "quarantine" / "okx_trades" / "_quarantine_index.jsonl"
+
+    report = quarantine_aged_unaccounted_run(
+        run_dir,
+        quarantine_index_path=quarantine_index,
+        checked_at=datetime.now(tz=UTC),
+    )
+
+    assert report.error is None
+    assert report.action == "quarantined_aged_unaccounted"
+    assert report.findings == ["aged_unaccounted", "missing_replay_summary"]
+    assert report.replayable is None
+    index_row = json.loads(quarantine_index.read_text(encoding="utf-8"))
+    assert index_row["classification"] == "aged_unaccounted"
+
+
+def test_aged_unaccounted_ignores_scalar_findings_in_replay_summary(tmp_path: Path) -> None:
+    """A damaged-but-valid summary with a scalar findings value must not explode
+    into per-character findings in the durable quarantine index."""
+    run_dir = tmp_path / "raw" / "okx_trades" / "20200101_000000"
+    (run_dir / "metrics").mkdir(parents=True)
+    (run_dir / "metrics" / "replay_summary.json").write_text(
+        json.dumps({"replayable": False, "findings": "gap_detected"}), encoding="utf-8"
+    )
+    quarantine_index = tmp_path / "quarantine" / "okx_trades" / "_quarantine_index.jsonl"
+
+    report = quarantine_aged_unaccounted_run(
+        run_dir,
+        quarantine_index_path=quarantine_index,
+        checked_at=datetime.now(tz=UTC),
+    )
+
+    assert report.error is None
+    assert report.findings == ["aged_unaccounted"]
+
+
 def test_aged_unaccounted_diagnostics_stream_only_bounded_samples(tmp_path: Path) -> None:
     source_root = tmp_path / "raw" / "market" / "binance_depth"
     run_dir = source_root / "20200101_000000"
