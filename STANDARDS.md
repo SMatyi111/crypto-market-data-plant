@@ -740,9 +740,14 @@ gate instead — `missing_source_id` / `missing_content_hash` / `missing_raw_ite
   offload age defaults to 14 days and may be overridden per lane; the live
   Kalshi quote lane uses 3 days because its curation is inline. Indexed lanes
   move only after a run appears in the lane's promotion index (the curated copy
-  is durably on disk) or quarantine index (known-bad); runs in neither index are
-  never touched and are surfaced as `unindexed`. `age_only` lanes may move once
-  old enough when curation is inline or the source is retired. Every move is
+  is durably on disk) or quarantine index (known-bad or an aged processing
+  timeout with a bounded diagnostics bundle). Runs in neither index are never
+  moved. When the optional preserve-first unaccounted backstop is enabled, a
+  run still outside both indexes after at least the full offload-age window is
+  classified `aged_unaccounted`, receives diagnostics, and enters the
+  quarantine index; only then can the normal byte-verified cold move proceed.
+  `age_only` lanes may move once old enough when curation is inline or the source
+  is retired. Every move is
   recorded in `_offload_index.jsonl`, so raw remains a locatable rebuild source
   after offload.
 - **Normalized / curated / quarantine / manifests**: retained indefinitely (no

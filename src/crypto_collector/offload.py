@@ -13,10 +13,12 @@ Safety model — a run dir is only ever deleted from the hot tier when BOTH hold
   diagnostics bundle); and
 * a byte-identical copy (per-file relative paths + sizes) exists in the cold tier.
 
-Old run dirs in NEITHER index are never touched; they are surfaced as
-`stuck_unaccounted_runs` findings so a silently-stalled scorer/promoter shows up
-in the offload report instead of aging data into deletion (the trap a purely
-age-based cleanup has).
+Old run dirs in NEITHER index are never moved. They are surfaced as
+`stuck_unaccounted_runs` findings unless the optional preserve-first backstop is
+enabled; after at least the full offload-age window, that path writes bounded
+diagnostics and a quarantine index row before the normal verified move can act.
+This prevents silent aging into deletion while giving interrupted runs a safe,
+observable terminal state.
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from .storage import JsonlSink, write_text_atomic
+from .quarantine import quarantine_aged_unaccounted_run
 
 # Cap how many stuck (old-but-unaccounted) run paths are listed per lane in the
 # report. The COUNT is always exact; this only bounds the example paths so a
@@ -135,6 +138,8 @@ class OffloadLaneStatus:
     scanned_count: int = 0
     eligible_count: int = 0
     moved_count: int = 0
+    backstop_candidate_count: int = 0
+    backstopped_count: int = 0
     stuck_unaccounted_count: int = 0
     stuck_examples: list[str] = field(default_factory=list)
 
@@ -155,6 +160,9 @@ class OffloadReport:
     moved_count: int
     moved_bytes: int
     failed_count: int
+    backstop_candidate_count: int
+    backstopped_count: int
+    backstop_failed_count: int
     stuck_unaccounted_count: int
     findings: list[str]
     lanes: list[OffloadLaneStatus]
@@ -173,6 +181,9 @@ class OffloadReport:
             "moved_count": self.moved_count,
             "moved_bytes": self.moved_bytes,
             "failed_count": self.failed_count,
+            "backstop_candidate_count": self.backstop_candidate_count,
+            "backstopped_count": self.backstopped_count,
+            "backstop_failed_count": self.backstop_failed_count,
             "stuck_unaccounted_count": self.stuck_unaccounted_count,
             "findings": self.findings,
             "lanes": [lane.to_dict() for lane in self.lanes],
@@ -199,9 +210,39 @@ def offload_accounted_runs(
     lanes: list[OffloadLaneSpec],
     min_age_days: float = 14.0,
     limit: int = 200,
+    quarantine_unaccounted_after_days: float | None = None,
+    quarantine_unaccounted_limit: int = 0,
     apply: bool = False,
 ) -> OffloadReport:
     checked_at = datetime.now(tz=UTC)
+
+    if quarantine_unaccounted_after_days is not None:
+        if (
+            isinstance(quarantine_unaccounted_after_days, bool)
+            or not isfinite(quarantine_unaccounted_after_days)
+            or quarantine_unaccounted_after_days <= 0
+        ):
+            raise ValueError("quarantine_unaccounted_after_days must be a positive number")
+    if quarantine_unaccounted_limit < 0:
+        raise ValueError("quarantine_unaccounted_limit must be non-negative")
+
+    # Validate the entire mutation plan before touching the first lane. A bad
+    # override on a later lane must not leave earlier lanes half-backstopped.
+    if quarantine_unaccounted_after_days is not None:
+        for lane in lanes:
+            if lane.gate != "indexed":
+                continue
+            lane_age_days = lane.min_age_days if lane.min_age_days is not None else min_age_days
+            if quarantine_unaccounted_after_days < lane_age_days:
+                raise ValueError(
+                    "quarantine_unaccounted_after_days must be at least the effective "
+                    f"offload age for lane {lane.source!r} ({lane_age_days} days)"
+                )
+            if apply and quarantine_unaccounted_limit > 0 and lane.quarantine_index is None:
+                raise ValueError(
+                    f"indexed lane {lane.source!r} needs quarantine_index when the "
+                    "unaccounted backstop is enabled in apply mode"
+                )
 
     findings: list[str] = []
     lane_statuses: list[OffloadLaneStatus] = []
@@ -211,8 +252,12 @@ def offload_accounted_runs(
     moved_count = 0
     moved_bytes = 0
     failed_count = 0
+    backstop_candidate_count = 0
+    backstopped_count = 0
+    backstop_failed_count = 0
     stuck_total = 0
     budget = max(0, int(limit))
+    backstop_budget = int(quarantine_unaccounted_limit)
 
     # A lane that exists on disk but is absent from the config would silently hoard
     # the hot disk forever (the same shape as the collector-concurrency starvation
@@ -231,6 +276,11 @@ def offload_accounted_runs(
     for lane in lanes:
         lane_age_days = lane.min_age_days if lane.min_age_days is not None else min_age_days
         lane_cutoff = checked_at - timedelta(days=lane_age_days)
+        backstop_cutoff = (
+            checked_at - timedelta(days=quarantine_unaccounted_after_days)
+            if quarantine_unaccounted_after_days is not None
+            else None
+        )
         lane_status = OffloadLaneStatus(source=lane.source, min_age_days=lane_age_days)
         lane_statuses.append(lane_status)
         lane_raw = raw_root / lane.source
@@ -258,11 +308,41 @@ def offload_accounted_runs(
             run_key = str(run_dir)
 
             if accounted is not None and run_key not in accounted:
-                stuck_total += 1
-                lane_status.stuck_unaccounted_count += 1
-                if len(lane_status.stuck_examples) < _STUCK_EXAMPLE_CAP:
-                    lane_status.stuck_examples.append(run_key)
-                continue
+                is_backstop_candidate = (
+                    backstop_cutoff is not None and started_at < backstop_cutoff
+                )
+                if is_backstop_candidate:
+                    backstop_candidate_count += 1
+                    lane_status.backstop_candidate_count += 1
+                    if apply and backstop_budget > 0:
+                        assert lane.quarantine_index is not None  # validated before mutation
+                        backstop_budget -= 1
+                        backstop = quarantine_aged_unaccounted_run(
+                            run_dir,
+                            quarantine_index_path=lane.quarantine_index,
+                            checked_at=checked_at,
+                        )
+                        runs.append(
+                            OffloadRunStatus(
+                                run_path=run_key,
+                                lane=lane.source,
+                                action=backstop.action,
+                                error=backstop.error,
+                            )
+                        )
+                        if backstop.error is None:
+                            accounted.add(run_key)
+                            backstopped_count += 1
+                            lane_status.backstopped_count += 1
+                        else:
+                            backstop_failed_count += 1
+
+                if run_key not in accounted:
+                    stuck_total += 1
+                    lane_status.stuck_unaccounted_count += 1
+                    if len(lane_status.stuck_examples) < _STUCK_EXAMPLE_CAP:
+                        lane_status.stuck_examples.append(run_key)
+                    continue
 
             if budget <= 0:
                 continue
@@ -304,6 +384,8 @@ def offload_accounted_runs(
 
     if stuck_total:
         findings.append(f"stuck_unaccounted_runs:{stuck_total}")
+    if backstop_failed_count:
+        findings.append(f"unaccounted_backstop_failures:{backstop_failed_count}")
     if eligible_count == 0:
         findings.append("no_offload_candidates")
 
@@ -311,6 +393,8 @@ def offload_accounted_runs(
     if any(finding.startswith(("stuck_unaccounted_runs", "unconfigured_lane", "missing_lane_dir")) for finding in findings):
         status = "warn"
     if failed_count:
+        status = "error"
+    if backstop_failed_count:
         status = "error"
 
     return OffloadReport(
@@ -325,6 +409,9 @@ def offload_accounted_runs(
         moved_count=moved_count,
         moved_bytes=moved_bytes,
         failed_count=failed_count,
+        backstop_candidate_count=backstop_candidate_count,
+        backstopped_count=backstopped_count,
+        backstop_failed_count=backstop_failed_count,
         stuck_unaccounted_count=stuck_total,
         findings=findings,
         lanes=lane_statuses,

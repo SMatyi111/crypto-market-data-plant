@@ -1312,6 +1312,8 @@
         "cold_root": "D:\\market_archive_cold\\raw\\text",
         "min_age_days": 10,
         "limit": 200,
+        "quarantine_unaccounted_after_days": 10,
+        "quarantine_unaccounted_limit": 1000,
         "apply": false,
         "ops_root": "G:\\market_archive\\ops",
         "write_report": false,
@@ -1330,6 +1332,8 @@
         "cold_root": "D:\\market_archive_cold\\raw\\market",
         "min_age_days": 10,
         "limit": 200,
+        "quarantine_unaccounted_after_days": 10,
+        "quarantine_unaccounted_limit": 1000,
         "apply": false,
         "ops_root": "G:\\market_archive\\ops",
         "lanes": [

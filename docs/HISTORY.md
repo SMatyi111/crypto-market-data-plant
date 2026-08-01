@@ -7,6 +7,35 @@ git log + the merged PR descriptions; this file keeps the *why*.
 
 ---
 
+## 2026-08-01 — aged-unaccounted preserve-first backstop and maintenance fairness
+
+The health audit found 17,809 raw run directories older than the processing and
+offload window but absent from both promotion and quarantine indexes. They were
+the accumulated crash-loop and interrupted-run cohort: offload correctly refused
+to move unaccounted data, but that left raw permanently stranded on the hot tier
+and made the warning non-actionable. The owner chose the preserve path. A live
+metadata-only pass wrote bounded diagnostics and `aged_unaccounted` quarantine
+index rows for all 17,809 runs with zero failures and no raw deletion. The normal
+offloader can now relocate them only through its existing byte-for-byte verified
+cold-copy gate; the official report was regenerated at `stuck_unaccounted=0`.
+
+The durable fix lives inside `archive-offload`: an optional age threshold and
+bounded per-pass budget classify future runs only after at least the lane's full
+offload-age window. It preflights every lane before mutation, streams tiny raw,
+clean, and metrics samples instead of loading large interrupted files, persists
+diagnostics before the index row, reports classification failures separately,
+and leaves raw untouched until verified cold movement succeeds.
+
+The same audit explained the remaining WARN: the single maintenance slot always
+selected the first due job in config order. During long manifest and cleanup
+passes, short-cadence jobs near the front became due again and starved the RSS
+score/quarantine/promote jobs near the end. Dispatch now selects the oldest due
+deadline (stable config order on ties), and the health queue allowance covers one
+observed 51-53 minute manifest pass while remaining bounded. Code deployment
+requires the guarded elevated restart because the live runner is SYSTEM-owned.
+
+---
+
 ## 2026-07-12 — two self-healed network incidents; pending PRs deployed via reboot; PR #28 gate validated live
 
 Session audit (stamp in `ROADMAP.md`) reconstructed two connectivity incidents
