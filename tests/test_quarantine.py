@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
-from crypto_collector.quarantine import quarantine_bad_runs
+from crypto_collector.quarantine import quarantine_aged_unaccounted_run, quarantine_bad_runs
 
 
 def test_quarantine_bad_runs_writes_index_and_diagnostics(tmp_path: Path) -> None:
@@ -50,3 +51,40 @@ def test_quarantine_bad_runs_skips_replayable_runs(tmp_path: Path) -> None:
     assert report.status == "warn"
     assert report.quarantined_count == 0
     assert report.runs[0].action == "skipped_replayable"
+
+
+def test_aged_unaccounted_diagnostics_stream_only_bounded_samples(tmp_path: Path) -> None:
+    source_root = tmp_path / "raw" / "market" / "binance_depth"
+    run_dir = source_root / "20200101_000000"
+    for folder, filename in (
+        ("raw", "messages.jsonl"),
+        ("clean", "events.jsonl"),
+        ("metrics", "summary.jsonl"),
+    ):
+        path = run_dir / folder / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "".join(json.dumps({"row": index}) + "\n" for index in range(100)),
+            encoding="utf-8",
+        )
+    quarantine_index = tmp_path / "quarantine" / "binance_depth" / "_quarantine_index.jsonl"
+
+    report = quarantine_aged_unaccounted_run(
+        run_dir,
+        quarantine_index_path=quarantine_index,
+        checked_at=datetime.now(tz=UTC),
+    )
+
+    assert report.error is None
+    diagnostics = json.loads(
+        (quarantine_index.parent / run_dir.name / "diagnostics.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert len(diagnostics["raw_sample"]) == 5
+    assert len(diagnostics["clean_sample"]) == 5
+    assert len(diagnostics["metrics_summary"]) == 20
+    assert diagnostics["classification"]["findings"] == [
+        "aged_unaccounted",
+        "missing_replay_summary",
+    ]

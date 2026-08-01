@@ -1027,6 +1027,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     offload_parser.add_argument("--min-age-days", type=float, default=14.0)
     offload_parser.add_argument("--limit", type=int, default=200)
+    offload_parser.add_argument(
+        "--quarantine-unaccounted-after-days",
+        type=float,
+        default=None,
+        help="Preserve-first backstop: classify runs still outside promotion and "
+        "quarantine indexes after this age. Must be at least --min-age-days.",
+    )
+    offload_parser.add_argument(
+        "--quarantine-unaccounted-limit",
+        type=int,
+        default=0,
+        help="Maximum aged unaccounted runs to classify per pass. Zero disables "
+        "writes while still reporting candidates when an age is configured.",
+    )
     offload_parser.add_argument("--apply", action="store_true")
     offload_parser.add_argument(
         "--ops-root",
@@ -3192,6 +3206,8 @@ def _execute_ops_job_inprocess(job: JobSpec) -> JobExecutionResult | str | None:
         return (
             f"archive offload completed; status={report.status}"
             f" moved={report.moved_count} failed={report.failed_count}"
+            f" backstopped={report.backstopped_count}"
+            f" backstop_failed={report.backstop_failed_count}"
             f" stuck_unaccounted={report.stuck_unaccounted_count}"
         )
     raise ValueError(f"Unsupported job_type: {job.job_type}")
@@ -3698,6 +3714,10 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             lanes=raw_args["lanes"],
             min_age_days=raw_args.get("min_age_days", 14.0),
             limit=raw_args.get("limit", 200),
+            quarantine_unaccounted_after_days=raw_args.get(
+                "quarantine_unaccounted_after_days"
+            ),
+            quarantine_unaccounted_limit=raw_args.get("quarantine_unaccounted_limit", 0),
             apply=raw_args.get("apply", False),
             # Where offload_report_latest.json lands for the health report; same
             # config key + default the collector lanes use for their ops_root.
@@ -3823,6 +3843,9 @@ def run_health(args: argparse.Namespace) -> None:
             f" baseline={offload.get('stuck_unaccounted_baseline')}"
             f" moved={offload.get('moved_count')}"
             f" failed={offload.get('failed_count')}"
+            f" backstop_candidates={offload.get('backstop_candidate_count')}"
+            f" backstopped={offload.get('backstopped_count')}"
+            f" backstop_failed={offload.get('backstop_failed_count')}"
             f" status={offload.get('status')}"
             f" report_age={age_str}"
             f" findings={','.join(str(item) for item in offload_findings) or 'none'}"
@@ -3861,6 +3884,8 @@ def run_archive_offload(args: argparse.Namespace) -> OffloadReport:
         lanes=lanes,
         min_age_days=args.min_age_days,
         limit=args.limit,
+        quarantine_unaccounted_after_days=args.quarantine_unaccounted_after_days,
+        quarantine_unaccounted_limit=args.quarantine_unaccounted_limit,
         apply=args.apply,
     )
     # Persist BEFORE printing or the failed-moves raise below: the report must be
@@ -3882,6 +3907,9 @@ def run_archive_offload(args: argparse.Namespace) -> OffloadReport:
         print(f"moved_count={report.moved_count}")
         print(f"moved_bytes={report.moved_bytes}")
         print(f"failed_count={report.failed_count}")
+        print(f"backstop_candidate_count={report.backstop_candidate_count}")
+        print(f"backstopped_count={report.backstopped_count}")
+        print(f"backstop_failed_count={report.backstop_failed_count}")
         print(f"stuck_unaccounted_count={report.stuck_unaccounted_count}")
         print(f"findings={','.join(report.findings) if report.findings else 'none'}")
         for lane in report.lanes:
@@ -3889,17 +3917,20 @@ def run_archive_offload(args: argparse.Namespace) -> OffloadReport:
                 print(
                     f"  {lane.source}: scanned={lane.scanned_count}"
                     f" eligible={lane.eligible_count} moved={lane.moved_count}"
+                    f" backstop_candidates={lane.backstop_candidate_count}"
+                    f" backstopped={lane.backstopped_count}"
                     f" stuck={lane.stuck_unaccounted_count}"
                 )
     # Unlike the report-only maintenance jobs, this one DELETES hot data after
     # verification — a verify/copy failure must register as a job failure in the
     # runner (and thus in health's recent_job_failures), not scroll by in a log.
-    if report.failed_count:
+    if report.failed_count or report.backstop_failed_count:
         # Carry the headline counts too: on this path the caller never gets the
         # report back, so without them the job log would again record a line
         # with no stuck count.
         raise RuntimeError(
             f"archive-offload had {report.failed_count} failed moves"
+            f" and {report.backstop_failed_count} failed backstop classifications"
             f" (moved={report.moved_count}"
             f" stuck_unaccounted={report.stuck_unaccounted_count})"
         )

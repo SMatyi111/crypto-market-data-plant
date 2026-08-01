@@ -80,6 +80,20 @@ class JobSpec:
         )
 
 
+def _select_oldest_due_job(
+    jobs: list[JobSpec], next_run_at: dict[str, datetime]
+) -> JobSpec:
+    """Pick the maintenance job whose deadline is furthest in the past.
+
+    Config-order selection starved jobs near the end of the live config whenever
+    the single maintenance slot fell behind: short-cadence jobs near the front
+    became due again before RSS quarantine/promote/score ever ran. ``min`` is
+    stable, so equal startup deadlines still preserve config order.
+    """
+
+    return min(jobs, key=lambda job: next_run_at[job.name])
+
+
 @dataclass(slots=True)
 class JobRunResult:
     job_name: str
@@ -706,7 +720,7 @@ class OpsRunner:
                     and maintenance_due
                     and not (max_runs is not None and started >= max_runs)
                 ):
-                    maintenance_job = maintenance_due[0]
+                    maintenance_job = _select_oldest_due_job(maintenance_due, next_run_at)
                     job_started_at = datetime.now(tz=UTC)
                     with self._run_lock:
                         self._sched_active[maintenance_job.name] = {
@@ -913,10 +927,11 @@ class OpsRunner:
 
 
 # How much extra staleness "the single maintenance slot was busy" may explain
-# before a queued maintenance job flags stale anyway. Sized to one long holder
-# pass (cleanup currently runs ~19 min and grows with the archive): a job whose
-# staleness exceeds its threshold by more than this is dead, not queued.
-_MAINTENANCE_SLOT_WAIT_ALLOWANCE_SECONDS = 1800.0
+# before a queued maintenance job flags stale anyway. Sized to one normal long
+# holder pass: the research manifest now consistently takes 51-53 minutes as the
+# archive has grown (cleanup is shorter). A job whose staleness exceeds its
+# threshold by more than this is dead, not merely queued.
+_MAINTENANCE_SLOT_WAIT_ALLOWANCE_SECONDS = 3600.0
 
 
 def build_health_report(
@@ -1199,6 +1214,9 @@ def build_health_report(
             "report_age_seconds": report_age_seconds,
             "moved_count": offload_payload.get("moved_count"),
             "failed_count": offload_payload.get("failed_count"),
+            "backstop_candidate_count": offload_payload.get("backstop_candidate_count"),
+            "backstopped_count": offload_payload.get("backstopped_count"),
+            "backstop_failed_count": offload_payload.get("backstop_failed_count"),
             "stuck_unaccounted_count": stuck_count,
             "stuck_unaccounted_baseline": stuck_unaccounted_baseline,
             "findings": offload_findings if isinstance(offload_findings, list) else [],

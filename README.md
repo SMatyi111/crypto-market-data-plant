@@ -96,7 +96,12 @@ The maintainer deployment runs on a Windows workstation with archive root
 `G:\market_archive` (NVMe — cut over from `D:\market_archive` on 2026-06-08
 because the D: disk couldn't keep up with concurrent collection; the old D:
 tree is retained read-only as history). Aged raw runs are verify-moved to a
-cold tier at `D:\market_archive_cold` by the `archive-offload` ops job. The
+cold tier at `D:\market_archive_cold` by the `archive-offload` ops job. If an
+interrupted run remains outside both promotion and quarantine indexes through
+the full offload-age window, the same job writes a bounded diagnostics bundle,
+classifies it as `aged_unaccounted`, and only then permits the existing
+byte-verified cold move. Raw is preserved; the backstop never deletes an
+unverified copy. The
 data-plant startup task was installed on 2026-05-25 and has been collecting
 continuously under the archive contract documented below.
 

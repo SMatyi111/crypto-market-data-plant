@@ -8,7 +8,7 @@ changes scope or state. Companion docs:
 - [`STANDARDS.md`](STANDARDS.md) — the data contract (schemas, replayability, retention)
 - [`docs/HISTORY.md`](docs/HISTORY.md) — resolved-work narrative (what was fixed, and why)
 
-Last updated: **2026-07-20**.
+Last updated: **2026-08-01**.
 
 > **Operating mode — safe shaping (owner directive, 2026-07-04).** No extended
 > building on Claude's initiative: no new venues, lanes, or instruments, no big
@@ -19,18 +19,20 @@ Last updated: **2026-07-20**.
 
 ---
 
-## Current state (2026-07-12)
+## Current state (2026-08-01)
 
-**21 enabled collector lanes** across Binance (spot USDT + USDC, USDT-M perp via
+**22 enabled collector lanes** across Binance (spot USDT + USDC, USDT-M perp via
 REST), Coinbase, Kraken, Bybit (spot + linear perp), MEXC, OKX (spot + linear
-perp) — all BTC. **Kalshi crypto-binary collection is TURNED OFF as of
+perp), plus the RSS text lane — market lanes are all BTC. **Kalshi
+crypto-binary collection is TURNED OFF as of
 2026-06-17** (both Kalshi jobs `enabled:false`; it was the G:-full root cause —
 see `docs/HISTORY.md` 2026-06-17 + Decision queue). Full quarantine → promote
 curation chain per lane, hourly score catch-up self-heal, research manifest,
-cleanup retention, and cold-tier archive offload. Live runner restarted at boot
-2026-07-11 ~15:50 UTC (machine reboot; SYSTEM task, `ops.live.local.json`) on
-current `main` (`b3cf669`), so **PRs #24, #26, #28, and #31 are all deployed** —
-nothing merged is awaiting a restart. All 21 lanes green. CI green on `main`.
+cleanup retention, and cold-tier archive offload. The live runner remains a
+SYSTEM task using `ops.live.local.json`; all 22 collectors are fresh. The
+2026-08-01 preserve-first aged-run backstop and maintenance fairness fix are on
+`codex/aged-unaccounted-backstop`; the one remaining deployment action is an
+elevated runner restart after review/merge.
 
 ---
 
@@ -41,29 +43,21 @@ nothing merged is awaiting a restart. All 21 lanes green. CI green on `main`.
 | ~~2026-06-18~~ DONE 06-22 | Offload-index spot-check **PASSED**: 4509 index rows == cold run-dirs 1:1 on every lane, 0 duplicates/malformed, 0 unindexed pile-up, 0 missing cold copies, 0 sampled file-count mismatches, 0 indexed runs still hot. Offload live (newest `moved_at` 2026-06-22T09:53Z). Dry-run also flags **16 `stuck_unaccounted_runs`** (raw from 06-09..06-11 never promoted: 8 `binance_perp_funding` + 8 trade/depth) — designed safety surface, but a real promotion gap to investigate. *(Re-measured 2026-07-04: the true cohort is **14,211** — the 06-16..06-23 crash-loop debris had not yet crossed the 10-day offload fence when this check ran. See the 07-04 audit stamp + Decision queue.)* |
 | ~~2026-07-15~~ DONE 07-16 | **The 07-05 orphan wave crossed the offload fence as predicted**: `stuck_unaccounted=17,519` (forecast ~17.5k), `failed=0`. Health's sole finding is the expected `offload_stuck_above_baseline:17519`; the queued cleanup/backstop decision remains open. |
 | ~~2026-06-19~~ DONE 06-24 | The 06-17 `robocopy /MINAGE:3` move never finished (~88% of partitions still on G:), leaving G: at **3.9 GB free**. First retry (06-22) was killed by the Bash tool's 10-min timeout after freeing ~57 GB. Relaunched **detached via `Start-Process`** (pid 48444) so it survives session/tool teardown -> **COMPLETED 2026-06-24 16:19, FAILED: 0** (45.29 M files / 555 GB moved G:->`D:\market_archive_cold`). **G: now 489 GB free.** D: holds 113,407 normalized partitions (full set). 1 partition / 2 parquet files remain on G: -- robocopy *skipped* them (already byte-present on D: from the 06-17 partial), so redundant not stranded; immaterial (489 GB free). Lesson: long-running moves must be detached, never run inside a Bash call (10-min cap). |
-| 2026-07-26 | **Text raw offload wiring.** The first `raw/text/text_rss` runs cross the 10-day offload fence 2026-07-26, but the `archive-offload-text` job (shipped `enabled:false` in the example config, PR #35) is **not in the live config** — nothing moves to cold and nothing accounts text runs after that date. Volume is tiny (~2 MB/day), so this is warn-level, not urgent; but it must land **before any future `cleanup` `apply:true`** (cleanup's raw scan covers `raw/text` at the 14-day default, and deleting un-offloaded raw would discard the rebuild source). Owner action: copy the job from the example config into `ops.live.local.json` at the next runner restart opportunity, or defer knowingly. |
+| ~~2026-07-26~~ DONE 08-01 | **Text raw offload wired for the next restart.** `archive-offload-text` is enabled in `ops.live.local.json` with the indexed promotion/quarantine gate, preserve-first aged-run backstop, byte-verified cold move, and `write_report:false` so it cannot replace the market health report. It remains inert until the guarded elevated runner restart. |
 
-**Last ops audit:** 2026-07-20 — **plant GREEN; one self-healed fapi incident
-since 07-16; RSS acceptance on track.** Health `status=warn` with the single
-expected finding `offload_stuck_above_baseline:17541` (heartbeat 2.5 s) — the
-stuck cohort grew **+22** vs the 07-16 baseline (17519 -> 17541), the documented
-funding-orphan-per-restart drip, nothing new. **All 22 workers running, 0
-stale**; quarantine ratios ~0 (only coinbase-trades 0.07%). **All 85 scheduled
-jobs' latest run = success.** Jobs since the 07-16 11:36 UTC restart:
-**34,614/34,978 success (98.96%)**; all 364 errors were `binance-futures-rest-*`
-fapi transport failures, **360 of them in one self-healed incident 2026-07-19
-~19:00-21:10 UTC** (REST lanes only: trades 138 / depth 131 / funding 93; WS
-lanes unaffected — the known fapi-degradation signature), **0 errors on 07-20**.
-Coverage impact of that ~2 h window: gapless aggTrades self-backfill on
-recovery; perp depth + funding carry ~2 h intraday holes and funding minted its
-usual restart orphans. **G: 458.3 GB free** (+21.6 vs 07-16 — raw offload
-outpacing normalized growth); offload fresh (~41 min, 49 moves / 0 failures).
-**RSS text acceptance GREEN, 4 days in** (window through 07-30): curated rows
-accruing daily across all five feeds (198 parquet files, newest promotion ~2 min
-before this audit), text-rss worker running, quarantine 0. No new autonomous
-work forced; the sole open finding stays owner-gated (stuck-cohort
-cleanup/backstop + normalized retention). Audit with
-`--stuck-unaccounted-baseline 17519` until the cohort cleanup lands.
+**Last ops audit:** 2026-08-01 — **capture healthy; aged-run accounting repaired
+without raw deletion.** All 22 collectors were fresh, heartbeat ~14 s, and G:
+had 384.45 GB free. The 17,809 aged unaccounted run directories were classified
+`aged_unaccounted` with bounded diagnostics and quarantine index rows: 17,809
+successes, 0 failures. Raw remained in place until the existing byte-verified
+cold move; the latest official offload report shows `stuck_unaccounted=0`,
+`failed=0`, and the audit baseline is reset to 0. The audit also exposed a real
+single-slot scheduling fairness bug: three RSS maintenance jobs near the end of
+the live config were stale while the RSS collector stayed fresh. The branch fix
+selects the oldest due maintenance deadline and allows one normal 51-53 minute
+manifest pass before declaring a queued job stale. Until the elevated restart,
+health remains WARN only for those three stale RSS maintenance jobs; collection
+itself remains live.
 
 **Previous ops audit:** 2026-07-16 — **plant GREEN before text deployment; RSS
 initial verification GREEN.** Pre-deploy health's sole finding was the expected
@@ -180,9 +174,10 @@ owner ask (safe-shaping directive above).
    (offload report persisted + growth-gated `health` finding; root-cause
    narrative in `docs/HISTORY.md` 2026-07-04). **Deployed at the 07-11 boot and
    verified live 07-12**: it caught the +4 cohort growth within a day. The
-   07-05 wave crossed the offload fence as forecast (~17.5k), so audit with
-   `--stuck-unaccounted-baseline 17519` (07-16 measure) until the cohort cleanup
-   lands, then reset the baseline to 0.
+   07-05 wave crossed the offload fence as forecast (~17.5k). **Cleanup and the
+   durable preserve-first backstop landed locally 2026-08-01:** all 17,809 runs
+   were classified with 0 failures and the live offload report is at 0 stuck;
+   audit with `--stuck-unaccounted-baseline 0` now.
 4. **PARKED — Phase 6 candidate: inverse (coin-margined) BTCUSD perps.** Natural next
    instrument-expansion step after the linear-perp triangle. Note: Binance USDT-M
    *websocket* is jurisdiction-blocked from this box (REST works — see Constraints),
@@ -340,43 +335,14 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   `(product, trade_id)` at read time in research consumers, or (b) re-promote the
   affected lanes from raw on the fixed code (touches curated data — owner call).
   New capture is clean once the fix PR deploys.
-- **14,211 `stuck_unaccounted_runs` (~95 GB hot on G:) — re-measured 2026-07-04;
-  the previously documented "16" was a stale 06-22 measurement.** Never-scored raw
-  run-dirs that aged past the 168 h scoring+quarantine window and are now permanent
-  orphans: promote needs `replayable`, quarantine needs a fresh
-  `replay_summary.json` within 168 h, and neither job will ever touch them again ->
-  offload refuses to move them (by design) and reports them as
-  `stuck_unaccounted_runs` forever. The cohort spans 06-09..06-23 and is dominated
-  by **crash-loop debris** from the 06-17 ENOSPC incident and the 06-21..22
-  robocopy-contention window (one run-dir per collector restart; binance_depth
-  alone has 1,266 dirs dated 06-22). Heaviest lanes: binance_perp_trades ~32 GB,
-  binance_perp_depth ~28 GB, binance_depth/binance_depth_usdc 1,602 dirs each.
-  NOT an active bug: the population is closed (0 new orphans post-06-24; verified
-  per-day) and curated coverage through the window held 34-49 promoted
-  segments/day (intraday holes of order hours on 06-17/06-21/06-22 only). Latent
-  gap: nothing back-stops runs that age out unscored, so a future multi-day
-  incident will mint new orphans (observability half DONE — PR #28: persisted
-  offload report + growth-gated health finding, active at next runner restart;
-  run health with `--stuck-unaccounted-baseline 14211` until this cohort is
-  cleaned up, then reset to 0). Options:
-  (a) one-time cleanup -- quarantine the cohort with diagnostics bundles
-  (preserves them, clears the warn-noise, lets offload move ~95 GB to D:) or
-  delete (mostly interrupted partial captures); (b) build a durable backstop job
-  that quarantines aged unaccounted runs (code change, but changes data
-  accounting -> owner sign-off); (c) leave as-is and accept the warn-noise +
-  ~95 GB permanently stranded hot. All three touch data retention / accounting =
-  owner-gated. Note (a)-delete would discard partial raw that could in principle
-  be backfill-scored to patch the 06-17/06-21/06-22 intraday curated holes --
-  if those hours matter for research, choose quarantine-preserve over delete.
-  **UPDATE 2026-07-12: the population is NOT closed.** +4 funding restart
-  partials (06-27..07-02) crossed the fence (count now 14,215), and a **~3.4k
-  wave of 07-05 network-outage crash-loop partials crosses ~2026-07-15** (->
-  ~17.5k total; small bytes, mostly sub-MB dirs). Root pattern: a fast
-  crash-loop mints run-dirs faster than they can ever be scored, and the
-  funding lane orphans on *every* worker restart (inline scoring at clean
-  segment close only; no catch-up scorer). This materially strengthens option
-  (b) — the drip is ongoing, not historical — with (a) still wanted once to
-  clear the backlog.
+Decided 2026-08-01 (implemented locally; elevated restart pending):
+- **Aged unaccounted runs: quarantine-preserve plus durable backstop.** The owner
+  asked to fix the plant health warning. All 17,809 aged unaccounted runs were
+  classified with bounded diagnostics and 0 failures; no raw data was deleted.
+  The live offload report is now at 0 stuck. The offloader now performs the same
+  preserve-first classification automatically after the full offload-age window,
+  then relies on the existing byte-verified cold move. The same audit found and
+  fixed oldest-deadline fairness for the serialized maintenance slot.
 
 Decided 2026-07-13 (recorded; build ACTIVE — see open item 15):
 - **2026-07-12 modelling collection request: APPROVED at P1 scope, native

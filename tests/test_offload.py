@@ -142,6 +142,152 @@ def test_old_unaccounted_run_is_kept_and_flagged(tmp_path: Path) -> None:
     assert run_dir.exists()
 
 
+def test_apply_backstops_old_unaccounted_without_deleting_raw_when_move_limit_is_zero(
+    tmp_path: Path,
+) -> None:
+    raw_root = tmp_path / "raw"
+    cold_root = tmp_path / "cold"
+    run_dir = _make_run(raw_root, "okx_trades", OLD_RUN)
+    spec = _lane_spec(tmp_path, "okx_trades")
+
+    report = offload_accounted_runs(
+        raw_root=raw_root,
+        cold_root=cold_root,
+        lanes=[spec],
+        min_age_days=10,
+        limit=0,
+        quarantine_unaccounted_after_days=10,
+        quarantine_unaccounted_limit=10,
+        apply=True,
+    )
+
+    assert report.status == "ok"
+    assert report.backstop_candidate_count == 1
+    assert report.backstopped_count == 1
+    assert report.backstop_failed_count == 0
+    assert report.stuck_unaccounted_count == 0
+    assert report.moved_count == 0
+    assert run_dir.exists()
+    diagnostics = spec.quarantine_index.parent / OLD_RUN / "diagnostics.json"
+    assert diagnostics.exists()
+    payload = json.loads(diagnostics.read_text(encoding="utf-8"))
+    assert payload["classification"]["findings"] == [
+        "aged_unaccounted",
+        "replayable_but_unpromoted",
+    ]
+    index_row = json.loads(spec.quarantine_index.read_text(encoding="utf-8"))
+    assert index_row["run_path"] == str(run_dir)
+    assert index_row["classification"] == "aged_unaccounted"
+
+
+def test_apply_backstops_then_verify_moves_old_unaccounted_in_same_pass(tmp_path: Path) -> None:
+    raw_root = tmp_path / "raw"
+    cold_root = tmp_path / "cold"
+    run_dir = _make_run(raw_root, "okx_trades", OLD_RUN, payload="preserve-me")
+    spec = _lane_spec(tmp_path, "okx_trades")
+
+    report = offload_accounted_runs(
+        raw_root=raw_root,
+        cold_root=cold_root,
+        lanes=[spec],
+        min_age_days=10,
+        limit=1,
+        quarantine_unaccounted_after_days=10,
+        quarantine_unaccounted_limit=10,
+        apply=True,
+    )
+
+    assert report.backstopped_count == 1
+    assert report.stuck_unaccounted_count == 0
+    assert report.moved_count == 1
+    assert not run_dir.exists()
+    assert (cold_root / "okx_trades" / OLD_RUN / "clean" / "events.jsonl").read_text(
+        encoding="utf-8"
+    ) == "preserve-me"
+
+
+def test_dry_run_reports_backstop_candidate_without_writing_accounting(tmp_path: Path) -> None:
+    raw_root = tmp_path / "raw"
+    run_dir = _make_run(raw_root, "okx_trades", OLD_RUN)
+    spec = _lane_spec(tmp_path, "okx_trades")
+
+    report = offload_accounted_runs(
+        raw_root=raw_root,
+        cold_root=tmp_path / "cold",
+        lanes=[spec],
+        min_age_days=10,
+        quarantine_unaccounted_after_days=10,
+        quarantine_unaccounted_limit=10,
+        apply=False,
+    )
+
+    assert report.backstop_candidate_count == 1
+    assert report.backstopped_count == 0
+    assert report.stuck_unaccounted_count == 1
+    assert not spec.quarantine_index.exists()
+    assert run_dir.exists()
+
+
+def test_backstop_age_cannot_preempt_the_offload_processing_window(tmp_path: Path) -> None:
+    spec = _lane_spec(tmp_path, "okx_trades")
+    _make_run(tmp_path / "raw", "okx_trades", OLD_RUN)
+
+    with pytest.raises(ValueError, match="at least the effective offload age"):
+        offload_accounted_runs(
+            raw_root=tmp_path / "raw",
+            cold_root=tmp_path / "cold",
+            lanes=[spec],
+            min_age_days=10,
+            quarantine_unaccounted_after_days=7,
+            quarantine_unaccounted_limit=10,
+            apply=True,
+        )
+
+
+def test_backstop_preflights_all_lanes_before_writing_any_index(tmp_path: Path) -> None:
+    raw_root = tmp_path / "raw"
+    first = _lane_spec(tmp_path, "first")
+    second = _lane_spec(tmp_path, "second")
+    second.min_age_days = 30
+    _make_run(raw_root, "first", OLD_RUN)
+    _make_run(raw_root, "second", OLD_RUN)
+
+    with pytest.raises(ValueError, match="lane 'second'"):
+        offload_accounted_runs(
+            raw_root=raw_root,
+            cold_root=tmp_path / "cold",
+            lanes=[first, second],
+            min_age_days=10,
+            quarantine_unaccounted_after_days=10,
+            quarantine_unaccounted_limit=10,
+            apply=True,
+        )
+
+    assert not first.quarantine_index.exists()
+
+
+def test_apply_backstop_requires_quarantine_index_before_writing(tmp_path: Path) -> None:
+    raw_root = tmp_path / "raw"
+    run_dir = _make_run(raw_root, "okx_trades", OLD_RUN)
+    spec = OffloadLaneSpec(
+        source="okx_trades",
+        promotion_index=tmp_path / "curated" / "_promotion_index.jsonl",
+    )
+
+    with pytest.raises(ValueError, match="needs quarantine_index"):
+        offload_accounted_runs(
+            raw_root=raw_root,
+            cold_root=tmp_path / "cold",
+            lanes=[spec],
+            min_age_days=10,
+            quarantine_unaccounted_after_days=10,
+            quarantine_unaccounted_limit=10,
+            apply=True,
+        )
+
+    assert run_dir.exists()
+
+
 def test_young_run_is_ignored_even_when_promoted(tmp_path: Path) -> None:
     raw_root = tmp_path / "raw"
     cold_root = tmp_path / "cold"
@@ -317,6 +463,8 @@ def test_cli_parser_accepts_archive_offload() -> None:
             "--cold-root", r"D:\market_archive_cold\raw\market",
             "--lanes-file", "lanes.json",
             "--min-age-days", "14",
+            "--quarantine-unaccounted-after-days", "14",
+            "--quarantine-unaccounted-limit", "500",
             "--ops-root", r"G:\market_archive\ops",
             "--apply",
         ]
@@ -325,6 +473,8 @@ def test_cli_parser_accepts_archive_offload() -> None:
     assert args.apply is True
     assert args.min_age_days == 14.0
     assert args.limit == 200
+    assert args.quarantine_unaccounted_after_days == 14.0
+    assert args.quarantine_unaccounted_limit == 500
     assert args.ops_root == Path(r"G:\market_archive\ops")
 
 
@@ -355,6 +505,8 @@ def test_job_args_archive_offload_passes_every_config_arg() -> None:
                 "lanes": lanes,
                 "min_age_days": 21.0,
                 "limit": 50,
+                "quarantine_unaccounted_after_days": 21.0,
+                "quarantine_unaccounted_limit": 500,
                 "apply": True,
                 "ops_root": r"G:\market_archive\ops",
             },
@@ -365,6 +517,8 @@ def test_job_args_archive_offload_passes_every_config_arg() -> None:
     assert args.lanes == lanes
     assert args.min_age_days == 21.0
     assert args.limit == 50
+    assert args.quarantine_unaccounted_after_days == 21.0
+    assert args.quarantine_unaccounted_limit == 500
     assert args.apply is True
     assert args.ops_root == Path(r"G:\market_archive\ops")
 
@@ -424,7 +578,8 @@ def test_run_archive_offload_raises_on_failed_moves(tmp_path: Path) -> None:
     # The error message carries the headline counts: on this path the caller
     # never gets the report object back.
     with pytest.raises(
-        RuntimeError, match=r"failed moves \(moved=0 stuck_unaccounted=0\)"
+        RuntimeError,
+        match=r"failed moves and 0 failed backstop classifications \(moved=0 stuck_unaccounted=0\)",
     ):
         run_archive_offload(args)
     assert run_dir.exists()
@@ -659,7 +814,8 @@ def test_ops_job_archive_offload_persists_report_and_reports_counts(tmp_path: Pa
     capsys.readouterr()
 
     assert message == (
-        "archive offload completed; status=warn moved=0 failed=0 stuck_unaccounted=1"
+        "archive offload completed; status=warn moved=0 failed=0 "
+        "backstopped=0 backstop_failed=0 stuck_unaccounted=1"
     )
     payload = json.loads(
         (ops_root / OFFLOAD_REPORT_FILENAME).read_text(encoding="utf-8")

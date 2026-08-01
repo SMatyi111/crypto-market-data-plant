@@ -2213,6 +2213,36 @@ def test_maintenance_jobs_stay_serialized_when_multiple_due(tmp_path: Path) -> N
     assert max_active == 1
 
 
+def test_maintenance_dispatch_selects_oldest_deadline_not_config_order() -> None:
+    """A perpetually-due early config job must not starve a later job forever."""
+    from crypto_collector.ops import _select_oldest_due_job
+
+    now = datetime.now(tz=UTC)
+    first = JobSpec(name="quarantine-market", job_type="quarantine-runs", interval_seconds=300)
+    starved = JobSpec(name="score-text-rss", job_type="backfill-text-replay", interval_seconds=3600)
+    selected = _select_oldest_due_job(
+        [first, starved],
+        {
+            first.name: now - timedelta(minutes=10),
+            starved.name: now - timedelta(days=1),
+        },
+    )
+
+    assert selected is starved
+
+
+def test_maintenance_dispatch_keeps_config_order_for_equal_deadlines() -> None:
+    from crypto_collector.ops import _select_oldest_due_job
+
+    now = datetime.now(tz=UTC)
+    first = JobSpec(name="first", job_type="cleanup", interval_seconds=3600)
+    second = JobSpec(name="second", job_type="research-manifest", interval_seconds=3600)
+
+    assert _select_oldest_due_job(
+        [first, second], {first.name: now, second.name: now}
+    ) is first
+
+
 def test_maintenance_runs_while_a_collector_is_active(tmp_path: Path) -> None:
     """A maintenance job may run concurrently with an in-flight collector. The collector
     blocks until the test releases it; the maintenance job records whether the collector
@@ -2744,7 +2774,7 @@ def test_partition_freshness_check_skips_lanes_that_opt_out_of_normalized_parque
 
 def test_maintenance_jobs_queued_behind_the_slot_are_not_flagged_stale(tmp_path: Path) -> None:
     """Maintenance is serialized on one executor slot: while a long pass holds it
-    (cleanup scans the archive for ~15-20 min), other due maintenance jobs are
+    (the research manifest now scans the archive for ~51-53 min), other due maintenance jobs are
     queued, not stale -- flagging them sprayed stale_job warnings on every cleanup
     pass after the executor deploy. Suppression is BOUNDED (the live slot is busy
     at most checks, so unbounded suppression would hide a dead job forever),
@@ -2811,6 +2841,13 @@ def test_maintenance_jobs_queued_behind_the_slot_are_not_flagged_stale(tmp_path:
     promote_row = next(r for r in report.jobs if r["name"] == "promote-kraken-depth")
     assert promote_row["waiting_on_maintenance_slot"] is True
 
+    # A normal ~53 minute manifest can leave this 10-minute-cadence job around
+    # 70 minutes old by the time health samples it. That is still explainable by
+    # one holder pass and must remain queued, not stale.
+    write_promote_run(4200.0)
+    report = build_health_report(ops_root=tmp_path, jobs=load_ops_config(config))
+    assert "stale_job:promote-kraken-depth" not in report.findings
+
     # Stale far beyond what waiting can explain: flags DESPITE the busy slot.
     write_promote_run(4 * 3600.0)
     report = build_health_report(ops_root=tmp_path, jobs=load_ops_config(config))
@@ -2858,6 +2895,9 @@ def _write_offload_report(
         moved_count=moved,
         moved_bytes=0,
         failed_count=failed,
+        backstop_candidate_count=0,
+        backstopped_count=0,
+        backstop_failed_count=0,
         stuck_unaccounted_count=stuck,
         findings=findings
         if findings is not None

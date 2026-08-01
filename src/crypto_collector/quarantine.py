@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .storage import JsonlSink
+from .storage import JsonlSink, write_text_atomic
 
 
 @dataclass(slots=True)
@@ -179,16 +179,93 @@ def quarantine_bad_runs(
     )
 
 
-def _build_diagnostics_bundle(run_dir: Path, replay_summary: dict[str, Any]) -> dict[str, Any]:
+def quarantine_aged_unaccounted_run(
+    run_dir: Path,
+    *,
+    quarantine_index_path: Path,
+    checked_at: datetime,
+) -> QuarantineRunStatus:
+    """Account an aged run that missed both promotion and quarantine.
+
+    This is the preserve-first terminal backstop for interrupted/crash-loop run
+    directories. It writes a bounded diagnostics bundle and a quarantine index
+    row, but deliberately leaves the raw directory in place. The existing
+    verify-copy-delete cold offloader can then relocate the raw tree safely.
+
+    The caller owns the age and index-membership checks. Keeping those checks in
+    the offloader lets one scan use the exact same configured promotion and
+    quarantine indexes that define ``stuck_unaccounted``.
+    """
+
+    run_key = str(run_dir)
+    quarantine_root = quarantine_index_path.parent
+    quarantine_dir = quarantine_root / run_dir.name
+    replay_summary_path = run_dir / "metrics" / "replay_summary.json"
+    replay_summary = _read_json_file(replay_summary_path)
+    replayable = None if replay_summary is None else bool(replay_summary.get("replayable"))
+    findings = ["aged_unaccounted"]
+    if replay_summary is None:
+        findings.append("missing_replay_summary")
+    else:
+        findings.extend(str(item) for item in replay_summary.get("findings", []))
+        if replayable:
+            findings.append("replayable_but_unpromoted")
+
+    try:
+        diagnostics = _build_diagnostics_bundle(run_dir, replay_summary)
+        diagnostics["classification"] = {
+            "classified_at": checked_at.isoformat(),
+            "findings": findings,
+            "reason": "run remained outside promotion and quarantine indexes beyond the processing window",
+        }
+        quarantine_dir.mkdir(parents=True, exist_ok=True)
+        write_text_atomic(
+            quarantine_dir / "diagnostics.json",
+            json.dumps(diagnostics, indent=2, sort_keys=True),
+            fsync=True,
+        )
+        JsonlSink(quarantine_root, quarantine_index_path.name).write(
+            {
+                "run_path": run_key,
+                "quarantined_at": checked_at.isoformat(),
+                "quarantine_dir": str(quarantine_dir),
+                "findings": findings,
+                "classification": "aged_unaccounted",
+            }
+        )
+        return QuarantineRunStatus(
+            run_path=run_key,
+            action="quarantined_aged_unaccounted",
+            quarantine_dir=str(quarantine_dir),
+            findings=findings,
+            replayable=replayable,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return QuarantineRunStatus(
+            run_path=run_key,
+            action="failed_aged_unaccounted",
+            quarantine_dir=str(quarantine_dir),
+            findings=findings,
+            replayable=replayable,
+            error=str(exc),
+        )
+
+
+def _build_diagnostics_bundle(
+    run_dir: Path, replay_summary: dict[str, Any] | None
+) -> dict[str, Any]:
     events_path = run_dir / "clean" / "events.jsonl"
     raw_path = run_dir / "raw" / "messages.jsonl"
     summary_path = run_dir / "metrics" / "summary.jsonl"
     return {
         "run_path": str(run_dir),
         "replay_summary": replay_summary,
-        "metrics_summary": _read_jsonl(summary_path),
-        "clean_sample": _read_jsonl(events_path)[:5],
-        "raw_sample": _read_jsonl(raw_path)[:5],
+        # Interrupted runs can contain multi-GB raw files. Diagnostics are evidence,
+        # not a second archive: stream only a bounded prefix instead of loading the
+        # whole file before slicing it.
+        "metrics_summary": _read_jsonl_sample(summary_path, limit=20),
+        "clean_sample": _read_jsonl_sample(events_path, limit=5),
+        "raw_sample": _read_jsonl_sample(raw_path, limit=5),
     }
 
 
@@ -231,4 +308,21 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     for line in path.read_text(encoding="utf-8").splitlines():
         if line.strip():
             rows.append(json.loads(line))
+    return rows
+
+
+def _read_jsonl_sample(path: Path, *, limit: int) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if not path.exists() or limit <= 0:
+        return rows
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                rows.append({"_diagnostic_error": "invalid_json"})
+            if len(rows) >= limit:
+                break
     return rows
