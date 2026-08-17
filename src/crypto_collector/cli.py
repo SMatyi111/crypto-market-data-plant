@@ -139,6 +139,7 @@ from .replay import (
     replay_text_run,
     replay_trades_run,
     replay_trades_stream_run,
+    replay_wallet_flow_run,
 )
 from .research_manifest import DEFAULT_MANIFEST_ROOT, generate_research_manifest
 from .storage import JsonlSink, ParquetDatasetSink, prepare_run_paths
@@ -1151,6 +1152,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Score with the none_native stream-trades replay (Bybit/MEXC, whose "
         "trade ids are UUIDs) instead of the dense sequence-bearing scorer "
         "(Binance/Coinbase/Kraken).",
+    )
+    backfill_trades_parser.add_argument(
+        "--wallet-flow",
+        action="store_true",
+        help="Score with the Hyperliquid wallet-flow replay: ordering is checked "
+        "per wallet (a run legitimately interleaves wallets whose poll windows sit "
+        "at different depths) and the clock-skew default is resume-window-sized. "
+        "Overrides --stream.",
+    )
+    backfill_trades_parser.add_argument(
+        "--max-clock-skew-ms",
+        type=float,
+        default=None,
+        help="Override the scorer's exchange->receipt clock-skew gate. Defaults to "
+        "each scorer's own default (60s dense/stream, 90 days --wallet-flow).",
     )
     backfill_trades_parser.add_argument("--format", choices=["json", "text"], default="text")
 
@@ -2466,9 +2482,9 @@ async def collect_hyperliquid_wallet_flow_segment(
     )
     events_path = run_paths.clean / "events.jsonl"
     if events_path.exists():
-        replay_summary = replay_trades_stream_run(
+        replay_summary = replay_wallet_flow_run(
             run_paths.base,
-            max_clock_skew_ms=float(getattr(args, "max_clock_skew_ms", 300_000.0)),
+            max_clock_skew_ms=float(getattr(args, "max_clock_skew_ms", 7_776_000_000.0)),
             write_summary=True,
         )
         replayable = replay_summary.replayable
@@ -3843,13 +3859,18 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
     if job.job_type == "backfill-trades-replay":
         # Trades scorer (run_backfill_trades_replay) — write replay summaries only, no
         # promotion. stream=True selects the none_native UUID scorer (Bybit/MEXC);
-        # default is the dense sequence-bearing scorer (Binance/Coinbase/Kraken).
+        # wallet_flow=True selects the per-wallet Hyperliquid scorer (overrides
+        # stream); default is the dense sequence-bearing scorer
+        # (Binance/Coinbase/Kraken). max_clock_skew_ms=None keeps each scorer's
+        # own default gate.
         return SimpleNamespace(
             source_root=Path(raw_args.get("source_root", default_archive_root() / "raw" / "market" / "binance_trades")),
             limit=raw_args.get("limit", 50),
             max_age_hours=raw_args.get("max_age_hours", 24.0),
             overwrite=raw_args.get("overwrite", False),
             stream=raw_args.get("stream", False),
+            wallet_flow=raw_args.get("wallet_flow", False),
+            max_clock_skew_ms=raw_args.get("max_clock_skew_ms"),
             format=raw_args.get("format", "text"),
         )
     if job.job_type == "backfill-text-replay":
@@ -4227,7 +4248,22 @@ def run_backfill_replay(args: argparse.Namespace) -> None:
 
 
 def run_backfill_trades_replay(args: argparse.Namespace) -> None:
-    replay_fn = replay_trades_stream_run if getattr(args, "stream", False) else replay_trades_run
+    if getattr(args, "wallet_flow", False):
+        scorer = replay_wallet_flow_run
+    elif getattr(args, "stream", False):
+        scorer = replay_trades_stream_run
+    else:
+        scorer = replay_trades_run
+    skew_override = getattr(args, "max_clock_skew_ms", None)
+    if skew_override is None:
+        replay_fn = scorer
+    else:
+        def replay_fn(run_dir, write_summary=True):
+            return scorer(
+                run_dir,
+                max_clock_skew_ms=float(skew_override),
+                write_summary=write_summary,
+            )
     report = backfill_replay_summaries(
         args.source_root,
         limit=args.limit,

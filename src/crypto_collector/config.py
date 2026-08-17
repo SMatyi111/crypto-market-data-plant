@@ -22,7 +22,10 @@ DEFAULT_ARCHIVE_ROOT = Path(r"G:\market_archive")
 # v8 (2026-07-16): text-capture lanes (text-rss / text-reddit) - new `text`
 # dataset under raw/text + curated/research/text with its own envelope schema and
 # `replay_text_run` verdict; existing market/trades/funding surfaces unchanged.
-STANDARDS_VERSION = 8
+# v9 (2026-08-17): Hyperliquid wallet-flow lane gets `replay_wallet_flow_run`
+# (per-wallet ordering, resume-window clock-skew default) and capped-response
+# paging; no other lane's replayability semantics changed.
+STANDARDS_VERSION = 9
 
 _FALLBACK_WARNED: set[str] = set()
 

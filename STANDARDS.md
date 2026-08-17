@@ -1,7 +1,19 @@
 # Data Standards
 
-`STANDARDS_VERSION = 8`
+`STANDARDS_VERSION = 9`
 
+> **v9 (2026-08-17):** the Hyperliquid wallet-flow lane (§4.7) gets its own replay
+> verdict, `replay_wallet_flow_run` (`mode="wallet_flow_none_native"`): structural
+> ordering is checked **per wallet** (`metadata.wallet`), not globally — a run
+> legitimately interleaves cohort wallets whose poll windows sit at different
+> depths after an outage or per-wallet error recovery, so the generic stream
+> scorer's global monotonicity failed every catch-up run; rows missing wallet
+> metadata now fail the run (`missing_wallet_metadata`). The scorer's clock-skew
+> default is resume-window-sized (90 days) to match the lane's capture gates.
+> Capped `userFillsByTime` responses now **page forward** (consume fills strictly
+> older than the newest returned timestamp and advance the per-wallet high-water)
+> instead of emitting nothing for that wallet. No other lane's schema, partition,
+> or replayability semantics changed.
 > **v8 (2026-07-16):** adds the **text-capture lanes** (`text-rss`, `text-reddit` —
 > ROADMAP item 15, owner-approved 2026-07-13): a new **`text` dataset** with its own
 > raw root (`raw/text/<lane>/…`), curated target (`curated/research/text`), envelope
@@ -680,11 +692,21 @@ taker/crossed status, fee/token, transaction hash, order/trade/client-order IDs,
 and TWAP ID.
 
 The source has no dense sequence proof, so replay uses
-`gap_detection="none_native"`: `replayable` means structurally clean, not
-complete. Dedup is the composite `(wallet, trade_id)` key across overlap polls
-and all durable clean rows, including unfinished prior runs. The exact configured
-response cap is treated as an incomplete interval and emits no rows for that
-wallet; a failure for one wallet is isolated but marks the poll incomplete.
+`replay_wallet_flow_run` (`mode="wallet_flow_none_native"`,
+`gap_detection="none_native"`): `replayable` means structurally clean, not
+complete. Structural ordering is **per wallet** — exchange timestamps must be
+monotonic non-decreasing within each `metadata.wallet`, never across wallets,
+because a run legitimately interleaves cohort wallets whose poll windows sit at
+different depths (outage catch-up, per-wallet error recovery); a row with no
+wallet metadata fails the run. The scorer's clock-skew gate defaults to the
+lane's resume-window-sized capture gates (90 days). Dedup is the composite
+`(wallet, trade_id)` key across overlap polls and all durable clean rows,
+including unfinished prior runs. A cap-sized response is treated as a truncated
+page: fills strictly older than the newest returned timestamp are consumed and
+the per-wallet high-water advances to that boundary, so the next poll pages
+forward (a cap-sized page whose fills all share one timestamp is an error);
+the poll is marked incomplete either way. A failure for one wallet is isolated
+but marks the poll incomplete.
 Per-wallet attempts, successes, response counts, high-water timestamps, global
 duplicates/errors, cohort hash, and prospective boundary are atomically persisted
 in `_collector_state.json`.

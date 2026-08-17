@@ -285,3 +285,142 @@ def test_cli_and_ops_thread_every_wallet_flow_field(tmp_path: Path, monkeypatch)
         "jsonl_fsync": False,
         "normalized_parquet": False,
     }
+
+
+def _write_clean_run(run_dir: Path, rows: list[dict]) -> None:
+    events = run_dir / "clean" / "events.jsonl"
+    events.parent.mkdir(parents=True)
+    events.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+
+
+def _clean_row(
+    *, wallet: str | None, event_ms: int, received_ms: int | None = None
+) -> dict:
+    event_at = datetime.fromtimestamp(event_ms / 1000, tz=UTC)
+    received_at = datetime.fromtimestamp(
+        (received_ms if received_ms is not None else event_ms) / 1000, tz=UTC
+    )
+    metadata = {"hyperliquid_timestamp_ms": event_ms}
+    if wallet is not None:
+        metadata["wallet"] = wallet
+    return {
+        "source": "hyperliquid",
+        "product": "BTC",
+        "trade_id": f"{wallet}:{event_ms}",
+        "exchange_time": event_at.isoformat(),
+        "received_at": received_at.isoformat(),
+        "price": 100000.0,
+        "size": 0.01,
+        "metadata": metadata,
+    }
+
+
+def test_wallet_flow_replay_orders_per_wallet_not_globally(tmp_path: Path) -> None:
+    from crypto_collector.replay import replay_wallet_flow_run
+
+    base_ms = int(START.timestamp() * 1000)
+    run_dir = tmp_path / "20260817_000001"
+    # Wallet B's catch-up fills are older than wallet A's live fills — globally
+    # non-monotonic, but monotonic within each wallet: structurally clean.
+    _write_clean_run(
+        run_dir,
+        [
+            _clean_row(wallet=ADDRESS_A, event_ms=base_ms + 500_000),
+            _clean_row(wallet=ADDRESS_A, event_ms=base_ms + 600_000),
+            _clean_row(wallet=ADDRESS_B, event_ms=base_ms + 1_000),
+            _clean_row(wallet=ADDRESS_B, event_ms=base_ms + 2_000),
+        ],
+    )
+    summary = replay_wallet_flow_run(run_dir)
+    assert summary.replayable is True
+    assert summary.findings == []
+    assert summary.mode == "wallet_flow_none_native"
+    assert (run_dir / "metrics" / "replay_summary.json").exists()
+
+
+def test_wallet_flow_replay_fails_within_wallet_regression_and_missing_wallet(
+    tmp_path: Path,
+) -> None:
+    from crypto_collector.replay import replay_wallet_flow_run
+
+    base_ms = int(START.timestamp() * 1000)
+    regressed = tmp_path / "20260817_000002"
+    _write_clean_run(
+        regressed,
+        [
+            _clean_row(wallet=ADDRESS_A, event_ms=base_ms + 2_000),
+            _clean_row(wallet=ADDRESS_A, event_ms=base_ms + 1_000),
+        ],
+    )
+    summary = replay_wallet_flow_run(regressed)
+    assert summary.replayable is False
+    assert "non_monotonic_event_time" in summary.findings
+
+    unattributed = tmp_path / "20260817_000003"
+    _write_clean_run(unattributed, [_clean_row(wallet=None, event_ms=base_ms + 1_000)])
+    summary = replay_wallet_flow_run(unattributed)
+    assert summary.replayable is False
+    assert "missing_wallet_metadata" in summary.findings
+
+
+def test_wallet_flow_replay_clock_skew_gate(tmp_path: Path) -> None:
+    from crypto_collector.replay import replay_wallet_flow_run
+
+    base_ms = int(START.timestamp() * 1000)
+    run_dir = tmp_path / "20260817_000004"
+    # A fill refetched 7 days after the event: passes the lane default gate,
+    # fails a 60s gate.
+    _write_clean_run(
+        run_dir,
+        [
+            _clean_row(
+                wallet=ADDRESS_A,
+                event_ms=base_ms + 1_000,
+                received_ms=base_ms + 1_000 + 7 * 86_400_000,
+            )
+        ],
+    )
+    assert replay_wallet_flow_run(run_dir).replayable is True
+    summary = replay_wallet_flow_run(run_dir, max_clock_skew_ms=60_000.0)
+    assert summary.replayable is False
+    assert "excessive_clock_skew" in summary.findings
+
+
+def test_backfill_trades_replay_threads_wallet_flow_scorer(
+    tmp_path: Path, monkeypatch
+) -> None:
+    args = _job_args(
+        SimpleNamespace(
+            job_type="backfill-trades-replay",
+            args={
+                "source_root": str(tmp_path),
+                "wallet_flow": True,
+                "max_clock_skew_ms": 123_000.0,
+                "max_age_hours": 336,
+                "limit": 10,
+                "format": "json",
+            },
+        )
+    )
+    assert args.wallet_flow is True
+    assert args.max_clock_skew_ms == 123_000.0
+
+    base_ms = int(START.timestamp() * 1000)
+    run_dir = tmp_path / datetime.now(tz=UTC).strftime("%Y%m%d_%H%M%S")
+    _write_clean_run(
+        run_dir,
+        [
+            _clean_row(wallet=ADDRESS_A, event_ms=base_ms + 500_000),
+            _clean_row(wallet=ADDRESS_B, event_ms=base_ms + 1_000),
+        ],
+    )
+    cli.run_backfill_trades_replay(args)
+    summary = json.loads(
+        (run_dir / "metrics" / "replay_summary.json").read_text(encoding="utf-8")
+    )
+    # Per-wallet scorer verdict (the stream scorer would have failed this run
+    # as globally non-monotonic), with the threaded skew gate recorded.
+    assert summary["mode"] == "wallet_flow_none_native"
+    assert summary["replayable"] is True

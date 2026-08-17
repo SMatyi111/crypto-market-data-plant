@@ -30,17 +30,27 @@ crypto-binary collection is TURNED OFF as of
 see `docs/HISTORY.md` 2026-06-17 + Decision queue). Full quarantine → promote
 curation chain per lane, hourly score catch-up self-heal, research manifest,
 cleanup retention, and cold-tier archive offload. The main live runner remains a
-SYSTEM task using its startup copy of `ops.live.local.json`. **Hyperliquid is
-currently dark**: the bounded 08-09 user-level bridge stopped around 2026-08-10
-(newest raw run `20260810_000001`), and the SYSTEM runner still executes its
-pre-08-09 startup config (22 jobs, no hyperliquid slot), so the lane resumes
-only at the next elevated restart or reboot — the gap is prospective-only by
-design (persisted cursor, frozen cohort). The on-disk config and concurrency
-bump remain ready for that restart. The 2026-08-01 preserve-first aged-run
-backstop is **merged** (PR #41, `b312657`) but not yet deployed for the same
-reason. The Hyperliquid lane code itself, which had sat uncommitted on the live
-working tree since 08-09, is now on `codex/hyperliquid-wallet-flow-lane`
-awaiting review/merge.
+SYSTEM task using its startup copy of `ops.live.local.json`. **Hyperliquid: the
+08-10 → 08-17 gap is fully recovered and curated** (2026-08-17, owner-directed):
+after PR #42 merged, a bounded user-level catch-up run (60 s segments, 5 s poll
+interval, live roots) refetched 10,663 backlog fills with zero poll errors —
+exercising the new capped-response paging live — and dropped to the ~6-fill
+live trickle, i.e. fully caught up to 13:33Z. The 08-10 torn run's 3,290
+already-collected rows plus both 08-09 bridge runs were rescued by re-scoring,
+and all 7 lane runs promoted: **16,874 rows now in
+`curated/research/trades_replayable/source=hyperliquid`** (BTC/ETH/SOL), 0
+failures. Scoring needed a lane-correct verdict — the generic stream scorer's
+GLOBAL timestamp monotonicity fails any multi-wallet catch-up run (wallets sit
+at different window depths), which post-restart would have sent the lane into a
+quarantine → refetch loop. `replay_wallet_flow_run` (per-wallet ordering,
+resume-window skew default, STANDARDS **v9**) is on
+`codex/wallet-flow-scorer-v9` awaiting review/merge; the live score job now
+selects it via `wallet_flow: true`. **Continuous collection still resumes only
+at the elevated restart or reboot** (the SYSTEM runner runs its pre-08-09
+startup config; on-disk config + concurrency bump are ready — and the restart
+is no longer data-urgent, the gap being closed as of today). The 2026-08-01
+preserve-first aged-run backstop is **merged** (PR #41, `b312657`) but awaits
+the same restart.
 
 ---
 

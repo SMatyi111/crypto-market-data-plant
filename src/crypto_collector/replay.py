@@ -1242,6 +1242,140 @@ def replay_trades_stream_run(
     return summary
 
 
+def replay_wallet_flow_run(
+    run_path: Path,
+    *,
+    max_clock_skew_ms: float = 7_776_000_000.0,
+    write_summary: bool = True,
+) -> TradesReplaySummary:
+    """Replay-validate a Hyperliquid wallet-flow run (STANDARDS §4.7).
+
+    Mirrors `replay_trades_stream_run` (`gap_detection="none_native"`, same
+    `metrics/replay_summary.json` contract) with two lane-required differences:
+
+    - **Ordering is per wallet** (`metadata.wallet`), not global. A run interleaves
+      cohort wallets whose poll windows sit at different depths in the past — after
+      any outage or per-wallet error recovery, one wallet's older fills legitimately
+      follow another wallet's newer fills. Global monotonicity would fail every
+      catch-up run, the quarantine job would move it aside, and the durable-scan
+      dedup would then refetch the same window into another failing run — a loop.
+      A row with no wallet metadata cannot be ordered and fails the run.
+    - **The clock-skew default is resume-window-sized** (90 days, matching the
+      lane's capture gates): received_at - exchange_time equals the outage length
+      on refetched fills, and both timestamps are recorded per row for auditing.
+    """
+    resolved_run_path, events_path, summary_path = _resolve_run_paths(run_path)
+    event_count = 0
+    first_event_time: str | None = None
+    last_event_time: str | None = None
+    non_monotonic_time_count = 0
+    missing_wallet_count = 0
+    invalid_price_count = 0
+    invalid_size_count = 0
+    excessive_clock_skew_count = 0
+    max_clock_skew_ms_seen: float | None = None
+    source: str | None = None
+    product: str | None = None
+    instrument_id: str | None = None
+    previous_event_dt_by_wallet: dict[str, datetime] = {}
+
+    for row in _read_jsonl(events_path):
+        event_count += 1
+        source = source or _optional_str(row.get("source"))
+        product = product or _optional_str(row.get("product"))
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        if instrument_id is None:
+            instrument_id = _optional_str(metadata.get("instrument_id"))
+
+        exchange_time_str = _optional_str(row.get("exchange_time"))
+        if first_event_time is None:
+            first_event_time = exchange_time_str
+        last_event_time = exchange_time_str
+
+        wallet = _optional_str(metadata.get("wallet"))
+        if wallet is None:
+            missing_wallet_count += 1
+        else:
+            event_dt = _parse_iso_dt(exchange_time_str)
+            if event_dt is not None:
+                previous_event_dt = previous_event_dt_by_wallet.get(wallet)
+                if previous_event_dt is not None and event_dt < previous_event_dt:
+                    non_monotonic_time_count += 1
+                if previous_event_dt is None or event_dt >= previous_event_dt:
+                    previous_event_dt_by_wallet[wallet] = event_dt
+
+        price = _optional_float(row.get("price"))
+        if price is None or not _is_finite_positive(price):
+            invalid_price_count += 1
+        size = _optional_float(row.get("size"))
+        if size is None or not _is_finite_positive(size):
+            invalid_size_count += 1
+
+        received_at_str = _optional_str(row.get("received_at"))
+        skew_ms = _abs_skew_ms(exchange_time_str, received_at_str)
+        if skew_ms is not None:
+            if max_clock_skew_ms_seen is None or skew_ms > max_clock_skew_ms_seen:
+                max_clock_skew_ms_seen = skew_ms
+            if skew_ms > max_clock_skew_ms:
+                excessive_clock_skew_count += 1
+
+    findings: list[str] = []
+    if event_count == 0:
+        findings.append("no_events")
+    if non_monotonic_time_count:
+        findings.append("non_monotonic_event_time")
+    if missing_wallet_count:
+        findings.append("missing_wallet_metadata")
+    if invalid_price_count:
+        findings.append("invalid_prices")
+    if invalid_size_count:
+        findings.append("invalid_sizes")
+    if excessive_clock_skew_count:
+        findings.append("excessive_clock_skew")
+
+    replayable = (
+        event_count > 0
+        and non_monotonic_time_count == 0
+        and missing_wallet_count == 0
+        and invalid_price_count == 0
+        and invalid_size_count == 0
+        and excessive_clock_skew_count == 0
+    )
+
+    summary = TradesReplaySummary(
+        replay_type="trades",
+        mode="wallet_flow_none_native",
+        run_path=str(resolved_run_path),
+        events_path=str(events_path),
+        source=source,
+        product=product,
+        instrument_id=instrument_id,
+        event_count=event_count,
+        first_trade_id=None,
+        last_trade_id=None,
+        first_event_time=first_event_time,
+        last_event_time=last_event_time,
+        non_monotonic_count=non_monotonic_time_count,
+        trade_id_gap_count=0,
+        trade_id_gap_total_missing=0,
+        invalid_price_count=invalid_price_count,
+        invalid_size_count=invalid_size_count,
+        excessive_clock_skew_count=excessive_clock_skew_count,
+        max_clock_skew_ms=max_clock_skew_ms_seen,
+        duplicate_trade_id_count=0,
+        replayable=replayable,
+        findings=findings,
+        gap_detection="none_native",
+        summary_path=str(summary_path) if summary_path is not None else None,
+    )
+
+    if write_summary and summary_path is not None:
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_json_atomic(summary_path, summary.to_dict())
+
+    return summary
+
+
 def replay_funding_run(
     run_path: Path,
     *,
