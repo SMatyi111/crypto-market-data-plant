@@ -54,6 +54,12 @@ from .collectors.binance_futures_rest import (
     write_aggtrades_cursor,
 )
 from .collectors.rest_poll import RestPollingCollector
+from .collectors.hyperliquid_wallet_flow import (
+    SOURCE_NAME as HYPERLIQUID_WALLET_FLOW_SOURCE,
+    HyperliquidWalletFillNormalizer,
+    HyperliquidWalletFlowPoller,
+    load_wallet_flow_cohort,
+)
 from .collectors.text_feeds import (
     DEFAULT_RSS_FEEDS,
     DEFAULT_SEEN_CAP,
@@ -396,6 +402,51 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-normalized-parquet", action="store_false", dest="normalized_parquet", default=True
     )
     _add_fsync_batching_args(bfr_parser)
+
+    hl_parser = subparsers.add_parser(
+        "hyperliquid-wallet-flow-worker",
+        help="Accrue public fills for a frozen Hyperliquid wallet cohort via REST.",
+    )
+    hl_parser.add_argument(
+        "--cohort-path",
+        type=Path,
+        required=True,
+        help="Local JSON containing prospective_start_at, target_coins and frozen wallets.",
+    )
+    hl_parser.add_argument("--poll-interval-seconds", type=float, default=60.0)
+    hl_parser.add_argument("--request-pause-seconds", type=float, default=0.1)
+    hl_parser.add_argument("--overlap-seconds", type=float, default=300.0)
+    hl_parser.add_argument("--response-cap", type=int, default=2000)
+    hl_parser.add_argument("--segment-count", type=int, default=100000)
+    hl_parser.add_argument("--max-segments", type=int)
+    hl_parser.add_argument("--cooldown-seconds", type=float, default=1.0)
+    hl_parser.add_argument("--output-root", type=Path, default=default_output_root())
+    hl_parser.add_argument("--ops-root", type=Path, default=default_ops_root())
+    hl_parser.add_argument("--worker-name", default="hyperliquid-wallet-flow-worker")
+    hl_parser.add_argument("--heartbeat-interval-seconds", type=float, default=30.0)
+    # The delay/skew gates must track this lane's resume window, which is bounded
+    # only by the cohort floor: the poller resumes from the durable high-water, so
+    # after an outage every refetched fill arrives with received_at - exchange_time
+    # equal to the outage length. A tight gate quarantines the whole catch-up at
+    # capture (the bfr lesson, at 60 s scale) — and because quarantined rows never
+    # reach clean, the durable scan never suppresses them and the worker refetches
+    # and re-quarantines the same growing window every segment. 90 days; per-row
+    # event time and receipt time are both recorded, so staleness stays auditable.
+    hl_parser.add_argument("--max-delay-ms", type=int, default=7_776_000_000)
+    hl_parser.add_argument("--max-future-skew-ms", type=int, default=5_000)
+    hl_parser.add_argument("--max-clock-skew-ms", type=float, default=7_776_000_000.0)
+    hl_parser.add_argument("--source-suffix", default="")
+    hl_parser.add_argument("--rotate-at-midnight", action="store_true")
+    hl_parser.add_argument(
+        "--no-jsonl-fsync", action="store_false", dest="jsonl_fsync", default=True
+    )
+    hl_parser.add_argument(
+        "--normalized-parquet",
+        action="store_true",
+        default=False,
+        help="Opt in to hot-path normalized parquet; normal curation uses promotion.",
+    )
+    _add_fsync_batching_args(hl_parser)
 
     cb_trades_parser = subparsers.add_parser(
         "coinbase-trades-worker", help="Run segmented Coinbase trade collection"
@@ -2364,6 +2415,120 @@ def run_binance_futures_rest_worker(args: argparse.Namespace) -> None:
     )
 
 
+async def collect_hyperliquid_wallet_flow_segment(
+    args: argparse.Namespace,
+) -> dict[str, object]:
+    cohort = load_wallet_flow_cohort(args.cohort_path)
+    source_name = _build_source_name(
+        HYPERLIQUID_WALLET_FLOW_SOURCE,
+        getattr(args, "source_suffix", ""),
+    )
+    run_paths = prepare_run_paths(output_root=args.output_root, source=source_name)
+    source_root = Path(args.output_root) / source_name
+    state_path = source_root / "_collector_state.json"
+    poller = HyperliquidWalletFlowPoller(
+        cohort=cohort,
+        source_root=source_root,
+        state_path=state_path,
+        request_pause_seconds=float(getattr(args, "request_pause_seconds", 0.1)),
+        overlap_seconds=float(getattr(args, "overlap_seconds", 300.0)),
+        response_cap=int(getattr(args, "response_cap", 2000)),
+    )
+    collector = RestPollingCollector(
+        source="hyperliquid",
+        poll=poller.poll,
+        poll_interval_seconds=float(getattr(args, "poll_interval_seconds", 60.0)),
+        deadline_utc=getattr(args, "deadline_utc", None),
+    )
+    fsync_events, fsync_ms = _fsync_intervals(args)
+    pipeline = CollectorPipeline(
+        collector=collector,
+        normalizer=HyperliquidWalletFillNormalizer(),
+        quality_gate=QualityGate(
+            max_delay_ms=int(getattr(args, "max_delay_ms", 7_776_000_000)),
+            max_future_skew_ms=int(getattr(args, "max_future_skew_ms", 5_000)),
+            require_monotonic_sequence=False,
+            session_id=run_paths.base.name,
+        ),
+        run_paths=run_paths,
+        normalized_root=(
+            _resolve_normalized_root(args, "trades")
+            if bool(getattr(args, "normalized_parquet", False))
+            else None
+        ),
+        jsonl_fsync=bool(getattr(args, "jsonl_fsync", True)),
+        fsync_interval_events=fsync_events,
+        fsync_interval_ms=fsync_ms,
+    )
+    pipeline_summary = await pipeline.run(
+        limit=args.count,
+        deadline_utc=getattr(args, "deadline_utc", None),
+    )
+    events_path = run_paths.clean / "events.jsonl"
+    if events_path.exists():
+        replay_summary = replay_trades_stream_run(
+            run_paths.base,
+            max_clock_skew_ms=float(getattr(args, "max_clock_skew_ms", 300_000.0)),
+            write_summary=True,
+        )
+        replayable = replay_summary.replayable
+        replay_findings = list(replay_summary.findings)
+        replay_summary_path = replay_summary.summary_path
+    else:
+        replayable = False
+        replay_findings = ["no_clean_events"]
+        replay_summary_path = None
+    JsonlSink(run_paths.metrics, "summary.jsonl").write(
+        {
+            "wallet_count": len(cohort.wallets),
+            "cohort_sha256": cohort.sha256,
+            "prospective_start_at": cohort.prospective_start_at.isoformat(),
+            "poll_count": poller.poll_count,
+            "poll_error_count": poller.poll_error_count,
+            "emitted_count": poller.emitted_count,
+            "duplicate_count": poller.duplicate_count,
+            "replayable": replayable,
+            "replay_findings": replay_findings,
+            "replay_summary_path": replay_summary_path,
+        }
+    )
+    return {
+        "raw_messages": pipeline_summary.raw_messages,
+        "clean_events": pipeline_summary.clean_events,
+        "quarantined_events": pipeline_summary.quarantined_events,
+        "run_path": str(run_paths.base),
+        "poll_count": poller.poll_count,
+        "poll_error_count": poller.poll_error_count,
+        "duplicate_count": poller.duplicate_count,
+        "replayable": replayable,
+        "replay_findings": replay_findings,
+        "replay_summary_path": replay_summary_path,
+        "deadline_reached": bool(pipeline_summary.deadline_reached),
+    }
+
+
+def run_hyperliquid_wallet_flow_worker(args: argparse.Namespace) -> None:
+    _run_segmented_worker(
+        args=args,
+        default_worker_name="hyperliquid-wallet-flow-worker",
+        worker_type="hyperliquid-wallet-flow-worker",
+        venue="hyperliquid",
+        build_segment_args=lambda source_args: SimpleNamespace(
+            count=source_args.segment_count,
+            output_root=source_args.output_root,
+            source_suffix=getattr(source_args, "source_suffix", ""),
+            deadline_utc=None,
+        ),
+        collect_segment=collect_hyperliquid_wallet_flow_segment,
+        progress_message=lambda segment_index, summary: (
+            "hyperliquid wallet-flow segment finished: "
+            f"segment={segment_index} clean_events={summary['clean_events']} "
+            f"poll_errors={summary.get('poll_error_count')} "
+            f"replayable={summary.get('replayable')} run_path={summary['run_path']}"
+        ),
+    )
+
+
 def run_binance_depth_worker(args: argparse.Namespace) -> None:
     _run_segmented_worker(
         args=args,
@@ -2965,6 +3130,27 @@ def _run_segmented_worker(
                     segment_args.snapshot_anchor_timeout_seconds = float(
                         getattr(args, "snapshot_anchor_timeout_seconds", 10.0)
                     )
+                    # Hyperliquid wallet-flow REST controls are threaded centrally so
+                    # the worker's segment builder cannot silently drop a live-config
+                    # field (the same enumeration failure this block exists to prevent).
+                    # Threaded only when the entry path actually provides the attr:
+                    # these names are generic — other lanes read poll_interval_seconds /
+                    # max_delay_ms / max_clock_skew_ms with their OWN lane-tuned
+                    # fallbacks (bfr: 1.0 s / 21_600_000) — so an unconditional
+                    # fallback here would silently re-default any lane whose entry
+                    # path omits the attr.
+                    segment_args.cohort_path = getattr(args, "cohort_path", None)
+                    for hl_field, hl_cast in (
+                        ("poll_interval_seconds", float),
+                        ("request_pause_seconds", float),
+                        ("overlap_seconds", float),
+                        ("response_cap", int),
+                        ("max_delay_ms", int),
+                        ("max_future_skew_ms", int),
+                        ("max_clock_skew_ms", float),
+                    ):
+                        if hasattr(args, hl_field):
+                            setattr(segment_args, hl_field, hl_cast(getattr(args, hl_field)))
                     summary = asyncio.run(collect_segment(segment_args))
                 except Exception as exc:
                     runtime.record_event("segment_error", details={"segment_index": segment_index, "error": str(exc)})
@@ -3127,6 +3313,9 @@ def _execute_ops_job_inprocess(job: JobSpec) -> JobExecutionResult | str | None:
     if job.job_type == "binance-futures-rest-worker":
         run_binance_futures_rest_worker(args)
         return "binance futures rest worker completed"
+    if job.job_type == "hyperliquid-wallet-flow-worker":
+        run_hyperliquid_wallet_flow_worker(args)
+        return "hyperliquid wallet flow worker completed"
     if job.job_type == "coinbase-trades-worker":
         run_coinbase_trades_worker(args)
         return "coinbase trades worker completed"
@@ -3310,6 +3499,36 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             idle_timeout_seconds=raw_args.get("idle_timeout_seconds", 0.0),
             jsonl_fsync=raw_args.get("jsonl_fsync", True),
             normalized_parquet=raw_args.get("normalized_parquet", True),
+        )
+    if job.job_type == "hyperliquid-wallet-flow-worker":
+        cohort_path = raw_args.get("cohort_path")
+        if not cohort_path:
+            raise ValueError("hyperliquid-wallet-flow-worker requires cohort_path")
+        return SimpleNamespace(
+            cohort_path=Path(cohort_path),
+            poll_interval_seconds=raw_args.get("poll_interval_seconds", 60.0),
+            request_pause_seconds=raw_args.get("request_pause_seconds", 0.1),
+            overlap_seconds=raw_args.get("overlap_seconds", 300.0),
+            response_cap=raw_args.get("response_cap", 2000),
+            segment_count=raw_args.get("segment_count", 100000),
+            max_segments=raw_args.get("max_segments"),
+            cooldown_seconds=raw_args.get("cooldown_seconds", 1.0),
+            output_root=raw_args.get("output_root", default_output_root()),
+            ops_root=Path(raw_args.get("ops_root", default_ops_root())),
+            normalized_root=raw_args.get("normalized_root"),
+            worker_name=raw_args.get(
+                "worker_name", "hyperliquid-wallet-flow-worker"
+            ),
+            heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
+            # Resume-window-sized gates — keep in sync with the hl_parser defaults
+            # (see the comment there: a tight gate quarantines every resumed backfill).
+            max_delay_ms=raw_args.get("max_delay_ms", 7_776_000_000),
+            max_future_skew_ms=raw_args.get("max_future_skew_ms", 5_000),
+            max_clock_skew_ms=raw_args.get("max_clock_skew_ms", 7_776_000_000.0),
+            source_suffix=raw_args.get("source_suffix", ""),
+            rotate_at_midnight=raw_args.get("rotate_at_midnight", False),
+            jsonl_fsync=raw_args.get("jsonl_fsync", True),
+            normalized_parquet=raw_args.get("normalized_parquet", False),
         )
     if job.job_type == "binance-futures-rest-worker":
         return SimpleNamespace(
@@ -4679,6 +4898,8 @@ def main() -> None:
         run_binance_trades_worker(args)
     elif args.command == "binance-futures-rest-worker":
         run_binance_futures_rest_worker(args)
+    elif args.command == "hyperliquid-wallet-flow-worker":
+        run_hyperliquid_wallet_flow_worker(args)
     elif args.command == "coinbase-trades-worker":
         run_coinbase_trades_worker(args)
     elif args.command == "coinbase-depth-worker":

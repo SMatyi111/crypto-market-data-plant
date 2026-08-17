@@ -12,6 +12,11 @@
 > metadata, untouched raw payload; dedup key `(source, source_id, content_hash)`
 > with edits retained as new rows. No change to the existing market/trades/funding
 > schemas, partitions, or replayability semantics.
+> **Compatible lane addition (2026-08-09; no version bump):** owner-approved
+> Hyperliquid public wallet-flow capture reuses the existing `trades` row and v2
+> partition contract. Public wallet identity, frozen cohort rank, fill/order ids,
+> fee/PnL fields and the prospective boundary live in `metadata`; no schema,
+> partition, or replayability definition changed. See §4.7.
 > **v7 (2026-06-12):** baseline-audit fixes that widen contract-visible surfaces
 > (no change to Parquet schemas or partition layout). (1) The manifest `lanes`
 > view now covers **perp lanes** (venue `<venue>_perp`) and the **`funding`**
@@ -81,14 +86,15 @@ instrument) lane (a fourth, non-market `text` dataset is specified in §4.6):
 | Dataset  | Channel  | Normalizer(s)                                  | Curated target            |
 | -------- | -------- | ---------------------------------------------- | ------------------------- |
 | `depth`  | order book diffs / snapshots | `BinanceDepthNormalizer`, `CoinbaseDepthNormalizer`, `BybitDepthNormalizer`, `KrakenDepthNormalizer`, `MexcDepthNormalizer`, `OkxDepthNormalizer` (+ Binance USDT-M REST snapshot polling) | `market_replayable`  |
-| `trades` | trade prints     | `BinanceTradeNormalizer`, `CoinbaseTradeNormalizer`, `KrakenTradeNormalizer`, `BybitTradeNormalizer`, `MexcTradeNormalizer`, `OkxTradeNormalizer` (+ Binance USDT-M REST aggTrades polling) | `trades_replayable` |
+| `trades` | trade prints     | `BinanceTradeNormalizer`, `CoinbaseTradeNormalizer`, `KrakenTradeNormalizer`, `BybitTradeNormalizer`, `MexcTradeNormalizer`, `OkxTradeNormalizer`, `HyperliquidWalletFillNormalizer` (+ REST polling lanes) | `trades_replayable` |
 | `funding` | perp funding / mark-price metric | Binance USDT-M `premiumIndex` REST poll (native dict passthrough) | `funding` |
 
 Venues live today: **Binance** (spot USDT + USDC depth + trades; USDT-M perp trades +
 depth + funding via REST polling — §4.5), **Coinbase** (trades + depth), **Kraken**
 (trades + depth), **Bybit** (spot + linear perp, trades + depth), **MEXC** (trades +
 depth; the only **protobuf-transport** venue, verified against live frames 2026-06-09 —
-see §4.3), **OKX** (spot + linear perp, trades + depth — §4.4). Perp lanes are tagged
+see §4.3), **OKX** (spot + linear perp, trades + depth — §4.4), and
+**Hyperliquid** (frozen public-wallet BTC/ETH/SOL perp fills — §4.7). Perp lanes are tagged
 `perp:<venue>:<symbol>` and write to their own `<venue>_perp_<dataset>` lane
 directories, so perp never mixes with spot.
 
@@ -109,7 +115,7 @@ directories, so perp never mixes with spot.
 >   **both MEXC lanes** (aggregated-deals trades carry no per-trade id; limit-depth
 >   pushes independent full books whose `version` is metadata-only — see §4.3), and
 >   the **Binance USDT-M perp REST `depth` + `funding`** lanes (per-poll snapshots /
->   metric rows — §4.5).
+>   metric rows — §4.5), and Hyperliquid public wallet fills (§4.7).
 >
 > `sequence` and `checksum` are both **provable** (consumers can rely on
 > completeness); `none_native` is best-effort. Two lanes of the same dataset can
@@ -655,6 +661,38 @@ quarantine/promote jobs act on permanently.
 Text lanes are **not** part of the market research manifest (§6), which discovers
 lanes from `raw/market` only; consumers read `curated/research/text` directly and
 join as-of on `ingestion_ts`.
+
+### 4.7 Hyperliquid frozen-wallet fills — REST-polled `trades`
+
+The owner-approved `hyperliquid-wallet-flow` lane polls the official, keyless
+Hyperliquid `POST /info` `userFillsByTime` endpoint for one externally stored,
+frozen cohort. It is read-only: no API key, wallet signature, account endpoint,
+order, or trading permission is used. The initial cohort is 10 public wallet
+addresses and the target coins are BTC, ETH, and SOL.
+
+Each fill reuses the v2 `trades` row contract. `source="hyperliquid"`,
+`channel="trades"`, `event_type="user_fill"`, `exchange_time` is the venue fill
+time, and `received_at` is the plant receipt time. Hyperliquid `B`/`A` maps to
+aggressor `buy`/`sell`; instruments are `perp:hyperliquid:<COIN>USDC`. Metadata
+preserves the public wallet, frozen candidate/cohort ranks, cohort hash and
+prospective boundary together with direction, starting position, realized PnL,
+taker/crossed status, fee/token, transaction hash, order/trade/client-order IDs,
+and TWAP ID.
+
+The source has no dense sequence proof, so replay uses
+`gap_detection="none_native"`: `replayable` means structurally clean, not
+complete. Dedup is the composite `(wallet, trade_id)` key across overlap polls
+and all durable clean rows, including unfinished prior runs. The exact configured
+response cap is treated as an incomplete interval and emits no rows for that
+wallet; a failure for one wallet is isolated but marks the poll incomplete.
+Per-wallet attempts, successes, response counts, high-water timestamps, global
+duplicates/errors, cohort hash, and prospective boundary are atomically persisted
+in `_collector_state.json`.
+
+Consumers performing the registered causal evaluation MUST filter on the frozen
+cohort's `prospective_start_at` and join using event time plus an explicit
+receipt/availability delay. Rows from earlier scratch or snapshot work are
+diagnostic only and are not admissible future evidence.
 
 ---
 

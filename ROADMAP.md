@@ -8,7 +8,7 @@ changes scope or state. Companion docs:
 - [`STANDARDS.md`](STANDARDS.md) — the data contract (schemas, replayability, retention)
 - [`docs/HISTORY.md`](docs/HISTORY.md) — resolved-work narrative (what was fixed, and why)
 
-Last updated: **2026-08-01**.
+Last updated: **2026-08-17**.
 
 > **Operating mode — safe shaping (owner directive, 2026-07-04).** No extended
 > building on Claude's initiative: no new venues, lanes, or instruments, no big
@@ -19,20 +19,28 @@ Last updated: **2026-08-01**.
 
 ---
 
-## Current state (2026-08-01)
+## Current state (2026-08-17)
 
-**22 enabled collector lanes** across Binance (spot USDT + USDC, USDT-M perp via
+**23 enabled collector lanes** across Binance (spot USDT + USDC, USDT-M perp via
 REST), Coinbase, Kraken, Bybit (spot + linear perp), MEXC, OKX (spot + linear
-perp), plus the RSS text lane — market lanes are all BTC. **Kalshi
+perp), Hyperliquid (frozen-wallet BTC/ETH/SOL perp fills), plus the RSS text lane.
+All other market lanes remain BTC. **Kalshi
 crypto-binary collection is TURNED OFF as of
 2026-06-17** (both Kalshi jobs `enabled:false`; it was the G:-full root cause —
 see `docs/HISTORY.md` 2026-06-17 + Decision queue). Full quarantine → promote
 curation chain per lane, hourly score catch-up self-heal, research manifest,
-cleanup retention, and cold-tier archive offload. The live runner remains a
-SYSTEM task using `ops.live.local.json`; all 22 collectors are fresh. The
-2026-08-01 preserve-first aged-run backstop and maintenance fairness fix are on
-`codex/aged-unaccounted-backstop`; the one remaining deployment action is an
-elevated runner restart after review/merge.
+cleanup retention, and cold-tier archive offload. The main live runner remains a
+SYSTEM task using its startup copy of `ops.live.local.json`. **Hyperliquid is
+currently dark**: the bounded 08-09 user-level bridge stopped around 2026-08-10
+(newest raw run `20260810_000001`), and the SYSTEM runner still executes its
+pre-08-09 startup config (22 jobs, no hyperliquid slot), so the lane resumes
+only at the next elevated restart or reboot — the gap is prospective-only by
+design (persisted cursor, frozen cohort). The on-disk config and concurrency
+bump remain ready for that restart. The 2026-08-01 preserve-first aged-run
+backstop is **merged** (PR #41, `b312657`) but not yet deployed for the same
+reason. The Hyperliquid lane code itself, which had sat uncommitted on the live
+working tree since 08-09, is now on `codex/hyperliquid-wallet-flow-lane`
+awaiting review/merge.
 
 ---
 
@@ -45,7 +53,65 @@ elevated runner restart after review/merge.
 | ~~2026-06-19~~ DONE 06-24 | The 06-17 `robocopy /MINAGE:3` move never finished (~88% of partitions still on G:), leaving G: at **3.9 GB free**. First retry (06-22) was killed by the Bash tool's 10-min timeout after freeing ~57 GB. Relaunched **detached via `Start-Process`** (pid 48444) so it survives session/tool teardown -> **COMPLETED 2026-06-24 16:19, FAILED: 0** (45.29 M files / 555 GB moved G:->`D:\market_archive_cold`). **G: now 489 GB free.** D: holds 113,407 normalized partitions (full set). 1 partition / 2 parquet files remain on G: -- robocopy *skipped* them (already byte-present on D: from the 06-17 partial), so redundant not stranded; immaterial (489 GB free). Lesson: long-running moves must be detached, never run inside a Bash call (10-min cap). |
 | ~~2026-07-26~~ DONE 08-01 | **Text raw offload wired for the next restart.** `archive-offload-text` is enabled in `ops.live.local.json` with the indexed promotion/quarantine gate, preserve-first aged-run backstop, byte-verified cold move, and `write_report:false` so it cannot replace the market health report. It remains inert until the guarded elevated runner restart. |
 
-**Last ops audit:** 2026-08-01 — **capture healthy; aged-run accounting repaired
+**Last ops audit:** 2026-08-17 — **market/text capture healthy; Hyperliquid
+stalled awaiting the elevated restart.** Manual markers only (the health command
+was not re-attempted after the 08-09 timeouts). SYSTEM-runner heartbeat fresh
+(status `running`, 23 pooled slots / 22 distinct jobs); job results since 08-09:
+38,233 success / 43 error (99.89%) — every error a transient collector network
+timeout or venue disconnect with clean restart, most on the Binance REST perp
+and depth lanes. All 22 SYSTEM-runner lanes fresh (newest raw run ≤ 29 min).
+G: 379 GB free, D: 1.8 TB free. Latest offload pass (2026-08-17T12:34Z,
+`mode:apply`): 69 runs / 2.3 GB moved byte-verified to cold, 0 failed, 0
+stuck-unaccounted, backstop idle (0 candidates). Quarantine intake last 7 days
+is low (2–13 runs/lane) except the Binance perp REST lanes (46–63/lane),
+consistent with their known REST-timeout profile. Findings: (1) **the
+Hyperliquid bridge is stopped** — newest run 2026-08-10, ~7.5 days dark; see
+Current state (prospective-only gap, resumes at the elevated restart). (2) The
+offload report `status:warn` is solely `unconfigured_lane` findings; two of the
+seven, `limitless_books` and `limitless_series_registry`, are **actively
+writing right now** (newest runs 1–4 min old) from outside the ops runner with
+no offload/retention coverage on G:, while three sibling limitless lanes are
+~66 days stale — owner call needed on retention/offload config for these (see
+Decision queue context in the limitless docs). (3) Hygiene: the unconfigured
+`mock` lane holds 98 hot run dirs; `coinbase_*_usdc` and `kalshi_crypto_quotes`
+lane dirs are empty leftovers.
+
+**Post-audit review of PR #42 (2026-08-17, same session):** the pre-merge review
+found three lane defects that would have fired at the pending elevated restart;
+all fixed on the PR branch + local config: (a) a cap-sized `userFillsByTime`
+response permanently stalled that wallet — the poller raised and never advanced
+the high-water, so the window re-capped identically forever; it now pages
+forward to the last complete timestamp and marks the poll incomplete. (b) The
+lane's 300 s delay/clock-skew gates would have quarantined the entire
+post-outage catch-up at capture — and since quarantined rows never reach clean,
+the durable scan couldn't suppress them and every segment refetched and
+re-quarantined the same growing window (the bfr lesson at 60 s scale). Gates
+are now resume-window-sized (90 days) in the code defaults and in
+`ops.live.local.json` (backup: `ops.live.local.json.bak-20260817-hyperliquid-gates`).
+(c) The `score-hyperliquid-wallet-flow` window (`max_age_hours: 6`) could never
+score a run torn by an outage longer than 6 h, stranding its rows out of curated
+while the durable scan suppresses their refetch; score/promote/quarantine
+windows widened to 336 h in the local config. **Timing note for the owner:** the
+08-10 torn run `20260810_000001` (3,290 clean rows, no replay summary) is healed
+automatically by the widened score job only if the elevated restart happens
+before ~2026-08-24; after that, rescue it manually with
+`backfill-trades-replay --stream` + a promote pass using a wide `--max-age-hours`.
+
+**Previous ops audit:** 2026-08-09 — **existing capture markers fresh; Hyperliquid
+prospective collection live.** The official health command exceeded both bounded
+30 s and 60 s attempts, so no clean overall verdict is claimed from it. Manual
+markers showed a fresh SYSTEM-runner heartbeat, 23 current jobs, success as the
+latest counter-tracked status, about 376.6 GB free on G: and 1.95 TB free on D:;
+the latest offload report had zero failed moves and zero stuck-unaccounted runs.
+The owner then approved the frozen 10-wallet Hyperliquid lane. A scratch probe
+proved capped-response handling and cross-run dedup; the native lane passed the
+full suite. Guarded redeploy stopped safely at the non-elevated SYSTEM boundary.
+A hidden user-level bridge is therefore collecting from the final prospective
+boundary `2026-08-09T00:45:48Z`; its heartbeat and all ten wallet polls are fresh,
+with zero poll errors. The live config and concurrency change will be adopted by
+the SYSTEM runner at the next elevated deploy/reboot.
+
+**Earlier ops audit:** 2026-08-01 — **capture healthy; aged-run accounting repaired
 without raw deletion.** All 22 collectors were fresh, heartbeat ~14 s, and G:
 had 384.45 GB free. The 17,809 aged unaccounted run directories were classified
 `aged_unaccounted` with bounded diagnostics and quarantine index rows: 17,809
@@ -59,7 +125,7 @@ manifest pass before declaring a queued job stale. Until the elevated restart,
 health remains WARN only for those three stale RSS maintenance jobs; collection
 itself remains live.
 
-**Previous ops audit:** 2026-07-16 — **plant GREEN before text deployment; RSS
+**Earlier ops audit:** 2026-07-16 — **plant GREEN before text deployment; RSS
 initial verification GREEN.** Pre-deploy health's sole finding was the expected
 `offload_stuck_above_baseline:17519`, exactly the forecast 07-05 crash cohort;
 heartbeat 2.3 s, all 81 enabled scheduled jobs' latest rows successful, all 21
@@ -302,7 +368,6 @@ owner ask (safe-shaping directive above).
 
 Decisions waiting on the owner; agents must not act on these without an explicit OK
 (see `CLAUDE.md` Governance):
-
 
 - **Text-capture P2 probes (from the 2026-07-16 feasibility doc — see
   `docs/text_source_p2_feasibility.md` §7; none urgent, no rationale here per

@@ -18,10 +18,10 @@
 #>
 param(
     [string]$OpsRoot = "G:\market_archive\ops",
-    # Match run_ops_runner.ps1's live default (one slot per pooled lane: 21 market
-    # workers + 2 kalshi REST jobs + 2 text-capture lanes). Keep these in sync -- a
+    # Match run_ops_runner.ps1's live default (one slot per pooled lane: 21 existing
+    # market workers + 2 kalshi REST jobs + 2 text lanes + Hyperliquid). Keep these in sync -- a
     # redeploy with a lower value silently throttles coverage until reboot.
-    [int]$CollectorConcurrency = 25
+    [int]$CollectorConcurrency = 26
 )
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot

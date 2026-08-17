@@ -24,10 +24,13 @@ This repo is a data plant, not a trading bot. It runs public collectors, writes 
 
 ## Supported Production Feeds
 
-The maintainer deployment runs **22 enabled collection lanes**, all BTC, across
-seven venues plus Kalshi. The public `ops.live.example.json` ships with only the
+The maintainer deployment has **23 enabled collection lanes** across eight venues
+plus Kalshi: the existing BTC market/text lanes and one frozen-cohort Hyperliquid
+wallet-flow lane for BTC, ETH and SOL. The public `ops.live.example.json` ships with only the
 Binance `BTCUSDT` spot lanes enabled — every other lane is included
-`enabled: false` as the recipe; flip them per lane when you want them.
+`enabled: false` as the recipe, except the Hyperliquid wallet-flow lane, which
+requires a local cohort file and therefore ships with no public recipe; flip
+lanes on per lane when you want them.
 
 | Venue   | Market | Trades | Depth | Gap-detection class |
 | ------- | ------ | ------ | ----- | ------------------- |
@@ -38,6 +41,7 @@ Binance `BTCUSDT` spot lanes enabled — every other lane is included
 | Bybit   | spot + linear perp `BTCUSDT` | ✅ | ✅ | trades = `none_native`; depth = `sequence` (`data.u` +1) |
 | MEXC    | spot `BTCUSDT` | ✅ | ✅ | both = `none_native` (protobuf transport) |
 | OKX     | spot + linear perp `BTC-USDT` | ✅ | ✅ | trades = `none_native`; depth = `sequence` (`prevSeqId`/`seqId` linked chain) |
+| Hyperliquid | public frozen-wallet perp fills (`BTC`/`ETH`/`SOL`) | ✅ REST polling | — | `none_native`; composite `(wallet, trade_id)` dedup, explicit event/receipt time |
 
 Perp lanes are tagged `perp:<venue>:<symbol>` and write to their own
 `<venue>_perp_<dataset>` lanes, so perp never mixes with spot. Two venue notes
@@ -66,6 +70,11 @@ chain. Shipped `enabled: false` in the example config.
 `none_native` lanes are curated as *structurally clean*, **not** gap-proof — see
 [`STANDARDS.md`](STANDARDS.md) §4.3. The mock feed exists only for local smoke
 tests.
+
+The Hyperliquid lane is read-only and keyless. It polls `userFillsByTime` for a
+local frozen 10-wallet cohort, preserves public wallet identity in trade metadata,
+and records a per-wallet completeness/freshness state. The cohort file and archive
+remain local; the public repository contains only the collector contract and tests.
 
 **MEXC** retired its JSON websocket on 2025-08-04, so its public market data is
 **Protocol Buffers** on `wss://wbs-api.mexc.com/ws` — the only binary-transport venue

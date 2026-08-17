@@ -12,10 +12,10 @@ param(
     # 8-physical / 16-logical-core box. Maintenance jobs (quarantine/promote/manifest/
     # cleanup/health) run on the runner's dedicated single-slot maintenance executor,
     # NOT the pool, so they don't consume collector slots.
-    # 21 market worker lanes + the 2 kalshi REST jobs (pool-dispatched since the
-    # 2026-06-11 scheduler-stall incident) + the 2 text-capture lanes (text-rss +
-    # text-reddit, ROADMAP item 15) = 25 slots, one per pooled lane.
-    [int]$CollectorConcurrency = 25
+    # 21 existing market workers + the 2 kalshi REST jobs (pool-dispatched since
+    # the 2026-06-11 scheduler-stall incident) + the 2 text-capture lanes + the
+    # frozen-cohort Hyperliquid worker = 26 slots, one per pooled lane.
+    [int]$CollectorConcurrency = 26
 )
 
 $ErrorActionPreference = "Stop"
