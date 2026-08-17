@@ -233,6 +233,35 @@ preserved on D:.)
 **PARKED** items are extended building — not picked up without an explicit
 owner ask (safe-shaping directive above).
 
+0. **Adaptive wallet-cohort program (owner-directed 2026-08-17 — ACTIVE).**
+   Owner directive: don't track only a fixed cohort; select wallets by an
+   adaptive rule, backfill deep history for backtesting, and if the screen shows
+   signal, move the selected cohort to a fast (WebSocket) feed. Methodology
+   guard: adaptive selection + retrospective backfill is survivorship-biased by
+   construction — the backtest is a *screen* only; the frozen 10-wallet lane
+   (§4.7) stays as the clean prospective evidence, and honest point-in-time
+   selection becomes possible only from leaderboard snapshots captured from
+   2026-08-17 onward. Feasibility probes (2026-08-17): leaderboard = 41,903
+   wallets with day/week/month/all-time PnL/ROI/volume (current state only);
+   fill history depth is inversely proportional to activity — top-1000-by-month-
+   volume sample: median 68 d lookback, only ~17 % reach 365 d.
+   - **Phase 1a (built 2026-08-17, awaiting merge + elevated restart):**
+     `hyperliquid-leaderboard-snapshot` raw-only reference lane (STANDARDS §4.8),
+     daily job in the live config; interim per-user daily scheduled task
+     `HyperliquidLeaderboardDaily` covers capture until the restart.
+   - **Phase 1b (approved scale: top 1,000 by month volume):** one-shot
+     retrospective fills backfill, each wallet as deep as the public API allows
+     (~2–3 GB expected), written to `raw/market/hyperliquid_retro_fills/` as a
+     clearly-tagged retrospective dataset via a local `artifacts/` script —
+     NEVER merged into the prospective curated tree.
+   - **Phase 2 (owner gate):** walk-forward screen — rule computed only from
+     fills ≤ each rebalance date; results discounted for universe survivorship.
+     Backtests live OUTSIDE this repo (publication contract: no model
+     experiments); the plant only ships the datasets.
+   - **Phase 3 (owner gate, PARKED until Phase 2 passes):** WebSocket
+     `userFills` subscription lane for the adaptive cohort (sub-second delay vs
+     ~37 s median REST polling).
+
 1. **D:\market_archive legacy history — decide retention or merge.** The pre-2026-06-08
    D: archive is kept read-only as history. Decide: backfill/merge its runs into the
    G: curated dataset (score with `backfill-trades-replay` / `backfill-stream-depth

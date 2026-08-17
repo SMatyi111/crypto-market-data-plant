@@ -42,6 +42,9 @@ COLLECTOR_JOB_TYPES: frozenset[str] = frozenset(
         "mexc-depth-worker",
         "binance-futures-rest-worker",
         "hyperliquid-wallet-flow-worker",
+        # Raw-only daily reference snapshot (STANDARDS 4.8) - tiny, but
+        # pool-dispatched like every network job (the 2026-06-11 kalshi lesson).
+        "hyperliquid-leaderboard-snapshot",
         # Text-capture P1 lanes (ROADMAP item 15): REST-polled, low-volume, but
         # pool-dispatched like every other lane so a hung HTTP call can never block
         # the scheduler thread (the 2026-06-11 kalshi lesson).

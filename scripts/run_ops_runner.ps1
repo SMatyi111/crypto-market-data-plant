@@ -14,8 +14,9 @@ param(
     # NOT the pool, so they don't consume collector slots.
     # 21 existing market workers + the 2 kalshi REST jobs (pool-dispatched since
     # the 2026-06-11 scheduler-stall incident) + the 2 text-capture lanes + the
-    # frozen-cohort Hyperliquid worker = 26 slots, one per pooled lane.
-    [int]$CollectorConcurrency = 26
+    # frozen-cohort Hyperliquid worker + the daily Hyperliquid leaderboard
+    # snapshot = 27 slots, one per pooled lane.
+    [int]$CollectorConcurrency = 27
 )
 
 $ErrorActionPreference = "Stop"
@@ -76,13 +77,13 @@ if ($invalidJobs.Count -gt 0) {
 
 # Guard: more enabled collector lanes than pool slots means the lanes sorting last in
 # the config are NEVER dispatched (silent starvation -- shipped twice: 12<17, 17<21).
-# Pool-dispatched job types end in -worker, plus the two pooled kalshi REST jobs
+# Pool-dispatched job types end in -worker, plus the pooled non-worker REST jobs
 # enumerated EXPLICITLY (pinned by tests/test_repo_hygiene.py): a kalshi- prefix wildcard
 # also matched the maintenance job kalshi-summarize-crypto-quotes, so adding that to
 # the config would have tripped this preflight and refused a valid boot.
-$kalshiPoolTypes = @("kalshi-collect-crypto-quotes", "kalshi-discover-crypto")
+$nonWorkerPoolTypes = @("kalshi-collect-crypto-quotes", "kalshi-discover-crypto", "hyperliquid-leaderboard-snapshot")
 $collectorLanes = @($configPayload.jobs | Where-Object {
-    ($_.job_type -like "*-worker" -or $kalshiPoolTypes -contains $_.job_type) -and ($null -eq $_.enabled -or $_.enabled)
+    ($_.job_type -like "*-worker" -or $nonWorkerPoolTypes -contains $_.job_type) -and ($null -eq $_.enabled -or $_.enabled)
 })
 if ($collectorLanes.Count -gt $CollectorConcurrency) {
     "[$(Get-Date -Format o)] $($collectorLanes.Count) enabled collector lanes exceed CollectorConcurrency=$CollectorConcurrency ($resolvedConfig)" | Out-File -FilePath $LogPath -Append -Encoding utf8
