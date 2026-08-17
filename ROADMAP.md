@@ -8,7 +8,7 @@ changes scope or state. Companion docs:
 - [`STANDARDS.md`](STANDARDS.md) — the data contract (schemas, replayability, retention)
 - [`docs/HISTORY.md`](docs/HISTORY.md) — resolved-work narrative (what was fixed, and why)
 
-Last updated: **2026-08-09**.
+Last updated: **2026-08-17**.
 
 > **Operating mode — safe shaping (owner directive, 2026-07-04).** No extended
 > building on Claude's initiative: no new venues, lanes, or instruments, no big
@@ -19,7 +19,7 @@ Last updated: **2026-08-09**.
 
 ---
 
-## Current state (2026-08-09)
+## Current state (2026-08-17)
 
 **23 enabled collector lanes** across Binance (spot USDT + USDC, USDT-M perp via
 REST), Coinbase, Kraken, Bybit (spot + linear perp), MEXC, OKX (spot + linear
@@ -30,13 +30,17 @@ crypto-binary collection is TURNED OFF as of
 see `docs/HISTORY.md` 2026-06-17 + Decision queue). Full quarantine → promote
 curation chain per lane, hourly score catch-up self-heal, research manifest,
 cleanup retention, and cold-tier archive offload. The main live runner remains a
-SYSTEM task using its startup copy of `ops.live.local.json`. Hyperliquid is live
-under a bounded user-level bridge because the guarded redeploy correctly refused
-to terminate the SYSTEM-owned runner without elevation; the on-disk config is
-ready for the next elevated restart or reboot to take ownership. The
-2026-08-01 preserve-first aged-run backstop and maintenance fairness fix are on
-`codex/aged-unaccounted-backstop`; the one remaining deployment action is an
-elevated runner restart after review/merge.
+SYSTEM task using its startup copy of `ops.live.local.json`. **Hyperliquid is
+currently dark**: the bounded 08-09 user-level bridge stopped around 2026-08-10
+(newest raw run `20260810_000001`), and the SYSTEM runner still executes its
+pre-08-09 startup config (22 jobs, no hyperliquid slot), so the lane resumes
+only at the next elevated restart or reboot — the gap is prospective-only by
+design (persisted cursor, frozen cohort). The on-disk config and concurrency
+bump remain ready for that restart. The 2026-08-01 preserve-first aged-run
+backstop is **merged** (PR #41, `b312657`) but not yet deployed for the same
+reason. The Hyperliquid lane code itself, which had sat uncommitted on the live
+working tree since 08-09, is now on `codex/hyperliquid-wallet-flow-lane`
+awaiting review/merge.
 
 ---
 
@@ -49,7 +53,30 @@ elevated runner restart after review/merge.
 | ~~2026-06-19~~ DONE 06-24 | The 06-17 `robocopy /MINAGE:3` move never finished (~88% of partitions still on G:), leaving G: at **3.9 GB free**. First retry (06-22) was killed by the Bash tool's 10-min timeout after freeing ~57 GB. Relaunched **detached via `Start-Process`** (pid 48444) so it survives session/tool teardown -> **COMPLETED 2026-06-24 16:19, FAILED: 0** (45.29 M files / 555 GB moved G:->`D:\market_archive_cold`). **G: now 489 GB free.** D: holds 113,407 normalized partitions (full set). 1 partition / 2 parquet files remain on G: -- robocopy *skipped* them (already byte-present on D: from the 06-17 partial), so redundant not stranded; immaterial (489 GB free). Lesson: long-running moves must be detached, never run inside a Bash call (10-min cap). |
 | ~~2026-07-26~~ DONE 08-01 | **Text raw offload wired for the next restart.** `archive-offload-text` is enabled in `ops.live.local.json` with the indexed promotion/quarantine gate, preserve-first aged-run backstop, byte-verified cold move, and `write_report:false` so it cannot replace the market health report. It remains inert until the guarded elevated runner restart. |
 
-**Last ops audit:** 2026-08-09 — **existing capture markers fresh; Hyperliquid
+**Last ops audit:** 2026-08-17 — **market/text capture healthy; Hyperliquid
+stalled awaiting the elevated restart.** Manual markers only (the health command
+was not re-attempted after the 08-09 timeouts). SYSTEM-runner heartbeat fresh
+(status `running`, 23 pooled slots / 22 distinct jobs); job results since 08-09:
+38,233 success / 43 error (99.89%) — every error a transient collector network
+timeout or venue disconnect with clean restart, most on the Binance REST perp
+and depth lanes. All 22 SYSTEM-runner lanes fresh (newest raw run ≤ 29 min).
+G: 379 GB free, D: 1.8 TB free. Latest offload pass (2026-08-17T12:34Z,
+`mode:apply`): 69 runs / 2.3 GB moved byte-verified to cold, 0 failed, 0
+stuck-unaccounted, backstop idle (0 candidates). Quarantine intake last 7 days
+is low (2–13 runs/lane) except the Binance perp REST lanes (46–63/lane),
+consistent with their known REST-timeout profile. Findings: (1) **the
+Hyperliquid bridge is stopped** — newest run 2026-08-10, ~7.5 days dark; see
+Current state (prospective-only gap, resumes at the elevated restart). (2) The
+offload report `status:warn` is solely `unconfigured_lane` findings; two of the
+seven, `limitless_books` and `limitless_series_registry`, are **actively
+writing right now** (newest runs 1–4 min old) from outside the ops runner with
+no offload/retention coverage on G:, while three sibling limitless lanes are
+~66 days stale — owner call needed on retention/offload config for these (see
+Decision queue context in the limitless docs). (3) Hygiene: the unconfigured
+`mock` lane holds 98 hot run dirs; `coinbase_*_usdc` and `kalshi_crypto_quotes`
+lane dirs are empty leftovers.
+
+**Previous ops audit:** 2026-08-09 — **existing capture markers fresh; Hyperliquid
 prospective collection live.** The official health command exceeded both bounded
 30 s and 60 s attempts, so no clean overall verdict is claimed from it. Manual
 markers showed a fresh SYSTEM-runner heartbeat, 23 current jobs, success as the
@@ -63,7 +90,7 @@ boundary `2026-08-09T00:45:48Z`; its heartbeat and all ten wallet polls are fres
 with zero poll errors. The live config and concurrency change will be adopted by
 the SYSTEM runner at the next elevated deploy/reboot.
 
-**Previous ops audit:** 2026-08-01 — **capture healthy; aged-run accounting repaired
+**Earlier ops audit:** 2026-08-01 — **capture healthy; aged-run accounting repaired
 without raw deletion.** All 22 collectors were fresh, heartbeat ~14 s, and G:
 had 384.45 GB free. The 17,809 aged unaccounted run directories were classified
 `aged_unaccounted` with bounded diagnostics and quarantine index rows: 17,809
