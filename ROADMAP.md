@@ -8,7 +8,7 @@ changes scope or state. Companion docs:
 - [`STANDARDS.md`](STANDARDS.md) — the data contract (schemas, replayability, retention)
 - [`docs/HISTORY.md`](docs/HISTORY.md) — resolved-work narrative (what was fixed, and why)
 
-Last updated: **2026-08-01**.
+Last updated: **2026-08-09**.
 
 > **Operating mode — safe shaping (owner directive, 2026-07-04).** No extended
 > building on Claude's initiative: no new venues, lanes, or instruments, no big
@@ -19,17 +19,21 @@ Last updated: **2026-08-01**.
 
 ---
 
-## Current state (2026-08-01)
+## Current state (2026-08-09)
 
-**22 enabled collector lanes** across Binance (spot USDT + USDC, USDT-M perp via
+**23 enabled collector lanes** across Binance (spot USDT + USDC, USDT-M perp via
 REST), Coinbase, Kraken, Bybit (spot + linear perp), MEXC, OKX (spot + linear
-perp), plus the RSS text lane — market lanes are all BTC. **Kalshi
+perp), Hyperliquid (frozen-wallet BTC/ETH/SOL perp fills), plus the RSS text lane.
+All other market lanes remain BTC. **Kalshi
 crypto-binary collection is TURNED OFF as of
 2026-06-17** (both Kalshi jobs `enabled:false`; it was the G:-full root cause —
 see `docs/HISTORY.md` 2026-06-17 + Decision queue). Full quarantine → promote
 curation chain per lane, hourly score catch-up self-heal, research manifest,
-cleanup retention, and cold-tier archive offload. The live runner remains a
-SYSTEM task using `ops.live.local.json`; all 22 collectors are fresh. The
+cleanup retention, and cold-tier archive offload. The main live runner remains a
+SYSTEM task using its startup copy of `ops.live.local.json`. Hyperliquid is live
+under a bounded user-level bridge because the guarded redeploy correctly refused
+to terminate the SYSTEM-owned runner without elevation; the on-disk config is
+ready for the next elevated restart or reboot to take ownership. The
 2026-08-01 preserve-first aged-run backstop and maintenance fairness fix are on
 `codex/aged-unaccounted-backstop`; the one remaining deployment action is an
 elevated runner restart after review/merge.
@@ -45,7 +49,21 @@ elevated runner restart after review/merge.
 | ~~2026-06-19~~ DONE 06-24 | The 06-17 `robocopy /MINAGE:3` move never finished (~88% of partitions still on G:), leaving G: at **3.9 GB free**. First retry (06-22) was killed by the Bash tool's 10-min timeout after freeing ~57 GB. Relaunched **detached via `Start-Process`** (pid 48444) so it survives session/tool teardown -> **COMPLETED 2026-06-24 16:19, FAILED: 0** (45.29 M files / 555 GB moved G:->`D:\market_archive_cold`). **G: now 489 GB free.** D: holds 113,407 normalized partitions (full set). 1 partition / 2 parquet files remain on G: -- robocopy *skipped* them (already byte-present on D: from the 06-17 partial), so redundant not stranded; immaterial (489 GB free). Lesson: long-running moves must be detached, never run inside a Bash call (10-min cap). |
 | ~~2026-07-26~~ DONE 08-01 | **Text raw offload wired for the next restart.** `archive-offload-text` is enabled in `ops.live.local.json` with the indexed promotion/quarantine gate, preserve-first aged-run backstop, byte-verified cold move, and `write_report:false` so it cannot replace the market health report. It remains inert until the guarded elevated runner restart. |
 
-**Last ops audit:** 2026-08-01 — **capture healthy; aged-run accounting repaired
+**Last ops audit:** 2026-08-09 — **existing capture markers fresh; Hyperliquid
+prospective collection live.** The official health command exceeded both bounded
+30 s and 60 s attempts, so no clean overall verdict is claimed from it. Manual
+markers showed a fresh SYSTEM-runner heartbeat, 23 current jobs, success as the
+latest counter-tracked status, about 376.6 GB free on G: and 1.95 TB free on D:;
+the latest offload report had zero failed moves and zero stuck-unaccounted runs.
+The owner then approved the frozen 10-wallet Hyperliquid lane. A scratch probe
+proved capped-response handling and cross-run dedup; the native lane passed the
+full suite. Guarded redeploy stopped safely at the non-elevated SYSTEM boundary.
+A hidden user-level bridge is therefore collecting from the final prospective
+boundary `2026-08-09T00:45:48Z`; its heartbeat and all ten wallet polls are fresh,
+with zero poll errors. The live config and concurrency change will be adopted by
+the SYSTEM runner at the next elevated deploy/reboot.
+
+**Previous ops audit:** 2026-08-01 — **capture healthy; aged-run accounting repaired
 without raw deletion.** All 22 collectors were fresh, heartbeat ~14 s, and G:
 had 384.45 GB free. The 17,809 aged unaccounted run directories were classified
 `aged_unaccounted` with bounded diagnostics and quarantine index rows: 17,809
@@ -59,7 +77,7 @@ manifest pass before declaring a queued job stale. Until the elevated restart,
 health remains WARN only for those three stale RSS maintenance jobs; collection
 itself remains live.
 
-**Previous ops audit:** 2026-07-16 — **plant GREEN before text deployment; RSS
+**Earlier ops audit:** 2026-07-16 — **plant GREEN before text deployment; RSS
 initial verification GREEN.** Pre-deploy health's sole finding was the expected
 `offload_stuck_above_baseline:17519`, exactly the forecast 07-05 crash cohort;
 heartbeat 2.3 s, all 81 enabled scheduled jobs' latest rows successful, all 21
@@ -302,7 +320,6 @@ owner ask (safe-shaping directive above).
 
 Decisions waiting on the owner; agents must not act on these without an explicit OK
 (see `CLAUDE.md` Governance):
-
 
 - **Text-capture P2 probes (from the 2026-07-16 feasibility doc — see
   `docs/text_source_p2_feasibility.md` §7; none urgent, no rationale here per

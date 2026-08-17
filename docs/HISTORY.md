@@ -7,6 +7,48 @@ git log + the merged PR descriptions; this file keeps the *why*.
 
 ---
 
+## 2026-08-09 — Hyperliquid frozen-wallet forward collection approved and started
+
+The owner approved starting the modelling handoff as a bounded, keyless plant lane.
+The new `hyperliquid-wallet-flow-worker` polls `userFillsByTime` once per minute for
+the frozen 10-wallet BTC/ETH/SOL cohort, writes the standard raw/clean/quarantine
+run layout, reuses the v2 `trades` contract, and feeds the normal score/promote
+chain. It persists per-wallet completeness/freshness state, isolates wallet errors,
+deduplicates composite `(wallet, trade_id)` keys across overlap polls and unfinished
+runs, and refuses to emit a response that exactly hits the configured source cap.
+
+The scratch probe exercised both live endpoint shapes: one busy wallet hit the exact
+2,000-row cap and was correctly marked incomplete, while an uncapped wallet returned
+440 fills, including 73 target-coin rows. Two restart/resume segments emitted 20
+rows with 20 unique composite keys and zero duplicates. The implementation passed
+the full plant suite (500 tests), full Ruff, PowerShell parse checks for both runner
+scripts, and `git diff --check`.
+
+The guarded redeploy correctly refused to cross the non-elevated boundary of the
+existing SYSTEM runner. To begin the owner-approved accrual without disrupting it,
+a hidden user-level bridge was started against the same archive and ops roots. The
+final admissible prospective boundary is `2026-08-09T00:45:48Z`; the bridge is fresh,
+all ten wallet polls are successful, and first post-boundary rows are present. The
+two rows captured during an earlier boundary smoke check remain diagnostic only and
+must be excluded from causal evaluation. The on-disk live config and collector-pool
+concurrency update are ready for the SYSTEM runner to adopt at the next elevated
+deploy or reboot.
+
+## 2026-08-09 — read-only audit and Hyperliquid modelling handoff
+
+The stale-audit ritual was run before touching plant plans. The official health command
+did not return within bounded 30 s and 60 s attempts, so no clean overall verdict is
+claimed from that command. A read-only inspection of the small live markers found a
+fresh runner heartbeat (`2026-08-08T23:25:35Z`, status `running`), 23 current jobs,
+success as the latest status for all counter-tracked jobs, fresh manifests, about
+376.6 GB free on G: and 1.95 TB free on D:. The latest offload report was WARN but had
+zero failed moves and zero stuck-unaccounted runs. Operational follow-up: profile why
+the health CLI exceeds a one-minute bounded audit; collection was not restarted.
+
+Modelling also delivered a new owner decision request for a bounded, keyless public
+Hyperliquid wallet-flow lane. That was the state at this audit checkpoint; the owner
+subsequently approved collection and the resolved deployment is recorded above.
+
 ## 2026-08-01 — aged-unaccounted preserve-first backstop and maintenance fairness
 
 The health audit found 17,809 raw run directories older than the processing and
