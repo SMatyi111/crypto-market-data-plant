@@ -19,9 +19,10 @@
 param(
     [string]$OpsRoot = "G:\market_archive\ops",
     # Match run_ops_runner.ps1's live default (one slot per pooled lane: 21 existing
-    # market workers + 2 kalshi REST jobs + 2 text lanes + Hyperliquid). Keep these in sync -- a
+    # market workers + 2 kalshi REST jobs + 2 text lanes + Hyperliquid wallet-flow +
+    # the daily leaderboard snapshot). Keep these in sync -- a
     # redeploy with a lower value silently throttles coverage until reboot.
-    [int]$CollectorConcurrency = 26
+    [int]$CollectorConcurrency = 27
 )
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
@@ -36,13 +37,13 @@ if (-not (Test-Path $config)) { throw "ops config not found: $config" }
 # Guard BEFORE stopping anything: more enabled collector lanes than pool slots means
 # the lanes sorting last are never dispatched (silent starvation -- shipped twice).
 # Pool-dispatched job types all end in -worker (pinned by tests/test_repo_hygiene.py)
-# plus the two pooled kalshi REST jobs, enumerated EXPLICITLY: a kalshi- prefix wildcard
+# plus the pooled non-worker REST jobs, enumerated EXPLICITLY: a kalshi- prefix wildcard
 # also matched the maintenance job kalshi-summarize-crypto-quotes, so adding that to
 # the config would have tripped this preflight and refused a valid boot.
-$kalshiPoolTypes = @("kalshi-collect-crypto-quotes", "kalshi-discover-crypto")
+$nonWorkerPoolTypes = @("kalshi-collect-crypto-quotes", "kalshi-discover-crypto", "hyperliquid-leaderboard-snapshot")
 $configPayload = Get-Content -LiteralPath $config -Raw -Encoding utf8 | ConvertFrom-Json
 $collectorLanes = @($configPayload.jobs | Where-Object {
-    ($_.job_type -like "*-worker" -or $kalshiPoolTypes -contains $_.job_type) -and ($null -eq $_.enabled -or $_.enabled)
+    ($_.job_type -like "*-worker" -or $nonWorkerPoolTypes -contains $_.job_type) -and ($null -eq $_.enabled -or $_.enabled)
 })
 if ($collectorLanes.Count -gt $CollectorConcurrency) {
     throw "$($collectorLanes.Count) enabled collector lanes exceed CollectorConcurrency=$CollectorConcurrency. Raise the default in run_ops_runner.ps1 AND redeploy_runner.ps1 before redeploying."

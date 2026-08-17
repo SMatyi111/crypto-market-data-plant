@@ -54,6 +54,7 @@ from .collectors.binance_futures_rest import (
     write_aggtrades_cursor,
 )
 from .collectors.rest_poll import RestPollingCollector
+from .collectors.hyperliquid_leaderboard import snapshot_leaderboard
 from .collectors.hyperliquid_wallet_flow import (
     SOURCE_NAME as HYPERLIQUID_WALLET_FLOW_SOURCE,
     HyperliquidWalletFillNormalizer,
@@ -448,6 +449,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Opt in to hot-path normalized parquet; normal curation uses promotion.",
     )
     _add_fsync_batching_args(hl_parser)
+
+    hl_lb_parser = subparsers.add_parser(
+        "hyperliquid-leaderboard-snapshot",
+        help="Archive one point-in-time snapshot of the public Hyperliquid "
+        "leaderboard (raw-only reference lane, STANDARDS section 4.8). "
+        "Point-in-time leaderboard state cannot be reconstructed retroactively, "
+        "so every uncaptured day is unrecoverable.",
+    )
+    hl_lb_parser.add_argument("--output-root", type=Path, default=default_output_root())
+    hl_lb_parser.add_argument("--format", choices=["json", "text"], default="text")
 
     cb_trades_parser = subparsers.add_parser(
         "coinbase-trades-worker", help="Run segmented Coinbase trade collection"
@@ -2545,6 +2556,25 @@ def run_hyperliquid_wallet_flow_worker(args: argparse.Namespace) -> None:
     )
 
 
+def run_hyperliquid_leaderboard_snapshot(args: argparse.Namespace) -> None:
+    result = snapshot_leaderboard(args.output_root)
+    payload = {
+        "run_path": result.run_path,
+        "snapshot_path": result.snapshot_path,
+        "fetched_at": result.fetched_at,
+        "raw_bytes": result.raw_bytes,
+        "sha256": result.sha256,
+        "row_count": result.row_count,
+    }
+    if getattr(args, "format", "text") == "json":
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    print(
+        "hyperliquid leaderboard snapshot: "
+        f"rows={result.row_count} bytes={result.raw_bytes} run_path={result.run_path}"
+    )
+
+
 def run_binance_depth_worker(args: argparse.Namespace) -> None:
     _run_segmented_worker(
         args=args,
@@ -3332,6 +3362,9 @@ def _execute_ops_job_inprocess(job: JobSpec) -> JobExecutionResult | str | None:
     if job.job_type == "hyperliquid-wallet-flow-worker":
         run_hyperliquid_wallet_flow_worker(args)
         return "hyperliquid wallet flow worker completed"
+    if job.job_type == "hyperliquid-leaderboard-snapshot":
+        run_hyperliquid_leaderboard_snapshot(args)
+        return "hyperliquid leaderboard snapshot completed"
     if job.job_type == "coinbase-trades-worker":
         run_coinbase_trades_worker(args)
         return "coinbase trades worker completed"
@@ -3545,6 +3578,11 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             rotate_at_midnight=raw_args.get("rotate_at_midnight", False),
             jsonl_fsync=raw_args.get("jsonl_fsync", True),
             normalized_parquet=raw_args.get("normalized_parquet", False),
+        )
+    if job.job_type == "hyperliquid-leaderboard-snapshot":
+        return SimpleNamespace(
+            output_root=Path(raw_args.get("output_root", default_output_root())),
+            format=raw_args.get("format", "text"),
         )
     if job.job_type == "binance-futures-rest-worker":
         return SimpleNamespace(
@@ -4936,6 +4974,8 @@ def main() -> None:
         run_binance_futures_rest_worker(args)
     elif args.command == "hyperliquid-wallet-flow-worker":
         run_hyperliquid_wallet_flow_worker(args)
+    elif args.command == "hyperliquid-leaderboard-snapshot":
+        run_hyperliquid_leaderboard_snapshot(args)
     elif args.command == "coinbase-trades-worker":
         run_coinbase_trades_worker(args)
     elif args.command == "coinbase-depth-worker":
