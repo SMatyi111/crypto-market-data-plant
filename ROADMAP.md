@@ -76,6 +76,27 @@ Decision queue context in the limitless docs). (3) Hygiene: the unconfigured
 `mock` lane holds 98 hot run dirs; `coinbase_*_usdc` and `kalshi_crypto_quotes`
 lane dirs are empty leftovers.
 
+**Post-audit review of PR #42 (2026-08-17, same session):** the pre-merge review
+found three lane defects that would have fired at the pending elevated restart;
+all fixed on the PR branch + local config: (a) a cap-sized `userFillsByTime`
+response permanently stalled that wallet — the poller raised and never advanced
+the high-water, so the window re-capped identically forever; it now pages
+forward to the last complete timestamp and marks the poll incomplete. (b) The
+lane's 300 s delay/clock-skew gates would have quarantined the entire
+post-outage catch-up at capture — and since quarantined rows never reach clean,
+the durable scan couldn't suppress them and every segment refetched and
+re-quarantined the same growing window (the bfr lesson at 60 s scale). Gates
+are now resume-window-sized (90 days) in the code defaults and in
+`ops.live.local.json` (backup: `ops.live.local.json.bak-20260817-hyperliquid-gates`).
+(c) The `score-hyperliquid-wallet-flow` window (`max_age_hours: 6`) could never
+score a run torn by an outage longer than 6 h, stranding its rows out of curated
+while the durable scan suppresses their refetch; score/promote/quarantine
+windows widened to 336 h in the local config. **Timing note for the owner:** the
+08-10 torn run `20260810_000001` (3,290 clean rows, no replay summary) is healed
+automatically by the widened score job only if the elevated restart happens
+before ~2026-08-24; after that, rescue it manually with
+`backfill-trades-replay --stream` + a promote pass using a wide `--max-age-hours`.
+
 **Previous ops audit:** 2026-08-09 — **existing capture markers fresh; Hyperliquid
 prospective collection live.** The official health command exceeded both bounded
 30 s and 60 s attempts, so no clean overall verdict is claimed from it. Manual

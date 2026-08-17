@@ -424,9 +424,17 @@ def build_parser() -> argparse.ArgumentParser:
     hl_parser.add_argument("--ops-root", type=Path, default=default_ops_root())
     hl_parser.add_argument("--worker-name", default="hyperliquid-wallet-flow-worker")
     hl_parser.add_argument("--heartbeat-interval-seconds", type=float, default=30.0)
-    hl_parser.add_argument("--max-delay-ms", type=int, default=300_000)
+    # The delay/skew gates must track this lane's resume window, which is bounded
+    # only by the cohort floor: the poller resumes from the durable high-water, so
+    # after an outage every refetched fill arrives with received_at - exchange_time
+    # equal to the outage length. A tight gate quarantines the whole catch-up at
+    # capture (the bfr lesson, at 60 s scale) — and because quarantined rows never
+    # reach clean, the durable scan never suppresses them and the worker refetches
+    # and re-quarantines the same growing window every segment. 90 days; per-row
+    # event time and receipt time are both recorded, so staleness stays auditable.
+    hl_parser.add_argument("--max-delay-ms", type=int, default=7_776_000_000)
     hl_parser.add_argument("--max-future-skew-ms", type=int, default=5_000)
-    hl_parser.add_argument("--max-clock-skew-ms", type=float, default=300_000.0)
+    hl_parser.add_argument("--max-clock-skew-ms", type=float, default=7_776_000_000.0)
     hl_parser.add_argument("--source-suffix", default="")
     hl_parser.add_argument("--rotate-at-midnight", action="store_true")
     hl_parser.add_argument(
@@ -2437,7 +2445,7 @@ async def collect_hyperliquid_wallet_flow_segment(
         collector=collector,
         normalizer=HyperliquidWalletFillNormalizer(),
         quality_gate=QualityGate(
-            max_delay_ms=int(getattr(args, "max_delay_ms", 300_000)),
+            max_delay_ms=int(getattr(args, "max_delay_ms", 7_776_000_000)),
             max_future_skew_ms=int(getattr(args, "max_future_skew_ms", 5_000)),
             require_monotonic_sequence=False,
             session_id=run_paths.base.name,
@@ -3125,24 +3133,24 @@ def _run_segmented_worker(
                     # Hyperliquid wallet-flow REST controls are threaded centrally so
                     # the worker's segment builder cannot silently drop a live-config
                     # field (the same enumeration failure this block exists to prevent).
+                    # Threaded only when the entry path actually provides the attr:
+                    # these names are generic — other lanes read poll_interval_seconds /
+                    # max_delay_ms / max_clock_skew_ms with their OWN lane-tuned
+                    # fallbacks (bfr: 1.0 s / 21_600_000) — so an unconditional
+                    # fallback here would silently re-default any lane whose entry
+                    # path omits the attr.
                     segment_args.cohort_path = getattr(args, "cohort_path", None)
-                    segment_args.poll_interval_seconds = float(
-                        getattr(args, "poll_interval_seconds", 60.0)
-                    )
-                    segment_args.request_pause_seconds = float(
-                        getattr(args, "request_pause_seconds", 0.1)
-                    )
-                    segment_args.overlap_seconds = float(
-                        getattr(args, "overlap_seconds", 300.0)
-                    )
-                    segment_args.response_cap = int(getattr(args, "response_cap", 2000))
-                    segment_args.max_delay_ms = int(getattr(args, "max_delay_ms", 300_000))
-                    segment_args.max_future_skew_ms = int(
-                        getattr(args, "max_future_skew_ms", 5_000)
-                    )
-                    segment_args.max_clock_skew_ms = float(
-                        getattr(args, "max_clock_skew_ms", 300_000.0)
-                    )
+                    for hl_field, hl_cast in (
+                        ("poll_interval_seconds", float),
+                        ("request_pause_seconds", float),
+                        ("overlap_seconds", float),
+                        ("response_cap", int),
+                        ("max_delay_ms", int),
+                        ("max_future_skew_ms", int),
+                        ("max_clock_skew_ms", float),
+                    ):
+                        if hasattr(args, hl_field):
+                            setattr(segment_args, hl_field, hl_cast(getattr(args, hl_field)))
                     summary = asyncio.run(collect_segment(segment_args))
                 except Exception as exc:
                     runtime.record_event("segment_error", details={"segment_index": segment_index, "error": str(exc)})
@@ -3512,9 +3520,11 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
                 "worker_name", "hyperliquid-wallet-flow-worker"
             ),
             heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
-            max_delay_ms=raw_args.get("max_delay_ms", 300_000),
+            # Resume-window-sized gates — keep in sync with the hl_parser defaults
+            # (see the comment there: a tight gate quarantines every resumed backfill).
+            max_delay_ms=raw_args.get("max_delay_ms", 7_776_000_000),
             max_future_skew_ms=raw_args.get("max_future_skew_ms", 5_000),
-            max_clock_skew_ms=raw_args.get("max_clock_skew_ms", 300_000.0),
+            max_clock_skew_ms=raw_args.get("max_clock_skew_ms", 7_776_000_000.0),
             source_suffix=raw_args.get("source_suffix", ""),
             rotate_at_midnight=raw_args.get("rotate_at_midnight", False),
             jsonl_fsync=raw_args.get("jsonl_fsync", True),

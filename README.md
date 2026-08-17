@@ -28,7 +28,9 @@ The maintainer deployment has **23 enabled collection lanes** across eight venue
 plus Kalshi: the existing BTC market/text lanes and one frozen-cohort Hyperliquid
 wallet-flow lane for BTC, ETH and SOL. The public `ops.live.example.json` ships with only the
 Binance `BTCUSDT` spot lanes enabled — every other lane is included
-`enabled: false` as the recipe; flip them per lane when you want them.
+`enabled: false` as the recipe, except the Hyperliquid wallet-flow lane, which
+requires a local cohort file and therefore ships with no public recipe; flip
+lanes on per lane when you want them.
 
 | Venue   | Market | Trades | Depth | Gap-detection class |
 | ------- | ------ | ------ | ----- | ------------------- |

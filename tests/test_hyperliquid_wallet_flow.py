@@ -121,6 +121,85 @@ def test_poller_deduplicates_and_isolates_one_wallet_error(tmp_path: Path) -> No
     assert state["per_wallet"][ADDRESS_B]["last_response_complete"] is False
 
 
+def test_capped_response_pages_forward_instead_of_stalling(tmp_path: Path) -> None:
+    cohort_path = tmp_path / "cohort.json"
+    _write_cohort(cohort_path)
+    cohort = load_wallet_flow_cohort(cohort_path)
+    base_ms = int(START.timestamp() * 1000)
+    now = datetime(2026, 8, 9, 0, 5, tzinfo=UTC)
+
+    ledger = [
+        _fill(trade_id=1, timestamp_ms=base_ms + 1_000),
+        _fill(trade_id=2, timestamp_ms=base_ms + 2_000),
+        _fill(trade_id=3, timestamp_ms=base_ms + 3_000),
+        _fill(trade_id=4, timestamp_ms=base_ms + 4_000),
+    ]
+
+    def fetch(payload):
+        if payload["user"] != ADDRESS_A:
+            return []
+        window = [fill for fill in ledger if fill["time"] >= payload["startTime"]]
+        return window[:3]  # server truncates at its cap (3 here)
+
+    poller = HyperliquidWalletFlowPoller(
+        cohort=cohort,
+        source_root=tmp_path / "raw" / "hyperliquid_wallet_flow",
+        state_path=tmp_path / "state.json",
+        fetch=fetch,
+        request_pause_seconds=0,
+        overlap_seconds=0,
+        response_cap=3,
+        clock=lambda: now,
+    )
+    first, _ = asyncio.run(poller.poll())
+    # The boundary-timestamp fill (tid=3) is dropped from the truncated page but
+    # the high-water advances to it, so the next poll re-enters at the boundary.
+    assert [fill["tid"] for fill in first] == [1, 2]
+    assert poller.highwater[ADDRESS_A] == base_ms + 3_000
+    state = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    assert state["last_poll_complete"] is False
+    assert state["per_wallet"][ADDRESS_A]["last_response_capped"] is True
+    assert state["per_wallet"][ADDRESS_A]["last_response_complete"] is False
+    assert state["poll_error_count"] == 0
+
+    second, _ = asyncio.run(poller.poll())
+    assert [fill["tid"] for fill in second] == [3, 4]
+    state = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    assert state["last_poll_complete"] is True
+    assert state["per_wallet"][ADDRESS_A]["last_response_capped"] is False
+
+
+def test_capped_single_timestamp_page_is_an_error_not_data_loss(tmp_path: Path) -> None:
+    cohort_path = tmp_path / "cohort.json"
+    _write_cohort(cohort_path)
+    cohort = load_wallet_flow_cohort(cohort_path)
+    base_ms = int(START.timestamp() * 1000)
+    now = datetime(2026, 8, 9, 0, 5, tzinfo=UTC)
+
+    def fetch(payload):
+        if payload["user"] != ADDRESS_A:
+            return []
+        return [
+            _fill(trade_id=index, timestamp_ms=base_ms + 1_000) for index in range(3)
+        ]
+
+    poller = HyperliquidWalletFlowPoller(
+        cohort=cohort,
+        source_root=tmp_path / "raw" / "hyperliquid_wallet_flow",
+        state_path=tmp_path / "state.json",
+        fetch=fetch,
+        request_pause_seconds=0,
+        response_cap=3,
+        clock=lambda: now,
+    )
+    emitted, _ = asyncio.run(poller.poll())
+    assert emitted == []
+    assert ADDRESS_A not in poller.highwater
+    state = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    assert state["poll_error_count"] == 1
+    assert "single-timestamp" in state["per_wallet"][ADDRESS_A]["last_error"]
+
+
 def test_scan_partial_run_prevents_cross_run_duplicate(tmp_path: Path) -> None:
     source_root = tmp_path / "hyperliquid_wallet_flow"
     events = source_root / "20260809_000100" / "clean" / "events.jsonl"

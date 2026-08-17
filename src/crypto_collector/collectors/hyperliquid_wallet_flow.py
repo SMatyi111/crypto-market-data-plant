@@ -223,10 +223,37 @@ class HyperliquidWalletFlowPoller:
                 response = await asyncio.to_thread(self.fetch, request_payload)
                 if not isinstance(response, list):
                     raise ValueError("userFillsByTime response is not a list")
-                if len(response) >= self.response_cap:
-                    raise RuntimeError(
-                        f"response_cap_reached:{len(response)}; interval incomplete"
-                    )
+                fills = [fill for fill in response if isinstance(fill, dict)]
+                capped = len(response) >= self.response_cap
+                boundary_ms: int | None = None
+                if capped:
+                    # The server truncated the window. Page forward instead of
+                    # stalling: a raise here never advances the high-water, so a
+                    # wallet whose un-covered window once exceeds the cap would
+                    # error on every subsequent poll forever. Keep only fills
+                    # strictly older than the newest returned timestamp (that
+                    # millisecond may be cut mid-batch), advance the high-water to
+                    # that boundary, and let the next poll re-enter at
+                    # boundary - overlap. A page whose fills all share a single
+                    # timestamp has no safe boundary — error as before rather than
+                    # silently dropping same-millisecond fills beyond the cap.
+                    stamps = {
+                        stamp
+                        for stamp in (_optional_int(fill.get("time")) for fill in fills)
+                        if stamp is not None
+                    }
+                    if len(stamps) < 2:
+                        raise RuntimeError(
+                            f"response_cap_reached:{len(response)}; "
+                            "single-timestamp page cannot advance"
+                        )
+                    boundary_ms = max(stamps)
+                    fills = [
+                        fill
+                        for fill in fills
+                        if (stamp := _optional_int(fill.get("time"))) is not None
+                        and stamp < boundary_ms
+                    ]
             except Exception as exc:  # noqa: BLE001 - isolate one public wallet failure
                 complete = False
                 self.poll_error_count += 1
@@ -235,13 +262,14 @@ class HyperliquidWalletFlowPoller:
                 state["last_response_complete"] = False
             else:
                 wallet_new = 0
+                if capped:
+                    complete = False
                 state["last_success_at"] = self.clock().astimezone(UTC).isoformat()
                 state["last_response_rows"] = len(response)
-                state["last_response_complete"] = True
+                state["last_response_complete"] = not capped
+                state["last_response_capped"] = capped
                 state.pop("last_error", None)
-                for fill in response:
-                    if not isinstance(fill, dict):
-                        continue
+                for fill in fills:
                     timestamp_ms = _optional_int(fill.get("time"))
                     coin = str(fill.get("coin") or "").upper()
                     if (
@@ -268,6 +296,13 @@ class HyperliquidWalletFlowPoller:
                         self.highwater.get(wallet.address, timestamp_ms),
                     )
                     wallet_new += 1
+                if boundary_ms is not None:
+                    # Advance past the consumed page even when it emitted nothing
+                    # (all duplicates or non-target coins) — otherwise the window
+                    # re-caps identically on every poll and never progresses.
+                    self.highwater[wallet.address] = max(
+                        boundary_ms, self.highwater.get(wallet.address, boundary_ms)
+                    )
                 state["last_new_rows"] = wallet_new
                 state["highwater_timestamp_ms"] = self.highwater.get(wallet.address)
             if index + 1 < len(self.cohort.wallets) and self.request_pause_seconds:
