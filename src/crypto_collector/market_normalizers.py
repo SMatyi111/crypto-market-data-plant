@@ -258,6 +258,91 @@ class CoinbaseDepthNormalizer:
         )
 
 
+class OkxLiquidationNormalizer:
+    """Normalize OKX v5 `liquidation-orders` frames.
+
+    Shape differs from every other lane here in two ways that matter:
+
+    * **Instrument-type scoped.** One subscription (`instType: SWAP`) streams
+      liquidations for EVERY swap on the venue, so `product` varies row to row and
+      is read from each entry's `instId` - it is not a lane-level constant.
+    * **Doubly nested.** `data[]` carries one object per instrument, each with a
+      `details[]` array of individual liquidations, so the fan-out is over the
+      cross product.
+
+    OKX also reports more than Bybit: `posSide` states plainly which side of the
+    book was liquidated (long/short) and `bkPx`/`bkLoss` give the bankruptcy price
+    and loss. `side` is the closing order's side, so it is the mirror of `posSide`
+    (a long is closed by a sell); both are kept rather than one being derived,
+    because the redundancy is what lets a consumer detect a venue semantics change.
+    """
+
+    def __init__(self) -> None:
+        self._resolve_instrument = resolve_perp_instrument
+
+    def normalize_many(self, raw: RawMessage) -> list[NormalizedL3Event]:
+        data = raw.payload.get("data")
+        if not isinstance(data, list):
+            return []
+        out: list[NormalizedL3Event] = []
+        for entry in data:
+            if not isinstance(entry, dict):
+                continue
+            details = entry.get("details")
+            if not isinstance(details, list):
+                continue
+            for detail in details:
+                out.append(self._normalize_one(entry, detail, raw))
+        return out
+
+    def _normalize_one(self, entry: Any, detail: Any, raw: RawMessage) -> NormalizedL3Event:
+        detail = detail if isinstance(detail, dict) else {}
+        parse_errors: list[str] = []
+        inst_id = str(entry.get("instId") or "UNKNOWN")
+        event_time = _parse_timestamp_ms(detail.get("ts"), parse_errors)
+        side = str(detail.get("side") or "").lower() or None
+        if side not in (None, "buy", "sell"):
+            parse_errors.append(f"unexpected side: {side}")
+            side = None
+        price = _optional_float(detail.get("bkPx"), "price", parse_errors)
+        size = _optional_float(detail.get("sz"), "size", parse_errors)
+        # OKX ids carry a market suffix (`BTC-USDT-SWAP`); the generic separator
+        # stripper leaves `BTCUSDTSWAP`, which resolves to nothing and would
+        # partition every row as instrument=unknown. Use the OKX-specific helper
+        # the trades/depth lanes already use.
+        instrument = self._resolve_instrument(
+            _okx_resolve_symbol(inst_id), venue=raw.source
+        )
+
+        metadata: dict[str, Any] = {
+            "instrument_id": instrument.instrument_id if instrument is not None else None,
+            "canonical_symbol": instrument.canonical_symbol if instrument is not None else None,
+            # The liquidated position's side, stated by the venue rather than
+            # inferred from `side`. Kept alongside so a semantics change is visible.
+            "okx_pos_side": detail.get("posSide"),
+            "okx_bankruptcy_loss": detail.get("bkLoss"),
+            "okx_inst_family": entry.get("instFamily"),
+            "okx_inst_type": entry.get("instType"),
+        }
+        if parse_errors:
+            metadata["parse_errors"] = parse_errors
+
+        return NormalizedL3Event(
+            source=raw.source,
+            product=inst_id,
+            channel="liquidations",
+            event_type="liquidation",
+            exchange_time=event_time,
+            received_at=raw.received_at,
+            side=side,
+            price=price,
+            size=size,
+            trade_id=None,
+            sequence=None,
+            metadata=metadata,
+        )
+
+
 class BybitLiquidationNormalizer:
     """Normalize Bybit v5 `allLiquidation.{symbol}` frames.
 

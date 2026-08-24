@@ -291,6 +291,14 @@ shape collision.
 | `trade_id`     | None            | venues expose no liquidation id |
 | `sequence`     | None            | no dense counter -> non-sequence (`none_native`) feed, structurally clean but NOT gap-proof (4.3) |
 
+**OKX shape differs from Bybit.** `liquidation-orders` is scoped by instrument
+TYPE (`instType: SWAP`), so one subscription covers every swap and `product`
+varies row to row; the payload is doubly nested (`data[].details[]`); and ids
+carry a market suffix, so resolution must use the OKX-specific helper or every
+row partitions as `instrument=unknown`. OKX additionally reports `posSide` (the
+liquidated side, stated rather than inferred) and `bkPx`/`bkLoss`, kept in
+metadata.
+
 No `buyer_is_maker` is emitted: the taker/maker convention does not apply to a
 forced close. Liquidations are **bursty** - long quiet stretches then a cascade
 - so lanes should set `rotate_at_midnight` rather than relying on

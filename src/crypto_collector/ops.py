@@ -40,6 +40,7 @@ COLLECTOR_JOB_TYPES: frozenset[str] = frozenset(
         # allLiquidation frame is shaped like publicTrade, so sharing the trades
         # worker would silently promote forced closes into the trade tape.
         "bybit-liquidations-worker",
+        "okx-liquidations-worker",
         "okx-trades-worker",
         "okx-depth-worker",
         "mexc-trades-worker",
