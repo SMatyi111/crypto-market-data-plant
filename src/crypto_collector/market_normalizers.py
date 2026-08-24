@@ -258,6 +258,91 @@ class CoinbaseDepthNormalizer:
         )
 
 
+class BinanceLiquidationNormalizer:
+    """Normalize Binance USD-M futures `!forceOrder@arr` frames.
+
+    One liquidation per frame (no batching), wrapped in an `o` order object:
+    `{"e":"forceOrder","E":..,"o":{"s","S","q","p","ap","X","l","z","T",..}}`.
+    The all-market stream covers every USD-M symbol, so `product` varies per
+    frame and is read from `o.s`.
+
+    Field choices, because Binance offers several and they are not equivalent:
+
+    * **price** uses `ap` (average FILL price) and falls back to `p` (the order's
+      limit price). `p` is what the liquidation engine asked for; `ap` is what the
+      market gave, which is the economically meaningful number.
+    * **size** uses `z` (accumulated filled) and falls back to `q` (order
+      quantity). For a fully filled liquidation they agree; for a partial they do
+      not, and the filled amount is the one that actually moved.
+
+    Both alternates are preserved in metadata so a consumer can disagree without
+    re-collecting - the same rule applied to Bybit's ambiguous side token.
+
+    `S` is the side of the liquidation ORDER, so a `SELL` means a long position
+    was force-closed. This mirrors OKX (`side` = closing order) rather than Bybit
+    (documented as the position side); the venue difference is why no lane derives
+    one from the other.
+    """
+
+    def __init__(self) -> None:
+        self._resolve_instrument = resolve_perp_instrument
+
+    def normalize_many(self, raw: RawMessage) -> list[NormalizedL3Event]:
+        order = raw.payload.get("o")
+        if not isinstance(order, dict):
+            return []
+        return [self._normalize_one(order, raw)]
+
+    def _normalize_one(self, order: dict, raw: RawMessage) -> NormalizedL3Event:
+        parse_errors: list[str] = []
+        product = str(order.get("s") or "UNKNOWN")
+        event_time = _parse_timestamp_ms(
+            order.get("T", raw.payload.get("E")), parse_errors
+        )
+        side_token = str(order.get("S") or "").lower() or None
+        side = side_token if side_token in ("buy", "sell") else None
+        if side_token is not None and side is None:
+            parse_errors.append(f"unexpected side: {side_token}")
+        avg_px = _optional_float(order.get("ap"), "avg_price", parse_errors)
+        lim_px = _optional_float(order.get("p"), "price", parse_errors)
+        filled = _optional_float(order.get("z"), "filled_qty", parse_errors)
+        qty = _optional_float(order.get("q"), "size", parse_errors)
+        instrument = self._resolve_instrument(
+            _strip_symbol_separators(product), venue=raw.source
+        )
+
+        metadata: dict[str, Any] = {
+            "instrument_id": instrument.instrument_id if instrument is not None else None,
+            "canonical_symbol": instrument.canonical_symbol if instrument is not None else None,
+            # Alternates kept so the choices documented above are reversible.
+            "binance_order_price": order.get("p"),
+            "binance_avg_price": order.get("ap"),
+            "binance_order_qty": order.get("q"),
+            "binance_filled_qty": order.get("z"),
+            "binance_last_filled_qty": order.get("l"),
+            "binance_order_status": order.get("X"),
+            "binance_time_in_force": order.get("f"),
+            "binance_order_type": order.get("o"),
+        }
+        if parse_errors:
+            metadata["parse_errors"] = parse_errors
+
+        return NormalizedL3Event(
+            source=raw.source,
+            product=product,
+            channel="liquidations",
+            event_type="liquidation",
+            exchange_time=event_time,
+            received_at=raw.received_at,
+            side=side,
+            price=avg_px if avg_px is not None else lim_px,
+            size=filled if filled is not None else qty,
+            trade_id=None,
+            sequence=None,
+            metadata=metadata,
+        )
+
+
 class OkxLiquidationNormalizer:
     """Normalize OKX v5 `liquidation-orders` frames.
 

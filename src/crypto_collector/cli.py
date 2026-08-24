@@ -90,6 +90,7 @@ from .market_normalizers import (
     BinanceFuturesFundingNormalizer,
     BinanceTradeNormalizer,
     BybitDepthNormalizer,
+    BinanceLiquidationNormalizer,
     BybitLiquidationNormalizer,
     BybitTradeNormalizer,
     CoinbaseDepthNormalizer,
@@ -627,6 +628,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="Rotate the run directory at midnight UTC instead of at --segment-count "
         "messages. See the depth worker's help text for the same flag.",
     )
+
+    bnc_liq_parser = subparsers.add_parser(
+        "binance-liquidations-worker",
+        help="Run segmented Binance USD-M `!forceOrder@arr` collection (all-market "
+        "forced orders)",
+    )
+    bnc_liq_parser.add_argument(
+        "--symbol",
+        default="!forceOrder@arr",
+        help="Stream name, not an instrument: the all-market forced-order stream "
+        "covers every USD-M symbol in one subscription.",
+    )
+    bnc_liq_parser.add_argument("--channel", default="!forceOrder@arr")
+    bnc_liq_parser.add_argument("--segment-count", type=int, default=5000)
+    bnc_liq_parser.add_argument("--max-segments", type=int)
+    bnc_liq_parser.add_argument("--cooldown-seconds", type=float, default=1.0)
+    bnc_liq_parser.add_argument("--output-root", type=Path, default=default_output_root())
+    bnc_liq_parser.add_argument("--ops-root", type=Path, default=default_ops_root())
+    bnc_liq_parser.add_argument("--worker-name", default="binance-liquidations-worker")
+    bnc_liq_parser.add_argument("--heartbeat-interval-seconds", type=float, default=30.0)
+    bnc_liq_parser.add_argument("--max-delay-ms", type=int, default=60_000)
+    bnc_liq_parser.add_argument("--max-future-skew-ms", type=int, default=5_000)
+    bnc_liq_parser.add_argument("--max-clock-skew-ms", type=float, default=60_000.0)
+    bnc_liq_parser.add_argument("--source-suffix", default="")
+    bnc_liq_parser.add_argument("--rotate-at-midnight", action="store_true", default=True)
 
     okx_liq_parser = subparsers.add_parser(
         "okx-liquidations-worker",
@@ -1962,6 +1988,23 @@ async def collect_bybit_trades_segment(args: argparse.Namespace) -> dict[str, ob
     )
 
 
+async def collect_binance_liquidations_segment(args: argparse.Namespace) -> dict[str, object]:
+    # USD-M futures all-market forced-order stream. NOTE: cli help elsewhere records
+    # that fstream WS was unreachable from this host (hence the REST perp lane); it
+    # is reachable as of 2026-08-24, verified by subscribe-ack. If it is blocked
+    # again this lane simply fails to connect and retries - it does not affect the
+    # REST lane.
+    return await _collect_trades_segment(
+        args,
+        source="binance",
+        websocket_url=_BINANCE_FUTURES_WS,
+        subscription_style="binance",
+        normalizer=BinanceLiquidationNormalizer(),
+        source_base="binance_perp_liquidations",
+        replay_fn=replay_trades_stream_run,
+    )
+
+
 async def collect_okx_liquidations_segment(args: argparse.Namespace) -> dict[str, object]:
     # OKX scopes this channel by instrument TYPE, not instrument: one subscription
     # streams every SWAP liquidation on the venue, so `symbol` carries "SWAP" and
@@ -2895,6 +2938,33 @@ def run_bybit_trades_worker(args: argparse.Namespace) -> None:
     )
 
 
+def run_binance_liquidations_worker(args: argparse.Namespace) -> None:
+    _run_segmented_worker(
+        args=args,
+        default_worker_name="binance-liquidations-worker",
+        worker_type="binance-liquidations-worker",
+        venue="binance",
+        build_segment_args=lambda source_args: SimpleNamespace(
+            symbol=source_args.symbol,
+            channel=source_args.channel,
+            market="linear",
+            count=source_args.segment_count,
+            output_root=source_args.output_root,
+            max_delay_ms=source_args.max_delay_ms,
+            max_future_skew_ms=getattr(source_args, "max_future_skew_ms", 5_000),
+            max_clock_skew_ms=getattr(source_args, "max_clock_skew_ms", 60_000.0),
+            source_suffix=getattr(source_args, "source_suffix", ""),
+            deadline_utc=None,
+        ),
+        collect_segment=collect_binance_liquidations_segment,
+        progress_message=lambda segment_index, summary: (
+            "binance liquidations segment finished: "
+            f"segment={segment_index} clean_events={summary['clean_events']} "
+            f"replayable={summary.get('replayable')} run_path={summary['run_path']}"
+        ),
+    )
+
+
 def run_okx_liquidations_worker(args: argparse.Namespace) -> None:
     _run_segmented_worker(
         args=args,
@@ -3545,6 +3615,9 @@ def _execute_ops_job_inprocess(job: JobSpec) -> JobExecutionResult | str | None:
     if job.job_type == "okx-liquidations-worker":
         run_okx_liquidations_worker(args)
         return "okx liquidations worker completed"
+    if job.job_type == "binance-liquidations-worker":
+        run_binance_liquidations_worker(args)
+        return "binance liquidations worker completed"
     if job.job_type == "bybit-depth-worker":
         run_bybit_depth_worker(args)
         return "bybit depth worker completed"
@@ -3853,6 +3926,27 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             # Per-lane data-arrival watchdog (0.0 = off; see
             # CollectorConfig.idle_timeout_seconds). Honored by the generic-WS lanes;
             # the Binance depth lane runs its own socket loop and ignores it.
+            idle_timeout_seconds=raw_args.get("idle_timeout_seconds", 0.0),
+        )
+    if job.job_type == "binance-liquidations-worker":
+        return SimpleNamespace(
+            # All-market stream: the "symbol" is the stream name, not an instrument.
+            symbol=raw_args.get("symbol", "!forceOrder@arr"),
+            channel=raw_args.get("channel", "!forceOrder@arr"),
+            segment_count=raw_args.get("segment_count", 5000),
+            max_segments=raw_args.get("max_segments"),
+            cooldown_seconds=raw_args.get("cooldown_seconds", 1.0),
+            output_root=raw_args.get("output_root", default_output_root()),
+            ops_root=Path(raw_args.get("ops_root", default_ops_root())),
+            normalized_root=raw_args.get("normalized_root"),
+            worker_name=raw_args.get("worker_name", "binance-liquidations-worker"),
+            jsonl_fsync=raw_args.get("jsonl_fsync", True),
+            heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
+            max_delay_ms=raw_args.get("max_delay_ms", _TRADES_STALE_WINDOW_MS),
+            max_future_skew_ms=raw_args.get("max_future_skew_ms", 5_000),
+            max_clock_skew_ms=raw_args.get("max_clock_skew_ms", 60_000.0),
+            source_suffix=raw_args.get("source_suffix", ""),
+            rotate_at_midnight=raw_args.get("rotate_at_midnight", True),
             idle_timeout_seconds=raw_args.get("idle_timeout_seconds", 0.0),
         )
     if job.job_type == "okx-liquidations-worker":
@@ -5193,6 +5287,8 @@ def main() -> None:
         run_coinbase_depth_worker(args)
     elif args.command == "kraken-trades-worker":
         run_kraken_trades_worker(args)
+    elif args.command == "binance-liquidations-worker":
+        run_binance_liquidations_worker(args)
     elif args.command == "okx-liquidations-worker":
         run_okx_liquidations_worker(args)
     elif args.command == "bybit-liquidations-worker":

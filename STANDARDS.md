@@ -299,6 +299,14 @@ row partitions as `instrument=unknown`. OKX additionally reports `posSide` (the
 liquidated side, stated rather than inferred) and `bkPx`/`bkLoss`, kept in
 metadata.
 
+**Binance shape.** `!forceOrder@arr` is one liquidation per frame (no batching)
+wrapped in an `o` order object, all-market. It offers several near-synonyms and
+the lane commits to `ap` (average fill price) over `p` (limit price) and `z`
+(accumulated filled) over `q` (order quantity) - equal on a full fill, divergent
+on a partial, i.e. precisely during a cascade. All alternates are kept in
+metadata. `S` is the closing order's side (SELL = a long was liquidated), like
+OKX and unlike Bybit; no lane derives one venue's convention from another's.
+
 No `buyer_is_maker` is emitted: the taker/maker convention does not apply to a
 forced close. Liquidations are **bursty** - long quiet stretches then a cascade
 - so lanes should set `rotate_at_midnight` rather than relying on

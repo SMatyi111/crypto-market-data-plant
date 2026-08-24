@@ -24,6 +24,7 @@ param(
     # redeploy with a lower value silently throttles coverage until reboot.
     [int]$CollectorConcurrency = 32
     [int]$CollectorConcurrency = 32
+    [int]$CollectorConcurrency = 32
 )
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot

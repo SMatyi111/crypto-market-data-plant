@@ -41,6 +41,7 @@ COLLECTOR_JOB_TYPES: frozenset[str] = frozenset(
         # worker would silently promote forced closes into the trade tape.
         "bybit-liquidations-worker",
         "okx-liquidations-worker",
+        "binance-liquidations-worker",
         "okx-trades-worker",
         "okx-depth-worker",
         "mexc-trades-worker",

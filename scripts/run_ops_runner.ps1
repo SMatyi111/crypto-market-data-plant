@@ -20,6 +20,7 @@ param(
     [int]$CollectorConcurrency = 32
     # frozen-cohort Hyperliquid worker = 26 slots, one per pooled lane.
     [int]$CollectorConcurrency = 32
+    [int]$CollectorConcurrency = 32
 )
 
 $ErrorActionPreference = "Stop"
