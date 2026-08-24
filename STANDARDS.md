@@ -14,6 +14,11 @@
 > older than the newest returned timestamp and advance the per-wallet high-water)
 > instead of emitting nothing for that wallet. No other lane's schema, partition,
 > or replayability semantics changed.
+> **Compatible lane addition (2026-08-17; within v9):** owner-approved
+> `hyperliquid-leaderboard-snapshot`, a **raw-only reference lane** (daily
+> point-in-time leaderboard archive for adaptive cohort selection) with a
+> lighter contract — no clean/quarantine/promotion chain and no replay verdict.
+> See §4.8.
 > **v8 (2026-07-16):** adds the **text-capture lanes** (`text-rss`, `text-reddit` —
 > ROADMAP item 15, owner-approved 2026-07-13): a new **`text` dataset** with its own
 > raw root (`raw/text/<lane>/…`), curated target (`curated/research/text`), envelope
@@ -715,6 +720,34 @@ Consumers performing the registered causal evaluation MUST filter on the frozen
 cohort's `prospective_start_at` and join using event time plus an explicit
 receipt/availability delay. Rows from earlier scratch or snapshot work are
 diagnostic only and are not admissible future evidence.
+
+### 4.8 Hyperliquid leaderboard snapshots — raw-only reference lane
+
+The `hyperliquid-leaderboard-snapshot` job (owner-approved 2026-08-17) archives
+one point-in-time copy per day of the public, keyless Hyperliquid leaderboard
+(`stats-data.hyperliquid.xyz/Mainnet/leaderboard`: ~42k wallets with
+day/week/month/all-time PnL, ROI, volume, and account value). Purpose: the
+venue exposes only the CURRENT leaderboard — historical states cannot be
+reconstructed retroactively — so these snapshots are the only source of honest
+**point-in-time cohort selection** for adaptive wallet-cohort rules (ROADMAP:
+adaptive wallet-cohort program). Every uncaptured day is unrecoverable.
+
+This is a **raw-only reference lane**, a lighter contract than market lanes:
+
+- Layout: `raw/market/hyperliquid_leaderboard/<run_id>/raw/leaderboard.json.gz`
+  (the exact upstream bytes, gzipped, sha256 recorded) +
+  `metrics/summary.json` (`fetched_at`, `raw_bytes`, `sha256`, `row_count`,
+  `parse_ok`). One run directory per snapshot.
+- No clean/quarantine split, no normalization, no replay verdict, no
+  promotion: the archived snapshot itself is the deliverable, and it is parsed
+  at read time only. A malformed or empty payload still archives the raw bytes
+  but FAILS the job, so runner job-status counters surface it.
+- Retention: keep indefinitely (a few MB/day gzipped). Excluded from the
+  offload accounting gate (there is no promotion/quarantine index to prove);
+  reference lanes surface in offload reports as `unconfigured_lane` by design.
+- Selection rules computed from these snapshots are versioned research inputs;
+  a cohort chosen with information from snapshot date T is prospective only
+  for fills with event time > T (same admissibility logic as §4.7).
 
 ---
 
