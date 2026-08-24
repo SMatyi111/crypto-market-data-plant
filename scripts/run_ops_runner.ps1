@@ -15,8 +15,9 @@ param(
     # 21 existing market workers + the 2 kalshi REST jobs (pool-dispatched since
     # the 2026-06-11 scheduler-stall incident) + the 2 text-capture lanes + the
     # frozen-cohort Hyperliquid worker + the daily Hyperliquid leaderboard
-    # snapshot = 27 slots, one per pooled lane.
-    [int]$CollectorConcurrency = 27
+    # snapshot + 5 liquidation lanes (3 bybit symbols, okx all-swap, binance
+    # all-market) = 32 slots, one per pooled lane.
+    [int]$CollectorConcurrency = 32
 )
 
 $ErrorActionPreference = "Stop"

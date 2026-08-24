@@ -272,6 +272,30 @@ under `instrument_ref` (the `instrument` column name is taken by the partition).
 | `source`       | str             | venue |
 | `product`      | str             | venue symbol (`BTCUSDT`, `BTC-USD`) |
 | `channel`      | str             | `trades` |
+
+### Liquidations channel (`channel = "liquidations"`)
+
+Forced closes are **not** trades and get their own channel. The Bybit v5
+`allLiquidation` frame is structurally identical to `publicTrade` (batched
+`data: [...]`, same `S/T/p/s/v` keys), so routing it through the trade
+normalizer silently files liquidations as ordinary prints and corrupts the
+trade tape. Any future venue added to this channel must be checked for the same
+shape collision.
+
+| field          | type            | value |
+| -------------- | --------------- | ----- |
+| `channel`      | str             | `liquidations` |
+| `event_type`   | str             | `liquidation` |
+| `side`         | str \| None     | venue value lower-cased. **Semantics differ from `trades`**: Bybit documents `S` on `allLiquidation` as the side of the *position being liquidated*, not the taker side. The raw token is preserved in `metadata.bybit_liquidation_side_raw`. |
+| `price`/`size` | float \| None   | liquidation print price and quantity |
+| `trade_id`     | None            | venues expose no liquidation id |
+| `sequence`     | None            | no dense counter -> non-sequence (`none_native`) feed, structurally clean but NOT gap-proof (4.3) |
+
+No `buyer_is_maker` is emitted: the taker/maker convention does not apply to a
+forced close. Liquidations are **bursty** - long quiet stretches then a cascade
+- so lanes should set `rotate_at_midnight` rather than relying on
+`segment_count` to finalize runs.
+
 | `event_type`   | str             | `trade` / `match` / `last_match` / `aggTrade` |
 | `exchange_time`| ISO-8601 \| null | trade time (UTC) |
 | `received_at`  | ISO-8601        | collector receipt time (UTC) |

@@ -90,6 +90,7 @@ from .market_normalizers import (
     BinanceFuturesFundingNormalizer,
     BinanceTradeNormalizer,
     BybitDepthNormalizer,
+    BybitLiquidationNormalizer,
     BybitTradeNormalizer,
     CoinbaseDepthNormalizer,
     CoinbaseTradeNormalizer,
@@ -624,6 +625,45 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Rotate the run directory at midnight UTC instead of at --segment-count "
         "messages. See the depth worker's help text for the same flag.",
+    )
+
+    bybit_liq_parser = subparsers.add_parser(
+        "bybit-liquidations-worker",
+        help="Run segmented Bybit v5 `allLiquidation` collection (forced closes; "
+        "NOT the trade tape)",
+    )
+    bybit_liq_parser.add_argument("--symbol", default="BTCUSDT")
+    bybit_liq_parser.add_argument(
+        "--channel",
+        default="allLiquidation",
+        help="Bybit v5 liquidation topic. 'allLiquidation' streams every forced "
+        "close for the symbol; the retired per-position 'liquidation' topic is not "
+        "supported.",
+    )
+    bybit_liq_parser.add_argument(
+        "--market",
+        choices=list(_BYBIT_MARKETS),
+        default="linear",
+        help="Liquidations exist only on derivatives, so the default is 'linear' "
+        "(USDT-perpetual). Runs land in bybit_perp_liquidations/ tagged perp:bybit:*.",
+    )
+    bybit_liq_parser.add_argument("--segment-count", type=int, default=5000)
+    bybit_liq_parser.add_argument("--max-segments", type=int)
+    bybit_liq_parser.add_argument("--cooldown-seconds", type=float, default=1.0)
+    bybit_liq_parser.add_argument("--output-root", type=Path, default=default_output_root())
+    bybit_liq_parser.add_argument("--ops-root", type=Path, default=default_ops_root())
+    bybit_liq_parser.add_argument("--worker-name", default="bybit-liquidations-worker")
+    bybit_liq_parser.add_argument("--heartbeat-interval-seconds", type=float, default=30.0)
+    bybit_liq_parser.add_argument("--max-delay-ms", type=int, default=60_000)
+    bybit_liq_parser.add_argument("--max-future-skew-ms", type=int, default=5_000)
+    bybit_liq_parser.add_argument("--max-clock-skew-ms", type=float, default=60_000.0)
+    bybit_liq_parser.add_argument("--source-suffix", default="")
+    bybit_liq_parser.add_argument(
+        "--rotate-at-midnight",
+        action="store_true",
+        help="Rotate the run directory at midnight UTC. Liquidations are bursty - "
+        "long quiet stretches then a cascade - so time-based rotation keeps a quiet "
+        "day from holding one segment open indefinitely.",
     )
 
     bybit_depth_parser = subparsers.add_parser(
@@ -1896,6 +1936,27 @@ async def collect_bybit_trades_segment(args: argparse.Namespace) -> dict[str, ob
     )
 
 
+async def collect_bybit_liquidations_segment(args: argparse.Namespace) -> dict[str, object]:
+    # Same v5 socket and batching as publicTrade, different topic and meaning; the
+    # dedicated normalizer stamps channel="liquidations" so curation can never merge
+    # these into the trade tape. No liquidation id exists, so this is a non-sequence
+    # ("none_native") feed - structurally clean, NOT gap-proof (STANDARDS 4.3).
+    market = _bybit_market(args)
+    return await _collect_trades_segment(
+        args,
+        source="bybit",
+        websocket_url=_bybit_ws_url(market),
+        subscription_style="bybit",
+        normalizer=BybitLiquidationNormalizer(
+            instrument_type=_bybit_instrument_type(market)
+        ),
+        source_base="bybit_liquidations" if market == "spot" else "bybit_perp_liquidations",
+        replay_fn=replay_trades_stream_run,
+        ping_message=_BYBIT_PING_MESSAGE,
+        ping_interval_seconds=_BYBIT_PING_INTERVAL_SECONDS,
+    )
+
+
 async def collect_mexc_trades_segment(args: argparse.Namespace) -> dict[str, object]:
     # MEXC's public market data is protobuf-encoded (JSON endpoint retired
     # 2025-08-04), so the lane supplies decode_mexc_frame as the binary-frame decoder;
@@ -2788,6 +2849,34 @@ def run_bybit_trades_worker(args: argparse.Namespace) -> None:
     )
 
 
+def run_bybit_liquidations_worker(args: argparse.Namespace) -> None:
+    _run_segmented_worker(
+        args=args,
+        default_worker_name="bybit-liquidations-worker",
+        worker_type="bybit-liquidations-worker",
+        venue="bybit",
+        build_segment_args=lambda source_args: SimpleNamespace(
+            symbol=source_args.symbol,
+            channel=source_args.channel,
+            # `market` MUST be carried explicitly (PR #6 enumeration trap).
+            market=getattr(source_args, "market", "linear"),
+            count=source_args.segment_count,
+            output_root=source_args.output_root,
+            max_delay_ms=source_args.max_delay_ms,
+            max_future_skew_ms=getattr(source_args, "max_future_skew_ms", 5_000),
+            max_clock_skew_ms=getattr(source_args, "max_clock_skew_ms", 60_000.0),
+            source_suffix=getattr(source_args, "source_suffix", ""),
+            deadline_utc=None,
+        ),
+        collect_segment=collect_bybit_liquidations_segment,
+        progress_message=lambda segment_index, summary: (
+            "bybit liquidations segment finished: "
+            f"segment={segment_index} clean_events={summary['clean_events']} "
+            f"replayable={summary.get('replayable')} run_path={summary['run_path']}"
+        ),
+    )
+
+
 def run_bybit_depth_worker(args: argparse.Namespace) -> None:
     _run_segmented_worker(
         args=args,
@@ -3377,6 +3466,9 @@ def _execute_ops_job_inprocess(job: JobSpec) -> JobExecutionResult | str | None:
     if job.job_type == "bybit-trades-worker":
         run_bybit_trades_worker(args)
         return "bybit trades worker completed"
+    if job.job_type == "bybit-liquidations-worker":
+        run_bybit_liquidations_worker(args)
+        return "bybit liquidations worker completed"
     if job.job_type == "bybit-depth-worker":
         run_bybit_depth_worker(args)
         return "bybit depth worker completed"
@@ -3685,6 +3777,28 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             # Per-lane data-arrival watchdog (0.0 = off; see
             # CollectorConfig.idle_timeout_seconds). Honored by the generic-WS lanes;
             # the Binance depth lane runs its own socket loop and ignores it.
+            idle_timeout_seconds=raw_args.get("idle_timeout_seconds", 0.0),
+        )
+    if job.job_type == "bybit-liquidations-worker":
+        return SimpleNamespace(
+            symbol=raw_args.get("symbol", "BTCUSDT"),
+            channel=raw_args.get("channel", "allLiquidation"),
+            # Liquidations only exist on derivatives; default to linear, not spot.
+            market=raw_args.get("market", "linear"),
+            segment_count=raw_args.get("segment_count", 5000),
+            max_segments=raw_args.get("max_segments"),
+            cooldown_seconds=raw_args.get("cooldown_seconds", 1.0),
+            output_root=raw_args.get("output_root", default_output_root()),
+            ops_root=Path(raw_args.get("ops_root", default_ops_root())),
+            normalized_root=raw_args.get("normalized_root"),
+            worker_name=raw_args.get("worker_name", "bybit-liquidations-worker"),
+            jsonl_fsync=raw_args.get("jsonl_fsync", True),
+            heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
+            max_delay_ms=raw_args.get("max_delay_ms", _TRADES_STALE_WINDOW_MS),
+            max_future_skew_ms=raw_args.get("max_future_skew_ms", 5_000),
+            max_clock_skew_ms=raw_args.get("max_clock_skew_ms", 60_000.0),
+            source_suffix=raw_args.get("source_suffix", ""),
+            rotate_at_midnight=raw_args.get("rotate_at_midnight", False),
             idle_timeout_seconds=raw_args.get("idle_timeout_seconds", 0.0),
         )
     if job.job_type == "bybit-trades-worker":
@@ -4982,6 +5096,8 @@ def main() -> None:
         run_coinbase_depth_worker(args)
     elif args.command == "kraken-trades-worker":
         run_kraken_trades_worker(args)
+    elif args.command == "bybit-liquidations-worker":
+        run_bybit_liquidations_worker(args)
     elif args.command == "bybit-trades-worker":
         run_bybit_trades_worker(args)
     elif args.command == "bybit-depth-worker":
