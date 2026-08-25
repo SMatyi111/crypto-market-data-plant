@@ -18,9 +18,6 @@ param(
     # snapshot + 5 liquidation lanes (3 bybit symbols, okx all-swap, binance
     # all-market) = 32 slots, one per pooled lane.
     [int]$CollectorConcurrency = 32
-    # frozen-cohort Hyperliquid worker = 26 slots, one per pooled lane.
-    [int]$CollectorConcurrency = 32
-    [int]$CollectorConcurrency = 32
 )
 
 $ErrorActionPreference = "Stop"
