@@ -22,7 +22,7 @@ param(
     # market workers + 2 kalshi REST jobs + 2 text lanes + Hyperliquid wallet-flow +
     # the daily leaderboard snapshot). Keep these in sync -- a
     # redeploy with a lower value silently throttles coverage until reboot.
-    [int]$CollectorConcurrency = 32
+    [int]$CollectorConcurrency = 35
 )
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
