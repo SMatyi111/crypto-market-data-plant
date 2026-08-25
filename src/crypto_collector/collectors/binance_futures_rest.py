@@ -194,6 +194,25 @@ def make_funding_poll(symbol: str, *, fetch: FetchFn = _get_json):
     return poll
 
 
+def make_open_interest_poll(symbol: str, *, fetch: FetchFn = _get_json):
+    """Build an open-interest poll over /fapi/v1/openInterest.
+
+    OI is the one derivatives metric here with a RETENTION cliff rather than a
+    stream-or-nothing property: Binance serves ~30 days of history and nothing
+    older, so a poll gap is recoverable for a month and then becomes permanent.
+    The response is a single low-rate row ({openInterest, symbol, time}); polling
+    every poll_interval loses nothing because OI is venue-computed state, not an
+    event stream.
+    """
+    sym = symbol.upper()
+
+    async def poll() -> tuple[list[dict], bool]:
+        row = await asyncio.to_thread(fetch, "/fapi/v1/openInterest", {"symbol": sym})
+        return [row], False
+
+    return poll
+
+
 # --- aggTrades cross-segment continuity --------------------------------------
 # Each collector segment is its own subprocess, so the aggTrades pager's `from_id`
 # would reset every ~30-min rotation and re-anchor to the most-recent page. On an

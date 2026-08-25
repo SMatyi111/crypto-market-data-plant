@@ -133,7 +133,8 @@ def test_example_config_worker_lanes_carry_normalized_root() -> None:
     with the dataset matching the lane kind. A future lane added without it would
     quietly fall back to the env/default root again."""
     payload = json.loads((REPO_ROOT / "ops.live.example.json").read_text(encoding="utf-8"))
-    rest_stream_dataset = {"trades": "trades", "depth": "market", "funding": "funding"}
+    rest_stream_dataset = {"trades": "trades", "depth": "market", "funding": "funding",
+                           "open_interest": "open_interest"}
     checked = 0
     for job in payload["jobs"]:
         job_type = job["job_type"]

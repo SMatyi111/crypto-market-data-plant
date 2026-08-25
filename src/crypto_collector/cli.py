@@ -48,6 +48,7 @@ from .collectors.binance_futures_rest import (
     make_aggtrades_poll,
     make_depth_poll,
     make_funding_poll,
+    make_open_interest_poll,
     max_agg_id_in_events,
     max_agg_id_in_recent_runs,
     read_aggtrades_cursor,
@@ -91,6 +92,7 @@ from .market_normalizers import (
     BinanceTradeNormalizer,
     BybitDepthNormalizer,
     BinanceLiquidationNormalizer,
+    BinanceOpenInterestNormalizer,
     BybitLiquidationNormalizer,
     BybitTradeNormalizer,
     CoinbaseDepthNormalizer,
@@ -360,7 +362,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Which REST data to poll: 'trades' (gapless aggTrades via fromId paging -> "
         "binance_perp_trades/, perp:binance-futures:*, gap-proof sequence feed), 'depth' "
         "(per-poll full-book snapshots -> binance_perp_depth/, none_native), or 'funding' "
-        "(premiumIndex mark/index/funding metric -> binance_perp_funding/, none_native).",
+        "(premiumIndex mark/index/funding metric -> binance_perp_funding/, none_native), or 'open_interest' (/fapi/v1/openInterest snapshot -> binance_perp_open_interest/, none_native; ~30-day venue retention makes gaps permanent after a month).",
     )
     bfr_parser.add_argument(
         "--poll-interval-seconds",
@@ -2388,7 +2390,7 @@ async def _collect_depth_stream_segment(
     }
 
 
-_BINANCE_FUTURES_REST_STREAMS = ("trades", "depth", "funding")
+_BINANCE_FUTURES_REST_STREAMS = ("trades", "depth", "funding", "open_interest")
 
 
 def _binance_futures_rest_stream(args: argparse.Namespace) -> str:
@@ -2427,11 +2429,21 @@ async def collect_binance_futures_rest_segment(args: argparse.Namespace) -> dict
         normalizer = BinanceDepthNormalizer(instrument_type="perp")
         source_base = "binance_perp_depth"
         normalized_dataset = "market"
-    else:  # funding
+    elif stream == "funding":
         poll = make_funding_poll(symbol)
         normalizer = BinanceFuturesFundingNormalizer()
         source_base = "binance_perp_funding"
         normalized_dataset = "funding"
+    else:  # open_interest
+        # Same metric-lane shape as funding: stateless snapshot poll, none_native
+        # curation via the funding replayer (both are single-row venue metrics).
+        poll = make_open_interest_poll(symbol)
+        normalizer = BinanceOpenInterestNormalizer()
+        source_base = "binance_perp_open_interest"
+        # Own dataset: routing OI parquet into normalized/funding would mix contract
+        # counts into a mark-price dataset - the same channel-mixing failure the
+        # liquidation lanes exist to prevent, one layer down.
+        normalized_dataset = "open_interest"
 
     source_name = _build_source_name(source_base, getattr(args, "source_suffix", ""))
     run_paths = prepare_run_paths(output_root=args.output_root, source=source_name)
@@ -2514,7 +2526,7 @@ async def collect_binance_futures_rest_segment(args: argparse.Namespace) -> dict
     if events_path.exists():
         if stream == "depth":
             replay_summary = replay_depth_stream_run(run_paths.base, write_summary=True)
-        elif stream == "funding":
+        elif stream in ("funding", "open_interest"):
             replay_summary = replay_funding_run(
                 run_paths.base,
                 max_clock_skew_ms=float(getattr(args, "max_clock_skew_ms", 60_000.0)),

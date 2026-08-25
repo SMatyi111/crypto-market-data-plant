@@ -273,6 +273,15 @@ under `instrument_ref` (the `instrument` column name is taken by the partition).
 | `product`      | str             | venue symbol (`BTCUSDT`, `BTC-USD`) |
 | `channel`      | str             | `trades` |
 
+### Open-interest channel (`channel = "open_interest"`)
+
+Venue-computed contract count, polled over REST (`/fapi/v1/openInterest`).
+`price` is deliberately None - OI is a quantity, and carrying it in `price`
+would let contract counts leak into price aggregation; the value rides in
+`size` and `metadata.open_interest`. Metric lane, none_native, curated via the
+funding replayer. Venue retention is ~30 days, so a poll gap is recoverable for
+a month and permanent after.
+
 ### Liquidations channel (`channel = "liquidations"`)
 
 Forced closes are **not** trades and get their own channel. The Bybit v5

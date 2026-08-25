@@ -1584,6 +1584,63 @@
         "normalized_root": "G:\\market_archive\\normalized\\trades",
         "rotate_at_midnight": true
       }
+    },
+    {
+      "name": "binance-btc-open-interest",
+      "job_type": "binance-futures-rest-worker",
+      "interval_seconds": 5,
+      "args": {
+        "symbol": "BTCUSDT",
+        "stream": "open_interest",
+        "poll_interval_seconds": 60,
+        "normalized_parquet": false,
+        "segment_count": 100000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "worker_name": "binance-futures-rest-funding",
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\open_interest",
+        "max_segment_seconds": 1800
+      }
+    },
+    {
+      "name": "binance-eth-open-interest",
+      "job_type": "binance-futures-rest-worker",
+      "interval_seconds": 5,
+      "args": {
+        "symbol": "ETHUSDT",
+        "stream": "open_interest",
+        "poll_interval_seconds": 60,
+        "normalized_parquet": false,
+        "segment_count": 100000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "worker_name": "binance-futures-rest-funding",
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\open_interest",
+        "max_segment_seconds": 1800
+      }
+    },
+    {
+      "name": "binance-sol-open-interest",
+      "job_type": "binance-futures-rest-worker",
+      "interval_seconds": 5,
+      "args": {
+        "symbol": "SOLUSDT",
+        "stream": "open_interest",
+        "poll_interval_seconds": 60,
+        "normalized_parquet": false,
+        "segment_count": 100000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "worker_name": "binance-futures-rest-funding",
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\open_interest",
+        "max_segment_seconds": 1800
+      }
     }
   ]
 }
