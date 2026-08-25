@@ -1583,7 +1583,8 @@
         "ops_root": "G:\\market_archive\\ops",
         "normalized_root": "G:\\market_archive\\normalized\\trades",
         "rotate_at_midnight": true
-      }
+      },
+      "enabled": false
     },
     {
       "name": "binance-btc-open-interest",

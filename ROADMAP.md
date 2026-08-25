@@ -20,6 +20,18 @@ Last updated: **2026-08-17**.
 ---
 
 
+## Finding — Binance fstream delivers no data from this host (2026-08-25)
+
+fstream.binance.com accepts websocket connections and acks SUBSCRIBE, then
+delivers no data frames at all: `btcusdt@aggTrade` + `!forceOrder@arr` on one
+socket for 90 s produced zero frames, and ~24 h on the liquidation stream alone
+produced zero. **A subscribe-ack is not evidence a Binance stream works from
+here.** This is the same jurisdiction block that motivated the REST perp lane,
+now measured at the data layer. Consequence: with REST `allForceOrders`
+discontinued, Binance liquidations are currently uncollectable from this host;
+the `binance-liquidations-worker` lane is correct code but ships disabled.
+Bybit and OKX liquidation lanes are unaffected (both live-verified).
+
 ## Open item — offload drain rate is the SSD bottleneck (noted 2026-08-24)
 
 **Owner directive: G: (ADATA SSD) stays the live write buffer.** Collection
