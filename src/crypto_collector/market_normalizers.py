@@ -258,6 +258,43 @@ class CoinbaseDepthNormalizer:
         )
 
 
+class BinanceOpenInterestNormalizer:
+    """Normalize Binance `/fapi/v1/openInterest` rows into an `open_interest`
+    event. A metric lane in the same mold as funding: `price` is None (OI is a
+    quantity, not a price - putting it in `price` would let it leak into anything
+    that aggregates prices), the contract count rides in `size`, and the lane is
+    curated none_native. Instrument tagged perp:binance-futures:*."""
+
+    def normalize(self, raw: RawMessage) -> NormalizedL3Event:
+        payload = raw.payload.get("data", raw.payload)
+        parse_errors: list[str] = []
+        product = str(payload.get("symbol") or "UNKNOWN")
+        event_time = _parse_timestamp_ms(payload.get("time"), parse_errors)
+        oi = _optional_float(payload.get("openInterest"), "open_interest", parse_errors)
+        instrument = resolve_perp_instrument(product, venue=raw.source)
+        metadata: dict[str, Any] = {
+            "instrument_id": instrument.instrument_id if instrument is not None else None,
+            "canonical_symbol": instrument.canonical_symbol if instrument is not None else None,
+            "open_interest": oi,
+        }
+        if parse_errors:
+            metadata["parse_errors"] = parse_errors
+        return NormalizedL3Event(
+            source=raw.source,
+            product=product,
+            channel="open_interest",
+            event_type="open_interest",
+            exchange_time=event_time,
+            received_at=raw.received_at,
+            side=None,
+            price=None,
+            size=oi,
+            trade_id=None,
+            sequence=None,
+            metadata=metadata,
+        )
+
+
 class BinanceLiquidationNormalizer:
     """Normalize Binance USD-M futures `!forceOrder@arr` frames.
 
