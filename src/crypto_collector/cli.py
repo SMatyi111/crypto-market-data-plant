@@ -1991,11 +1991,17 @@ async def collect_bybit_trades_segment(args: argparse.Namespace) -> dict[str, ob
 
 
 async def collect_binance_liquidations_segment(args: argparse.Namespace) -> dict[str, object]:
-    # USD-M futures all-market forced-order stream. NOTE: cli help elsewhere records
-    # that fstream WS was unreachable from this host (hence the REST perp lane); it
-    # is reachable as of 2026-08-24, verified by subscribe-ack. If it is blocked
-    # again this lane simply fails to connect and retries - it does not affect the
-    # REST lane.
+    # USD-M futures all-market forced-order stream. HOST CAVEAT (measured
+    # 2026-08-25): from this host fstream accepts the connection and ACKS the
+    # subscribe, then delivers ZERO data frames - verified by subscribing
+    # btcusdt@aggTrade (never quiet) alongside !forceOrder@arr on one socket for
+    # 90s and receiving nothing, plus ~24h of the liquidation stream alone
+    # yielding no frame. The jurisdiction block documented for the REST perp
+    # lane's existence is at the DATA layer, not the connection - a subscribe-ack
+    # is NOT evidence the stream works. Binance discontinued the REST
+    # allForceOrders endpoint, so there is no fallback: from this host, Binance
+    # liquidations are currently uncollectable. The lane is kept (correct
+    # elsewhere / if the block lifts) but ships DISABLED in the configs.
     return await _collect_trades_segment(
         args,
         source="binance",
