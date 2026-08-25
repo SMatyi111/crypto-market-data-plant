@@ -36,6 +36,12 @@ COLLECTOR_JOB_TYPES: frozenset[str] = frozenset(
         "kraken-depth-worker",
         "bybit-trades-worker",
         "bybit-depth-worker",
+        # Liquidations are their OWN lane, not a bybit-trades channel: the v5
+        # allLiquidation frame is shaped like publicTrade, so sharing the trades
+        # worker would silently promote forced closes into the trade tape.
+        "bybit-liquidations-worker",
+        "okx-liquidations-worker",
+        "binance-liquidations-worker",
         "okx-trades-worker",
         "okx-depth-worker",
         "mexc-trades-worker",

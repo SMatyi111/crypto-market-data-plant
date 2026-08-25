@@ -19,6 +19,43 @@ Last updated: **2026-08-17**.
 
 ---
 
+
+## Open item — offload drain rate is the SSD bottleneck (noted 2026-08-24)
+
+**Owner directive: G: (ADATA SSD) stays the live write buffer.** Collection
+lanes need fast writes, so the fix for a filling SSD is to drain it faster, not
+to move live roots onto bulk disk. This item is about drain rate only.
+
+**Measured 2026-08-24:** G: at 97%, 76 GB free, having dropped ~18 GB in a day.
+`archive-offload-cold` reports `eligible_count: 200` against `limit: 200` -
+i.e. it is hitting its per-invocation cap every run, so the true backlog is
+unknown and the drain is throttled rather than keeping up.
+
+Levers, cheapest first:
+
+1. **`min_age_days: 10` -> 3-5.** The dominant lever. Raw runs sit on the SSD
+   for ten days before becoming eligible, but promotion to curated happens
+   within minutes; the ten days only buys a replay-verification window. Halving
+   it roughly halves steady-state SSD occupancy.
+2. **`limit: 200` -> higher** (or shorten `interval_seconds` from 3600). While
+   eligible == limit the queue is capped, so raising this is what actually
+   converts eligibility into moved bytes. Raise and re-read `moved_count` /
+   `moved_bytes` in the report rather than assuming.
+3. **`cleanup` `raw_days: 14`** trails offload; it can come down once (1) lands.
+
+Verify with `moved_bytes` in `ops/offload_report_latest.json`, not by eyeballing
+free space - other things write to G: too.
+
+**Separately (not an offload matter):** `G:-reference-data\hyperliquid_node`
+is ~147 GB of STATIC research corpus on the SSD. It is not a write buffer, is
+outside the plant tree, and is invisible to `archive-offload`. K: has ~4 TB free.
+Moving it is the single biggest one-off reclaim available and does not conflict
+with the SSD-as-buffer directive.
+
+**Blocking risk:** at the current rate G: fills within days, and a full SSD
+stops the plant writing - including the two new liquidation lanes.
+
+
 ## Current state (2026-08-17)
 
 **23 enabled collector lanes** across Binance (spot USDT + USDC, USDT-M perp via

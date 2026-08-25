@@ -585,7 +585,7 @@
       }
     },
     {
-      "// quote-variant lanes (USD/USDT/USDC basis)": "BTC/USDC alongside the BTC/USDT (Binance/Bybit/MEXC) and BTC/USD (Coinbase/Kraken) lanes completes the stablecoin triangle on one base asset, so cross-quote basis + depeg microstructure is directly observable. This is a different expansion axis from the ETH per-instrument example above (base-asset variant) — same source_suffix + unique worker_name mechanism, different quote. Binance USDC is gap-proof depth like BTC/USDT; Coinbase USDC depth is none_native. Enable to activate; lanes write to *_usdc/ so they never interleave the BTC lanes.",
+      "// quote-variant lanes (USD/USDT/USDC basis)": "BTC/USDC alongside the BTC/USDT (Binance/Bybit/MEXC) and BTC/USD (Coinbase/Kraken) lanes completes the stablecoin triangle on one base asset, so cross-quote basis + depeg microstructure is directly observable. This is a different expansion axis from the ETH per-instrument example above (base-asset variant) \u2014 same source_suffix + unique worker_name mechanism, different quote. Binance USDC is gap-proof depth like BTC/USDT; Coinbase USDC depth is none_native. Enable to activate; lanes write to *_usdc/ so they never interleave the BTC lanes.",
       "name": "binance-btcusdc-depth",
       "job_type": "binance-depth-worker",
       "enabled": false,
@@ -710,7 +710,7 @@
       }
     },
     {
-      "// perpetual-futures lanes (Bybit USDT-perp)": "Set market='linear' on the Bybit v5 workers to collect USDT-perpetual futures instead of spot. Same publicTrade/orderbook.50 topics, same v5 keepalive, same delta==1 depth sequence guarantee — only the URL path (/v5/public/linear) and the resolved instrument (perp:bybit:* canonical BTC/USDT-PERP) differ. Runs auto-route to bybit_perp_{trades,depth}/ so perp never mixes with the spot lanes; use distinct worker_names. This is the cheapest perp on-ramp (no new collector) and unlocks funding/basis/perp-spot dislocation vs the spot lanes. Enable to activate.",
+      "// perpetual-futures lanes (Bybit USDT-perp)": "Set market='linear' on the Bybit v5 workers to collect USDT-perpetual futures instead of spot. Same publicTrade/orderbook.50 topics, same v5 keepalive, same delta==1 depth sequence guarantee \u2014 only the URL path (/v5/public/linear) and the resolved instrument (perp:bybit:* canonical BTC/USDT-PERP) differ. Runs auto-route to bybit_perp_{trades,depth}/ so perp never mixes with the spot lanes; use distinct worker_names. This is the cheapest perp on-ramp (no new collector) and unlocks funding/basis/perp-spot dislocation vs the spot lanes. Enable to activate.",
       "name": "bybit-perp-trades",
       "job_type": "bybit-trades-worker",
       "enabled": false,
@@ -816,7 +816,7 @@
       }
     },
     {
-      "// Binance USDT-M perp trades": "Set market='futures' on the Binance trades worker to collect USDT-M perpetual aggregate trades from fstream.binance.com. The frame shape matches spot (BinanceTradeNormalizer already reads the aggTrade `a` id), so this is a URL + endpoint + instrument-tagging switch: channel is forced to aggTrade, runs land in binance_perp_trades/ tagged perp:binance-futures:* (the explicit instrument-master record), and `a` is a dense counter so the lane stays a provable sequence feed. NOTE: this is Phase-3 TRADES ONLY. Binance futures DEPTH is intentionally absent — futures depth chains via the `pu` (previous-final-update-id) field, NOT the spot snapshot-anchor rule the binance-depth-worker book-sync is built on, so a futures depth lane needs its own sync variant + book-sync-health before it can be added (it would false-green otherwise). Enable to activate trades.",
+      "// Binance USDT-M perp trades": "Set market='futures' on the Binance trades worker to collect USDT-M perpetual aggregate trades from fstream.binance.com. The frame shape matches spot (BinanceTradeNormalizer already reads the aggTrade `a` id), so this is a URL + endpoint + instrument-tagging switch: channel is forced to aggTrade, runs land in binance_perp_trades/ tagged perp:binance-futures:* (the explicit instrument-master record), and `a` is a dense counter so the lane stays a provable sequence feed. NOTE: this is Phase-3 TRADES ONLY. Binance futures DEPTH is intentionally absent \u2014 futures depth chains via the `pu` (previous-final-update-id) field, NOT the spot snapshot-anchor rule the binance-depth-worker book-sync is built on, so a futures depth lane needs its own sync variant + book-sync-health before it can be added (it would false-green otherwise). Enable to activate trades.",
       "name": "binance-perp-trades",
       "job_type": "binance-trades-worker",
       "enabled": false,
@@ -1318,8 +1318,16 @@
         "ops_root": "G:\\market_archive\\ops",
         "write_report": false,
         "lanes": [
-          {"source": "text_rss", "promotion_index": "G:\\market_archive\\curated\\research\\text\\_promotion_index.jsonl", "quarantine_index": "G:\\market_archive\\quarantine\\text\\text_rss\\_quarantine_index.jsonl"},
-          {"source": "text_reddit", "promotion_index": "G:\\market_archive\\curated\\research\\text\\_promotion_index.jsonl", "quarantine_index": "G:\\market_archive\\quarantine\\text\\text_reddit\\_quarantine_index.jsonl"}
+          {
+            "source": "text_rss",
+            "promotion_index": "G:\\market_archive\\curated\\research\\text\\_promotion_index.jsonl",
+            "quarantine_index": "G:\\market_archive\\quarantine\\text\\text_rss\\_quarantine_index.jsonl"
+          },
+          {
+            "source": "text_reddit",
+            "promotion_index": "G:\\market_archive\\curated\\research\\text\\_promotion_index.jsonl",
+            "quarantine_index": "G:\\market_archive\\quarantine\\text\\text_reddit\\_quarantine_index.jsonl"
+          }
         ]
       }
     },
@@ -1337,30 +1345,124 @@
         "apply": false,
         "ops_root": "G:\\market_archive\\ops",
         "lanes": [
-          {"source": "binance_depth", "promotion_index": "G:\\market_archive\\curated\\research\\market_replayable\\_promotion_index.jsonl", "quarantine_index": "G:\\market_archive\\quarantine\\market\\binance_depth\\_quarantine_index.jsonl"},
-          {"source": "coinbase_depth", "promotion_index": "G:\\market_archive\\curated\\research\\market_replayable\\_promotion_index.jsonl", "quarantine_index": "G:\\market_archive\\quarantine\\market\\coinbase_depth\\_quarantine_index.jsonl"},
-          {"source": "kraken_depth", "promotion_index": "G:\\market_archive\\curated\\research\\market_replayable\\_promotion_index.jsonl", "quarantine_index": "G:\\market_archive\\quarantine\\market\\kraken_depth\\_quarantine_index.jsonl"},
-          {"source": "bybit_depth", "promotion_index": "G:\\market_archive\\curated\\research\\market_replayable\\_promotion_index.jsonl", "quarantine_index": "G:\\market_archive\\quarantine\\market\\bybit_depth\\_quarantine_index.jsonl"},
-          {"source": "mexc_depth", "promotion_index": "G:\\market_archive\\curated\\research\\market_replayable\\_promotion_index.jsonl", "quarantine_index": "G:\\market_archive\\quarantine\\market\\mexc_depth\\_quarantine_index.jsonl"},
-          {"source": "binance_depth_usdc", "promotion_index": "G:\\market_archive\\curated\\research\\market_replayable\\_promotion_index.jsonl", "quarantine_index": "G:\\market_archive\\quarantine\\market\\binance_depth_usdc\\_quarantine_index.jsonl"},
-          {"source": "bybit_perp_depth", "promotion_index": "G:\\market_archive\\curated\\research\\market_replayable\\_promotion_index.jsonl", "quarantine_index": "G:\\market_archive\\quarantine\\market\\bybit_perp_depth\\_quarantine_index.jsonl"},
-          {"source": "binance_perp_depth", "promotion_index": "G:\\market_archive\\curated\\research\\market_replayable\\_promotion_index.jsonl", "quarantine_index": "G:\\market_archive\\quarantine\\market\\binance_perp_depth\\_quarantine_index.jsonl"},
-          {"source": "okx_depth", "promotion_index": "G:\\market_archive\\curated\\research\\market_replayable\\_promotion_index.jsonl", "quarantine_index": "G:\\market_archive\\quarantine\\market\\okx_depth\\_quarantine_index.jsonl"},
-          {"source": "okx_perp_depth", "promotion_index": "G:\\market_archive\\curated\\research\\market_replayable\\_promotion_index.jsonl", "quarantine_index": "G:\\market_archive\\quarantine\\market\\okx_perp_depth\\_quarantine_index.jsonl"},
-          {"source": "binance_trades", "promotion_index": "G:\\market_archive\\curated\\research\\trades_replayable\\_promotion_index.jsonl", "quarantine_index": "G:\\market_archive\\quarantine\\market\\binance_trades\\_quarantine_index.jsonl"},
-          {"source": "coinbase_trades", "promotion_index": "G:\\market_archive\\curated\\research\\trades_replayable\\_promotion_index.jsonl", "quarantine_index": "G:\\market_archive\\quarantine\\market\\coinbase_trades\\_quarantine_index.jsonl"},
-          {"source": "kraken_trades", "promotion_index": "G:\\market_archive\\curated\\research\\trades_replayable\\_promotion_index.jsonl", "quarantine_index": "G:\\market_archive\\quarantine\\market\\kraken_trades\\_quarantine_index.jsonl"},
-          {"source": "bybit_trades", "promotion_index": "G:\\market_archive\\curated\\research\\trades_replayable\\_promotion_index.jsonl", "quarantine_index": "G:\\market_archive\\quarantine\\market\\bybit_trades\\_quarantine_index.jsonl"},
-          {"source": "mexc_trades", "promotion_index": "G:\\market_archive\\curated\\research\\trades_replayable\\_promotion_index.jsonl", "quarantine_index": "G:\\market_archive\\quarantine\\market\\mexc_trades\\_quarantine_index.jsonl"},
-          {"source": "binance_trades_usdc", "promotion_index": "G:\\market_archive\\curated\\research\\trades_replayable\\_promotion_index.jsonl", "quarantine_index": "G:\\market_archive\\quarantine\\market\\binance_trades_usdc\\_quarantine_index.jsonl"},
-          {"source": "bybit_perp_trades", "promotion_index": "G:\\market_archive\\curated\\research\\trades_replayable\\_promotion_index.jsonl", "quarantine_index": "G:\\market_archive\\quarantine\\market\\bybit_perp_trades\\_quarantine_index.jsonl"},
-          {"source": "binance_perp_trades", "promotion_index": "G:\\market_archive\\curated\\research\\trades_replayable\\_promotion_index.jsonl", "quarantine_index": "G:\\market_archive\\quarantine\\market\\binance_perp_trades\\_quarantine_index.jsonl"},
-          {"source": "okx_trades", "promotion_index": "G:\\market_archive\\curated\\research\\trades_replayable\\_promotion_index.jsonl", "quarantine_index": "G:\\market_archive\\quarantine\\market\\okx_trades\\_quarantine_index.jsonl"},
-          {"source": "okx_perp_trades", "promotion_index": "G:\\market_archive\\curated\\research\\trades_replayable\\_promotion_index.jsonl", "quarantine_index": "G:\\market_archive\\quarantine\\market\\okx_perp_trades\\_quarantine_index.jsonl"},
-          {"source": "binance_perp_funding", "promotion_index": "G:\\market_archive\\curated\\research\\funding\\_promotion_index.jsonl", "quarantine_index": "G:\\market_archive\\quarantine\\market\\binance_perp_funding\\_quarantine_index.jsonl"},
-          {"source": "kalshi_crypto_quotes", "gate": "age_only", "min_age_days": 3},
-          {"source": "coinbase_trades_usdc", "gate": "age_only"},
-          {"source": "coinbase_depth_usdc", "gate": "age_only"}
+          {
+            "source": "binance_depth",
+            "promotion_index": "G:\\market_archive\\curated\\research\\market_replayable\\_promotion_index.jsonl",
+            "quarantine_index": "G:\\market_archive\\quarantine\\market\\binance_depth\\_quarantine_index.jsonl"
+          },
+          {
+            "source": "coinbase_depth",
+            "promotion_index": "G:\\market_archive\\curated\\research\\market_replayable\\_promotion_index.jsonl",
+            "quarantine_index": "G:\\market_archive\\quarantine\\market\\coinbase_depth\\_quarantine_index.jsonl"
+          },
+          {
+            "source": "kraken_depth",
+            "promotion_index": "G:\\market_archive\\curated\\research\\market_replayable\\_promotion_index.jsonl",
+            "quarantine_index": "G:\\market_archive\\quarantine\\market\\kraken_depth\\_quarantine_index.jsonl"
+          },
+          {
+            "source": "bybit_depth",
+            "promotion_index": "G:\\market_archive\\curated\\research\\market_replayable\\_promotion_index.jsonl",
+            "quarantine_index": "G:\\market_archive\\quarantine\\market\\bybit_depth\\_quarantine_index.jsonl"
+          },
+          {
+            "source": "mexc_depth",
+            "promotion_index": "G:\\market_archive\\curated\\research\\market_replayable\\_promotion_index.jsonl",
+            "quarantine_index": "G:\\market_archive\\quarantine\\market\\mexc_depth\\_quarantine_index.jsonl"
+          },
+          {
+            "source": "binance_depth_usdc",
+            "promotion_index": "G:\\market_archive\\curated\\research\\market_replayable\\_promotion_index.jsonl",
+            "quarantine_index": "G:\\market_archive\\quarantine\\market\\binance_depth_usdc\\_quarantine_index.jsonl"
+          },
+          {
+            "source": "bybit_perp_depth",
+            "promotion_index": "G:\\market_archive\\curated\\research\\market_replayable\\_promotion_index.jsonl",
+            "quarantine_index": "G:\\market_archive\\quarantine\\market\\bybit_perp_depth\\_quarantine_index.jsonl"
+          },
+          {
+            "source": "binance_perp_depth",
+            "promotion_index": "G:\\market_archive\\curated\\research\\market_replayable\\_promotion_index.jsonl",
+            "quarantine_index": "G:\\market_archive\\quarantine\\market\\binance_perp_depth\\_quarantine_index.jsonl"
+          },
+          {
+            "source": "okx_depth",
+            "promotion_index": "G:\\market_archive\\curated\\research\\market_replayable\\_promotion_index.jsonl",
+            "quarantine_index": "G:\\market_archive\\quarantine\\market\\okx_depth\\_quarantine_index.jsonl"
+          },
+          {
+            "source": "okx_perp_depth",
+            "promotion_index": "G:\\market_archive\\curated\\research\\market_replayable\\_promotion_index.jsonl",
+            "quarantine_index": "G:\\market_archive\\quarantine\\market\\okx_perp_depth\\_quarantine_index.jsonl"
+          },
+          {
+            "source": "binance_trades",
+            "promotion_index": "G:\\market_archive\\curated\\research\\trades_replayable\\_promotion_index.jsonl",
+            "quarantine_index": "G:\\market_archive\\quarantine\\market\\binance_trades\\_quarantine_index.jsonl"
+          },
+          {
+            "source": "coinbase_trades",
+            "promotion_index": "G:\\market_archive\\curated\\research\\trades_replayable\\_promotion_index.jsonl",
+            "quarantine_index": "G:\\market_archive\\quarantine\\market\\coinbase_trades\\_quarantine_index.jsonl"
+          },
+          {
+            "source": "kraken_trades",
+            "promotion_index": "G:\\market_archive\\curated\\research\\trades_replayable\\_promotion_index.jsonl",
+            "quarantine_index": "G:\\market_archive\\quarantine\\market\\kraken_trades\\_quarantine_index.jsonl"
+          },
+          {
+            "source": "bybit_trades",
+            "promotion_index": "G:\\market_archive\\curated\\research\\trades_replayable\\_promotion_index.jsonl",
+            "quarantine_index": "G:\\market_archive\\quarantine\\market\\bybit_trades\\_quarantine_index.jsonl"
+          },
+          {
+            "source": "mexc_trades",
+            "promotion_index": "G:\\market_archive\\curated\\research\\trades_replayable\\_promotion_index.jsonl",
+            "quarantine_index": "G:\\market_archive\\quarantine\\market\\mexc_trades\\_quarantine_index.jsonl"
+          },
+          {
+            "source": "binance_trades_usdc",
+            "promotion_index": "G:\\market_archive\\curated\\research\\trades_replayable\\_promotion_index.jsonl",
+            "quarantine_index": "G:\\market_archive\\quarantine\\market\\binance_trades_usdc\\_quarantine_index.jsonl"
+          },
+          {
+            "source": "bybit_perp_trades",
+            "promotion_index": "G:\\market_archive\\curated\\research\\trades_replayable\\_promotion_index.jsonl",
+            "quarantine_index": "G:\\market_archive\\quarantine\\market\\bybit_perp_trades\\_quarantine_index.jsonl"
+          },
+          {
+            "source": "binance_perp_trades",
+            "promotion_index": "G:\\market_archive\\curated\\research\\trades_replayable\\_promotion_index.jsonl",
+            "quarantine_index": "G:\\market_archive\\quarantine\\market\\binance_perp_trades\\_quarantine_index.jsonl"
+          },
+          {
+            "source": "okx_trades",
+            "promotion_index": "G:\\market_archive\\curated\\research\\trades_replayable\\_promotion_index.jsonl",
+            "quarantine_index": "G:\\market_archive\\quarantine\\market\\okx_trades\\_quarantine_index.jsonl"
+          },
+          {
+            "source": "okx_perp_trades",
+            "promotion_index": "G:\\market_archive\\curated\\research\\trades_replayable\\_promotion_index.jsonl",
+            "quarantine_index": "G:\\market_archive\\quarantine\\market\\okx_perp_trades\\_quarantine_index.jsonl"
+          },
+          {
+            "source": "binance_perp_funding",
+            "promotion_index": "G:\\market_archive\\curated\\research\\funding\\_promotion_index.jsonl",
+            "quarantine_index": "G:\\market_archive\\quarantine\\market\\binance_perp_funding\\_quarantine_index.jsonl"
+          },
+          {
+            "source": "kalshi_crypto_quotes",
+            "gate": "age_only",
+            "min_age_days": 3
+          },
+          {
+            "source": "coinbase_trades_usdc",
+            "gate": "age_only"
+          },
+          {
+            "source": "coinbase_depth_usdc",
+            "gate": "age_only"
+          }
         ]
       }
     },
@@ -1393,6 +1495,94 @@
           "text/text_reddit=14"
         ],
         "apply": false
+      }
+    },
+    {
+      "name": "bybit-btc-liquidations",
+      "job_type": "bybit-liquidations-worker",
+      "interval_seconds": 5,
+      "args": {
+        "symbol": "BTCUSDT",
+        "channel": "allLiquidation",
+        "segment_count": 100000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "worker_name": "bybit-liquidations-worker",
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\trades",
+        "market": "linear",
+        "rotate_at_midnight": true
+      }
+    },
+    {
+      "name": "bybit-eth-liquidations",
+      "job_type": "bybit-liquidations-worker",
+      "interval_seconds": 5,
+      "args": {
+        "symbol": "ETHUSDT",
+        "channel": "allLiquidation",
+        "segment_count": 100000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "worker_name": "bybit-liquidations-worker",
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\trades",
+        "market": "linear",
+        "rotate_at_midnight": true
+      }
+    },
+    {
+      "name": "bybit-sol-liquidations",
+      "job_type": "bybit-liquidations-worker",
+      "interval_seconds": 5,
+      "args": {
+        "symbol": "SOLUSDT",
+        "channel": "allLiquidation",
+        "segment_count": 100000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "worker_name": "bybit-liquidations-worker",
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\trades",
+        "market": "linear",
+        "rotate_at_midnight": true
+      }
+    },
+    {
+      "name": "okx-swap-liquidations",
+      "job_type": "okx-liquidations-worker",
+      "interval_seconds": 5,
+      "args": {
+        "symbol": "SWAP",
+        "channel": "liquidation-orders",
+        "segment_count": 100000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "worker_name": "okx-liquidations-worker",
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\trades",
+        "rotate_at_midnight": true
+      }
+    },
+    {
+      "name": "binance-perp-liquidations",
+      "job_type": "binance-liquidations-worker",
+      "interval_seconds": 5,
+      "args": {
+        "symbol": "!forceOrder@arr",
+        "channel": "!forceOrder@arr",
+        "segment_count": 100000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "worker_name": "binance-liquidations-worker",
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\trades",
+        "rotate_at_midnight": true
       }
     }
   ]

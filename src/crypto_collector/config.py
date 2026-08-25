@@ -60,6 +60,12 @@ class CollectorConfig:
     channel: str = "full"
     websocket_url: str | None = None
     subscription_style: str = "coinbase"
+    # OKX only. Most v5 channels key a subscription by instrument
+    # ({"channel":..,"instId":"BTC-USDT-SWAP"}), but a few are instrument-TYPE
+    # scoped: `liquidation-orders` takes {"instType":"SWAP"} and then streams every
+    # swap on the venue in one subscription. Set to "instType" for those lanes;
+    # `product` then carries the type ("SWAP") rather than an instrument id.
+    okx_subscription_key: str = "instId"
     max_delay_ms: int = 60_000
     max_future_skew_ms: int = 5_000
     require_monotonic_sequence: bool = True

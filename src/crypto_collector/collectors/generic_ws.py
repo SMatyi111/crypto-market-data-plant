@@ -387,7 +387,12 @@ class GenericWebsocketCollector(BaseCollector):
             # (BTC-USDT spot vs BTC-USDT-SWAP perp). Both use the same public socket.
             return {
                 "op": "subscribe",
-                "args": [{"channel": self.config.channel, "instId": self.config.product}],
+                "args": [
+                    {
+                        "channel": self.config.channel,
+                        self.config.okx_subscription_key: self.config.product,
+                    }
+                ],
             }
         raise ValueError(f"Unsupported subscription_style: {self.config.subscription_style}")
 
