@@ -32,6 +32,22 @@ discontinued, Binance liquidations are currently uncollectable from this host;
 the `binance-liquidations-worker` lane is correct code but ships disabled.
 Bybit and OKX liquidation lanes are unaffected (both live-verified).
 
+## Finding — Binance OI history backfilled from Vision daily zips (2026-08-27)
+
+The open-interest lane's premise (PR #47: Binance API serves ~30 days of OI
+history, older days are permanent loss) has a lossless complement:
+`data.binance.vision/data/futures/um/daily/metrics/<SYMBOL>/` publishes daily
+zips of 5-minute OI + long/short-ratio snapshots (BTCUSDT from 2020-09-01;
+ETHUSDT/SOLUSDT from 2021-12-01). Owner-approved backfill landed 2026-08-27 at
+`G:\03-reference-data\binance_futures_metrics\` — **outside the plant tree**,
+~130 MB: raw zips (size-verified, archive of record) plus per-symbol zstd
+parquet, gapless through 2026-08-26. Re-running its `backfill_metrics.py`
+extends coverage (Vision trails ~1 day); the live lane remains the only
+sub-daily-latency OI source. Source quirk recorded there: 2020-09→2021-05 zips
+duplicate every row byte-identically; parquet layer drops exact dupes only.
+This closes the "backfill OI metrics (BTC/ETH/SOL 2020→now) or defer?"
+question orphaned when its RC session died on 2026-08-26.
+
 ## Open item — offload drain rate is the SSD bottleneck (noted 2026-08-24)
 
 **Owner directive: G: (ADATA SSD) stays the live write buffer.** Collection
