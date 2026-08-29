@@ -798,6 +798,43 @@ This is a **raw-only reference lane**, a lighter contract than market lanes:
   a cohort chosen with information from snapshot date T is prospective only
   for fills with event time > T (same admissibility logic as §4.7).
 
+### 4.9 Options-IV snapshots (Binance eapi + Deribit) — raw-only reference lanes
+
+The `binance-options-chain-snapshot` and `deribit-options-snapshot` jobs
+(scope reassigned from `G:\Binance_IV_V1` by owner approval of the PR that
+added this section, 2026-08-29) archive point-in-time options-market state on
+the cadences the V1 series established: every 15 min the full Binance options
+chain (`eapi.binance.com`: exchangeInfo + mark + ticker for all contracts,
+plus per-underlying index, BTC + ETH), and every 5 min Deribit's live option
+instrument list plus option and future book summaries per currency (BTC +
+ETH). Purpose: both venues expose only CURRENT chain state — quotes, IVs, and
+greeks at a past instant cannot be reconstructed retroactively — so every
+uncaptured interval is unrecoverable (the V1 collector's 2026-08-11..27
+Deribit outage is permanent).
+
+Same raw-only contract as §4.8, multi-payload:
+
+- Layout: `raw/market/binance_options_chain/<run_id>/raw/<endpoint>.json.gz`
+  and `raw/market/deribit_options/<run_id>/raw/<endpoint>_<CCY>.json.gz` (the
+  exact upstream bytes per endpoint, gzipped, sha256 recorded per payload) +
+  `metrics/summary.json` (per-payload `raw_bytes`, `sha256`, `row_count`,
+  `parse_ok`, plus overall `parse_ok` and `failures`). One run directory per
+  snapshot.
+- No clean/quarantine split, no normalization, no replay verdict, no
+  promotion: snapshots are parsed at read time only. A malformed payload, an
+  empty chain/result, a Deribit JSON-RPC error body, or a Binance ticker with
+  no contracts for a requested underlying still archives all raw bytes but
+  FAILS the job, so runner job-status counters surface it.
+- Binance fetches inherit the fapi REST rule: bounded 429 retry honoring
+  `Retry-After`, and NEVER retry 418 (the hammering-escalation ban signal).
+- Retention: offloaded to the cold tier `age_only` (there is no promotion or
+  quarantine index to prove), declared in the `archive-offload-cold` lane list
+  so they do not surface as `unconfigured_lane`.
+- Pre-cutover history (Binance chain CSVs from 2026-03-26, Deribit from
+  2026-05-17) stays frozen in `G:\Binance_IV_V1\data\` — it is V1-schema CSV,
+  not this contract, and is deliberately NOT imported into the archive (same
+  policy as the Vision open-interest backfill kept in reference-data).
+
 ---
 
 ## 5. Live quality gate (pre-replay)

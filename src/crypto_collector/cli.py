@@ -55,6 +55,8 @@ from .collectors.binance_futures_rest import (
     write_aggtrades_cursor,
 )
 from .collectors.rest_poll import RestPollingCollector
+from .collectors.binance_options import snapshot_binance_options_chain
+from .collectors.deribit_options import snapshot_deribit_options
 from .collectors.hyperliquid_leaderboard import snapshot_leaderboard
 from .collectors.hyperliquid_wallet_flow import (
     SOURCE_NAME as HYPERLIQUID_WALLET_FLOW_SOURCE,
@@ -464,6 +466,38 @@ def build_parser() -> argparse.ArgumentParser:
     )
     hl_lb_parser.add_argument("--output-root", type=Path, default=default_output_root())
     hl_lb_parser.add_argument("--format", choices=["json", "text"], default="text")
+
+    bo_chain_parser = subparsers.add_parser(
+        "binance-options-chain-snapshot",
+        help="Archive one point-in-time snapshot of the Binance options chain "
+        "(eapi exchangeInfo + mark + ticker + per-underlying index; raw-only "
+        "reference lane, STANDARDS section 4.9). Chain state cannot be "
+        "reconstructed retroactively, so every uncaptured interval is "
+        "unrecoverable.",
+    )
+    bo_chain_parser.add_argument(
+        "--underlying",
+        nargs="+",
+        default=["BTCUSDT", "ETHUSDT"],
+        help="Underlyings to capture index payloads and validate contracts for.",
+    )
+    bo_chain_parser.add_argument("--output-root", type=Path, default=default_output_root())
+    bo_chain_parser.add_argument("--format", choices=["json", "text"], default="text")
+
+    dr_options_parser = subparsers.add_parser(
+        "deribit-options-snapshot",
+        help="Archive one point-in-time snapshot of Deribit options per currency "
+        "(instrument list + option/future book summaries; raw-only reference "
+        "lane, STANDARDS section 4.9).",
+    )
+    dr_options_parser.add_argument(
+        "--currency",
+        nargs="+",
+        default=["BTC", "ETH"],
+        help="Deribit currencies to snapshot, e.g. BTC ETH.",
+    )
+    dr_options_parser.add_argument("--output-root", type=Path, default=default_output_root())
+    dr_options_parser.add_argument("--format", choices=["json", "text"], default="text")
 
     cb_trades_parser = subparsers.add_parser(
         "coinbase-trades-worker", help="Run segmented Coinbase trade collection"
@@ -2743,6 +2777,46 @@ def run_hyperliquid_leaderboard_snapshot(args: argparse.Namespace) -> None:
     )
 
 
+def run_binance_options_chain_snapshot(args: argparse.Namespace) -> None:
+    result = snapshot_binance_options_chain(
+        args.output_root, underlyings=tuple(args.underlying)
+    )
+    payload = {
+        "run_path": result.run_path,
+        "fetched_at": result.fetched_at,
+        "payload_count": result.payload_count,
+        "total_raw_bytes": result.total_raw_bytes,
+        "option_symbol_count": result.option_symbol_count,
+    }
+    if getattr(args, "format", "text") == "json":
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    print(
+        "binance options chain snapshot: "
+        f"contracts={result.option_symbol_count} payloads={result.payload_count} "
+        f"bytes={result.total_raw_bytes} run_path={result.run_path}"
+    )
+
+
+def run_deribit_options_snapshot(args: argparse.Namespace) -> None:
+    result = snapshot_deribit_options(args.output_root, currencies=tuple(args.currency))
+    payload = {
+        "run_path": result.run_path,
+        "fetched_at": result.fetched_at,
+        "payload_count": result.payload_count,
+        "total_raw_bytes": result.total_raw_bytes,
+        "option_summary_count": result.option_summary_count,
+    }
+    if getattr(args, "format", "text") == "json":
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    print(
+        "deribit options snapshot: "
+        f"option_summaries={result.option_summary_count} payloads={result.payload_count} "
+        f"bytes={result.total_raw_bytes} run_path={result.run_path}"
+    )
+
+
 def run_binance_depth_worker(args: argparse.Namespace) -> None:
     _run_segmented_worker(
         args=args,
@@ -3615,6 +3689,12 @@ def _execute_ops_job_inprocess(job: JobSpec) -> JobExecutionResult | str | None:
     if job.job_type == "hyperliquid-leaderboard-snapshot":
         run_hyperliquid_leaderboard_snapshot(args)
         return "hyperliquid leaderboard snapshot completed"
+    if job.job_type == "binance-options-chain-snapshot":
+        run_binance_options_chain_snapshot(args)
+        return "binance options chain snapshot completed"
+    if job.job_type == "deribit-options-snapshot":
+        run_deribit_options_snapshot(args)
+        return "deribit options snapshot completed"
     if job.job_type == "coinbase-trades-worker":
         run_coinbase_trades_worker(args)
         return "coinbase trades worker completed"
@@ -3841,6 +3921,18 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
     if job.job_type == "hyperliquid-leaderboard-snapshot":
         return SimpleNamespace(
             output_root=Path(raw_args.get("output_root", default_output_root())),
+            format=raw_args.get("format", "text"),
+        )
+    if job.job_type == "binance-options-chain-snapshot":
+        return SimpleNamespace(
+            output_root=Path(raw_args.get("output_root", default_output_root())),
+            underlying=list(raw_args.get("underlyings", ["BTCUSDT", "ETHUSDT"])),
+            format=raw_args.get("format", "text"),
+        )
+    if job.job_type == "deribit-options-snapshot":
+        return SimpleNamespace(
+            output_root=Path(raw_args.get("output_root", default_output_root())),
+            currency=list(raw_args.get("currencies", ["BTC", "ETH"])),
             format=raw_args.get("format", "text"),
         )
     if job.job_type == "binance-futures-rest-worker":
@@ -5299,6 +5391,10 @@ def main() -> None:
         run_hyperliquid_wallet_flow_worker(args)
     elif args.command == "hyperliquid-leaderboard-snapshot":
         run_hyperliquid_leaderboard_snapshot(args)
+    elif args.command == "binance-options-chain-snapshot":
+        run_binance_options_chain_snapshot(args)
+    elif args.command == "deribit-options-snapshot":
+        run_deribit_options_snapshot(args)
     elif args.command == "coinbase-trades-worker":
         run_coinbase_trades_worker(args)
     elif args.command == "coinbase-depth-worker":
