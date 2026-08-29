@@ -1500,7 +1500,9 @@
           "market/binance_perp_depth=14",
           "market/binance_perp_funding=14",
           "text/text_rss=14",
-          "text/text_reddit=14"
+          "text/text_reddit=14",
+          "market/binance_options_chain=3650",
+          "market/deribit_options=3650"
         ],
         "apply": false
       }

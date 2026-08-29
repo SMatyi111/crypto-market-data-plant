@@ -16,10 +16,10 @@ param(
     # the 2026-06-11 scheduler-stall incident) + the 2 text-capture lanes + the
     # frozen-cohort Hyperliquid worker + the daily Hyperliquid leaderboard
     # snapshot + 5 liquidation lanes (3 bybit symbols, okx all-swap, binance
-    # all-market) + 3 Binance open-interest lanes = 35 slots, one per pooled lane.
-    # The 2 options-IV snapshot lanes (binance-options-chain-snapshot,
-    # deribit-options-snapshot) fit inside the existing 35 (33 enabled lanes live).
-    [int]$CollectorConcurrency = 35
+    # all-market) + 3 Binance open-interest lanes + 2 options-IV snapshot lanes
+    # (binance-options-chain-snapshot, deribit-options-snapshot) = 37 slots,
+    # one per pooled lane.
+    [int]$CollectorConcurrency = 37
 )
 
 $ErrorActionPreference = "Stop"

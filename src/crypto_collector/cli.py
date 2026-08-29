@@ -56,7 +56,10 @@ from .collectors.binance_futures_rest import (
 )
 from .collectors.rest_poll import RestPollingCollector
 from .collectors.binance_options import snapshot_binance_options_chain
-from .collectors.deribit_options import snapshot_deribit_options
+from .collectors.deribit_options import (
+    option_summary_count as deribit_option_summary_count,
+    snapshot_deribit_options,
+)
 from .collectors.hyperliquid_leaderboard import snapshot_leaderboard
 from .collectors.hyperliquid_wallet_flow import (
     SOURCE_NAME as HYPERLIQUID_WALLET_FLOW_SOURCE,
@@ -2781,38 +2784,40 @@ def run_binance_options_chain_snapshot(args: argparse.Namespace) -> None:
     result = snapshot_binance_options_chain(
         args.output_root, underlyings=tuple(args.underlying)
     )
+    contracts = result.row_counts.get("exchange_info")
     payload = {
         "run_path": result.run_path,
         "fetched_at": result.fetched_at,
         "payload_count": result.payload_count,
         "total_raw_bytes": result.total_raw_bytes,
-        "option_symbol_count": result.option_symbol_count,
+        "option_symbol_count": contracts,
     }
-    if getattr(args, "format", "text") == "json":
+    if args.format == "json":
         print(json.dumps(payload, indent=2, sort_keys=True))
         return
     print(
         "binance options chain snapshot: "
-        f"contracts={result.option_symbol_count} payloads={result.payload_count} "
+        f"contracts={contracts} payloads={result.payload_count} "
         f"bytes={result.total_raw_bytes} run_path={result.run_path}"
     )
 
 
 def run_deribit_options_snapshot(args: argparse.Namespace) -> None:
     result = snapshot_deribit_options(args.output_root, currencies=tuple(args.currency))
+    summaries = deribit_option_summary_count(result)
     payload = {
         "run_path": result.run_path,
         "fetched_at": result.fetched_at,
         "payload_count": result.payload_count,
         "total_raw_bytes": result.total_raw_bytes,
-        "option_summary_count": result.option_summary_count,
+        "option_summary_count": summaries,
     }
-    if getattr(args, "format", "text") == "json":
+    if args.format == "json":
         print(json.dumps(payload, indent=2, sort_keys=True))
         return
     print(
         "deribit options snapshot: "
-        f"option_summaries={result.option_summary_count} payloads={result.payload_count} "
+        f"option_summaries={summaries} payloads={result.payload_count} "
         f"bytes={result.total_raw_bytes} run_path={result.run_path}"
     )
 

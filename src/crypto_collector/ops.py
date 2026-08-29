@@ -156,7 +156,17 @@ def load_ops_config(path: Path) -> list[JobSpec]:
 # standalone_workers), these never appear in the standalone-worker table, so the
 # health report surfaces their freshness separately under poll_lanes. Extend this
 # set as new poll-based collectors are added.
-POLL_LANE_JOB_TYPES = frozenset({"kalshi-collect-crypto-quotes", "kalshi-discover-crypto"})
+POLL_LANE_JOB_TYPES = frozenset(
+    {
+        "kalshi-collect-crypto-quotes",
+        "kalshi-discover-crypto",
+        # Options-IV raw-only snapshot lanes (STANDARDS 4.9): interval REST jobs,
+        # so poll_lanes is the only place their freshness is visible - the cutover
+        # runbook's parallel-run check reads exactly this table.
+        "binance-options-chain-snapshot",
+        "deribit-options-snapshot",
+    }
+)
 
 
 @dataclass(slots=True)
