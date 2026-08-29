@@ -196,7 +196,7 @@ def test_fetch_honors_retry_after_on_429_capped(monkeypatch) -> None:
             def __exit__(self, *exc):
                 return False
 
-            def read(self):
+            def read(self, n=-1):
                 return b"[]"
 
         return _Response()
@@ -207,6 +207,29 @@ def test_fetch_honors_retry_after_on_429_capped(monkeypatch) -> None:
     assert deribit_options.fetch_url("https://www.deribit.com/api/v2/x") == b"[]"
     assert calls["n"] == 3
     assert sleeps == [7.0, 15.0]
+
+
+def test_oversized_response_is_a_recorded_fetch_failure(monkeypatch) -> None:
+    """The size cap must surface as OSError so capture_raw_snapshot records it
+    per payload (summary still written) instead of escaping the summary path."""
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self, n=-1):
+            return b"x" * n if n and n > 0 else b"x" * 1024
+
+    monkeypatch.setattr(raw_snapshot, "urlopen", lambda request, timeout: _Response())
+    with pytest.raises(OSError, match="exceeded 16 byte cap"):
+        raw_snapshot.fetch_bytes(
+            "https://eapi.binance.com/eapi/v1/mark",
+            user_agent="test",
+            max_response_bytes=16,
+        )
 
 
 def _deribit_payloads() -> dict[str, bytes]:

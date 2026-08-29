@@ -34,6 +34,10 @@ ValidateFn = Callable[[str, Any], tuple[int | None, str | None]]
 _RETRY_MAX_ATTEMPTS = 3
 _RETRY_MAX_SLEEP_SECONDS = 15.0
 _RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
+# Generous vs the ~2 MB real chain payloads, but bounded: urlopen's timeout is
+# per socket op, so an endlessly-streaming (compromised) endpoint would
+# otherwise OOM the job or fill the archive drive with garbage bytes.
+MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 
 # Module seam so tests can record instead of really sleeping.
 _sleep = time.sleep
@@ -45,6 +49,7 @@ def fetch_bytes(
     user_agent: str,
     timeout_seconds: float = 20.0,
     never_retry_codes: frozenset[int] = frozenset(),
+    max_response_bytes: int = MAX_RESPONSE_BYTES,
 ) -> bytes:
     """Fetch one public endpoint as raw bytes with a bounded retry ladder.
 
@@ -63,7 +68,16 @@ def fetch_bytes(
         )
         try:
             with urlopen(request, timeout=timeout_seconds) as response:
-                return response.read()
+                raw = response.read(max_response_bytes + 1)
+                if len(raw) > max_response_bytes:
+                    # OSError so capture_raw_snapshot records it as a per-payload
+                    # fetch failure (summary still written, job fails loudly)
+                    # instead of the ValueError escaping the summary path. Not
+                    # retried: an oversized body is not transient.
+                    raise OSError(
+                        f"response exceeded {max_response_bytes} byte cap: {url}"
+                    )
+                return raw
         except HTTPError as exc:
             if (
                 exc.code in never_retry_codes
