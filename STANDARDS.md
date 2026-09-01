@@ -798,6 +798,63 @@ This is a **raw-only reference lane**, a lighter contract than market lanes:
   a cohort chosen with information from snapshot date T is prospective only
   for fills with event time > T (same admissibility logic as §4.7).
 
+### 4.9 Options-IV snapshots (Binance eapi + Deribit) — raw-only reference lanes
+
+The `binance-options-chain-snapshot` and `deribit-options-snapshot` jobs
+(scope reassignment from `G:\Binance_IV_V1` proposed 2026-08-29; the owner's
+merge of the PR that added this section is the approval — cutover steps queue
+in ROADMAP's Decision queue) archive point-in-time options-market state on
+the cadences the V1 series has actually run since 2026-05 (its first weeks
+were ~2-min; cadence is the job's `interval_seconds`, so raising resolution
+is a config decision, not a code change): every 15 min the full Binance
+options chain (`eapi.binance.com`: exchangeInfo + mark + ticker for all
+contracts, plus per-underlying index, BTC + ETH), and every 5 min Deribit's
+live option instrument list plus option and future book summaries per
+currency (BTC + ETH). Purpose: both venues expose only CURRENT chain state —
+quotes, IVs, and greeks at a past instant cannot be reconstructed
+retroactively — so every uncaptured interval is unrecoverable (the V1
+collector's 2026-08-11..27 Deribit outage is permanent).
+
+Same raw-only contract as §4.8, multi-payload:
+
+- Layout: `raw/market/binance_options_chain/<run_id>/raw/<endpoint>.json.gz`
+  and `raw/market/deribit_options/<run_id>/raw/<endpoint>_<CCY>.json.gz` (the
+  exact upstream bytes per endpoint, gzipped, sha256 recorded per payload) +
+  `metrics/summary.json` (per-payload `url`, `fetched_at`, `raw_bytes`,
+  `sha256`, `row_count`, `parse_ok`, `error`, plus overall `parse_ok` and
+  `failures`). One run directory per snapshot. The shared skeleton is
+  `collectors/raw_snapshot.py`; both lanes (and any future 4.x raw-only lane)
+  must go through it so the on-disk contract cannot drift per lane.
+- `summary.json` is ALWAYS written, including when a payload's fetch fails
+  outright (the failure is recorded per payload and the job then fails). A run
+  directory WITHOUT `metrics/summary.json` therefore means the process was
+  killed mid-run — it is not a settled snapshot and read-time consumers must
+  skip it.
+- No clean/quarantine split, no normalization, no replay verdict, no
+  promotion: snapshots are parsed at read time only. A malformed payload, an
+  empty chain/result, a Deribit JSON-RPC error body (Deribit signals throttling
+  this way, sometimes over HTTP 200), or a Binance ticker with no contracts for
+  a requested underlying still archives whatever raw bytes arrived but FAILS
+  the job, so runner job-status counters surface it. The next scheduled
+  interval is the retry — per-request retry budgets are deliberately tight
+  (3 attempts, 20 s timeout, backoff capped at 15 s) so a venue brownout fails
+  the job cleanly instead of outliving the runner's subprocess timeout.
+- Binance fetches inherit the fapi REST rule: bounded 429 retry honoring
+  `Retry-After`, and NEVER retry 418 (the hammering-escalation ban signal).
+- Retention: offloaded to the cold tier `age_only` (there is no promotion or
+  quarantine index to prove), declared in the `archive-offload-cold` lane list
+  so they do not surface as `unconfigured_lane`, AND pinned in the cleanup
+  job's `raw_policy` (`market/<lane>=3650`) so the hot-tier `raw_days` default
+  deleter can never touch unrecoverable snapshots if the offload rows are ever
+  missing from a config.
+- Freshness: both job types are in `POLL_LANE_JOB_TYPES`, so the health
+  report's `poll_lanes` table carries their staleness — that table is what the
+  cutover runbook's parallel-run check reads.
+- Pre-cutover history (Binance chain CSVs from 2026-03-26, Deribit from
+  2026-05-17) stays frozen in `G:\Binance_IV_V1\data\` — it is V1-schema CSV,
+  not this contract, and is deliberately NOT imported into the archive (same
+  policy as the Vision open-interest backfill kept in reference-data).
+
 ---
 
 ## 5. Live quality gate (pre-replay)

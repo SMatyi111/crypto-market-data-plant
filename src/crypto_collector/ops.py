@@ -51,6 +51,11 @@ COLLECTOR_JOB_TYPES: frozenset[str] = frozenset(
         # Raw-only daily reference snapshot (STANDARDS 4.8) - tiny, but
         # pool-dispatched like every network job (the 2026-06-11 kalshi lesson).
         "hyperliquid-leaderboard-snapshot",
+        # Options-IV raw-only snapshot lanes (STANDARDS 4.9) - collection
+        # reassigned here from G:\Binance_IV_V1; same raw-only contract as the
+        # leaderboard lane, pool-dispatched for the same reason.
+        "binance-options-chain-snapshot",
+        "deribit-options-snapshot",
         # Text-capture P1 lanes (ROADMAP item 15): REST-polled, low-volume, but
         # pool-dispatched like every other lane so a hung HTTP call can never block
         # the scheduler thread (the 2026-06-11 kalshi lesson).
@@ -151,7 +156,17 @@ def load_ops_config(path: Path) -> list[JobSpec]:
 # standalone_workers), these never appear in the standalone-worker table, so the
 # health report surfaces their freshness separately under poll_lanes. Extend this
 # set as new poll-based collectors are added.
-POLL_LANE_JOB_TYPES = frozenset({"kalshi-collect-crypto-quotes", "kalshi-discover-crypto"})
+POLL_LANE_JOB_TYPES = frozenset(
+    {
+        "kalshi-collect-crypto-quotes",
+        "kalshi-discover-crypto",
+        # Options-IV raw-only snapshot lanes (STANDARDS 4.9): interval REST jobs,
+        # so poll_lanes is the only place their freshness is visible - the cutover
+        # runbook's parallel-run check reads exactly this table.
+        "binance-options-chain-snapshot",
+        "deribit-options-snapshot",
+    }
+)
 
 
 @dataclass(slots=True)

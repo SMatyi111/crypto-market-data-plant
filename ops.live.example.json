@@ -1462,6 +1462,14 @@
           {
             "source": "coinbase_depth_usdc",
             "gate": "age_only"
+          },
+          {
+            "source": "binance_options_chain",
+            "gate": "age_only"
+          },
+          {
+            "source": "deribit_options",
+            "gate": "age_only"
           }
         ]
       }
@@ -1492,7 +1500,9 @@
           "market/binance_perp_depth=14",
           "market/binance_perp_funding=14",
           "text/text_rss=14",
-          "text/text_reddit=14"
+          "text/text_reddit=14",
+          "market/binance_options_chain=3650",
+          "market/deribit_options=3650"
         ],
         "apply": false
       }
@@ -1641,6 +1651,25 @@
         "ops_root": "G:\\market_archive\\ops",
         "normalized_root": "G:\\market_archive\\normalized\\open_interest",
         "max_segment_seconds": 1800
+      }
+    },
+    {
+      "// options-IV lanes": "Raw-only reference snapshots (STANDARDS 4.9); collection reassigned from G:\\Binance_IV_V1. One-shot interval jobs: no segments, no promoter, offloaded age_only. Cadences preserve the V1 series (15 min Binance chain, 5 min Deribit).",
+      "name": "binance-options-chain-snapshot",
+      "job_type": "binance-options-chain-snapshot",
+      "interval_seconds": 900,
+      "args": {
+        "underlyings": ["BTCUSDT", "ETHUSDT"],
+        "output_root": "G:\\market_archive\\raw\\market"
+      }
+    },
+    {
+      "name": "deribit-options-snapshot",
+      "job_type": "deribit-options-snapshot",
+      "interval_seconds": 300,
+      "args": {
+        "currencies": ["BTC", "ETH"],
+        "output_root": "G:\\market_archive\\raw\\market"
       }
     }
   ]

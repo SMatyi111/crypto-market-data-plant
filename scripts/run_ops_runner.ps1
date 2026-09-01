@@ -16,8 +16,10 @@ param(
     # the 2026-06-11 scheduler-stall incident) + the 2 text-capture lanes + the
     # frozen-cohort Hyperliquid worker + the daily Hyperliquid leaderboard
     # snapshot + 5 liquidation lanes (3 bybit symbols, okx all-swap, binance
-    # all-market) + 3 Binance open-interest lanes = 35 slots, one per pooled lane.
-    [int]$CollectorConcurrency = 35
+    # all-market) + 3 Binance open-interest lanes + 2 options-IV snapshot lanes
+    # (binance-options-chain-snapshot, deribit-options-snapshot) = 37 slots,
+    # one per pooled lane.
+    [int]$CollectorConcurrency = 37
 )
 
 $ErrorActionPreference = "Stop"
@@ -82,7 +84,7 @@ if ($invalidJobs.Count -gt 0) {
 # enumerated EXPLICITLY (pinned by tests/test_repo_hygiene.py): a kalshi- prefix wildcard
 # also matched the maintenance job kalshi-summarize-crypto-quotes, so adding that to
 # the config would have tripped this preflight and refused a valid boot.
-$nonWorkerPoolTypes = @("kalshi-collect-crypto-quotes", "kalshi-discover-crypto", "hyperliquid-leaderboard-snapshot")
+$nonWorkerPoolTypes = @("kalshi-collect-crypto-quotes", "kalshi-discover-crypto", "hyperliquid-leaderboard-snapshot", "binance-options-chain-snapshot", "deribit-options-snapshot")
 $collectorLanes = @($configPayload.jobs | Where-Object {
     ($_.job_type -like "*-worker" -or $nonWorkerPoolTypes -contains $_.job_type) -and ($null -eq $_.enabled -or $_.enabled)
 })

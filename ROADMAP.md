@@ -473,6 +473,31 @@ owner ask (safe-shaping directive above).
 Decisions waiting on the owner; agents must not act on these without an explicit OK
 (see `CLAUDE.md` Governance):
 
+- **Options-IV lane reassignment (2026-08-29, PR `feat/options-iv-snapshot-lanes`).**
+  Collection of the Binance eapi options chain + Deribit options snapshots moves
+  from `G:\Binance_IV_V1` into two raw-only reference lanes here (STANDARDS §4.9;
+  keyless public endpoints; cadences match what the V1 series has run since
+  2026-05: 15 min Binance / 5 min Deribit). Owner steps, in order: (1) merge the
+  PR; (2) copy THREE things from `ops.live.example.json` into
+  `ops.live.local.json` — the two lane entries, the two `archive-offload-cold`
+  `age_only` lane rows, AND the two cleanup `raw_policy` pins
+  (`market/*_options*=3650`; without the pins the cleanup default `raw_days: 14`
+  would eventually delete unrecoverable snapshots) — then run
+  `scripts/redeploy_runner.ps1` (merged != deployed; CollectorConcurrency is now
+  37); (3) run OLD and NEW collectors in parallel ~24 h and check both lanes in
+  the health report's `poll_lanes` table; also glance at hot-tier run-dir counts
+  after any offload backlog — the shared 200-runs/pass offload budget drains
+  lanes in config order and these two sit last; (4) only then disable the three
+  `Binance_IV_V1` scheduled tasks (`Binance IV Collector`,
+  `BinanceIV Collect History`, `BinanceIV Collect Deribit`) — overlap beats a
+  gap, dedup at read time is trivial, backfill is impossible. Note
+  `BinanceIV Collect History` only DERIVES the surface-history CSV from the same
+  chain pull, so nothing is lost by disabling it once step (5) lands; (5)
+  repoint the V1 repo's surface-history builder at the archive (V1-side work,
+  tracked in that repo's `NEXT_STEP.md`). Open cadence choice: the earliest V1
+  weeks sampled the Binance chain at ~2 min; if intraday IV research wants that
+  resolution back, it is one `interval_seconds` edit on the lane (payload is
+  ~2 MB raw per snapshot — ~1 GB/day raw at 2-min).
 - **Text-capture P2 probes (from the 2026-07-16 feasibility doc — see
   `docs/text_source_p2_feasibility.md` §7; none urgent, no rationale here per
   the public-safe contract).** Four calls: (1) approve the 72 h keyless
@@ -599,7 +624,7 @@ BTC derivatives/market-data coverage is split across repos by design:
 | --- | --- |
 | Spot order books + trades (6 venues), linear perps (Bybit, OKX, Binance-via-REST), Binance funding | **this plant** |
 | Kalshi crypto binary-option quotes | **this plant** |
-| Options chains + IV surface (Binance `eapi` BTC+ETH, ~2-min cadence; Deribit source) | `G:\Binance_IV_V1` (separate live repo) |
+| Options chain + Deribit snapshots (Binance `eapi` BTC+ETH 15-min, ~2-min in V1's earliest weeks; Deribit BTC+ETH 5-min) | **this plant** (raw-only lanes, STANDARDS §4.9; reassigned from `G:\Binance_IV_V1` 2026-08-29 — pre-cutover history stays frozen there; IV research/surface derivation stays in that repo) |
 | CME futures | out of scope (paid data) |
 
 ## Retired (not candidates)
@@ -613,7 +638,9 @@ BTC derivatives/market-data coverage is split across repos by design:
   `G:\04-archive\Crypto_L3 collection`, scheduled tasks removed. Any feed it had
   that's still wanted gets built as a native lane here instead.
 - **Deribit perps** — dropped from the instrument-expansion plan (options-side
-  Deribit data is covered by `Binance_IV_V1`).
+  Deribit data was covered by `Binance_IV_V1`; since 2026-08-29 by the §4.9
+  `deribit-options-snapshot` lane here, which also captures future book
+  summaries).
 
 ---
 
