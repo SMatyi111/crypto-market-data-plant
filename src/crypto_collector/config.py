@@ -25,7 +25,10 @@ DEFAULT_ARCHIVE_ROOT = Path(r"G:\market_archive")
 # v9 (2026-08-17): Hyperliquid wallet-flow lane gets `replay_wallet_flow_run`
 # (per-wallet ordering, resume-window clock-skew default) and capped-response
 # paging; no other lane's replayability semantics changed.
-STANDARDS_VERSION = 9
+# v10 (2026-09-02): open_interest rows are scored on `size` (finite, >= 0, price
+# must stay None) by `replay_funding_run`; before, they were scored on `price`
+# and no OI run could be replayable. Funding rows unchanged.
+STANDARDS_VERSION = 10
 
 _FALLBACK_WARNED: set[str] = set()
 

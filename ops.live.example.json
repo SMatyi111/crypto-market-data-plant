@@ -1659,7 +1659,7 @@
       }
     },
     {
-      "// open-interest curation": "OI runs are scored by the funding replayer (STANDARDS 'Open-interest channel'). Promotion target curated/research/open_interest is a NEW curated dataset (STANDARDS section 1 row + version bump = owner decision, see ROADMAP Decision queue), so the chain ships disabled; enable both jobs together and add the matching archive-offload-cold lane row {source: binance_perp_open_interest, promotion_index: .../open_interest/_promotion_index.jsonl, quarantine_index: .../binance_perp_open_interest/_quarantine_index.jsonl} in the same edit - never a promoter without offload coverage.",
+      "// open-interest curation": "OI runs are scored by the funding replayer (STANDARDS 'Open-interest channel', v10). Runs closed BEFORE the v10 redeploy keep their stale invalid_mark_price summaries - rescore them once with `backfill-trades-replay --funding --overwrite --source-root ...\\binance_perp_open_interest --max-age-hours 720 --limit 1000`; the disabled score job below is the ongoing self-heal (overwrite off). Promotion target curated/research/open_interest is a NEW curated dataset (STANDARDS section 1 row + version bump = owner decision, see ROADMAP Decision queue), so the chain ships disabled; enable both jobs together and add the matching archive-offload-cold lane row {source: binance_perp_open_interest, promotion_index: .../open_interest/_promotion_index.jsonl, quarantine_index: .../binance_perp_open_interest/_quarantine_index.jsonl} in the same edit - never a promoter without offload coverage.",
       "name": "quarantine-binance-perp-open-interest",
       "job_type": "quarantine-runs",
       "enabled": false,
@@ -1680,6 +1680,18 @@
         "source_root": "G:\\market_archive\\raw\\market\\binance_perp_open_interest",
         "target_root": "G:\\market_archive\\curated\\research\\open_interest",
         "quarantine_index": "G:\\market_archive\\quarantine\\market\\binance_perp_open_interest\\_quarantine_index.jsonl",
+        "limit": 1000,
+        "max_age_hours": 336
+      }
+    },
+    {
+      "name": "score-binance-perp-open-interest",
+      "job_type": "backfill-trades-replay",
+      "enabled": false,
+      "interval_seconds": 3600,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\binance_perp_open_interest",
+        "funding": true,
         "limit": 1000,
         "max_age_hours": 336
       }

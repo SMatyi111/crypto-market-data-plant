@@ -1429,9 +1429,16 @@ def replay_funding_run(
             # STANDARDS "Open-interest channel": OI is a quantity and deliberately
             # never rides in `price` (None by contract) - the value is `size`. Scoring
             # it on `price` made every OI run unreplayable (245/245 live runs flagged
-            # invalid_mark_price, 2026-08-25..09-02). Zero OI is a legal reading.
+            # invalid_mark_price, 2026-08-25..09-02). Zero OI is a legal reading; a
+            # populated `price` is not (a regressed normalizer or a foreign row would
+            # leak contract counts into price aggregation - exactly what the contract
+            # forbids), so it fails the row too.
             metric = _optional_float(row.get("size"))
-            if metric is None or not _is_finite_non_negative(metric):
+            if (
+                metric is None
+                or not (_is_finite_positive(metric) or metric == 0.0)
+                or row.get("price") is not None
+            ):
                 invalid_open_interest_count += 1
         else:
             price = _optional_float(row.get("price"))
@@ -1702,19 +1709,6 @@ def replay_text_run(
         _write_json_atomic(summary_path, summary.to_dict())
 
     return summary
-
-
-def _is_finite_non_negative(value: float) -> bool:
-    try:
-        if value < 0:
-            return False
-        if value != value:  # NaN
-            return False
-        if value in (float("inf"), float("-inf")):
-            return False
-    except TypeError:
-        return False
-    return True
 
 
 def _is_finite_positive(value: float) -> bool:

@@ -457,6 +457,52 @@ def test_replay_funding_run_scores_open_interest_on_size_not_price(tmp_path) -> 
     assert "invalid_open_interest" in bad.findings and "invalid_mark_price" not in bad.findings
     assert bad.invalid_size_count == 1 and bad.invalid_price_count == 0
 
+    # `price` must stay None by contract: a populated price on an OI row is the
+    # leak the contract exists to prevent, not a bonus field.
+    leaked_run = tmp_path / "leaked"
+    (leaked_run / "clean").mkdir(parents=True)
+    row = good[0].copy()
+    row["price"] = row["size"]
+    (leaked_run / "clean" / "events.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+    leaked = replay_funding_run(leaked_run, write_summary=True)
+    assert leaked.replayable is False and "invalid_open_interest" in leaked.findings
+
+
+def test_backfill_trades_replay_funding_rescores_stale_open_interest_summary(tmp_path, capsys) -> None:
+    # The 245 OI runs closed before the v10 replayer carry `invalid_mark_price`
+    # summaries; promote/quarantine only read the file, so a score job must be
+    # able to re-issue funding-family summaries (there was none until v10).
+    now = utc_now()
+    run_dir = tmp_path / now.strftime("%Y%m%d_%H%M%S")
+    (run_dir / "clean").mkdir(parents=True)
+    (run_dir / "metrics").mkdir()
+    rows = [
+        BinanceOpenInterestNormalizer().normalize(
+            RawMessage(source="binance-futures", received_at=now,
+                       payload={"symbol": "BTCUSDT", "openInterest": "106529", "time": int(now.timestamp() * 1000)})
+        ).to_dict()
+    ]
+    with (run_dir / "clean" / "events.jsonl").open("w", encoding="utf-8") as fh:
+        for r in rows:
+            fh.write(json.dumps(r) + "\n")
+    (run_dir / "metrics" / "replay_summary.json").write_text(
+        json.dumps({"replayable": False, "findings": ["invalid_mark_price"]}), encoding="utf-8"
+    )
+    args = cli._job_args(
+        SimpleNamespace(
+            job_type="backfill-trades-replay",
+            args={"source_root": str(tmp_path), "funding": True, "overwrite": True,
+                  "max_age_hours": 24, "limit": 10, "format": "json"},
+        )
+    )
+    assert args.funding is True
+    cli.run_backfill_trades_replay(args)
+    report = json.loads(capsys.readouterr().out)
+    assert report["updated_count"] == 1 and report["failed_count"] == 0
+    summary = json.loads((run_dir / "metrics" / "replay_summary.json").read_text(encoding="utf-8"))
+    assert summary["mode"] == "funding_none_native"
+    assert summary["replayable"] is True and summary["findings"] == []
+
 
 # --- end-to-end segment (stubbed pollers, no network, no parquet) ------------
 

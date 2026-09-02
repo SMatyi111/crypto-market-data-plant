@@ -3045,13 +3045,16 @@ def _write_ops_config(tmp_path, jobs):
     return path
 
 
-def _lane(name, worker_name, *, job_type="binance-futures-rest-worker", enabled=True):
+def _lane(name, worker_name=None, *, job_type="binance-futures-rest-worker", enabled=True):
+    args = {"output_root": "G:/market_archive/raw/market"}
+    if worker_name is not None:
+        args["worker_name"] = worker_name
     return {
         "name": name,
         "job_type": job_type,
         "interval_seconds": 5,
         "enabled": enabled,
-        "args": {"worker_name": worker_name, "output_root": "G:/market_archive/raw/market"},
+        "args": args,
     }
 
 
@@ -3068,13 +3071,28 @@ def test_load_ops_config_rejects_shared_worker_name_between_enabled_collector_la
     assert "binance-btc-open-interest" in str(excinfo.value)
 
 
+def test_load_ops_config_resolves_implicit_worker_name_to_job_type(tmp_path):
+    # run_*_worker defaults --worker-name to its job type, so a lane WITHOUT
+    # worker_name collides with a sibling that spells the default out (and with a
+    # second lane that also omits it). The check must see the effective name.
+    path = _write_ops_config(
+        tmp_path,
+        [
+            _lane("binance-btc-depth", job_type="binance-depth-worker"),
+            _lane("binance-eth-depth", "binance-depth-worker", job_type="binance-depth-worker"),
+        ],
+    )
+    with pytest.raises(ValueError, match="'binance-depth-worker' <- binance-btc-depth, binance-eth-depth"):
+        load_ops_config(path)
+
+
 def test_load_ops_config_allows_shared_worker_name_when_one_lane_is_disabled(tmp_path):
     path = _write_ops_config(
         tmp_path,
         [
             _lane("binance-futures-rest-funding", "binance-futures-rest-funding"),
             _lane("binance-btc-open-interest", "binance-futures-rest-funding", enabled=False),
-            # Maintenance jobs carry no lock; an incidental worker_name arg must not count.
+            # Maintenance jobs take no lock; an incidental worker_name arg must not count.
             {
                 "name": "promote-x",
                 "job_type": "promote-replayable",

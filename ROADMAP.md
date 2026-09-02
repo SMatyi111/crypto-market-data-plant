@@ -152,8 +152,9 @@ both configs, loader now rejects shared names, hygiene test pins it. (2)
 `invalid_mark_price` because the funding replayer required a positive `price`
 and OI carries `price: null` by contract (value in `size`). Fix: replayer
 scores `open_interest` rows on `size` (finite, ≥ 0; `invalid_open_interest`
-finding), STANDARDS text clarified, test pins it. Promotion still needs a
-curation chain — see Decision queue. (3) **`hyperliquid-leaderboard-snapshot`
+finding, `price` must stay None), **STANDARDS v10**, `backfill-trades-replay
+--funding` added so the mis-scored runs can be re-issued; tests pin it.
+Promotion still needs a curation chain — see Decision queue. (3) **`hyperliquid-leaderboard-snapshot`
 never ran in the runner** — its live-config `output_root` had a single
 backslash before `raw` (= a carriage return), so mkdir failed with WinError 123
 on both attempts. Fix: path corrected in the live config, loader rejects
@@ -519,8 +520,15 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   `bybit-{btc,eth,sol}-liquidations` accumulate `success_count` with 0 new
   errors, and that `hyperliquid-leaderboard-snapshot` succeeds once (daily);
   only then disable the interim `HyperliquidLeaderboardDaily` user task.
-- **Open-interest curated dataset (2026-09-02).** OI runs are replayable after
-  the replayer fix but nothing promotes them: the lane needs
+- **Open-interest curated dataset (2026-09-02).** OI segments closed after the
+  v10 redeploy score replayable, but (a) the 245 runs closed before it keep
+  their stale `invalid_mark_price` summaries — promote/quarantine only read the
+  file — so they must be re-issued once, from the repo venv:
+  `python -m crypto_collector.cli backfill-trades-replay --funding --overwrite
+  --source-root G:\market_archive\raw\market\binance_perp_open_interest
+  --max-age-hours 720 --limit 1000` (do this BEFORE enabling any quarantine job
+  on the lane, or the stale verdicts get quarantined instead); and (b) nothing
+  promotes them: the lane needs
   `quarantine-binance-perp-open-interest` + `promote-binance-perp-open-interest`
   (shipped **disabled** in `ops.live.example.json`, target
   `curated/research/open_interest`) plus an `archive-offload-cold` lane row with
