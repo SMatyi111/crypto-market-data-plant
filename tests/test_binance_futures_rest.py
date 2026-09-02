@@ -492,7 +492,7 @@ def test_backfill_trades_replay_funding_rescores_stale_open_interest_summary(tmp
         SimpleNamespace(
             job_type="backfill-trades-replay",
             args={"source_root": str(tmp_path), "funding": True, "overwrite": True,
-                  "max_age_hours": 24, "limit": 10, "format": "json"},
+                  "min_age_hours": 0, "max_age_hours": 24, "limit": 10, "format": "json"},
         )
     )
     assert args.funding is True
@@ -788,7 +788,37 @@ def test_backfill_trades_replay_min_age_hours_skips_live_run(tmp_path, capsys) -
         )
     )
     assert args.min_age_hours == 1
+    # And it is the default when the config omits it (the 5 trades score jobs).
+    assert cli._job_args(SimpleNamespace(job_type="backfill-trades-replay", args={})).min_age_hours == 1.0
     cli.run_backfill_trades_replay(args)
     report = json.loads(capsys.readouterr().out)
     assert report["skipped_count"] == 1 and report["created_count"] == 0
     assert not (live_run / "metrics" / "replay_summary.json").exists()
+
+
+def test_replay_funding_run_open_interest_orders_per_product(tmp_path) -> None:
+    # Until 2026-09-02 the three OI symbol lanes shared one raw dir and their
+    # lockstep segments merged into one run: three interleaved monotonic series.
+    # Each series is checked on its own; a regression WITHIN a product still fails.
+    now = utc_now()
+    ms = int(now.timestamp() * 1000)
+
+    def oi(symbol, t):
+        return BinanceOpenInterestNormalizer().normalize(
+            RawMessage(source="binance-futures", received_at=now,
+                       payload={"symbol": symbol, "openInterest": "1", "time": t})
+        ).to_dict()
+
+    # Offsets stay inside the 60 s clock-skew gate (received_at is `now`).
+    merged = [oi("BTCUSDT", ms + 5000), oi("ETHUSDT", ms + 1000), oi("BTCUSDT", ms + 30000), oi("ETHUSDT", ms + 25000)]
+    summary = replay_funding_run(_write_clean_run(tmp_path, merged), write_summary=True)
+    assert summary.replayable is True, summary.findings
+    assert summary.event_count == 4
+
+    bad_run = tmp_path / "bad"
+    (bad_run / "clean").mkdir(parents=True)
+    with (bad_run / "clean" / "events.jsonl").open("w", encoding="utf-8") as fh:
+        for row in [oi("BTCUSDT", ms + 30000), oi("ETHUSDT", ms + 1000), oi("BTCUSDT", ms + 5000)]:
+            fh.write(json.dumps(row) + "\n")
+    bad = replay_funding_run(bad_run, write_summary=True)
+    assert bad.replayable is False and "non_monotonic_event_time" in bad.findings

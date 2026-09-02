@@ -8,9 +8,14 @@
 > quarantine → promote chain (scored by `replay_funding_run`, v10 rule). Rows keep
 > the §1 event shape with `price = None` (all-null, so absent from the Parquet) and
 > the contract count in `size` + `metadata.open_interest`; partitions
-> `schema_version=v2/source/instrument/event_date` like `funding`. The research
-> manifest's lane parser now matches multi-token dataset names, so the lane
-> appears in the lanes view. No change to existing datasets.
+> `schema_version=v2/source/instrument/event_date` like `funding`. Each symbol lane
+> writes its own raw dir `binance_perp_open_interest_<symbol>/` (`source_suffix`);
+> the un-suffixed `binance_perp_open_interest/` is the pre-v11 shared dir, drained
+> by its own quarantine/promote pair. `replay_funding_run` checks OI ordering
+> **per product**, so the merged runs that shared dir produced on 2026-09-02 are
+> curated correctly (rows partition by instrument). The research manifest's lane
+> parser now matches multi-token dataset names, so the lanes appear in the lanes
+> view. No change to existing datasets.
 > **v10 (2026-09-02):** replay verdict for the Binance `open_interest` metric
 > lane (§4.5, "Open-interest channel"): `replay_funding_run` scores OI rows on
 > `size` (finite, ≥ 0) and requires `price` to stay `None`; failures are the new
@@ -666,8 +671,10 @@ perp lanes poll REST (`binance-futures-rest-worker`), one lane per stream:
   and promoted to `curated/research/funding`; scored by `replay_funding_run`
   (`none_native`: finite-positive marks, monotonic timestamps — there is no sequence
   to prove).
-- **`open_interest`** (`/fapi/v1/openInterest` → `binance_perp_open_interest/`,
-  one lane per symbol, 60 s poll): venue-computed contract count, `price` None by
+- **`open_interest`** (`/fapi/v1/openInterest` → `binance_perp_open_interest_<symbol>/`,
+  one lane and one raw dir per symbol, 60 s poll — never share a raw dir between
+  lanes: run dirs are named to the second, so lockstep segments merge): venue-computed
+  contract count, `price` None by
   contract (see "Open-interest channel" above), value in `size` +
   `metadata.open_interest`. Normalized into the **`open_interest` dataset** and
   promoted to `curated/research/open_interest` (v11); scored by

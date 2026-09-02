@@ -154,7 +154,7 @@ and OI carries `price: null` by contract (value in `size`). Fix: replayer
 scores `open_interest` rows on `size` (finite, ≥ 0; `invalid_open_interest`
 finding, `price` must stay None), **STANDARDS v10**, `backfill-trades-replay
 --funding` added so the mis-scored runs can be re-issued; tests pin it.
-Promotion still needs a curation chain — see Decision queue. (3) **`hyperliquid-leaderboard-snapshot`
+Curation chain shipped as STANDARDS v11 (PR #54; see `docs/HISTORY.md` 2026-09-02). (3) **`hyperliquid-leaderboard-snapshot`
 never ran in the runner** — its live-config `output_root` had a single
 backslash before `raw` (= a carriage return), so mkdir failed with WinError 123
 on both attempts. Fix: path corrected in the live config, loader rejects
@@ -175,8 +175,9 @@ the restart (the last `standalone worker already active` row is 16:02:44Z,
 pre-restart). `hyperliquid-leaderboard-snapshot` succeeded on its first runner
 run (44,554 rows, `parse_ok`), so the interim `HyperliquidLeaderboardDaily` user
 task was disabled (not deleted) the same hour. Options-IV lanes resumed on
-cadence. Still open: the Decision-queue items above (OI rescore + curated
-dataset, liquidation lanes vs the 7200 s timeout, V1 task disable).
+cadence. Same-day owner decisions (OI curated dataset v11, liquidation lane
+timeout rule) shipped in PR #54 — see `docs/HISTORY.md` 2026-09-02; V1 task
+disable stays queued ("not yet").
 
 **Previous ops audit:** 2026-08-17 — **market/text capture healthy; Hyperliquid
 stalled awaiting the elevated restart.** Manual markers only (the health command
@@ -523,44 +524,6 @@ owner ask (safe-shaping directive above).
 Decisions waiting on the owner; agents must not act on these without an explicit OK
 (see `CLAUDE.md` Governance):
 
-- **Redeploy for the 2026-09-02 lane fixes (PR `fix/lane-worker-names-oi-replay`).**
-  The worker-name and leaderboard-path fixes live in `ops.live.local.json`
-  (backup `ops.live.local.json.bak-20260902-worker-names`) and take effect only
-  at `scripts/redeploy_runner.ps1`. After the restart, confirm in the heartbeat
-  that `binance-{btc,eth,sol}-open-interest`, `binance-futures-rest-funding` and
-  `bybit-{btc,eth,sol}-liquidations` accumulate `success_count` with 0 new
-  errors, and that `hyperliquid-leaderboard-snapshot` succeeds once (daily);
-  only then disable the interim `HyperliquidLeaderboardDaily` user task.
-- **Open-interest curated dataset (2026-09-02) — APPROVED by the owner the same
-  day ("full chain"): STANDARDS v11, chain + offload row + `min_age_hours: 1`
-  score job in both configs, stale summaries re-issued; takes effect at the next
-  redeploy.** Original ask: OI segments closed after the
-  v10 redeploy score replayable, but (a) the 245 runs closed before it keep
-  their stale `invalid_mark_price` summaries — promote/quarantine only read the
-  file — so they must be re-issued once, from the repo venv:
-  `python -m crypto_collector.cli backfill-trades-replay --funding --overwrite
-  --source-root G:\market_archive\raw\market\binance_perp_open_interest
-  --max-age-hours 720 --limit 1000` (do this BEFORE enabling any quarantine job
-  on the lane, or the stale verdicts get quarantined instead); and (b) nothing
-  promotes them: the lane needs
-  `quarantine-binance-perp-open-interest` + `promote-binance-perp-open-interest`
-  (shipped **disabled** in `ops.live.example.json`, target
-  `curated/research/open_interest`) plus an `archive-offload-cold` lane row with
-  the matching promotion/quarantine indexes. That is a new curated dataset —
-  STANDARDS §1 row + `STANDARDS_VERSION` bump — hence owner-gated. Until then
-  the 245+ OI runs sit on the hot tier (no offload row either — deliberately,
-  so an `age_only` move cannot strand them un-promoted on cold).
-- **Liquidation lanes vs. the 7200 s subprocess timeout (2026-09-02) — DECIDED:
-  option (a); `subprocess_timeout_seconds: 90000` (25 h) on the four
-  rotate-at-midnight liquidation lanes in both configs, effective at the next
-  redeploy.** Original ask: The
-  Bybit/OKX liquidation workers are `rotate_at_midnight` day-long segments, but
-  the runner kills any collector subprocess after 7200 s, so every run is torn
-  at the 2 h mark and never gets a replay summary (126/133 Bybit runs). Options:
-  (a) per-lane subprocess timeout ≥ 25 h for the rotate-at-midnight lanes
-  (recommended — the lanes were designed for daily files); (b) declare them
-  raw-only (STANDARDS row) and give them `age_only` offload rows; (c) drop
-  `rotate_at_midnight` and use `max_segment_seconds: 1800` like the REST lanes.
 - **Options-IV cutover step (4) is ready (2026-09-02). Owner 2026-09-02: not yet —
   keep both V1 tasks running in parallel for now.** Both plant lanes have
   run 24 h+ clean in parallel with V1; disabling `BinanceIV Collect History`
