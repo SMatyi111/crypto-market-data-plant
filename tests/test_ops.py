@@ -3037,3 +3037,81 @@ def test_health_cli_threads_baseline_and_renders_offload(tmp_path: Path, capsys)
     run_health(args)
     out = capsys.readouterr().out
     assert "offload_stuck_above_baseline:7" in out
+
+
+def _write_ops_config(tmp_path, jobs):
+    path = tmp_path / "ops.json"
+    path.write_text(json.dumps({"jobs": jobs}), encoding="utf-8")
+    return path
+
+
+def _lane(name, worker_name=None, *, job_type="binance-futures-rest-worker", enabled=True):
+    args = {"output_root": "G:/market_archive/raw/market"}
+    if worker_name is not None:
+        args["worker_name"] = worker_name
+    return {
+        "name": name,
+        "job_type": job_type,
+        "interval_seconds": 5,
+        "enabled": enabled,
+        "args": args,
+    }
+
+
+def test_load_ops_config_rejects_shared_worker_name_between_enabled_collector_lanes(tmp_path):
+    path = _write_ops_config(
+        tmp_path,
+        [
+            _lane("binance-futures-rest-funding", "binance-futures-rest-funding"),
+            _lane("binance-btc-open-interest", "binance-futures-rest-funding"),
+        ],
+    )
+    with pytest.raises(ValueError, match="share a worker_name") as excinfo:
+        load_ops_config(path)
+    assert "binance-btc-open-interest" in str(excinfo.value)
+
+
+def test_load_ops_config_resolves_implicit_worker_name_to_job_type(tmp_path):
+    # run_*_worker defaults --worker-name to its job type, so a lane WITHOUT
+    # worker_name collides with a sibling that spells the default out (and with a
+    # second lane that also omits it). The check must see the effective name.
+    path = _write_ops_config(
+        tmp_path,
+        [
+            _lane("binance-btc-depth", job_type="binance-depth-worker"),
+            _lane("binance-eth-depth", "binance-depth-worker", job_type="binance-depth-worker"),
+        ],
+    )
+    with pytest.raises(ValueError, match="'binance-depth-worker' <- binance-btc-depth, binance-eth-depth"):
+        load_ops_config(path)
+
+
+def test_load_ops_config_allows_shared_worker_name_when_one_lane_is_disabled(tmp_path):
+    path = _write_ops_config(
+        tmp_path,
+        [
+            _lane("binance-futures-rest-funding", "binance-futures-rest-funding"),
+            _lane("binance-btc-open-interest", "binance-futures-rest-funding", enabled=False),
+            # Maintenance jobs take no lock; an incidental worker_name arg must not count.
+            {
+                "name": "promote-x",
+                "job_type": "promote-replayable",
+                "interval_seconds": 300,
+                "args": {"worker_name": "binance-futures-rest-funding"},
+            },
+        ],
+    )
+    assert [job.name for job in load_ops_config(path)] == [
+        "binance-futures-rest-funding",
+        "promote-x",
+    ]
+
+
+def test_load_ops_config_rejects_control_characters_in_string_args(tmp_path):
+    lane = _lane("hyperliquid-leaderboard-snapshot", "lb", job_type="hyperliquid-leaderboard-snapshot")
+    # The live-config defect: one backslash before "raw" -> a literal carriage return.
+    lane["args"]["output_root"] = "G:/market_archive/" + chr(13) + "aw/market"
+    path = _write_ops_config(tmp_path, [lane])
+    with pytest.raises(ValueError, match="control characters") as excinfo:
+        load_ops_config(path)
+    assert "hyperliquid-leaderboard-snapshot.args.output_root" in str(excinfo.value)

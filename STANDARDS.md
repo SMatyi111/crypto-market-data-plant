@@ -1,7 +1,15 @@
 # Data Standards
 
-`STANDARDS_VERSION = 9`
+`STANDARDS_VERSION = 10`
 
+> **v10 (2026-09-02):** replay verdict for the Binance `open_interest` metric
+> lane (§4.5, "Open-interest channel"): `replay_funding_run` scores OI rows on
+> `size` (finite, ≥ 0) and requires `price` to stay `None`; failures are the new
+> `invalid_open_interest` finding. Before this the OI rows were scored on
+> `price` — `None` by contract — so no OI run could ever be replayable (245/245
+> live runs `invalid_mark_price`). `backfill-trades-replay --funding` can now
+> re-issue funding-family summaries. No schema, partition or dataset change;
+> funding rows are scored exactly as before.
 > **v9 (2026-08-17):** the Hyperliquid wallet-flow lane (§4.7) gets its own replay
 > verdict, `replay_wallet_flow_run` (`mode="wallet_flow_none_native"`): structural
 > ordering is checked **per wallet** (`metadata.wallet`), not globally — a run
@@ -279,8 +287,12 @@ Venue-computed contract count, polled over REST (`/fapi/v1/openInterest`).
 `price` is deliberately None - OI is a quantity, and carrying it in `price`
 would let contract counts leak into price aggregation; the value rides in
 `size` and `metadata.open_interest`. Metric lane, none_native, curated via the
-funding replayer. Venue retention is ~30 days, so a poll gap is recoverable for
-a month and permanent after.
+funding replayer, which scores `open_interest` rows on `size` (finite, >= 0 -
+zero OI is a legal reading) instead of `price`; a missing/invalid reading is
+the `invalid_open_interest` finding. (Until 2026-09-02 the replayer scored OI
+rows on `price` and every OI run was flagged `invalid_mark_price`.) Venue
+retention is ~30 days, so a poll gap is recoverable for a month and permanent
+after.
 
 ### Liquidations channel (`channel = "liquidations"`)
 

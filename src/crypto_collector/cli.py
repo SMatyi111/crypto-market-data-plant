@@ -1304,6 +1304,14 @@ def build_parser() -> argparse.ArgumentParser:
         "Overrides --stream.",
     )
     backfill_trades_parser.add_argument(
+        "--funding",
+        action="store_true",
+        help="Score with the funding/open-interest metric replay (replay_funding_run: "
+        "binance_perp_funding, binance_perp_open_interest). Overrides --stream and "
+        "--wallet-flow. With --overwrite this re-issues summaries the pre-2026-09-02 "
+        "replayer mis-scored as invalid_mark_price.",
+    )
+    backfill_trades_parser.add_argument(
         "--max-clock-skew-ms",
         type=float,
         default=None,
@@ -4318,7 +4326,8 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
         # Trades scorer (run_backfill_trades_replay) — write replay summaries only, no
         # promotion. stream=True selects the none_native UUID scorer (Bybit/MEXC);
         # wallet_flow=True selects the per-wallet Hyperliquid scorer (overrides
-        # stream); default is the dense sequence-bearing scorer
+        # stream); funding=True selects the funding/open-interest metric scorer
+        # (overrides both); default is the dense sequence-bearing scorer
         # (Binance/Coinbase/Kraken). max_clock_skew_ms=None keeps each scorer's
         # own default gate.
         return SimpleNamespace(
@@ -4328,6 +4337,7 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             overwrite=raw_args.get("overwrite", False),
             stream=raw_args.get("stream", False),
             wallet_flow=raw_args.get("wallet_flow", False),
+            funding=raw_args.get("funding", False),
             max_clock_skew_ms=raw_args.get("max_clock_skew_ms"),
             format=raw_args.get("format", "text"),
         )
@@ -4706,7 +4716,12 @@ def run_backfill_replay(args: argparse.Namespace) -> None:
 
 
 def run_backfill_trades_replay(args: argparse.Namespace) -> None:
-    if getattr(args, "wallet_flow", False):
+    if getattr(args, "funding", False):
+        # Metric lanes (binance_perp_funding / binance_perp_open_interest). Until
+        # 2026-09-02 no score job could re-issue a funding-family summary, so the
+        # 245 OI runs mis-scored before the replayer fix had no path back.
+        scorer = replay_funding_run
+    elif getattr(args, "wallet_flow", False):
         scorer = replay_wallet_flow_run
     elif getattr(args, "stream", False):
         scorer = replay_trades_stream_run

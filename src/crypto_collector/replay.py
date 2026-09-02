@@ -1397,6 +1397,7 @@ def replay_funding_run(
     last_event_time: str | None = None
     non_monotonic_time_count = 0
     invalid_price_count = 0
+    invalid_open_interest_count = 0
     excessive_clock_skew_count = 0
     max_clock_skew_ms_seen: float | None = None
     source: str | None = None
@@ -1424,9 +1425,25 @@ def replay_funding_run(
             if previous_event_dt is None or event_dt >= previous_event_dt:
                 previous_event_dt = event_dt
 
-        price = _optional_float(row.get("price"))
-        if price is None or not _is_finite_positive(price):
-            invalid_price_count += 1
+        if _optional_str(row.get("channel")) == "open_interest":
+            # STANDARDS "Open-interest channel": OI is a quantity and deliberately
+            # never rides in `price` (None by contract) - the value is `size`. Scoring
+            # it on `price` made every OI run unreplayable (245/245 live runs flagged
+            # invalid_mark_price, 2026-08-25..09-02). Zero OI is a legal reading; a
+            # populated `price` is not (a regressed normalizer or a foreign row would
+            # leak contract counts into price aggregation - exactly what the contract
+            # forbids), so it fails the row too.
+            metric = _optional_float(row.get("size"))
+            if (
+                metric is None
+                or not (_is_finite_positive(metric) or metric == 0.0)
+                or row.get("price") is not None
+            ):
+                invalid_open_interest_count += 1
+        else:
+            price = _optional_float(row.get("price"))
+            if price is None or not _is_finite_positive(price):
+                invalid_price_count += 1
 
         skew_ms = _abs_skew_ms(exchange_time_str, _optional_str(row.get("received_at")))
         if skew_ms is not None:
@@ -1442,6 +1459,8 @@ def replay_funding_run(
         findings.append("non_monotonic_event_time")
     if invalid_price_count:
         findings.append("invalid_mark_price")
+    if invalid_open_interest_count:
+        findings.append("invalid_open_interest")
     if excessive_clock_skew_count:
         findings.append("excessive_clock_skew")
 
@@ -1449,6 +1468,7 @@ def replay_funding_run(
         event_count > 0
         and non_monotonic_time_count == 0
         and invalid_price_count == 0
+        and invalid_open_interest_count == 0
         and excessive_clock_skew_count == 0
     )
 
@@ -1469,7 +1489,7 @@ def replay_funding_run(
         trade_id_gap_count=0,
         trade_id_gap_total_missing=0,
         invalid_price_count=invalid_price_count,
-        invalid_size_count=0,
+        invalid_size_count=invalid_open_interest_count,
         excessive_clock_skew_count=excessive_clock_skew_count,
         max_clock_skew_ms=max_clock_skew_ms_seen,
         duplicate_trade_id_count=0,

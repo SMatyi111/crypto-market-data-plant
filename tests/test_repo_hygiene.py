@@ -10,6 +10,14 @@ repository itself so CI turns known footguns into red X's:
   never dispatched (starved lanes shipped twice: 12<17 and 17<21).
 - Each raw lane may appear in at most one archive-offload job: two jobs owning
   the same lane is a double-move race on aged run dirs.
+- Enabled collector lanes must not share an effective worker name
+  (`args.worker_name`, else the job type): the standalone worker lock is keyed
+  by that name, so only one of them ever runs (2026-08-25: the 3 open-interest
+  lanes + funding, and the 3 bybit liquidation lanes, crash-looped for 8 days
+  through a redeploy).
+- No control characters in config string values: a JSON path with a single
+  backslash before `raw` parses as a carriage return and the lane fails every
+  mkdir with WinError 123.
 """
 
 from __future__ import annotations
@@ -20,7 +28,12 @@ from pathlib import Path
 
 import pytest
 
-from crypto_collector.ops import COLLECTOR_JOB_TYPES
+from crypto_collector.ops import (
+    COLLECTOR_JOB_TYPES,
+    JobSpec,
+    find_control_characters,
+    shared_worker_names,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = sorted((REPO_ROOT / "scripts").glob("*.ps1"))
@@ -142,3 +155,37 @@ def test_each_lane_has_at_most_one_offload_job(config_name: str) -> None:
         f"{config_name}: lanes offloaded by more than one archive-offload job "
         f"(double-handling): {duplicates}"
     )
+
+
+def _job_specs(config_name: str) -> list[JobSpec]:
+    config = json.loads((REPO_ROOT / config_name).read_text(encoding="utf-8"))
+    return [JobSpec.from_dict(row) for row in config["jobs"]]
+
+
+@pytest.mark.parametrize("config_name", OPS_CONFIGS)
+def test_enabled_collector_lanes_have_unique_worker_names(config_name: str) -> None:
+    """`StandaloneWorkerLock` is keyed by the EFFECTIVE worker name
+    (`args.worker_name`, else the job type), not by job name. Lanes copy-pasted
+    from a sibling (open-interest from funding, bybit liquidations per symbol)
+    kept the sibling's worker_name, so the scheduler dispatched all of them but
+    only the first ever acquired the lock; the rest failed every 5 s with
+    "standalone worker already active" -- 39k of 48k job results per day -- and
+    it survived the 2026-09-01 redeploy because every job NAME was unique. Same
+    rule the runner applies at load (`load_ops_config`), pinned here for the
+    template, which the runner never loads."""
+    shared = shared_worker_names(_job_specs(config_name))
+    assert not shared, (
+        f"{config_name}: enabled collector lanes share a worker name (one lock per "
+        f"name, so only one lane per name can run): {shared}"
+    )
+
+
+@pytest.mark.parametrize("config_name", OPS_CONFIGS)
+def test_config_strings_have_no_control_characters(config_name: str) -> None:
+    """Hand-edited JSON: a path with ONE backslash before `raw` is valid JSON
+    containing a carriage return. The leaderboard lane shipped that way in the
+    live config and failed every daily run with WinError 123 on mkdir. Same
+    rule the runner applies at load, here over disabled jobs as well so a lane
+    cannot be enabled into the failure later."""
+    offenders = find_control_characters(_job_specs(config_name))
+    assert not offenders, f"{config_name}: control characters in job args: {offenders}"

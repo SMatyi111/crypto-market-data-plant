@@ -148,7 +148,80 @@ def load_ops_config(path: Path) -> list[JobSpec]:
         raise ValueError(
             f"duplicate enabled job names in ops config {path}: {', '.join(duplicates)}"
         )
+    _reject_shared_worker_names(path, enabled)
+    _reject_control_characters(path, enabled)
     return enabled
+
+
+def effective_worker_name(job: JobSpec) -> str | None:
+    """The name a `*-worker` lane really runs under - its StandaloneWorkerLock file,
+    heartbeat and health row: `args.worker_name` when set, else the job type (every
+    `run_*_worker` defaults `--worker-name` to its own job type). None for
+    non-worker jobs, which take no lock."""
+    if not job.job_type.endswith("-worker"):
+        return None
+    return str(job.args.get("worker_name") or job.job_type)
+
+
+def shared_worker_names(jobs: list[JobSpec]) -> dict[str, list[str]]:
+    """Effective worker names claimed by more than one ENABLED lane -> the lanes.
+
+    Two lanes on one name share one lock: only the first to start ever runs, the
+    others crash every dispatch with "standalone worker already active". Shipped
+    live 2026-08-25 (3 open-interest lanes + funding on one name, 3 bybit
+    liquidation lanes on another) and survived a redeploy unnoticed for 8 days
+    because the lane NAMES were unique. Resolving the default here too means a
+    copy-pasted lane that simply omits worker_name is caught as well."""
+    owners: dict[str, list[str]] = {}
+    for job in jobs:
+        if not job.enabled:
+            continue
+        name = effective_worker_name(job)
+        if name is not None:
+            owners.setdefault(name, []).append(job.name)
+    return {name: lanes for name, lanes in owners.items() if len(lanes) > 1}
+
+
+def find_control_characters(jobs: list[JobSpec]) -> list[str]:
+    """`<job>.args.<path>=<repr>` for every string arg containing a control
+    character. A hand-edited JSON path with a single backslash before the lane
+    folder is valid JSON - it parses as a carriage return - and the lane then
+    fails every run on mkdir with WinError 123 while nothing upstream notices."""
+    offenders: list[str] = []
+
+    def walk(value: Any, where: str) -> None:
+        if isinstance(value, str):
+            if any(ord(ch) < 0x20 for ch in value):
+                offenders.append(f"{where}={value!r}")
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                walk(item, f"{where}.{key}")
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                walk(item, f"{where}[{index}]")
+
+    for job in jobs:
+        walk(job.args, f"{job.name}.args")
+    return offenders
+
+
+def _reject_shared_worker_names(path: Path, jobs: list[JobSpec]) -> None:
+    shared = shared_worker_names(jobs)
+    if shared:
+        detail = "; ".join(f"{name!r} <- {', '.join(js)}" for name, js in sorted(shared.items()))
+        raise ValueError(
+            f"enabled collector lanes share a worker_name in ops config {path} "
+            f"(one standalone-worker lock per name, so only one of them can run): {detail}"
+        )
+
+
+def _reject_control_characters(path: Path, jobs: list[JobSpec]) -> None:
+    offenders = find_control_characters(jobs)
+    if offenders:
+        raise ValueError(
+            f"control characters in ops config {path} string values (a JSON path with a "
+            f"single backslash before r/n/t?): {'; '.join(offenders)}"
+        )
 
 
 # Collector lanes that poll a REST/HTTP API on an interval instead of holding a
@@ -2031,8 +2104,9 @@ def _managed_worker_names(jobs: list[JobSpec] | None) -> set[str]:
         # unset worker_name maps to the job_type — matching what the worker writes to its
         # heartbeat. Enumerating venues here was the old approach and silently dropped the
         # non-Binance lanes, flagging healthy workers as unmanaged.
-        if job.job_type.endswith("-worker"):
-            names.add(str(job.args.get("worker_name") or job.job_type))
+        name = effective_worker_name(job)
+        if name is not None:
+            names.add(name)
     return names
 
 
