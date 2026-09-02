@@ -167,6 +167,17 @@ run dirs (now `age_only` offload); `bybit_perp_liquidations`,
 `okx_perp_liquidations`, `hyperliquid_leaderboard`, `hyperliquid_retro_fills`
 and the limitless lanes remain `unconfigured_lane` for offload.
 
+**Deployed 2026-09-02 16:03Z** (owner, elevated `redeploy_runner.ps1` on `107a235`):
+runner up with 100 jobs / 31 pooled; all six previously colliding lanes hold their
+own lock (`binance-futures-rest-open-interest-{btc,eth,sol}`,
+`bybit-liquidations-worker-{btc,eth,sol}`) with fresh heartbeats, 0 errors since
+the restart (the last `standalone worker already active` row is 16:02:44Z,
+pre-restart). `hyperliquid-leaderboard-snapshot` succeeded on its first runner
+run (44,554 rows, `parse_ok`), so the interim `HyperliquidLeaderboardDaily` user
+task was disabled (not deleted) the same hour. Options-IV lanes resumed on
+cadence. Still open: the Decision-queue items above (OI rescore + curated
+dataset, liquidation lanes vs the 7200 s timeout, V1 task disable).
+
 **Previous ops audit:** 2026-08-17 — **market/text capture healthy; Hyperliquid
 stalled awaiting the elevated restart.** Manual markers only (the health command
 was not re-attempted after the 08-09 timeouts). SYSTEM-runner heartbeat fresh
