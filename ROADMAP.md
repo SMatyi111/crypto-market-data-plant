@@ -684,7 +684,9 @@ Decided 2026-06-11 (recorded, closed):
   audit ritual's ~3-day detection latency is accepted.
 - Baseline-audit completion (open item 0): **approved** for the next session,
   slim design; the deferred PR #17 review pass folds into its ops-runner pass.
-- **Per-symbol source dirs for the OI and Bybit liquidation lanes (2026-09-02).**
+- **Per-symbol source dirs for the OI and Bybit liquidation lanes (2026-09-02) —
+  IMPLEMENTED as option (a) in PR #54 (`source_suffix` on all six lanes, OI chain
+  + offload rows + manifest parser follow; effective at the next redeploy).**
   The three `binance-*-open-interest` lanes and the three `bybit-*-liquidations`
   lanes write into one `<source>/<YYYYMMDD_HHMMSS>/` run dir whenever their
   segments start in the same second — systematic after a restart, because the
