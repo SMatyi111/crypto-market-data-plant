@@ -343,6 +343,9 @@ _LIVE_LANE_INVENTORY = {
     "binance_perp_funding": ("binance_perp", "funding", None),
     # Multi-token dataset name: must not parse as dataset="open" -> None (invisible).
     "binance_perp_open_interest": ("binance_perp", "open_interest", None),
+    # ...and the per-symbol form the live lanes write since v11: the instrument must
+    # be the remainder AFTER the longest dataset match, not "interest_btcusdt".
+    "binance_perp_open_interest_btcusdt": ("binance_perp", "open_interest", "btcusdt"),
 }
 
 

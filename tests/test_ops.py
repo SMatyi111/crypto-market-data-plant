@@ -2424,6 +2424,22 @@ def test_health_does_not_flag_long_continuous_segment_as_long_running(tmp_path: 
     assert legacy_row["long_running"] is True
     assert "long_running_job:coinbase-btc-trades" in legacy_report.findings
 
+    # A rotate_at_midnight lane (no max_segment_seconds, 5 s interval) is one day-long
+    # segment by design; its health cadence is a day, so the same 20-min run is fine.
+    daily = JobSpec(
+        name="coinbase-btc-trades",
+        job_type="coinbase-trades-worker",
+        interval_seconds=5,
+        args={"rotate_at_midnight": True},
+    )
+    daily_report = build_health_report(
+        ops_root=ops_root, jobs=[daily], stale_after_seconds=300, job_stale_multiplier=3.0
+    )
+    daily_row = next(r for r in daily_report.jobs if r["name"] == "coinbase-btc-trades")
+    assert daily_row["long_running"] is False
+    assert daily_row["long_running_threshold_seconds"] == 86_400.0 * 1.5
+    assert "long_running_job:coinbase-btc-trades" not in daily_report.findings
+
 
 def test_ops_runner_collector_concurrency_defaults_to_one(tmp_path: Path) -> None:
     parser = build_parser()
