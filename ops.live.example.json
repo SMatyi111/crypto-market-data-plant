@@ -1538,6 +1538,7 @@
       "interval_seconds": 5,
       "args": {
         "symbol": "BTCUSDT",
+        "source_suffix": "btcusdt",
         "channel": "allLiquidation",
         "segment_count": 100000,
         "max_segments": 1,
@@ -1557,6 +1558,7 @@
       "interval_seconds": 5,
       "args": {
         "symbol": "ETHUSDT",
+        "source_suffix": "ethusdt",
         "channel": "allLiquidation",
         "segment_count": 100000,
         "max_segments": 1,
@@ -1576,6 +1578,7 @@
       "interval_seconds": 5,
       "args": {
         "symbol": "SOLUSDT",
+        "source_suffix": "solusdt",
         "channel": "allLiquidation",
         "segment_count": 100000,
         "max_segments": 1,

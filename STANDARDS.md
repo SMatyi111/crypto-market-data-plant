@@ -316,7 +316,13 @@ Forced closes are **not** trades and get their own channel. The Bybit v5
 `data: [...]`, same `S/T/p/s/v` keys), so routing it through the trade
 normalizer silently files liquidations as ordinary prints and corrupts the
 trade tape. Any future venue added to this channel must be checked for the same
-shape collision.
+shape collision. Raw dirs are per symbol (`bybit_perp_liquidations_<symbol>/`,
+`source_suffix`) since 2026-09-02: the three Bybit lanes shared
+`bybit_perp_liquidations/` and their synchronized segments merged into one
+run dir (run dirs are named to the second) — 31 of 135 historical runs and
+every post-restart run were mixed-symbol, with at least one torn
+`clean/events.jsonl` line from the concurrent appends. The un-suffixed dir is
+frozen history.
 
 | field          | type            | value |
 | -------------- | --------------- | ----- |

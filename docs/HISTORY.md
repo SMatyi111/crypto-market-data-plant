@@ -43,8 +43,12 @@ curated rather than quarantined. Also from that review: `min_age_hours` defaults
 to 1 h for every trades score job (scoring the live segment let promote index a
 partial run and never revisit it), and `rotate_at_midnight` lanes get a 25 h
 subprocess timeout by rule instead of the 7200 s default that tore 126/133 Bybit
-liquidation runs before they could write a summary. Lesson recorded in
-STANDARDS §4.5: never let two lanes share a raw dir.
+liquidation runs before they could write a summary. A parallel verification
+session (PR #55) found the same collision on the three Bybit liquidation lanes
+(shared `bybit_perp_liquidations/`, 31 of 135 historical runs mixed, one torn
+events line), so those lanes got per-symbol `source_suffix` too. Lesson recorded
+in STANDARDS §4.5 and the liquidations channel: never let two lanes share a raw
+dir.
 
 ## 2026-08-09 — Hyperliquid frozen-wallet forward collection approved and started
 
