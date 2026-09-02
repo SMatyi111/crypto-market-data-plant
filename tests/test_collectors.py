@@ -3032,6 +3032,26 @@ def test_collector_subprocess_timeout_scales_for_poll_jobs() -> None:
     )
     assert _collector_subprocess_timeout_seconds(pinned) == 42.0
 
+    # A rotate_at_midnight lane is one day-long segment: the 7200 s default tore
+    # every Bybit/OKX liquidation run at 2 h (126/133 runs without a summary).
+    from crypto_collector.cli import _MIDNIGHT_ROTATION_TIMEOUT_SECONDS
+
+    daily = JobSpec(
+        name="d",
+        job_type="bybit-liquidations-worker",
+        interval_seconds=5,
+        args={"rotate_at_midnight": True},
+    )
+    assert _collector_subprocess_timeout_seconds(daily) == _MIDNIGHT_ROTATION_TIMEOUT_SECONDS >= 25 * 3600
+    # An explicit pin still wins over the rule.
+    daily_pinned = JobSpec(
+        name="dp",
+        job_type="bybit-liquidations-worker",
+        interval_seconds=5,
+        args={"rotate_at_midnight": True, "subprocess_timeout_seconds": 60.0},
+    )
+    assert _collector_subprocess_timeout_seconds(daily_pinned) == 60.0
+
 
 def test_coinbase_last_match_is_tagged_subscribe_replay() -> None:
     """`last_match` is always the most recent print from BEFORE the subscription — a

@@ -1403,12 +1403,20 @@ def replay_funding_run(
     source: str | None = None
     product: str | None = None
     instrument_id: str | None = None
-    previous_event_dt: datetime | None = None
+    # Ordering is checked per product. Funding runs are single-symbol so this is the
+    # global check; open_interest rows are keyed by product because until
+    # 2026-09-02 the three OI symbol lanes shared one raw dir and their lockstep
+    # segments merged into one run (prepare_run_paths names runs to the second) -
+    # three interleaved monotonic series that a global check rejected wholesale.
+    # Rows are promoted per row with an instrument partition, so a merged run is
+    # curated correctly once each series is monotonic on its own.
+    previous_event_dt_by_product: dict[str, datetime] = {}
 
     for row in _read_jsonl(events_path):
         event_count += 1
         source = source or _optional_str(row.get("source"))
-        product = product or _optional_str(row.get("product"))
+        row_product = _optional_str(row.get("product"))
+        product = product or row_product
         metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
         if instrument_id is None:
             instrument_id = _optional_str(metadata.get("instrument_id"))
@@ -1420,10 +1428,12 @@ def replay_funding_run(
 
         event_dt = _parse_iso_dt(exchange_time_str)
         if event_dt is not None:
+            series_key = row_product or "" if _optional_str(row.get("channel")) == "open_interest" else ""
+            previous_event_dt = previous_event_dt_by_product.get(series_key)
             if previous_event_dt is not None and event_dt < previous_event_dt:
                 non_monotonic_time_count += 1
             if previous_event_dt is None or event_dt >= previous_event_dt:
-                previous_event_dt = event_dt
+                previous_event_dt_by_product[series_key] = event_dt
 
         if _optional_str(row.get("channel")) == "open_interest":
             # STANDARDS "Open-interest channel": OI is a quantity and deliberately

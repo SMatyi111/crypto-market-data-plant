@@ -7,6 +7,49 @@ git log + the merged PR descriptions; this file keeps the *why*.
 
 ---
 
+## 2026-09-02 — the three 2026-08-25 lanes were defective since deploy day; OI becomes a curated dataset (v11)
+
+The session-start audit found the runner healthy and the options-IV cutover live,
+but every lane added on 2026-08-25 broken in a way no counter surfaced. (1) The
+three open-interest lanes reused the funding lane's `worker_name` and the three
+Bybit liquidation lanes shared one; `StandaloneWorkerLock` is keyed by that name,
+so one lane per group ran and the rest failed every 5 s with "standalone worker
+already active" — 39,665 of 48,598 job results per day, 308k since 08-25, and it
+survived the 09-01 redeploy because every job *name* was unique. (2) The funding
+replayer required a positive `price`, but OI carries `price: null` by contract, so
+all 245 OI runs scored `invalid_mark_price` and none was promoted. (3) The
+leaderboard lane's live-config path had a single backslash before `raw` — valid
+JSON containing a carriage return — so every run failed on mkdir; the interim
+per-user daily task had covered capture (17/17 snapshots).
+
+PR #52 fixed all three: unique worker names, a loader that rejects shared
+*effective* worker names (explicit or job-type default) and control characters,
+OI scored on `size` with `price` required to stay None (STANDARDS v10), a
+`--funding` scorer so the mis-scored summaries could be re-issued, hygiene tests
+for both configs. Deployed 16:03Z; 0 errors since, leaderboard lane succeeded on
+its first run, interim task disabled.
+
+The owner then approved the follow-ups the same day (PR #54): OI becomes the
+`open_interest` curated dataset (STANDARDS v11) with the standard quarantine →
+promote → score chain and offload gate; the 249 pre-fix runs were re-issued
+(`--funding --overwrite --min-age-hours 1`, all replayable). Review of that PR
+found a second latent defect: the three OI symbol lanes wrote into ONE raw dir,
+and once they all ran (post-#52) their lockstep 30-min segments merged into one
+run dir (`prepare_run_paths` names runs to the second, `mkdir(exist_ok=True)`),
+which the global monotonicity check rejected. Fix: per-symbol `source_suffix`
+(`binance_perp_open_interest_<symbol>/`, one chain each, legacy dir drained by
+its own pair) plus per-product ordering in the OI replay so the merged runs are
+curated rather than quarantined. Also from that review: `min_age_hours` defaults
+to 1 h for every trades score job (scoring the live segment let promote index a
+partial run and never revisit it), and `rotate_at_midnight` lanes get a 25 h
+subprocess timeout by rule instead of the 7200 s default that tore 126/133 Bybit
+liquidation runs before they could write a summary. A parallel verification
+session (PR #55) found the same collision on the three Bybit liquidation lanes
+(shared `bybit_perp_liquidations/`, 31 of 135 historical runs mixed, one torn
+events line), so those lanes got per-symbol `source_suffix` too. Lesson recorded
+in STANDARDS §4.5 and the liquidations channel: never let two lanes share a raw
+dir.
+
 ## 2026-08-09 — Hyperliquid frozen-wallet forward collection approved and started
 
 The owner approved starting the modelling handoff as a bounded, keyless plant lane.
