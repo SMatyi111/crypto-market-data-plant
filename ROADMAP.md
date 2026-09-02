@@ -531,7 +531,10 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   `bybit-{btc,eth,sol}-liquidations` accumulate `success_count` with 0 new
   errors, and that `hyperliquid-leaderboard-snapshot` succeeds once (daily);
   only then disable the interim `HyperliquidLeaderboardDaily` user task.
-- **Open-interest curated dataset (2026-09-02).** OI segments closed after the
+- **Open-interest curated dataset (2026-09-02) — APPROVED by the owner the same
+  day ("full chain"): STANDARDS v11, chain + offload row + `min_age_hours: 1`
+  score job in both configs, stale summaries re-issued; takes effect at the next
+  redeploy.** Original ask: OI segments closed after the
   v10 redeploy score replayable, but (a) the 245 runs closed before it keep
   their stale `invalid_mark_price` summaries — promote/quarantine only read the
   file — so they must be re-issued once, from the repo venv:
@@ -547,7 +550,10 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   STANDARDS §1 row + `STANDARDS_VERSION` bump — hence owner-gated. Until then
   the 245+ OI runs sit on the hot tier (no offload row either — deliberately,
   so an `age_only` move cannot strand them un-promoted on cold).
-- **Liquidation lanes vs. the 7200 s subprocess timeout (2026-09-02).** The
+- **Liquidation lanes vs. the 7200 s subprocess timeout (2026-09-02) — DECIDED:
+  option (a); `subprocess_timeout_seconds: 90000` (25 h) on the four
+  rotate-at-midnight liquidation lanes in both configs, effective at the next
+  redeploy.** Original ask: The
   Bybit/OKX liquidation workers are `rotate_at_midnight` day-long segments, but
   the runner kills any collector subprocess after 7200 s, so every run is torn
   at the 2 h mark and never gets a replay summary (126/133 Bybit runs). Options:
@@ -555,7 +561,8 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   (recommended — the lanes were designed for daily files); (b) declare them
   raw-only (STANDARDS row) and give them `age_only` offload rows; (c) drop
   `rotate_at_midnight` and use `max_segment_seconds: 1800` like the REST lanes.
-- **Options-IV cutover step (4) is ready (2026-09-02).** Both plant lanes have
+- **Options-IV cutover step (4) is ready (2026-09-02). Owner 2026-09-02: not yet —
+  keep both V1 tasks running in parallel for now.** Both plant lanes have
   run 24 h+ clean in parallel with V1; disabling `BinanceIV Collect History`
   and `BinanceIV Collect Deribit` (there is no task literally named
   `Binance IV Collector`) is now purely the owner's call. Step (5) (repoint the

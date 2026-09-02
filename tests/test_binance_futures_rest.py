@@ -767,3 +767,28 @@ def test_max_agg_id_in_recent_runs_ignores_runs_older_than_the_resume_gap(tmp_pa
         )
         == 150
     )
+
+
+def test_backfill_trades_replay_min_age_hours_skips_live_run(tmp_path, capsys) -> None:
+    # A 30-min OI segment still being written has clean events but no summary; the
+    # hourly score job must not mint one early (promote acts on it permanently).
+    now = utc_now()
+    live_run = tmp_path / now.strftime("%Y%m%d_%H%M%S")
+    (live_run / "clean").mkdir(parents=True)
+    row = BinanceOpenInterestNormalizer().normalize(
+        RawMessage(source="binance-futures", received_at=now,
+                   payload={"symbol": "BTCUSDT", "openInterest": "1", "time": int(now.timestamp() * 1000)})
+    ).to_dict()
+    (live_run / "clean" / "events.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+    args = cli._job_args(
+        SimpleNamespace(
+            job_type="backfill-trades-replay",
+            args={"source_root": str(tmp_path), "funding": True, "min_age_hours": 1,
+                  "max_age_hours": 24, "limit": 10, "format": "json"},
+        )
+    )
+    assert args.min_age_hours == 1
+    cli.run_backfill_trades_replay(args)
+    report = json.loads(capsys.readouterr().out)
+    assert report["skipped_count"] == 1 and report["created_count"] == 0
+    assert not (live_run / "metrics" / "replay_summary.json").exists()

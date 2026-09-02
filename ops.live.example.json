@@ -1475,6 +1475,11 @@
             "// binance_perp_liquidations": "Lane ships disabled (fstream delivers no frames from this host, ROADMAP 2026-08-25) but ran until the 2026-09-01 redeploy and left ~4.5k near-empty run dirs on the hot tier with no promoter. age_only so the offload drains them instead of flagging unconfigured_lane forever.",
             "source": "binance_perp_liquidations",
             "gate": "age_only"
+          },
+          {
+            "source": "binance_perp_open_interest",
+            "promotion_index": "G:\\market_archive\\curated\\research\\open_interest\\_promotion_index.jsonl",
+            "quarantine_index": "G:\\market_archive\\quarantine\\market\\binance_perp_open_interest\\_quarantine_index.jsonl"
           }
         ]
       }
@@ -1527,6 +1532,7 @@
         "ops_root": "G:\\market_archive\\ops",
         "normalized_root": "G:\\market_archive\\normalized\\trades",
         "market": "linear",
+        "subprocess_timeout_seconds": 90000,
         "rotate_at_midnight": true
       }
     },
@@ -1545,6 +1551,7 @@
         "ops_root": "G:\\market_archive\\ops",
         "normalized_root": "G:\\market_archive\\normalized\\trades",
         "market": "linear",
+        "subprocess_timeout_seconds": 90000,
         "rotate_at_midnight": true
       }
     },
@@ -1563,6 +1570,7 @@
         "ops_root": "G:\\market_archive\\ops",
         "normalized_root": "G:\\market_archive\\normalized\\trades",
         "market": "linear",
+        "subprocess_timeout_seconds": 90000,
         "rotate_at_midnight": true
       }
     },
@@ -1580,6 +1588,7 @@
         "output_root": "G:\\market_archive\\raw\\market",
         "ops_root": "G:\\market_archive\\ops",
         "normalized_root": "G:\\market_archive\\normalized\\trades",
+        "subprocess_timeout_seconds": 90000,
         "rotate_at_midnight": true
       }
     },
@@ -1597,6 +1606,7 @@
         "output_root": "G:\\market_archive\\raw\\market",
         "ops_root": "G:\\market_archive\\ops",
         "normalized_root": "G:\\market_archive\\normalized\\trades",
+        "subprocess_timeout_seconds": 90000,
         "rotate_at_midnight": true
       },
       "enabled": false
@@ -1659,10 +1669,23 @@
       }
     },
     {
-      "// open-interest curation": "OI runs are scored by the funding replayer (STANDARDS 'Open-interest channel', v10). Runs closed BEFORE the v10 redeploy keep their stale invalid_mark_price summaries - rescore them once with `backfill-trades-replay --funding --overwrite --source-root ...\\binance_perp_open_interest --max-age-hours 720 --limit 1000`; the disabled score job below is the ongoing self-heal (overwrite off). Promotion target curated/research/open_interest is a NEW curated dataset (STANDARDS section 1 row + version bump = owner decision, see ROADMAP Decision queue), so the chain ships disabled; enable both jobs together and add the matching archive-offload-cold lane row {source: binance_perp_open_interest, promotion_index: .../open_interest/_promotion_index.jsonl, quarantine_index: .../binance_perp_open_interest/_quarantine_index.jsonl} in the same edit - never a promoter without offload coverage.",
+      "// open-interest curation": "STANDARDS v11 (owner-approved 2026-09-02): OI runs are scored by the funding replayer on size (v10) and curated to curated/research/open_interest. Runs closed before the v10 redeploy were re-issued once with `backfill-trades-replay --funding --overwrite --min-age-hours 1`; the score job below is the ongoing self-heal (overwrite off, min_age_hours 1 so a live 30-min segment is never scored early). The archive-offload-cold lane row for binance_perp_open_interest gates on this promotion index.",
+      "name": "score-binance-perp-open-interest",
+      "job_type": "backfill-trades-replay",
+      "enabled": true,
+      "interval_seconds": 3600,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\binance_perp_open_interest",
+        "funding": true,
+        "min_age_hours": 1,
+        "limit": 1000,
+        "max_age_hours": 336
+      }
+    },
+    {
       "name": "quarantine-binance-perp-open-interest",
       "job_type": "quarantine-runs",
-      "enabled": false,
+      "enabled": true,
       "interval_seconds": 300,
       "args": {
         "source_root": "G:\\market_archive\\raw\\market\\binance_perp_open_interest",
@@ -1674,24 +1697,12 @@
     {
       "name": "promote-binance-perp-open-interest",
       "job_type": "promote-replayable",
-      "enabled": false,
+      "enabled": true,
       "interval_seconds": 300,
       "args": {
         "source_root": "G:\\market_archive\\raw\\market\\binance_perp_open_interest",
         "target_root": "G:\\market_archive\\curated\\research\\open_interest",
         "quarantine_index": "G:\\market_archive\\quarantine\\market\\binance_perp_open_interest\\_quarantine_index.jsonl",
-        "limit": 1000,
-        "max_age_hours": 336
-      }
-    },
-    {
-      "name": "score-binance-perp-open-interest",
-      "job_type": "backfill-trades-replay",
-      "enabled": false,
-      "interval_seconds": 3600,
-      "args": {
-        "source_root": "G:\\market_archive\\raw\\market\\binance_perp_open_interest",
-        "funding": true,
         "limit": 1000,
         "max_age_hours": 336
       }

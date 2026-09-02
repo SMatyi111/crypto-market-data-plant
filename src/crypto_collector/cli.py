@@ -1312,6 +1312,15 @@ def build_parser() -> argparse.ArgumentParser:
         "replayer mis-scored as invalid_mark_price.",
     )
     backfill_trades_parser.add_argument(
+        "--min-age-hours",
+        type=float,
+        default=0.0,
+        help="Skip runs younger than this (the collector may still be writing "
+        "them). Scoring a LIVE run mints a premature summary that the quarantine/"
+        "promote jobs act on. Default 0 keeps the historical behaviour; set it "
+        "above the lane's max_segment_seconds when re-scoring a live lane.",
+    )
+    backfill_trades_parser.add_argument(
         "--max-clock-skew-ms",
         type=float,
         default=None,
@@ -4338,6 +4347,7 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             stream=raw_args.get("stream", False),
             wallet_flow=raw_args.get("wallet_flow", False),
             funding=raw_args.get("funding", False),
+            min_age_hours=raw_args.get("min_age_hours", 0.0),
             max_clock_skew_ms=raw_args.get("max_clock_skew_ms"),
             format=raw_args.get("format", "text"),
         )
@@ -4743,6 +4753,7 @@ def run_backfill_trades_replay(args: argparse.Namespace) -> None:
         max_age_hours=args.max_age_hours,
         overwrite=args.overwrite,
         replay_fn=replay_fn,
+        min_age_hours=float(getattr(args, "min_age_hours", 0.0) or 0.0),
     )
     if args.format == "json":
         print(json.dumps(report.to_dict(), indent=2, sort_keys=True))

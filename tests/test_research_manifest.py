@@ -341,6 +341,8 @@ _LIVE_LANE_INVENTORY = {
     "binance_perp_depth": ("binance_perp", "depth", None),
     "binance_perp_trades": ("binance_perp", "trades", None),
     "binance_perp_funding": ("binance_perp", "funding", None),
+    # Multi-token dataset name: must not parse as dataset="open" -> None (invisible).
+    "binance_perp_open_interest": ("binance_perp", "open_interest", None),
 }
 
 

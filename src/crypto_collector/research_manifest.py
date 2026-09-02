@@ -14,13 +14,16 @@ DEFAULT_MANIFEST_ROOT = default_archive_root() / "curated" / "research" / "manif
 
 # How each dataset maps onto the on-disk layout (STANDARDS.md §1/§2). The raw
 # lane directory name is `<venue>[_perp]_<dataset>[_<instrument>]`; depth promotes
-# into market_replayable, trades into trades_replayable, funding into funding.
+# into market_replayable, trades into trades_replayable, funding into funding,
+# open_interest into open_interest. A dataset name may itself contain an
+# underscore (`open_interest`), so parse_lane matches the LONGEST token run here.
 # (Kalshi quote lanes are deliberately absent: kalshi sits outside the STANDARDS
 # market-data contract and has its own summaries.)
 DATASET_CONFIG: dict[str, dict[str, str]] = {
     "depth": {"curated_dataset": "market_replayable", "normalized_dataset": "market"},
     "trades": {"curated_dataset": "trades_replayable", "normalized_dataset": "trades"},
     "funding": {"curated_dataset": "funding", "normalized_dataset": "funding"},
+    "open_interest": {"curated_dataset": "open_interest", "normalized_dataset": "open_interest"},
 }
 
 # Worst-first precedence for a lane's gap-detection class: a lane that has EVER
@@ -313,11 +316,17 @@ def parse_lane(dirname: str) -> tuple[str, str, str | None] | None:
     if rest[0] == "perp" and len(rest) >= 2:
         venue = f"{venue}_perp"
         rest = rest[1:]
-    dataset = rest[0]
-    if not venue or dataset not in DATASET_CONFIG:
+    if not venue:
         return None
-    instrument = "_".join(rest[1:]) or None
-    return venue, dataset, instrument
+    # Longest dataset match first: `binance_perp_open_interest` must parse as
+    # dataset="open_interest", not dataset="open" (unknown -> lane invisible, the
+    # same silent-absence failure the perp fix above removed).
+    for width in range(len(rest), 0, -1):
+        dataset = "_".join(rest[:width])
+        if dataset in DATASET_CONFIG:
+            instrument = "_".join(rest[width:]) or None
+            return venue, dataset, instrument
+    return None
 
 
 def read_promotion_index_by_lane(path: Path) -> dict[str, dict[str, dict[str, Any]]]:

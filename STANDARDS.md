@@ -1,7 +1,16 @@
 # Data Standards
 
-`STANDARDS_VERSION = 10`
+`STANDARDS_VERSION = 11`
 
+> **v11 (2026-09-02, owner-approved):** new **`open_interest` dataset** — the
+> Binance USDT-M `/fapi/v1/openInterest` metric lane (`binance_perp_open_interest/`,
+> §4.5) is now curated to `curated/research/open_interest` through the standard
+> quarantine → promote chain (scored by `replay_funding_run`, v10 rule). Rows keep
+> the §1 event shape with `price = None` (all-null, so absent from the Parquet) and
+> the contract count in `size` + `metadata.open_interest`; partitions
+> `schema_version=v2/source/instrument/event_date` like `funding`. The research
+> manifest's lane parser now matches multi-token dataset names, so the lane
+> appears in the lanes view. No change to existing datasets.
 > **v10 (2026-09-02):** replay verdict for the Binance `open_interest` metric
 > lane (§4.5, "Open-interest channel"): `replay_funding_run` scores OI rows on
 > `size` (finite, ≥ 0) and requires `price` to stay `None`; failures are the new
@@ -113,6 +122,7 @@ instrument) lane (a fourth, non-market `text` dataset is specified in §4.6):
 | `depth`  | order book diffs / snapshots | `BinanceDepthNormalizer`, `CoinbaseDepthNormalizer`, `BybitDepthNormalizer`, `KrakenDepthNormalizer`, `MexcDepthNormalizer`, `OkxDepthNormalizer` (+ Binance USDT-M REST snapshot polling) | `market_replayable`  |
 | `trades` | trade prints     | `BinanceTradeNormalizer`, `CoinbaseTradeNormalizer`, `KrakenTradeNormalizer`, `BybitTradeNormalizer`, `MexcTradeNormalizer`, `OkxTradeNormalizer`, `HyperliquidWalletFillNormalizer` (+ REST polling lanes) | `trades_replayable` |
 | `funding` | perp funding / mark-price metric | Binance USDT-M `premiumIndex` REST poll (native dict passthrough) | `funding` |
+| `open_interest` | perp open-interest metric (contract count in `size`, `price` None) | `BinanceOpenInterestNormalizer` (Binance USDT-M `/fapi/v1/openInterest` REST poll) | `open_interest` |
 
 Venues live today: **Binance** (spot USDT + USDC depth + trades; USDT-M perp trades +
 depth + funding via REST polling — §4.5), **Coinbase** (trades + depth), **Kraken**
@@ -656,6 +666,14 @@ perp lanes poll REST (`binance-futures-rest-worker`), one lane per stream:
   and promoted to `curated/research/funding`; scored by `replay_funding_run`
   (`none_native`: finite-positive marks, monotonic timestamps — there is no sequence
   to prove).
+- **`open_interest`** (`/fapi/v1/openInterest` → `binance_perp_open_interest/`,
+  one lane per symbol, 60 s poll): venue-computed contract count, `price` None by
+  contract (see "Open-interest channel" above), value in `size` +
+  `metadata.open_interest`. Normalized into the **`open_interest` dataset** and
+  promoted to `curated/research/open_interest` (v11); scored by
+  `replay_funding_run` on `size`. Venue history is ~30 days, so this lane is the
+  only sub-daily record — the Vision daily zips (reference-data) cover 5-minute
+  history losslessly but trail by a day.
 
 ### 4.6 Text-capture lanes (`text-rss`, `text-reddit`) — the `text` dataset
 
