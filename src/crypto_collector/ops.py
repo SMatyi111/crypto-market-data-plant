@@ -148,7 +148,60 @@ def load_ops_config(path: Path) -> list[JobSpec]:
         raise ValueError(
             f"duplicate enabled job names in ops config {path}: {', '.join(duplicates)}"
         )
+    _reject_shared_worker_names(path, enabled)
+    _reject_control_characters(path, enabled)
     return enabled
+
+
+def _reject_shared_worker_names(path: Path, jobs: list[JobSpec]) -> None:
+    """Two enabled collector lanes sharing `args.worker_name` share one
+    StandaloneWorkerLock: only the first to start ever runs, the others crash
+    every dispatch with "standalone worker already active". Shipped live
+    2026-08-25 (3 open-interest lanes + the funding lane on one name, 3 bybit
+    liquidation lanes on another) and survived a redeploy unnoticed for 8 days
+    because the lane names themselves were unique."""
+    owners: dict[str, list[str]] = {}
+    for job in jobs:
+        if not is_collector_job(job):
+            continue
+        worker_name = job.args.get("worker_name")
+        if worker_name is None:
+            continue
+        owners.setdefault(str(worker_name), []).append(job.name)
+    shared = {name: jobs_ for name, jobs_ in owners.items() if len(jobs_) > 1}
+    if shared:
+        detail = "; ".join(f"{name!r} <- {', '.join(js)}" for name, js in sorted(shared.items()))
+        raise ValueError(
+            f"enabled collector lanes share a worker_name in ops config {path} "
+            f"(one standalone-worker lock per name, so only one of them can run): {detail}"
+        )
+
+
+def _reject_control_characters(path: Path, jobs: list[JobSpec]) -> None:
+    """A hand-edited JSON path with a single backslash before the lane folder
+    (G:, market_archive, one backslash, raw) is valid JSON - it parses as a
+    carriage return. The lane then fails every run on mkdir with WinError 123
+    and nothing upstream notices. Fail at load instead."""
+    offenders: list[str] = []
+
+    def walk(value: Any, where: str) -> None:
+        if isinstance(value, str):
+            if any(ord(ch) < 0x20 for ch in value):
+                offenders.append(f"{where}={value!r}")
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                walk(item, f"{where}.{key}")
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                walk(item, f"{where}[{index}]")
+
+    for job in jobs:
+        walk(job.args, f"{job.name}.args")
+    if offenders:
+        raise ValueError(
+            f"control characters in ops config {path} string values (a JSON path with a "
+            f"single backslash before r/n/t?): {'; '.join(offenders)}"
+        )
 
 
 # Collector lanes that poll a REST/HTTP API on an interval instead of holding a

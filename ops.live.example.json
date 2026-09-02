@@ -1470,6 +1470,11 @@
           {
             "source": "deribit_options",
             "gate": "age_only"
+          },
+          {
+            "// binance_perp_liquidations": "Lane ships disabled (fstream delivers no frames from this host, ROADMAP 2026-08-25) but ran until the 2026-09-01 redeploy and left ~4.5k near-empty run dirs on the hot tier with no promoter. age_only so the offload drains them instead of flagging unconfigured_lane forever.",
+            "source": "binance_perp_liquidations",
+            "gate": "age_only"
           }
         ]
       }
@@ -1517,7 +1522,7 @@
         "segment_count": 100000,
         "max_segments": 1,
         "cooldown_seconds": 1.0,
-        "worker_name": "bybit-liquidations-worker",
+        "worker_name": "bybit-liquidations-worker-btc",
         "output_root": "G:\\market_archive\\raw\\market",
         "ops_root": "G:\\market_archive\\ops",
         "normalized_root": "G:\\market_archive\\normalized\\trades",
@@ -1535,7 +1540,7 @@
         "segment_count": 100000,
         "max_segments": 1,
         "cooldown_seconds": 1.0,
-        "worker_name": "bybit-liquidations-worker",
+        "worker_name": "bybit-liquidations-worker-eth",
         "output_root": "G:\\market_archive\\raw\\market",
         "ops_root": "G:\\market_archive\\ops",
         "normalized_root": "G:\\market_archive\\normalized\\trades",
@@ -1553,7 +1558,7 @@
         "segment_count": 100000,
         "max_segments": 1,
         "cooldown_seconds": 1.0,
-        "worker_name": "bybit-liquidations-worker",
+        "worker_name": "bybit-liquidations-worker-sol",
         "output_root": "G:\\market_archive\\raw\\market",
         "ops_root": "G:\\market_archive\\ops",
         "normalized_root": "G:\\market_archive\\normalized\\trades",
@@ -1608,7 +1613,7 @@
         "segment_count": 100000,
         "max_segments": 1,
         "cooldown_seconds": 1.0,
-        "worker_name": "binance-futures-rest-funding",
+        "worker_name": "binance-futures-rest-open-interest-btc",
         "output_root": "G:\\market_archive\\raw\\market",
         "ops_root": "G:\\market_archive\\ops",
         "normalized_root": "G:\\market_archive\\normalized\\open_interest",
@@ -1627,7 +1632,7 @@
         "segment_count": 100000,
         "max_segments": 1,
         "cooldown_seconds": 1.0,
-        "worker_name": "binance-futures-rest-funding",
+        "worker_name": "binance-futures-rest-open-interest-eth",
         "output_root": "G:\\market_archive\\raw\\market",
         "ops_root": "G:\\market_archive\\ops",
         "normalized_root": "G:\\market_archive\\normalized\\open_interest",
@@ -1646,11 +1651,48 @@
         "segment_count": 100000,
         "max_segments": 1,
         "cooldown_seconds": 1.0,
-        "worker_name": "binance-futures-rest-funding",
+        "worker_name": "binance-futures-rest-open-interest-sol",
         "output_root": "G:\\market_archive\\raw\\market",
         "ops_root": "G:\\market_archive\\ops",
         "normalized_root": "G:\\market_archive\\normalized\\open_interest",
         "max_segment_seconds": 1800
+      }
+    },
+    {
+      "// open-interest curation": "OI runs are scored by the funding replayer (STANDARDS 'Open-interest channel'). Promotion target curated/research/open_interest is a NEW curated dataset (STANDARDS section 1 row + version bump = owner decision, see ROADMAP Decision queue), so the chain ships disabled; enable both jobs together and add the matching archive-offload-cold lane row {source: binance_perp_open_interest, promotion_index: .../open_interest/_promotion_index.jsonl, quarantine_index: .../binance_perp_open_interest/_quarantine_index.jsonl} in the same edit - never a promoter without offload coverage.",
+      "name": "quarantine-binance-perp-open-interest",
+      "job_type": "quarantine-runs",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\binance_perp_open_interest",
+        "quarantine_root": "G:\\market_archive\\quarantine\\market\\binance_perp_open_interest",
+        "limit": 1000,
+        "max_age_hours": 336
+      }
+    },
+    {
+      "name": "promote-binance-perp-open-interest",
+      "job_type": "promote-replayable",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\binance_perp_open_interest",
+        "target_root": "G:\\market_archive\\curated\\research\\open_interest",
+        "quarantine_index": "G:\\market_archive\\quarantine\\market\\binance_perp_open_interest\\_quarantine_index.jsonl",
+        "limit": 1000,
+        "max_age_hours": 336
+      }
+    },
+    {
+      "// hyperliquid-leaderboard-snapshot": "Raw-only daily reference snapshot (STANDARDS 4.8). Was only ever in the live config, where its output_root shipped with a single backslash before raw (= a carriage return) and failed every run on mkdir; load_ops_config now rejects control characters. Disabled in the template because it counts toward CollectorConcurrency.",
+      "name": "hyperliquid-leaderboard-snapshot",
+      "job_type": "hyperliquid-leaderboard-snapshot",
+      "enabled": false,
+      "interval_seconds": 86400,
+      "args": {
+        "output_root": "G:\\market_archive\\raw\\market",
+        "format": "text"
       }
     },
     {

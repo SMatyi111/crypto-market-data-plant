@@ -279,8 +279,12 @@ Venue-computed contract count, polled over REST (`/fapi/v1/openInterest`).
 `price` is deliberately None - OI is a quantity, and carrying it in `price`
 would let contract counts leak into price aggregation; the value rides in
 `size` and `metadata.open_interest`. Metric lane, none_native, curated via the
-funding replayer. Venue retention is ~30 days, so a poll gap is recoverable for
-a month and permanent after.
+funding replayer, which scores `open_interest` rows on `size` (finite, >= 0 -
+zero OI is a legal reading) instead of `price`; a missing/invalid reading is
+the `invalid_open_interest` finding. (Until 2026-09-02 the replayer scored OI
+rows on `price` and every OI run was flagged `invalid_mark_price`.) Venue
+retention is ~30 days, so a poll gap is recoverable for a month and permanent
+after.
 
 ### Liquidations channel (`channel = "liquidations"`)
 

@@ -23,6 +23,7 @@ from crypto_collector.collectors.binance_futures_rest import (
 )
 from crypto_collector.collectors.rest_poll import RestPollingCollector
 from crypto_collector.market_normalizers import (
+    BinanceOpenInterestNormalizer,
     BinanceDepthNormalizer,
     BinanceFuturesFundingNormalizer,
 )
@@ -422,6 +423,39 @@ def test_replay_funding_run_replayable_and_flags_missing_mark(tmp_path) -> None:
     (bad_run / "clean" / "events.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
     bad = replay_funding_run(bad_run, write_summary=True)
     assert bad.replayable is False and "invalid_mark_price" in bad.findings
+
+
+def test_replay_funding_run_scores_open_interest_on_size_not_price(tmp_path) -> None:
+    # STANDARDS "Open-interest channel": price is None BY CONTRACT and the value
+    # rides in `size`. Scoring OI rows on `price` flagged every live OI run
+    # invalid_mark_price (245/245, 2026-08-25..09-02) so none was ever promoted.
+    now = utc_now()
+    ms = int(now.timestamp() * 1000)
+    good = [
+        BinanceOpenInterestNormalizer().normalize(
+            RawMessage(source="binance-futures", received_at=now,
+                       payload={"symbol": "SOLUSDT", "openInterest": "8688508.66", "time": ms})
+        ).to_dict(),
+        # Zero OI is a legal reading, not a missing one.
+        BinanceOpenInterestNormalizer().normalize(
+            RawMessage(source="binance-futures", received_at=now,
+                       payload={"symbol": "SOLUSDT", "openInterest": "0", "time": ms + 1})
+        ).to_dict(),
+    ]
+    assert good[0]["price"] is None and good[0]["channel"] == "open_interest"
+    summary = replay_funding_run(_write_clean_run(tmp_path, good), write_summary=True)
+    assert summary.replayable is True, summary.findings
+    assert summary.invalid_price_count == 0 and summary.invalid_size_count == 0
+
+    bad_run = tmp_path / "bad"
+    (bad_run / "clean").mkdir(parents=True)
+    row = good[0].copy()
+    row["size"] = None  # OI reading missing
+    (bad_run / "clean" / "events.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+    bad = replay_funding_run(bad_run, write_summary=True)
+    assert bad.replayable is False
+    assert "invalid_open_interest" in bad.findings and "invalid_mark_price" not in bad.findings
+    assert bad.invalid_size_count == 1 and bad.invalid_price_count == 0
 
 
 # --- end-to-end segment (stubbed pollers, no network, no parquet) ------------

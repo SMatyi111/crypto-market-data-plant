@@ -10,6 +10,13 @@ repository itself so CI turns known footguns into red X's:
   never dispatched (starved lanes shipped twice: 12<17 and 17<21).
 - Each raw lane may appear in at most one archive-offload job: two jobs owning
   the same lane is a double-move race on aged run dirs.
+- Enabled collector lanes must not share `args.worker_name`: the standalone
+  worker lock is keyed by that name, so only one of them ever runs (2026-08-25:
+  the 3 open-interest lanes + funding, and the 3 bybit liquidation lanes,
+  crash-looped for 8 days through a redeploy).
+- No control characters in config string values: a JSON path with a single
+  backslash before `raw` parses as a carriage return and the lane fails every
+  mkdir with WinError 123.
 """
 
 from __future__ import annotations
@@ -142,3 +149,52 @@ def test_each_lane_has_at_most_one_offload_job(config_name: str) -> None:
         f"{config_name}: lanes offloaded by more than one archive-offload job "
         f"(double-handling): {duplicates}"
     )
+
+
+@pytest.mark.parametrize("config_name", OPS_CONFIGS)
+def test_enabled_collector_lanes_have_unique_worker_names(config_name: str) -> None:
+    """`StandaloneWorkerLock` is keyed by `args.worker_name`, not by job name.
+    Lanes copy-pasted from a sibling (open-interest from funding, bybit
+    liquidations per symbol) kept the sibling's worker_name, so the scheduler
+    dispatched all of them but only the first ever acquired the lock; the rest
+    failed every 5 s with "standalone worker already active" -- 39k of 48k job
+    results per day -- and the failure survived the 2026-09-01 redeploy because
+    every job NAME was unique. Mirrors the loader check in
+    `crypto_collector.ops.load_ops_config`; this pins it for the template too."""
+    config = json.loads((REPO_ROOT / config_name).read_text(encoding="utf-8"))
+    owners: dict[str, list[str]] = {}
+    for job in config["jobs"]:
+        if not job.get("enabled", True) or job["job_type"] not in COLLECTOR_JOB_TYPES:
+            continue
+        worker_name = job.get("args", {}).get("worker_name")
+        if worker_name is not None:
+            owners.setdefault(str(worker_name), []).append(job["name"])
+    shared = {name: jobs for name, jobs in owners.items() if len(jobs) > 1}
+    assert not shared, (
+        f"{config_name}: enabled collector lanes share a worker_name (one lock per "
+        f"name, so only one lane per name can run): {shared}"
+    )
+
+
+@pytest.mark.parametrize("config_name", OPS_CONFIGS)
+def test_config_strings_have_no_control_characters(config_name: str) -> None:
+    """Hand-edited JSON: a path with ONE backslash before `raw` is valid JSON
+    containing a carriage return. The leaderboard lane shipped that way in the
+    live config and failed every daily run with WinError 123 on mkdir. Mirrors
+    the loader check in `load_ops_config`."""
+    config = json.loads((REPO_ROOT / config_name).read_text(encoding="utf-8"))
+    offenders: list[str] = []
+
+    def walk(value, where: str) -> None:
+        if isinstance(value, str):
+            if any(ord(ch) < 0x20 for ch in value):
+                offenders.append(f"{where}={value!r}")
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                walk(item, f"{where}.{key}")
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                walk(item, f"{where}[{index}]")
+
+    walk(config, config_name)
+    assert not offenders, f"control characters in config strings: {offenders}"
