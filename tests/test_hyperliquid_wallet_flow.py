@@ -399,6 +399,7 @@ def test_backfill_trades_replay_threads_wallet_flow_scorer(
                 "wallet_flow": True,
                 "max_clock_skew_ms": 123_000.0,
                 "max_age_hours": 336,
+                "min_age_hours": 0,  # the fixture run is named "now"
                 "limit": 10,
                 "format": "json",
             },

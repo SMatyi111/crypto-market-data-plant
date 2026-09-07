@@ -28,7 +28,9 @@ DEFAULT_ARCHIVE_ROOT = Path(r"G:\market_archive")
 # v10 (2026-09-02): open_interest rows are scored on `size` (finite, >= 0, price
 # must stay None) by `replay_funding_run`; before, they were scored on `price`
 # and no OI run could be replayable. Funding rows unchanged.
-STANDARDS_VERSION = 10
+# v11 (2026-09-02): new `open_interest` curated dataset (binance_perp_open_interest
+# promoted to curated/research/open_interest); existing datasets unchanged.
+STANDARDS_VERSION = 11
 
 _FALLBACK_WARNED: set[str] = set()
 

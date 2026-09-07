@@ -1312,6 +1312,16 @@ def build_parser() -> argparse.ArgumentParser:
         "replayer mis-scored as invalid_mark_price.",
     )
     backfill_trades_parser.add_argument(
+        "--min-age-hours",
+        type=float,
+        default=1.0,
+        help="Skip runs younger than this (the collector may still be writing "
+        "them). Scoring a LIVE run mints a premature summary that the 300 s "
+        "quarantine/promote jobs act on - promote then indexes the partial run and "
+        "never revisits it. Keep it above the lane's segment length expressed in "
+        "hours (1800 s segments -> the 1 h default). Pass 0 only for closed lanes.",
+    )
+    backfill_trades_parser.add_argument(
         "--max-clock-skew-ms",
         type=float,
         default=None,
@@ -3591,6 +3601,11 @@ def run_ops_runner(args: argparse.Namespace) -> None:
 # on the subprocess. Maintenance jobs (quarantine/promote/manifest/health/...) stay
 # in-process — they're light and already serialized by the runner.
 _COLLECTOR_SUBPROCESS_TIMEOUT_SECONDS = 7200.0
+# A rotate_at_midnight lane runs ONE segment per UTC day, so its subprocess legitimately
+# lives up to 24 h (+ a start just after midnight). The 7200 s default tore every
+# Bybit/OKX liquidation run at the 2 h mark before it could write a replay summary
+# (126/133 Bybit runs, 2026-08-25..09-02) and nothing flagged it.
+_MIDNIGHT_ROTATION_TIMEOUT_SECONDS = 90_000.0
 
 
 def _execute_ops_job(job: JobSpec) -> JobExecutionResult | str | None:
@@ -3608,6 +3623,8 @@ def _collector_subprocess_timeout_seconds(job: JobSpec) -> float:
     configured = job.args.get("subprocess_timeout_seconds")
     if configured is not None:
         return float(configured)
+    if job.args.get("rotate_at_midnight"):
+        return _MIDNIGHT_ROTATION_TIMEOUT_SECONDS
     if job.args.get("max_segment_seconds") or job.job_type.endswith("-worker"):
         return _COLLECTOR_SUBPROCESS_TIMEOUT_SECONDS
     interval = max(0, int(job.interval_seconds))
@@ -4338,6 +4355,10 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             stream=raw_args.get("stream", False),
             wallet_flow=raw_args.get("wallet_flow", False),
             funding=raw_args.get("funding", False),
+            # 1 h floor by default (2x the 1800 s live segments): scoring the run a
+            # collector is still writing mints a premature summary that promote acts
+            # on permanently (run-keyed index). Same posture as backfill-text-replay.
+            min_age_hours=raw_args.get("min_age_hours", 1.0),
             max_clock_skew_ms=raw_args.get("max_clock_skew_ms"),
             format=raw_args.get("format", "text"),
         )
@@ -4743,6 +4764,7 @@ def run_backfill_trades_replay(args: argparse.Namespace) -> None:
         max_age_hours=args.max_age_hours,
         overwrite=args.overwrite,
         replay_fn=replay_fn,
+        min_age_hours=float(getattr(args, "min_age_hours", 1.0) or 0.0),
     )
     if args.format == "json":
         print(json.dumps(report.to_dict(), indent=2, sort_keys=True))

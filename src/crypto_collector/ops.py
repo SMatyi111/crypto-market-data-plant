@@ -1162,6 +1162,12 @@ def build_health_report(
                 segment_seconds = float(job.args.get("max_segment_seconds") or 0.0)
             except (TypeError, ValueError):
                 segment_seconds = 0.0
+            if job.args.get("rotate_at_midnight"):
+                # Day-bounded segment (Bybit/OKX liquidations): the segment legitimately
+                # runs to midnight UTC and the runner allows it 25 h, so its cadence is a
+                # day, not the 5 s re-dispatch interval - otherwise every such lane is
+                # long_running_job after 12.5 s and forces status=error all day.
+                segment_seconds = max(segment_seconds, 86_400.0)
             cadence_seconds = max(float(job.interval_seconds), segment_seconds)
             stale_threshold = cadence_seconds * job_stale_multiplier
             # A running segment is "long" only past its own rotation deadline (+ slack

@@ -1,7 +1,21 @@
 # Data Standards
 
-`STANDARDS_VERSION = 10`
+`STANDARDS_VERSION = 11`
 
+> **v11 (2026-09-02, owner-approved):** new **`open_interest` dataset** — the
+> Binance USDT-M `/fapi/v1/openInterest` metric lane (`binance_perp_open_interest/`,
+> §4.5) is now curated to `curated/research/open_interest` through the standard
+> quarantine → promote chain (scored by `replay_funding_run`, v10 rule). Rows keep
+> the §1 event shape with `price = None` (all-null, so absent from the Parquet) and
+> the contract count in `size` + `metadata.open_interest`; partitions
+> `schema_version=v2/source/instrument/event_date` like `funding`. Each symbol lane
+> writes its own raw dir `binance_perp_open_interest_<symbol>/` (`source_suffix`);
+> the un-suffixed `binance_perp_open_interest/` is the pre-v11 shared dir, drained
+> by its own quarantine/promote pair. `replay_funding_run` checks OI ordering
+> **per product**, so the merged runs that shared dir produced on 2026-09-02 are
+> curated correctly (rows partition by instrument). The research manifest's lane
+> parser now matches multi-token dataset names, so the lanes appear in the lanes
+> view. No change to existing datasets.
 > **v10 (2026-09-02):** replay verdict for the Binance `open_interest` metric
 > lane (§4.5, "Open-interest channel"): `replay_funding_run` scores OI rows on
 > `size` (finite, ≥ 0) and requires `price` to stay `None`; failures are the new
@@ -113,6 +127,7 @@ instrument) lane (a fourth, non-market `text` dataset is specified in §4.6):
 | `depth`  | order book diffs / snapshots | `BinanceDepthNormalizer`, `CoinbaseDepthNormalizer`, `BybitDepthNormalizer`, `KrakenDepthNormalizer`, `MexcDepthNormalizer`, `OkxDepthNormalizer` (+ Binance USDT-M REST snapshot polling) | `market_replayable`  |
 | `trades` | trade prints     | `BinanceTradeNormalizer`, `CoinbaseTradeNormalizer`, `KrakenTradeNormalizer`, `BybitTradeNormalizer`, `MexcTradeNormalizer`, `OkxTradeNormalizer`, `HyperliquidWalletFillNormalizer` (+ REST polling lanes) | `trades_replayable` |
 | `funding` | perp funding / mark-price metric | Binance USDT-M `premiumIndex` REST poll (native dict passthrough) | `funding` |
+| `open_interest` | perp open-interest metric (contract count in `size`, `price` None) | `BinanceOpenInterestNormalizer` (Binance USDT-M `/fapi/v1/openInterest` REST poll) | `open_interest` |
 
 Venues live today: **Binance** (spot USDT + USDC depth + trades; USDT-M perp trades +
 depth + funding via REST polling — §4.5), **Coinbase** (trades + depth), **Kraken**
@@ -301,7 +316,13 @@ Forced closes are **not** trades and get their own channel. The Bybit v5
 `data: [...]`, same `S/T/p/s/v` keys), so routing it through the trade
 normalizer silently files liquidations as ordinary prints and corrupts the
 trade tape. Any future venue added to this channel must be checked for the same
-shape collision.
+shape collision. Raw dirs are per symbol (`bybit_perp_liquidations_<symbol>/`,
+`source_suffix`) since 2026-09-02: the three Bybit lanes shared
+`bybit_perp_liquidations/` and their synchronized segments merged into one
+run dir (run dirs are named to the second) — 31 of 135 historical runs and
+every post-restart run were mixed-symbol, with at least one torn
+`clean/events.jsonl` line from the concurrent appends. The un-suffixed dir is
+frozen history.
 
 | field          | type            | value |
 | -------------- | --------------- | ----- |
@@ -656,6 +677,16 @@ perp lanes poll REST (`binance-futures-rest-worker`), one lane per stream:
   and promoted to `curated/research/funding`; scored by `replay_funding_run`
   (`none_native`: finite-positive marks, monotonic timestamps — there is no sequence
   to prove).
+- **`open_interest`** (`/fapi/v1/openInterest` → `binance_perp_open_interest_<symbol>/`,
+  one lane and one raw dir per symbol, 60 s poll — never share a raw dir between
+  lanes: run dirs are named to the second, so lockstep segments merge): venue-computed
+  contract count, `price` None by
+  contract (see "Open-interest channel" above), value in `size` +
+  `metadata.open_interest`. Normalized into the **`open_interest` dataset** and
+  promoted to `curated/research/open_interest` (v11); scored by
+  `replay_funding_run` on `size`. Venue history is ~30 days, so this lane is the
+  only sub-daily record — the Vision daily zips (reference-data) cover 5-minute
+  history losslessly but trail by a day.
 
 ### 4.6 Text-capture lanes (`text-rss`, `text-reddit`) — the `text` dataset
 
