@@ -178,6 +178,29 @@ task was disabled (not deleted) the same hour. Options-IV lanes resumed on
 cadence. Still open: the Decision-queue items above (OI rescore + curated
 dataset, liquidation lanes vs the 7200 s timeout, V1 task disable).
 
+**Verified 2026-09-02 20:06Z (4 h after the restart):** `binance-{btc,eth,sol}-open-interest`
+and `binance-futures-rest-funding` 8 successes each, 0 errors (1800 s segments);
+1,529 success / 8 error job results since 16:03Z (pre-restart 24 h: 9,062 /
+38,563), 0 `standalone worker already active` rows, six new per-lane locks
+present. All 8 errors are the known 7200 s subprocess kills of
+`bybit-{btc,eth,sol}-liquidations` + `okx-swap-liquidations` (18:03Z, 20:03Z): the
+runner read its config at 16:03Z, before `subprocess_timeout_seconds: 90000`
+landed on disk (PR #54, 16:19Z), so that fix is not deployed yet.
+`hyperliquid-leaderboard-snapshot` next run 2026-09-03 16:03Z;
+`HyperliquidLeaderboardDaily` confirmed Disabled. **New finding — same-second
+run-dir collision:** run dirs are `<source>/<YYYYMMDD_HHMMSS>` with no symbol
+component (`prepare_run_paths`), and the three OI lanes (shared
+`binance_perp_open_interest/`, synchronized 1800 s segments) and the three Bybit
+liquidation lanes (shared `bybit_perp_liquidations/`) start their segments within
+the same second, so they append into one run dir: 13 run dirs for 21 OI segments,
+9 of the 12 closed OI runs hold 2-3 symbols interleaved and score
+`non_monotonic_event_time` (non-replayable); only the 3 single-symbol runs are
+replayable; one torn `clean/events.jsonl` line from the concurrent appends. Both
+post-restart Bybit runs are mixed (31 of 135 historical Bybit runs already were).
+Not fixed here — see Decision queue. Note: the shared checkout on the box has
+been on `feat/open-interest-curation-v11` (PR #54, unmerged) since 16:19Z, so
+`run-job` child processes import that code while the runner itself is 107a235.
+
 **Previous ops audit:** 2026-08-17 — **market/text capture healthy; Hyperliquid
 stalled awaiting the elevated restart.** Manual markers only (the health command
 was not re-attempted after the 08-09 timeouts). SYSTEM-runner heartbeat fresh
@@ -691,6 +714,22 @@ Decided 2026-06-11 (recorded, closed):
   audit ritual's ~3-day detection latency is accepted.
 - Baseline-audit completion (open item 0): **approved** for the next session,
   slim design; the deferred PR #17 review pass folds into its ops-runner pass.
+- **Per-symbol source dirs for the OI and Bybit liquidation lanes (2026-09-02).**
+  The three `binance-*-open-interest` lanes and the three `bybit-*-liquidations`
+  lanes write into one `<source>/<YYYYMMDD_HHMMSS>/` run dir whenever their
+  segments start in the same second — systematic after a restart, because the
+  segments stay synchronized — so 9 of the 12 post-restart OI runs are
+  mixed-symbol and non-replayable, and the PR #54 OI curated chain would promote
+  nothing from them. Options: (a) set `source_suffix` per lane in both configs
+  (`binance_perp_open_interest_{btcusdt,ethusdt,solusdt}`,
+  `bybit_perp_liquidations_{...}`), the per-instrument mechanism STANDARDS §2.1
+  already documents; a layout change for those lanes, so the PR #54 OI
+  promote/quarantine/score jobs, the offload lane rows and the research-manifest
+  lane parser must follow, and the per-source `_collector_state.json` resume
+  state stops being shared between symbols; (b) make `prepare_run_paths`
+  collision-proof (suffix on an existing dir) — code-only, but it changes the
+  run-dir naming contract in STANDARDS §2.1. Recommendation: (a), then redeploy.
+  Owner-gated (layout + config + redeploy).
 
 ## Environmental constraints (verified, not bugs)
 
