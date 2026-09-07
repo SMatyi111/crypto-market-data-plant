@@ -8,7 +8,7 @@ changes scope or state. Companion docs:
 - [`STANDARDS.md`](STANDARDS.md) — the data contract (schemas, replayability, retention)
 - [`docs/HISTORY.md`](docs/HISTORY.md) — resolved-work narrative (what was fixed, and why)
 
-Last updated: **2026-08-17**.
+Last updated: **2026-09-07**.
 
 > **Operating mode — safe shaping (owner directive, 2026-07-04).** No extended
 > building on Claude's initiative: no new venues, lanes, or instruments, no big
@@ -128,7 +128,75 @@ the same restart.
 | ~~2026-06-19~~ DONE 06-24 | The 06-17 `robocopy /MINAGE:3` move never finished (~88% of partitions still on G:), leaving G: at **3.9 GB free**. First retry (06-22) was killed by the Bash tool's 10-min timeout after freeing ~57 GB. Relaunched **detached via `Start-Process`** (pid 48444) so it survives session/tool teardown -> **COMPLETED 2026-06-24 16:19, FAILED: 0** (45.29 M files / 555 GB moved G:->`D:\market_archive_cold`). **G: now 489 GB free.** D: holds 113,407 normalized partitions (full set). 1 partition / 2 parquet files remain on G: -- robocopy *skipped* them (already byte-present on D: from the 06-17 partial), so redundant not stranded; immaterial (489 GB free). Lesson: long-running moves must be detached, never run inside a Bash call (10-min cap). |
 | ~~2026-07-26~~ DONE 08-01 | **Text raw offload wired for the next restart.** `archive-offload-text` is enabled in `ops.live.local.json` with the indexed promotion/quarantine gate, preserve-first aged-run backstop, byte-verified cold move, and `write_report:false` so it cannot replace the market health report. It remains inert until the guarded elevated runner restart. |
 
-**Last ops audit:** 2026-09-02 — **runner healthy, options-IV cutover live; the
+**Last ops audit:** 2026-09-07 — **every lane capturing and fresh; health
+`status=error` is entirely the two 09-02 defects still waiting on PR #54 + a
+redeploy; one NEW dataset-wide finding: roughly a third of curated runs are
+truncated because the hourly scorers score the live segment.** Runner pid 31808
+up since 2026-09-02 16:03Z (100 jobs / 32 pooled, heartbeat 4 s). 45,490 job
+results since the restart: 45,230 success / 260 error (99.43 %). Newest raw run
+≤ 28 min on all 33 hot lanes; promotions within minutes on all 22 indexed
+lanes; options lanes on cadence (470 Binance chain / 1,396 Deribit snapshots
+since the restart); leaderboard daily 5/5. Quarantine intake 7 d: kraken 24 and
+coinbase 14 `trade_id_gaps` (4–7 % of runs), binance ≤ 2, text_rss 142
+`no_events` (by design). G: 172 GB free (−22 GB since 09-02), D: 908 GB; hot
+raw 131 GB, ops root 7 GB. Offload 13:38Z pass: 66 runs / 2.07 GB, 0 failed,
+eligible == moved (the 1000 cap no longer binds); `stuck_unaccounted=3`
+(funding 08-30 + 09-01, perp-depth 08-30 restart partials; the 10-day backstop
+will classify them). `main a35deac`: 556 tests pass, ruff clean. **Findings:**
+(1) **NEW — truncated promotions on every scored lane, since at least June.**
+The hourly `backfill-*` score jobs (`max_age_hours: 6`, no minimum age) land
+every ~77 min on the single maintenance slot and score whichever 1800 s segment
+is still being written; the 5-min promoter then indexes the partial rows, and
+the collector's own close-of-segment summary is never re-read because the
+promotion index already holds the run. Measured as promoted_rows vs raw
+`clean/` rows: since 09-03, 58–71 of ~190 promoted runs per trades lane carry
+< 98 % of their rows (e.g. `binance_perp_trades/20260903_134004`: 19,461 of
+61,886); depth lanes 38–43 of ~124 since 09-05; `binance_trades` sampled by
+promotion day: 06-20 8/44, 07-10 17/49, 07-25 12/47, 08-10 12/44, 08-25 5/66,
+09-01 15/51; `hyperliquid_wallet_flow` over its whole life 225 of 950 runs
+short = **7.5 % of fills absent from curated** (227,086 promoted of 245,387
+clean). Funding (inline summary, no hourly scorer) and text (`min_age_hours: 1`)
+are unaffected. Raw is intact on hot + cold, so this is repairable. PR #54 adds
+`min_age_hours` (default 1 h) to `backfill-trades-replay` and text only —
+`backfill-replay` (Binance depth ×2) and `backfill-stream-depth` (8 depth
+lanes) still have no minimum age (commented on the PR). Repair of the
+historical rows touches curated data → Decision queue. (2) **The shared-run-dir
+collision is still corrupting raw daily.** Since the restart
+`binance_perp_open_interest/` has 220 mixed-symbol runs of 374, 41 torn
+`clean/events.jsonl` lines and 20 worker crashes (JSON decode of a
+half-written line by another lane's replayer, plus `PermissionError` races on
+the shared `replay_summary.json`) — all three lanes die in the same second
+(09-02 20:36:07, 09-04 21:36:48). `bybit_perp_liquidations/`: 56 mixed of 70,
+11 torn lines. The fix (`source_suffix`) is on disk in `ops.live.local.json`
+(undeployed) and in PR #54. (3) **Liquidation lanes:** 230 of the 260 errors
+are the 7200 s kills (every run of all four lanes); 69/70 Bybit and 55/60 OKX
+runs have no replay summary; data is on disk. The 25 h rule is code in PR #54
+and the local config carries no explicit pin, so a redeploy on `main` alone
+leaves this unfixed. (4) **Config drift / ordering hazard.**
+`ops.live.local.json` (edited 09-02 22:35Z, 115 jobs / 112 enabled) is ahead
+of the running config (100 jobs) and of `main`: its 12 OI curation jobs and
+`min_age_hours` args need PR #54's code (`main` silently drops `min_age_hours`
+for trades scorers; health flags the 12 jobs `stale_job`). `source_suffix` is
+supported on `main`. **Merge #54 first, then redeploy** — the reverse order
+deploys the OI curation chain with live-segment scoring and no liquidation
+timeout fix. (5) Transient, self-healed: 4 fapi transport errors (SSL EOF /
+WinError 10054), 6 Deribit 503s 09-05 09:02–09:35Z. (6) Hygiene: archived the
+two orphaned heartbeat files (`binance-liquidations-worker`,
+`bybit-liquidations-worker`) via `ops-prune-stale-workers --apply` →
+`ops/archived_standalone_workers/20260907_144114` (clears the four
+`unmanaged_*` findings). **The test suite writes to the live archive:**
+`tests/test_ops.py` runs the real runner with `mock` jobs and no
+`output_root`, so every `pytest` run adds run dirs under `raw/market/mock/`
+(56 now, two from this audit's own test run) — the source of the standing
+`unconfigured_lane:mock` warning (open item 16). `heartbeat_history.jsonl` is
+**5.8 GB** (27 KB per row, ~80 MB/day; open item 12).
+`scripts/redeploy_runner.ps1` starts the runner without redirecting
+stdout/stderr, so `runner.log` has not been written since the 08-25 boot-task
+start and a runner-process crash would leave no trace (open item 17). V1 tasks
+`BinanceIV Collect History` / `Collect Deribit` still run (cutover step 4,
+owner).
+
+**Previous ops audit:** 2026-09-02 — **runner healthy, options-IV cutover live; the
 three lanes added 2026-08-25 have been defective since deploy day.** SYSTEM
 runner redeployed by the owner 2026-09-01 ~12:32Z (PR #51 merged 12:30Z), so
 merged == deployed for the first time since 08-09; heartbeat fresh, 100 enabled
@@ -178,6 +246,29 @@ task was disabled (not deleted) the same hour. Options-IV lanes resumed on
 cadence. Same-day owner decisions (OI curated dataset v11, liquidation lane
 timeout rule) shipped in PR #54 — see `docs/HISTORY.md` 2026-09-02; V1 task
 disable stays queued ("not yet").
+
+**Verified 2026-09-02 20:06Z (4 h after the restart):** `binance-{btc,eth,sol}-open-interest`
+and `binance-futures-rest-funding` 8 successes each, 0 errors (1800 s segments);
+1,529 success / 8 error job results since 16:03Z (pre-restart 24 h: 9,062 /
+38,563), 0 `standalone worker already active` rows, six new per-lane locks
+present. All 8 errors are the known 7200 s subprocess kills of
+`bybit-{btc,eth,sol}-liquidations` + `okx-swap-liquidations` (18:03Z, 20:03Z): the
+runner read its config at 16:03Z, before `subprocess_timeout_seconds: 90000`
+landed on disk (PR #54, 16:19Z), so that fix is not deployed yet.
+`hyperliquid-leaderboard-snapshot` next run 2026-09-03 16:03Z;
+`HyperliquidLeaderboardDaily` confirmed Disabled. **New finding — same-second
+run-dir collision:** run dirs are `<source>/<YYYYMMDD_HHMMSS>` with no symbol
+component (`prepare_run_paths`), and the three OI lanes (shared
+`binance_perp_open_interest/`, synchronized 1800 s segments) and the three Bybit
+liquidation lanes (shared `bybit_perp_liquidations/`) start their segments within
+the same second, so they append into one run dir: 13 run dirs for 21 OI segments,
+9 of the 12 closed OI runs hold 2-3 symbols interleaved and score
+`non_monotonic_event_time` (non-replayable); only the 3 single-symbol runs are
+replayable; one torn `clean/events.jsonl` line from the concurrent appends. Both
+post-restart Bybit runs are mixed (31 of 135 historical Bybit runs already were).
+Not fixed here — see Decision queue. Note: the shared checkout on the box has
+been on `feat/open-interest-curation-v11` (PR #54, unmerged) since 16:19Z, so
+`run-job` child processes import that code while the runner itself is 107a235.
 
 **Verified 2026-09-02 20:06Z (4 h after the restart):** `binance-{btc,eth,sol}-open-interest`
 and `binance-futures-rest-funding` 8 successes each, 0 errors (1800 s segments);
@@ -460,7 +551,24 @@ owner ask (safe-shaping directive above).
     `heartbeat_history.jsonl`, and `worker_events.jsonl` grow unbounded (~3–5k
     rows/day). The 2026-06-12 audit made health tail-read the run log (cost
     contained), but the files themselves still need a rotation or retention policy
-    — fold into `run_cleanup`.
+    — fold into `run_cleanup`. *Measured 2026-09-07: `heartbeat_history.jsonl`
+    is 5.8 GB (each row embeds the full 100-job counter map, ~27 KB, ~2,900
+    rows/day = ~80 MB/day on the SSD), `job_runs.jsonl` 554 MB, `worker_events`
+    150 MB — the ops root is 7 GB. No longer minor; autonomous fix.*
+16. **Test suite writes into the live archive (found 2026-09-07).** The
+    `run_ops_runner` tests in `tests/test_ops.py` dispatch `mock` jobs without
+    an `output_root`, so `run_mock` falls back to `default_output_root()` =
+    `G:\market_archive\raw\market\mock` — 56 run dirs so far, +2 per `pytest`
+    run, and the cause of the permanent `unconfigured_lane:mock` offload
+    warning. Fix: an autouse `conftest.py` fixture pointing every
+    `MARKET_DATA_*_ROOT` at `tmp_path` (hermetic by construction), then delete
+    the `mock` lane dir (owner nod — it is test debris, not data). Autonomous.
+17. **`redeploy_runner.ps1` discards runner stdout/stderr (found 2026-09-07).**
+    Its `Start-Process` has no `-RedirectStandardOutput/-RedirectStandardError`,
+    unlike `run_ops_runner.ps1` (`*>> runner.log`), so `runner.log` last grew at
+    the 08-25 boot start and a runner-process crash after a manual redeploy
+    leaves no trace; the script's own "check runner.log" warning is misleading.
+    Autonomous fix (ASCII-only `.ps1`, parse-check).
 13. ~~Verify OKX/Bybit trades subscribe-replay behavior over live frames~~
     **DONE — verified 2026-07-06, no code change needed.** Live probe (2
     independent runs, 8 connections: OKX spot + swap, Bybit spot + linear,
@@ -610,6 +718,29 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   `(product, trade_id)` at read time in research consumers, or (b) re-promote the
   affected lanes from raw on the fixed code (touches curated data — owner call).
   New capture is clean once the fix PR deploys.
+- **Repair the truncated curated runs (2026-09-07 audit, finding 1).** About a
+  third of promoted runs on all 21 trades/depth lanes and the wallet-flow lane
+  since June carry a partial row set (the hourly scorer scored the live
+  segment; per-lane counts in the audit stamp; 7.5 % of wallet-flow fills
+  missing). Raw is intact on hot and cold tiers, so the rows are recoverable.
+  Options: (a) build a `repromote-short-runs` tool that finds index rows with
+  `promoted_rows` below the run's clean row count, removes that run's curated
+  rows, re-promotes from raw (hot or cold) and rewrites the index row —
+  touches curated data, hence owner-gated; recommended, wallet-flow lane first
+  (it is the §4.7 prospective evidence); (b) leave history as is and document
+  the truncation for consumers. Either way the bleeding stops only when a
+  minimum-age floor reaches ALL scorers: PR #54 covers trades + text, the two
+  depth scorers (`backfill-replay`, `backfill-stream-depth`) still need it
+  (comment on #54).
+- **Merge PR #54 BEFORE the next redeploy (2026-09-07).** The live config on
+  disk already carries #54's jobs and args; `main` drops `min_age_hours`
+  silently and has no 25 h liquidation timeout rule, so redeploying `main`
+  with this config deploys the OI curation chain with live-segment scoring and
+  leaves the 7200 s kills in place. Order: merge #54 (and #55) → elevated
+  `redeploy_runner.ps1` → confirm the OI lanes write to `_<symbol>` dirs, the
+  liquidation lanes stop logging `timed out after 7200s`, and the 12 OI
+  curation jobs clear their `stale_job` findings.
+
 Decided 2026-08-01 (implemented locally; elevated restart pending):
 - **Aged unaccounted runs: quarantine-preserve plus durable backstop.** The owner
   asked to fix the plant health warning. All 17,809 aged unaccounted runs were
