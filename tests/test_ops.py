@@ -416,7 +416,10 @@ def test_ops_runner_refreshes_heartbeat_during_long_running_job(tmp_path: Path) 
     ]
 
     def execute_job(_job: JobSpec) -> str:
-        time.sleep(0.35)
+        # Long enough for several 0.1 s refresher ticks even on a loaded CI runner
+        # (the test polls for a refreshed heartbeat below instead of assuming one
+        # lands within a fixed sleep - that assumption failed twice on 2026-09-08).
+        time.sleep(1.5)
         return "segment complete"
 
     thread = threading.Thread(
@@ -458,8 +461,20 @@ def test_ops_runner_refreshes_heartbeat_during_long_running_job(tmp_path: Path) 
         time.sleep(0.02)
 
     first = json.loads(heartbeat_path.read_text(encoding="utf-8"))
-    time.sleep(0.18)
-    second = json.loads(heartbeat_path.read_text(encoding="utf-8"))
+    # Poll for a refreshed snapshot while the job is still running. A fixed sleep
+    # raced the 0.1 s refresher thread on slow CI runners (identical last_seen).
+    deadline = time.time() + 1.0
+    second = first
+    while time.time() < deadline:
+        snapshot = _read_heartbeat()
+        if (
+            snapshot is not None
+            and snapshot.get("status") == "running"
+            and snapshot.get("last_seen") != first["last_seen"]
+        ):
+            second = snapshot
+            break
+        time.sleep(0.02)
 
     thread.join(timeout=5.0)
     assert not thread.is_alive()
