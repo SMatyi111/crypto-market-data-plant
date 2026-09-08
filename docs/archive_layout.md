@@ -89,7 +89,9 @@ G:\market_archive\ops
 Important files:
 
 - `heartbeat.json`
-- `heartbeat_history.jsonl`
+- `heartbeat_history.jsonl` — rotated by the runner at 256 MB to
+  `heartbeat_history.<YYYYMMDD_HHMMSS>.jsonl` (UTC stamp), newest 8 rotated
+  files kept, older ones pruned
 - `job_runs.jsonl`
 - `worker_events.jsonl`
 - `runner.log`

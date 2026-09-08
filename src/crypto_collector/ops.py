@@ -642,6 +642,55 @@ class StandaloneWorkerRuntime:
         return stop_event, thread
 
 
+HEARTBEAT_HISTORY_MAX_BYTES = 256 * 1024 * 1024
+HEARTBEAT_HISTORY_KEEP = 8
+"""Size-based rotation for heartbeat_history.jsonl (ROADMAP item 12). Each row is
+the full heartbeat (~27 KB with ~100 jobs) appended every 30 s, ~80 MB/day; the
+live file reached 5.8 GB on the SSD before rotation existed. 256 MB x 8 rotated
+files bounds it at ~2.3 GB (~4 weeks of history) with no config change."""
+
+
+def rotate_jsonl_if_oversized(
+    path: Path,
+    *,
+    max_bytes: int,
+    keep: int,
+    now: datetime | None = None,
+) -> Path | None:
+    """Rename `path` to `<stem>.<YYYYMMDD_HHMMSS>.jsonl` once it exceeds `max_bytes`,
+    then drop the oldest rotated siblings so at most `keep` remain. Returns the new
+    rotated path, or None when nothing was rotated.
+
+    Best-effort by design: any OSError (a reader holding the file on Windows, a
+    full disk) is logged and swallowed, so a failed rotation can never take the
+    heartbeat - and with it the runner - down. The caller must hold whatever lock
+    serialises writes to `path`; the JsonlSink used for the ops logs reopens the
+    file per write, so a rename between writes is safe.
+    """
+    try:
+        if not path.exists() or path.stat().st_size <= max_bytes:
+            return None
+        stamp = (now or datetime.now(tz=UTC)).strftime("%Y%m%d_%H%M%S")
+        rotated = path.with_name(f"{path.stem}.{stamp}{path.suffix}")
+        counter = 0
+        while rotated.exists():
+            counter += 1
+            rotated = path.with_name(f"{path.stem}.{stamp}_{counter}{path.suffix}")
+        path.rename(rotated)
+        # Rotated siblings sort by name == by stamp; the live file has no stamp and
+        # never matches the glob.
+        siblings = sorted(path.parent.glob(f"{path.stem}.*{path.suffix}"))
+        for stale in siblings[: max(0, len(siblings) - max(0, int(keep)))]:
+            try:
+                stale.unlink()
+            except OSError:
+                logger.exception("could not prune rotated log %s; continuing", stale)
+        return rotated
+    except OSError:
+        logger.exception("log rotation of %s failed; continuing", path)
+        return None
+
+
 class OpsRunner:
     def __init__(
         self,
@@ -998,6 +1047,12 @@ class OpsRunner:
                     or (now - self._last_heartbeat_write).total_seconds() >= 30
                 )
                 if should_append_history:
+                    rotate_jsonl_if_oversized(
+                        self.heartbeat_history.path,
+                        max_bytes=HEARTBEAT_HISTORY_MAX_BYTES,
+                        keep=HEARTBEAT_HISTORY_KEEP,
+                        now=now,
+                    )
                     self.heartbeat_history.write(payload)
                     self._last_heartbeat_status = status
                     self._last_heartbeat_write = now
