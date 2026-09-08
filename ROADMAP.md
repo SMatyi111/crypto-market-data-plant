@@ -798,11 +798,19 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   (comment on #54). *Status 2026-09-08: trades + text + wallet-flow truncation
   stopped at the 00:29Z redeploy (0 short runs since); depth lanes still
   truncating ~40 % of runs until PR #58 (merged) deploys.* **DECIDED 2026-09-08:
-  option (a) — build the re-promote tool.** ACTIVE on `feat/repromote-short-runs`:
+  option (a) — build the re-promote tool.** Tool merged as PR #63 (2026-09-08;
   `repromote-short-runs` CLI, dry-run by default, `--apply` per lane after the
-  owner reads the dry-run report; wallet-flow lane first. The apply itself is
-  a curated-data change and stays owner-gated per lane; the decision here only
-  authorises building the tool and running dry-runs.
+  owner reads the dry-run report). **Wallet-flow lane REPAIRED 2026-09-08
+  13:51Z (owner-approved apply):** 229 runs re-promoted from raw (177 from the
+  cold tier), 20,079 partial rows replaced by 38,495, 0 failures; the lane's
+  curated total is now 251,733 of 251,848 raw fills (99.95 %, was 92.5 %).
+  Two runs still short: `20260908_001139` (summary was scored on the live
+  prefix; re-scored with `--wallet-flow --overwrite` the same hour, repairable
+  on the next pass) and `20260904_124639` (moved to cold by the offload job
+  during the 13-min scan — the race PR #65 fixes; repairable on the next pass).
+  Remaining: the other 10 trades lanes and the 10 depth lanes, each `--apply`
+  owner-gated after its dry-run; the all-lanes trades inventory dry-run is in
+  progress.
 
 Decided 2026-09-08 (recorded, closed):
 - **Liquidation raw dirs get `age_only` offload rows.** Owner approved 2026-09-08;

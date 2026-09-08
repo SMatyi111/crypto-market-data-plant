@@ -212,3 +212,67 @@ def test_limit_caps_candidates_before_raw_scanning(tmp_path: Path) -> None:
     report = repromote_short_runs(target_root=target_root, limit=1, now=datetime.now(tz=UTC))
     assert report.candidate_count == 1
     assert report.index_runs == 2
+
+
+def test_raw_offloaded_between_scan_and_apply_is_re_resolved(tmp_path: Path, monkeypatch) -> None:
+    """Live 2026-09-08: the offload job moved a candidate to the cold tier during the
+    13-minute dataset scan; the run must be repaired from the cold copy, not skipped."""
+    from crypto_collector import repromote as mod
+
+    _, target_root, run_dir = _truncated_setup(tmp_path)
+    cold_root = tmp_path / "cold" / "raw" / "market"
+    cold_run = cold_root / run_dir.parent.name / run_dir.name
+    real_scan = mod.build_run_file_map
+
+    def scan_then_offload(root: Path):
+        result = real_scan(root)
+        cold_run.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(run_dir), str(cold_run))  # offload lands mid-repair
+        return result
+
+    monkeypatch.setattr(mod, "build_run_file_map", scan_then_offload)
+    report = repromote_short_runs(target_root=target_root, cold_root=cold_root, apply=True)
+    (run,) = report.runs
+    assert run.action == "repromote" and run.raw_dir == str(cold_run)
+    assert len(_curated_rows_for(target_root, str(run_dir))) == 10
+
+
+def test_raw_moved_after_summary_read_fails_closed_with_curated_intact(tmp_path: Path, monkeypatch) -> None:
+    """If the move lands after the summary read, parsing raw fails and the run is
+    reported failed - with the original curated part-files still in place."""
+    from crypto_collector import repromote as mod
+
+    _, target_root, run_dir = _truncated_setup(tmp_path)
+    cold_root = tmp_path / "cold" / "raw" / "market"
+    real_read = mod.read_clean_rows
+
+    def move_then_read(path: Path):
+        cold_run = cold_root / run_dir.parent.name / run_dir.name
+        cold_run.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(run_dir), str(cold_run))
+        return real_read(path)  # hot path -> FileNotFoundError
+
+    monkeypatch.setattr(mod, "read_clean_rows", move_then_read)
+    report = repromote_short_runs(target_root=target_root, cold_root=cold_root, apply=True)
+    (run,) = report.runs
+    assert run.action == "failed" and report.status == "error"
+    assert len(_curated_rows_for(target_root, str(run_dir))) == 4
+    assert len((target_root / "_promotion_index.jsonl").read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_raw_moved_mid_scan_without_cold_root_is_reported_as_raw_missing(tmp_path: Path, monkeypatch) -> None:
+    from crypto_collector import repromote as mod
+
+    _, target_root, run_dir = _truncated_setup(tmp_path)
+    real_scan = mod.build_run_file_map
+
+    def scan_then_offload(root: Path):
+        result = real_scan(root)
+        shutil.move(str(run_dir), str(tmp_path / "elsewhere"))
+        return result
+
+    monkeypatch.setattr(mod, "build_run_file_map", scan_then_offload)
+    report = repromote_short_runs(target_root=target_root, apply=True)
+    (run,) = report.runs
+    assert run.action == "skipped_raw_missing"  # not the misleading missing-summary label
+    assert len(_curated_rows_for(target_root, str(run_dir))) == 4
