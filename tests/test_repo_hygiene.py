@@ -198,7 +198,15 @@ def test_redeploy_runner_appends_runner_output_to_runner_log() -> None:
     would have left no trace (2026-09-07 audit, ROADMAP item 17). Pin the append
     redirect so a refactor cannot quietly drop it again."""
     body = (REPO_ROOT / "scripts" / "redeploy_runner.ps1").read_text(encoding="ascii")
-    assert "*>> '$logPath'" in body, "redeploy_runner.ps1 no longer appends the runner's output to runner.log"
-    assert 'Join-Path $OpsRoot "runner.log"' in body
+    # Comments must not satisfy the pin (a reverted launch line with the explanatory
+    # comment block left in place would otherwise pass).
+    code = "\n".join(line for line in body.splitlines() if not line.lstrip().startswith("#"))
+    assert 'Join-Path $OpsRoot "runner.log"' in code
+    command_lines = [line for line in code.splitlines() if "crypto_collector.cli ops-runner" in line]
+    assert command_lines, "redeploy_runner.ps1 no longer builds the ops-runner launch command"
+    assert all("*>> {0}" in line for line in command_lines), (
+        "redeploy_runner.ps1 launch command no longer appends the runner's output to runner.log"
+    )
+    assert "-EncodedCommand" in code, "launch must go through -EncodedCommand (no argv re-tokenisation)"
     run_body = (REPO_ROOT / "scripts" / "run_ops_runner.ps1").read_text(encoding="ascii")
     assert "*>> $LogPath" in run_body, "run_ops_runner.ps1 lost its runner.log redirect"

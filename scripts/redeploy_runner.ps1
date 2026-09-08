@@ -180,12 +180,40 @@ Remove-Item (Join-Path $OpsRoot "standalone_workers\*.lock.stale-*") -Force -Err
 #    process crash would have left no trace (2026-09-07 audit). Start-Process's own
 #    -RedirectStandard* switches are not used because they truncate instead of
 #    appending and cannot share one file between the two streams.
+#    Design notes (from the PR #60 review):
+#    - The parent never opens runner.log. We are past the lock deletions here and
+#      $ErrorActionPreference is Stop, so an Out-File that hit a held handle would
+#      abort the script with the plant down and no runner started. All three log
+#      writes (relaunch marker, runner output, exit marker) happen INSIDE the child
+#      under one `*>>` redirect, so they also share one encoding (PS 5.1 `*>>` is
+#      always UTF-16LE; mixing it with a UTF-8 Out-File marker renders the runner
+#      output as spaced mojibake in Get-Content).
+#    - The command travels as -EncodedCommand (base64 UTF-16), so it is never
+#      re-tokenised by CommandLineToArgvW: apostrophes or doubled spaces in
+#      $repo / -OpsRoot cannot break the quoting. Literals are single-quoted with
+#      ' doubled, the only escape single quotes need.
+#    - The child intentionally runs at the default ErrorActionPreference=Continue:
+#      under Stop, PS 5.1 turns python's first stderr line (e.g. the config
+#      UserWarning) into a terminating NativeCommandError. Do not "harden" it.
+#    - The hidden powershell.exe is a plant process: it owns python's stdout/stderr
+#      pipes and exits by itself when python does. Killing it early leaves the
+#      runner alive but unlogged (the pre-fix state), nothing worse.
 $env:PYTHONPATH = Join-Path $repo "src"
 $logPath = Join-Path $OpsRoot "runner.log"
-"[$(Get-Date -Format o)] redeploy_runner.ps1 relaunching ops runner with $config" | Out-File -FilePath $logPath -Append -Encoding utf8
-$runnerCommand = "& '$python' -m crypto_collector.cli ops-runner --config '$config' --ops-root '$OpsRoot' --collector-concurrency $CollectorConcurrency *>> '$logPath'"
-Start-Process -WindowStyle Hidden -WorkingDirectory $repo -FilePath "powershell.exe" `
-    -ArgumentList '-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-Command',$runnerCommand
+function Quote-PsLiteral([string]$s) { return "'" + $s.Replace("'", "''") + "'" }
+$qLog = Quote-PsLiteral $logPath
+$qConfig = Quote-PsLiteral $config
+$qPython = Quote-PsLiteral $python
+$qOps = Quote-PsLiteral $OpsRoot
+# Single-quoted templates: $(Get-Date ...) and $LASTEXITCODE must expand in the CHILD.
+$runnerCommand = (
+    '"[$(Get-Date -Format o)] redeploy_runner.ps1 relaunching ops runner with {1}" *>> {0}; ' +
+    '& {2} -m crypto_collector.cli ops-runner --config {1} --ops-root {3} --collector-concurrency {4} *>> {0}; ' +
+    '"[$(Get-Date -Format o)] ops runner exited with code $LASTEXITCODE" *>> {0}'
+) -f $qLog, $qConfig, $qPython, $qOps, $CollectorConcurrency
+$encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($runnerCommand))
+$launcher = Start-Process -PassThru -WindowStyle Hidden -WorkingDirectory $repo -FilePath "powershell.exe" `
+    -ArgumentList '-NoProfile','-NonInteractive','-EncodedCommand',$encodedCommand
 
 # 4. Verify it came up. Three proofs, all required: a lock whose pid is ALIVE, a
 #    heartbeat STRICTLY NEWER than the pre-kill baseline (the dead runner's last
@@ -214,6 +242,10 @@ if (Test-Path $lockPath) {
 if ($ok) {
     Write-Host "Redeploy OK. Trades workers will write buffered (low-quarantine) runs as they cycle." -ForegroundColor Green
 } else {
-    Write-Warning "Runner did not confirm healthy within 12s. Check $OpsRoot\runner.log."
+    $launcherState = "launcher pid $($launcher.Id) still running"
+    if ($launcher.HasExited) {
+        $launcherState = "launcher exited with code $($launcher.ExitCode) before the runner registered a lock -- runner.log may be locked/unwritable, or python failed to start"
+    }
+    Write-Warning "Runner did not confirm healthy within 12s ($launcherState). Check $logPath."
     exit 1
 }
