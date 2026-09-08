@@ -599,7 +599,20 @@ owner ask (safe-shaping directive above).
     unlike `run_ops_runner.ps1` (`*>> runner.log`), so `runner.log` last grew at
     the 08-25 boot start and a runner-process crash after a manual redeploy
     leaves no trace; the script's own "check runner.log" warning is misleading.
-    Autonomous fix (ASCII-only `.ps1`, parse-check).
+    Autonomous fix (ASCII-only `.ps1`, parse-check). *2026-09-08: fixed on
+    `fix/redeploy-runner-log` — the relaunch goes through a hidden PowerShell
+    child that appends stdout+stderr to `runner.log` (same `*>>` posture as the
+    boot script) and writes a dated relaunch marker first; hygiene test pins
+    the redirect in both scripts. Takes effect at the NEXT manual redeploy (the
+    current runner was launched by the old script and stays unlogged).* Review
+    residue, not fixed here: PS 5.1 `*>>` writes UTF-16LE while both scripts'
+    `Out-File -Encoding utf8` markers are UTF-8, so `runner.log` from the BOOT
+    path is already a mixed-encoding file (Get-Content renders the python output
+    spaced). The redeploy path now writes all its lines under one redirect;
+    aligning `run_ops_runner.ps1` the same way is a one-line follow-up. The
+    reviewer's altitude suggestion — have the redeploy child run
+    `run_ops_runner.ps1` itself instead of a hand-copied launch line — is
+    recorded as an option; it needs a `-SkipMutex` switch for non-elevated use.
 18. **Minimum-age floor for the two depth scorers (found 2026-09-07, still
     live after the 09-08 redeploy).** `backfill-replay` (`score-binance-depth`,
     `score-binance-depth-usdc`) and `backfill-stream-depth` (`score-stream-depth`,
