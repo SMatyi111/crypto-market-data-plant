@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from collections.abc import Callable
@@ -9,6 +10,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
+
+logger = logging.getLogger(__name__)
 
 
 _MISSING = object()
@@ -179,10 +182,26 @@ class RotatingJsonlSink:
         fsync_interval_events: int = 1,
         fsync_interval_ms: float = 0.0,
         time_fn: Callable[[], float] = time.monotonic,
+        max_files: int | None = None,
+        on_rotate_error: str = "raise",
+        rotate_retry_seconds: float = 600.0,
     ) -> None:
+        """`max_files` (retention): after each roll, prune the oldest numbered parts
+        so at most that many remain. None (default) keeps everything - the raw
+        collector sinks must never delete data. `on_rotate_error="warn"` makes a
+        failed roll (Windows: another process holding the active file blocks the
+        rename) non-fatal: the sink keeps appending to the active file, logs one
+        warning, and retries after `rotate_retry_seconds`. The default "raise"
+        preserves the collectors' fail-loud posture."""
         self.root = root
         self.filename = filename
         self.max_bytes = max(1, int(max_bytes))
+        self.max_files = None if max_files is None else max(1, int(max_files))
+        if on_rotate_error not in {"raise", "warn"}:
+            raise ValueError(f"on_rotate_error must be 'raise' or 'warn', got {on_rotate_error!r}")
+        self._on_rotate_error = on_rotate_error
+        self._rotate_retry_seconds = max(0.0, float(rotate_retry_seconds))
+        self._rotate_retry_at = 0.0
         self._fsync = fsync
         self._flush_every = max(1, int(flush_every))
         self._fsync_interval_events = max(1, int(fsync_interval_events))
@@ -210,7 +229,11 @@ class RotatingJsonlSink:
 
     def write(self, row: dict[str, Any]) -> None:
         encoded = (json.dumps(row, sort_keys=True) + "\n").encode("utf-8")
-        if self._current_bytes > 0 and self._current_bytes + len(encoded) > self.max_bytes:
+        if (
+            self._current_bytes > 0
+            and self._current_bytes + len(encoded) > self.max_bytes
+            and self._time_fn() >= self._rotate_retry_at
+        ):
             self._rotate()
         if self._per_event_fsync:
             with self._active_path.open("ab") as handle:
@@ -255,9 +278,54 @@ class RotatingJsonlSink:
         else:
             new_name = f"{self.filename}.{self._part_index}"
         rotated_path = self.root / new_name
-        os.replace(self._active_path, rotated_path)
+        try:
+            os.replace(self._active_path, rotated_path)
+        except OSError as exc:
+            if self._on_rotate_error == "raise":
+                raise
+            # Keep appending to the (now oversized) active file; the handle was closed
+            # above and reopens on the next write. One warning, no traceback, and no
+            # retry storm: the next attempt waits rotate_retry_seconds.
+            self._rotate_retry_at = self._time_fn() + self._rotate_retry_seconds
+            logger.warning(
+                "rotation of %s deferred %.0f s: %s", self._active_path, self._rotate_retry_seconds, exc
+            )
+            return
         self._part_index += 1
         self._current_bytes = 0
+        self._prune_rotated()
+
+    def _rotated_parts(self) -> list[tuple[int, Path]]:
+        """Numbered parts `<stem>.<n>.<ext>` this sink owns, sorted by part index.
+        Strict: only an ASCII integer between the prefix and suffix qualifies, so a
+        hand-made `<stem>.archive.<ext>` or `<stem>.00_backup.<ext>` is never
+        counted, pruned, or mistaken for the highest part."""
+        stem, dot, ext = self.filename.rpartition(".")
+        if not dot:
+            prefix, suffix = self.filename + ".", ""
+        else:
+            prefix, suffix = stem + ".", "." + ext
+        parts: list[tuple[int, Path]] = []
+        if not self.root.exists():
+            return parts
+        for entry in self.root.iterdir():
+            name = entry.name
+            if name == self.filename or not (name.startswith(prefix) and name.endswith(suffix)):
+                continue
+            middle = name[len(prefix) : len(name) - len(suffix)] if suffix else name[len(prefix) :]
+            if middle.isascii() and middle.isdigit():
+                parts.append((int(middle), entry))
+        return sorted(parts)
+
+    def _prune_rotated(self) -> None:
+        if self.max_files is None:
+            return
+        parts = self._rotated_parts()
+        for _, stale in parts[: max(0, len(parts) - self.max_files)]:
+            try:
+                stale.unlink()
+            except OSError as exc:
+                logger.warning("could not prune rotated log %s: %s", stale, exc)
 
     def close(self) -> None:
         if self._handle is not None:
@@ -272,21 +340,8 @@ class RotatingJsonlSink:
             self._fsync_pending = 0
 
     def _discover_next_part_index(self) -> int:
-        stem, dot, ext = self.filename.rpartition(".")
-        if not dot:
-            prefix, suffix = self.filename + ".", ""
-        else:
-            prefix, suffix = stem + ".", "." + ext
-        highest = 0
-        if self.root.exists():
-            for entry in self.root.iterdir():
-                name = entry.name
-                if not (name.startswith(prefix) and name.endswith(suffix)):
-                    continue
-                middle = name[len(prefix) : len(name) - len(suffix)] if suffix else name[len(prefix) :]
-                if middle.isdigit():
-                    highest = max(highest, int(middle))
-        return highest + 1
+        parts = self._rotated_parts()
+        return (parts[-1][0] if parts else 0) + 1
 
 
 class ParquetDatasetSink:
