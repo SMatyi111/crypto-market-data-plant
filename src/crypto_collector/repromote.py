@@ -276,16 +276,19 @@ def repromote_short_runs(
             cand.curated_files = [str(f) for f in files]
             cand.curated_rows = sum(file_rows.get(f, 0) for f in files)
             cand.index_mismatch = cand.curated_rows != cand.promoted_rows
-            raw_dir = Path(cand.raw_dir or cand.run_path)
-            if not (raw_dir / "metrics" / "replay_summary.json").is_file():
-                # The hourly offload job may move a run to the cold tier between the
-                # candidate scan and this point (the dataset scan takes minutes).
-                # Observed live 2026-09-08: resolved hot, moved 13 min later, reported
-                # skipped_missing_replay_summary although the cold copy was complete.
-                moved = resolve_raw_dir(cand.run_path, cold_root)
-                if moved is not None:
-                    raw_dir = moved
-                    cand.raw_dir = str(raw_dir)
+            # Re-resolve raw unconditionally at apply time: the hourly offload job
+            # may have moved the run to the cold tier during the dataset scan
+            # (minutes). Observed live 2026-09-08: resolved hot, moved 13 min later,
+            # reported skipped_missing_replay_summary although the cold copy was
+            # complete. A run mid-rmtree on hot (clean/ already gone) also lands on
+            # the cold copy this way; a run gone from both tiers is reported as such.
+            resolved = resolve_raw_dir(cand.run_path, cold_root)
+            if resolved is None:
+                cand.action = "skipped_raw_missing"
+                runs.append(cand)
+                continue
+            raw_dir = resolved
+            cand.raw_dir = str(raw_dir)
             summary = _read_json_file(raw_dir / "metrics" / "replay_summary.json")
             if summary is None:
                 cand.action = "skipped_missing_replay_summary"
