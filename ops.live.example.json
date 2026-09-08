@@ -1477,6 +1477,27 @@
             "gate": "age_only"
           },
           {
+            "// liquidation offload": "Liquidation lanes are raw-only (STANDARDS liquidations channel: no promoter), so the fitting offload gate is age_only, like the options lanes. Added 2026-09-08 (owner decision) after the per-symbol split left these dirs unconfigured_lane. The un-suffixed bybit dir is the legacy shared dir (runs 2026-08-25..09-08); binance_perp_liquidations already has its own row above.",
+            "source": "bybit_perp_liquidations_btcusdt",
+            "gate": "age_only"
+          },
+          {
+            "source": "bybit_perp_liquidations_ethusdt",
+            "gate": "age_only"
+          },
+          {
+            "source": "bybit_perp_liquidations_solusdt",
+            "gate": "age_only"
+          },
+          {
+            "source": "okx_perp_liquidations",
+            "gate": "age_only"
+          },
+          {
+            "source": "bybit_perp_liquidations",
+            "gate": "age_only"
+          },
+          {
             "source": "binance_perp_open_interest",
             "promotion_index": "G:\\market_archive\\curated\\research\\open_interest\\_promotion_index.jsonl",
             "quarantine_index": "G:\\market_archive\\quarantine\\market\\binance_perp_open_interest\\_quarantine_index.jsonl"
