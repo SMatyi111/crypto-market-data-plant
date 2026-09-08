@@ -590,6 +590,10 @@ owner ask (safe-shaping directive above).
     warning. Fix: an autouse `conftest.py` fixture pointing every
     `MARKET_DATA_*_ROOT` at `tmp_path` (hermetic by construction), then delete
     the `mock` lane dir (owner nod — it is test debris, not data). Autonomous.
+    *2026-09-08: fixture landed on `fix/test-hermetic-roots` (`tests/conftest.py`
+    points `MARKET_DATA_ARCHIVE_ROOT` at a per-test temp dir and clears inherited
+    per-root overrides; `test_suite_default_roots_are_hermetic` pins it). The 60
+    existing `raw/market/mock/` run dirs still await the owner's delete nod.*
 17. **`redeploy_runner.ps1` discards runner stdout/stderr (found 2026-09-07).**
     Its `Start-Process` has no `-RedirectStandardOutput/-RedirectStandardError`,
     unlike `run_ops_runner.ps1` (`*>> runner.log`), so `runner.log` last grew at
@@ -620,6 +624,19 @@ owner ask (safe-shaping directive above).
     (default applies) but the runner must restart to pick up the code for the
     scheduler-thread jobs — collector subprocesses import the checkout, the
     maintenance jobs run in-process. Autonomous PR; deploy at the next redeploy.
+    *2026-09-08: fix on `fix/depth-scorer-min-age` — `--min-age-hours` (default
+    1 h, `0` disables) on both `backfill-replay` and `backfill-stream-depth`,
+    runner dispatch defaults pinned, `skipped_too_recent` surfaced in the
+    stream-depth report; 6 regression tests in `tests/test_scorer_min_age.py`.
+    Merged != deployed: the depth lanes keep truncating until the runner
+    restarts on this code.* **Follow-up idea (from the PR review, not built):**
+    the floor guards the two hourly summary writers, but the root cause is that
+    `promote_replayable_runs` promotes any run with a replayable summary and
+    the run-keyed index never revisits — a manual `replay-depth` on a live run,
+    or `--min-age-hours 0`, re-opens the hole. A segment-close marker that the
+    promoter requires (or the scorer refuses runs without) would close every
+    path at once. Contract-adjacent (touches what "promotable" means) → needs an
+    owner nod before building.
 13. ~~Verify OKX/Bybit trades subscribe-replay behavior over live frames~~
     **DONE — verified 2026-07-06, no code change needed.** Live probe (2
     independent runs, 8 connections: OKX spot + swap, Bybit spot + linear,

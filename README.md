@@ -320,6 +320,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install_startup_task.ps1 -Tri
 market-data-plant health --config .\ops.live.example.json
 market-data-plant book-sync-health --source-root G:\market_archive\raw\market\binance_depth
 market-data-plant backfill-replay --source-root G:\market_archive\raw\market\binance_depth --limit 50
+# score jobs skip runs younger than --min-age-hours (default 1 h; they may still be
+# receiving events). Pass --min-age-hours 0 only for a deliberate full re-score.
 market-data-plant quarantine-runs --source-root G:\market_archive\raw\market\binance_depth --quarantine-root G:\market_archive\quarantine\market\binance_depth
 market-data-plant promote-replayable --source-root G:\market_archive\raw\market\binance_depth --target-root G:\market_archive\curated\research\market_replayable
 market-data-plant research-manifest --archive-root G:\market_archive --output-root G:\market_archive\curated\research\manifests
