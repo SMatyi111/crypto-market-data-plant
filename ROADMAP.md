@@ -607,6 +607,12 @@ owner ask (safe-shaping directive above).
     (default applies) but the runner must restart to pick up the code for the
     scheduler-thread jobs — collector subprocesses import the checkout, the
     maintenance jobs run in-process. Autonomous PR; deploy at the next redeploy.
+    *2026-09-08: fix on `fix/depth-scorer-min-age` — `--min-age-hours` (default
+    1 h, `0` disables) on both `backfill-replay` and `backfill-stream-depth`,
+    runner dispatch defaults pinned, `skipped_too_recent` surfaced in the
+    stream-depth report; 6 regression tests in `tests/test_scorer_min_age.py`.
+    Merged != deployed: the depth lanes keep truncating until the runner
+    restarts on this code.*
 13. ~~Verify OKX/Bybit trades subscribe-replay behavior over live frames~~
     **DONE — verified 2026-07-06, no code change needed.** Live probe (2
     independent runs, 8 connections: OKX spot + swap, Bybit spot + linear,
