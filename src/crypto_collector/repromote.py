@@ -12,25 +12,36 @@ This module finds those runs and, with `apply=True`, replaces their curated rows
 1. Candidates come from the promotion index (latest row per `run_path`, the
    same dedup rule `research_manifest` uses) whose `promoted_rows` fall below
    `min_ratio` x the raw clean row count. Raw is resolved hot-first, then under
-   `cold_root/<lane>/<run>` (the byte-verified offload copy).
-2. The run's curated part-files are located by reading the `source_run_path`
-   column of every part-file in the event_date partitions around the run date.
-   The promoter flushes once per run, so part-files are run-pure; any file that
-   also holds rows of another run is never touched (the run is skipped).
-3. Safety cross-check: the rows found in those files must equal the index's
-   `promoted_rows`. A mismatch means the locator missed or double-counted
-   something, and the run is skipped rather than guessed at.
-4. Apply order is delete-then-write: if the process dies in between, the run is
-   simply absent from curated while its index row still claims the old (short)
-   count, so a re-run finds it short again and repairs it. Write-then-delete
-   would instead risk silent duplicates.
-5. The index is append-only and shared with the live promoter, so the repair
+   `cold_root/<lane>/<run>` (the byte-verified offload copy); a run dir without
+   `clean/events.jsonl` does not count as found.
+2. ALL of the run's curated part-files are located by reading the
+   `source_run_path` column of every part-file in the dataset (one scan per
+   invocation). The promoter flushes once per run, so part-files are run-pure;
+   any file that also holds rows of another run is never touched (the run is
+   skipped). Because the scan is complete, leftovers of an interrupted earlier
+   repair are found and replaced too.
+3. The run's replay summary must be replayable AND current: its `event_count`
+   must equal the raw row count, otherwise the verdict was computed on the
+   partial prefix (the same defect) and the run is skipped until re-scored.
+4. Raw is parsed and validated BEFORE anything is deleted. A torn final line
+   (STANDARDS 2.1: readers tolerate a torn tail) is dropped; any other parse
+   failure skips the run with the curated rows left in place.
+5. Apply order is delete-then-write with a single flush sized to the run: if the
+   process dies in between, the run is absent (or partially present) in curated
+   while its index row still claims the old count, so the next pass finds it
+   short again and repairs it. Write-then-delete would risk silent duplicates.
+6. The index is append-only and shared with the live promoter, so the repair
    APPENDS a superseding row for the run (`repromoted: true`, new
    `promoted_rows`, `previous_promoted_rows`). Readers keep the latest
-   `promoted_at` per run. A run whose current replay summary is no longer
-   replayable has its partial rows removed and gets a `promoted_rows: 0` row.
+   `promoted_at`. A run whose current summary is no longer replayable has its
+   partial rows removed and gets a `promoted_rows: 0` row with
+   `removed_not_replayable: true`; such runs are not candidates again.
 
 Dry-run is the default; nothing is written or deleted without `apply=True`.
+This is the one sanctioned writer of curated parquet besides the
+`promote-replayable` jobs (CLAUDE.md "exactly one promoter" exception): it only
+ever touches runs the promoter has already indexed, so the two never write the
+same run.
 """
 
 from __future__ import annotations
@@ -42,7 +53,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .promotion import _parse_run_started_at, _read_json_file, _read_jsonl
+from .promotion import _parse_run_started_at, _read_json_file
 from .storage import JsonlSink, ParquetDatasetSink
 
 DEFAULT_MIN_RATIO = 0.98
@@ -58,8 +69,11 @@ class RepromoteRun:
     raw_rows: int | None = None
     raw_dir: str | None = None
     replayable: bool | None = None
+    summary_event_count: int | None = None
     curated_files: list[str] = field(default_factory=list)
     curated_rows: int = 0
+    index_mismatch: bool = False
+    torn_tail: bool = False
     new_rows: int = 0
     error: str | None = None
 
@@ -89,14 +103,13 @@ class RepromoteReport:
     def status(self) -> str:
         if self.failed_count:
             return "error"
-        if any(run.action.startswith("skipped_") for run in self.runs):
+        if self.skipped_count:
             return "warn"
         return "ok"
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["status"] = self.status
-        payload["runs"] = [run.to_dict() for run in self.runs]
         return payload
 
 
@@ -126,12 +139,14 @@ def latest_index_rows(index_path: Path) -> dict[str, dict[str, Any]]:
 
 
 def resolve_raw_dir(run_path: str, cold_root: Path | None) -> Path | None:
+    """Hot first, then cold. A dir counts only if it still holds clean/events.jsonl
+    (an offload interrupted mid-rmtree can leave a hot skeleton behind)."""
     hot = Path(run_path)
-    if hot.is_dir():
+    if (hot / "clean" / "events.jsonl").is_file():
         return hot
     if cold_root is not None:
         cold = cold_root / hot.parent.name / hot.name
-        if cold.is_dir():
+        if (cold / "clean" / "events.jsonl").is_file():
             return cold
     return None
 
@@ -148,25 +163,32 @@ def count_clean_rows(run_dir: Path) -> int | None:
     return count
 
 
-def _partition_value(path: Path, key: str) -> str | None:
-    prefix = f"{key}="
-    for part in path.parts:
-        if part.startswith(prefix):
-            return part[len(prefix):]
-    return None
+def read_clean_rows(run_dir: Path) -> tuple[list[dict[str, Any]], bool]:
+    """Parse clean/events.jsonl. Returns (rows, torn_tail). Only the FINAL
+    non-blank line may fail to parse (torn tail after a hard kill); any other
+    bad line raises ValueError so the caller leaves curated untouched."""
+    events = run_dir / "clean" / "events.jsonl"
+    lines = [line for line in events.read_text(encoding="utf-8").splitlines() if line.strip()]
+    rows: list[dict[str, Any]] = []
+    torn_tail = False
+    for index, line in enumerate(lines):
+        try:
+            row = json.loads(line)
+        except ValueError as exc:
+            if index == len(lines) - 1:
+                torn_tail = True
+                break
+            raise ValueError(f"unparseable clean row {index + 1} of {len(lines)}: {exc}") from exc
+        if not isinstance(row, dict):
+            raise ValueError(f"clean row {index + 1} is not an object")
+        rows.append(row)
+    return rows, torn_tail
 
 
-def build_run_file_map(
-    target_root: Path,
-    *,
-    event_dates: set[str] | None = None,
-) -> tuple[dict[str, list[Path]], dict[Path, int], set[Path]]:
-    """Map `source_run_path` -> curated part-files, plus per-file row counts and
-    the set of files holding rows from more than one run (never to be deleted).
-
-    Reads one column per part-file, restricted to the given `event_date`
-    partitions when provided (a 30-minute run's rows sit in the run date and, at
-    most, its neighbours)."""
+def build_run_file_map(target_root: Path) -> tuple[dict[str, list[Path]], dict[Path, int], set[Path]]:
+    """Map `source_run_path` -> curated part-files for the WHOLE dataset, plus
+    per-file row counts and the set of files holding rows from more than one
+    run (never to be deleted). One column read per part-file."""
     try:
         import pyarrow.parquet as pq
     except ImportError as exc:  # pragma: no cover - pyarrow is a hard dependency of curated
@@ -178,8 +200,6 @@ def build_run_file_map(
     if not target_root.exists():
         return run_files, file_rows, shared
     for part in target_root.rglob("*.parquet"):
-        if event_dates is not None and _partition_value(part, "event_date") not in event_dates:
-            continue
         try:
             table = pq.read_table(part, columns=["source_run_path"])
         except (OSError, ValueError, KeyError):
@@ -194,11 +214,6 @@ def build_run_file_map(
     return run_files, file_rows, shared
 
 
-def _neighbour_dates(started_at: datetime) -> set[str]:
-    day = started_at.astimezone(UTC).date()
-    return {(day + timedelta(days=offset)).isoformat() for offset in (-1, 0, 1)}
-
-
 def repromote_short_runs(
     *,
     target_root: Path,
@@ -209,7 +224,6 @@ def repromote_short_runs(
     min_age_hours: float = DEFAULT_MIN_AGE_HOURS,
     limit: int = 1000,
     apply: bool = False,
-    parquet_batch_size: int = 50_000,
     now: datetime | None = None,
 ) -> RepromoteReport:
     checked_at = now or datetime.now(tz=UTC)
@@ -217,18 +231,23 @@ def repromote_short_runs(
     lane_filter = set(lanes or [])
     latest = latest_index_rows(index_path)
     min_age_cutoff = checked_at - timedelta(hours=max(0.0, float(min_age_hours)))
+    limit = max(0, int(limit))
 
     runs: list[RepromoteRun] = []
     candidates: list[RepromoteRun] = []
     for run_path in sorted(latest):
+        if len(candidates) >= limit:
+            break  # bound the raw I/O, not just the writes
         row = latest[run_path]
         lane = Path(run_path).parent.name
         if lane_filter and lane not in lane_filter:
             continue
+        if row.get("removed_not_replayable"):
+            continue  # already resolved by an earlier apply; nothing to restore
         promoted_rows = int(row.get("promoted_rows") or 0)
         started_at = _parse_run_started_at(Path(run_path))
         if started_at is not None and started_at > min_age_cutoff:
-            continue  # may still be written; the live floor handles it
+            continue  # may still be written; the live scorer floor handles it
         raw_dir = resolve_raw_dir(run_path, cold_root)
         if raw_dir is None:
             runs.append(RepromoteRun(run_path, lane, "skipped_raw_missing", promoted_rows))
@@ -241,7 +260,6 @@ def repromote_short_runs(
         candidates.append(
             RepromoteRun(run_path, lane, "candidate", promoted_rows, raw_rows=raw_rows, raw_dir=str(raw_dir))
         )
-    candidates = candidates[: max(0, int(limit))]
 
     rows_removed = 0
     rows_written = 0
@@ -250,39 +268,39 @@ def repromote_short_runs(
     failed_count = 0
 
     if candidates:
-        dates: set[str] = set()
-        for cand in candidates:
-            started_at = _parse_run_started_at(Path(cand.run_path))
-            if started_at is None:
-                dates = set()  # unknown date -> scan everything
-                break
-            dates |= _neighbour_dates(started_at)
-        run_files, file_rows, shared_files = build_run_file_map(
-            target_root, event_dates=dates or None
-        )
-        sink = ParquetDatasetSink(target_root, batch_size=parquet_batch_size, fsync_parts=True)
-        index_sink = JsonlSink(target_root, index_path.name) if index_path.parent == target_root else JsonlSink(
-            index_path.parent, index_path.name
-        )
+        run_files, file_rows, shared_files = build_run_file_map(target_root)
+        index_sink = JsonlSink(index_path.parent, index_path.name)
 
         for cand in candidates:
             files = sorted(run_files.get(cand.run_path, []))
             cand.curated_files = [str(f) for f in files]
             cand.curated_rows = sum(file_rows.get(f, 0) for f in files)
+            cand.index_mismatch = cand.curated_rows != cand.promoted_rows
             raw_dir = Path(cand.raw_dir or cand.run_path)
-            summary = _read_json_file(raw_dir / "metrics" / "replay_summary.json") or {}
-            cand.replayable = bool(summary.get("replayable")) if summary else None
+            summary = _read_json_file(raw_dir / "metrics" / "replay_summary.json")
+            if summary is None:
+                cand.action = "skipped_missing_replay_summary"
+                runs.append(cand)
+                continue
+            cand.replayable = bool(summary.get("replayable"))
+            event_count = summary.get("event_count")
+            cand.summary_event_count = int(event_count) if isinstance(event_count, int | float) else None
 
             if any(f in shared_files for f in files):
                 cand.action = "skipped_shared_part_file"
                 runs.append(cand)
                 continue
-            if cand.curated_rows != cand.promoted_rows:
-                cand.action = "skipped_row_mismatch"
-                runs.append(cand)
-                continue
-            if cand.replayable is None:
-                cand.action = "skipped_missing_replay_summary"
+            if (
+                cand.replayable
+                and cand.summary_event_count is not None
+                and cand.summary_event_count not in (cand.raw_rows, (cand.raw_rows or 0) - 1)
+            ):
+                # The verdict was computed on the partial prefix (the very defect
+                # being repaired): re-score the run with --overwrite first. The
+                # line count may exceed event_count by exactly one when the final
+                # line is torn (never counted by the collector); the apply path
+                # re-checks against the parsed row count precisely.
+                cand.action = "skipped_stale_replay_summary"
                 runs.append(cand)
                 continue
 
@@ -293,22 +311,44 @@ def repromote_short_runs(
                 continue
 
             try:
+                # Everything that can fail on the raw side happens BEFORE any delete.
+                new_rows_payload: list[dict[str, Any]] = []
+                if cand.replayable:
+                    parsed, torn_tail = read_clean_rows(raw_dir)
+                    cand.torn_tail = torn_tail
+                    expected = cand.raw_rows - (1 if torn_tail else 0)
+                    if len(parsed) != expected:
+                        raise ValueError(
+                            f"raw row count changed while repairing: counted {cand.raw_rows}, parsed {len(parsed)}"
+                        )
+                    if cand.summary_event_count is not None and cand.summary_event_count != len(parsed):
+                        # Precise re-check now that the torn tail (if any) is known.
+                        cand.action = "skipped_stale_replay_summary"
+                        runs.append(cand)
+                        continue
+                    hot_summary = str(Path(cand.run_path) / "metrics" / "replay_summary.json")
+                    for row in parsed:
+                        curated_row = dict(row)
+                        curated_row["source_run_path"] = cand.run_path
+                        curated_row["replay_summary_path"] = hot_summary
+                        curated_row["promotion_checked_at"] = checked_at.isoformat()
+                        curated_row["promotion_tag"] = "replayable"
+                        new_rows_payload.append(curated_row)
+
                 for part in files:
                     os.remove(part)
                 rows_removed += cand.curated_rows
-                new_rows = 0
-                if cand.replayable:
-                    hot_run = Path(cand.run_path)
-                    hot_summary = hot_run / "metrics" / "replay_summary.json"
-                    for row in _read_jsonl(raw_dir / "clean" / "events.jsonl"):
-                        curated_row = dict(row)
-                        curated_row["source_run_path"] = cand.run_path
-                        curated_row["replay_summary_path"] = str(hot_summary)
-                        curated_row["promotion_checked_at"] = checked_at.isoformat()
-                        curated_row["promotion_tag"] = "replayable"
+
+                if new_rows_payload:
+                    # Batch sized to the run: exactly one flush, so a failure here
+                    # leaves either nothing or everything on disk for this run.
+                    sink = ParquetDatasetSink(
+                        target_root, batch_size=len(new_rows_payload) + 1, fsync_parts=True
+                    )
+                    for curated_row in new_rows_payload:
                         sink.write(curated_row)
-                        new_rows += 1
                     sink.flush()
+                new_rows = len(new_rows_payload)
                 index_sink.write(
                     {
                         "run_path": cand.run_path,
@@ -320,6 +360,7 @@ def repromote_short_runs(
                         "previous_promoted_rows": cand.promoted_rows,
                         "removed_rows": cand.curated_rows,
                         "raw_dir": str(raw_dir),
+                        "torn_tail": cand.torn_tail,
                     }
                 )
                 cand.new_rows = new_rows
@@ -330,7 +371,6 @@ def repromote_short_runs(
                 else:
                     removed_count += 1
             except Exception as exc:  # noqa: BLE001 - keep going; the report carries the error
-                sink.discard()
                 cand.action = "failed"
                 cand.error = str(exc)
                 failed_count += 1

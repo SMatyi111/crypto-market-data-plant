@@ -204,16 +204,19 @@ def test_shared_part_file_is_never_touched(tmp_path: Path) -> None:
     assert len(list(target_root.rglob("*.parquet"))) == 1  # untouched
 
 
-def test_row_mismatch_between_index_and_files_is_a_skip(tmp_path: Path) -> None:
+def test_index_file_row_mismatch_is_reported_but_repaired(tmp_path: Path) -> None:
+    """The file scan is complete (whole dataset), so a stale index count is
+    informational - the run's files are all known and can be replaced safely."""
     source_root, target_root, run_dir = _truncated_setup(tmp_path)
-    # Corrupt the index claim so the located files (4 rows) no longer match it.
     index = target_root / "_promotion_index.jsonl"
     row = json.loads(index.read_text(encoding="utf-8").splitlines()[0])
-    row["promoted_rows"] = 5
+    row["promoted_rows"] = 5  # files hold 4
     index.write_text(json.dumps(row) + "\n", encoding="utf-8")
     report = repromote_short_runs(target_root=target_root, apply=True)
-    assert report.runs[0].action == "skipped_row_mismatch"
-    assert len(_curated_rows_for(target_root, str(run_dir))) == 4
+    assert report.runs[0].action == "repromote"
+    assert report.runs[0].index_mismatch is True
+    assert report.rows_removed == 4
+    assert len(_curated_rows_for(target_root, str(run_dir))) == 10
 
 
 def test_lane_filter_and_limit(tmp_path: Path) -> None:
