@@ -43,12 +43,13 @@ def test_max_files_prunes_oldest_parts_by_index_not_name(tmp_path: Path) -> None
         path.write_text("{}\n", encoding="utf-8")
 
     sink = RotatingJsonlSink(tmp_path, "messages.jsonl", max_bytes=40, max_files=3)
-    for i in range(3):  # ~35 bytes each -> one roll
+    for i in range(3):  # ~35 bytes each -> rolls before the 2nd and 3rd write -> parts 11, 12
         sink.write(_row(i))
 
     numbered = sorted(int(p.name.split(".")[1]) for p in tmp_path.glob("messages.*.jsonl") if p.name.split(".")[1].isdigit())
-    # Newest three by INDEX survive (9, 10, 11) - a name sort would have kept 10, 8, 9.
-    assert numbered == [9, 10, 11]
+    # Newest three by INDEX survive (10, 11, 12) - a plain name sort ("1" < "10" < "2"
+    # < ... < "9") would have kept 7, 8, 9 and deleted the newest parts.
+    assert numbered == [10, 11, 12]
     assert all(path.exists() for path in foreign)
     assert (tmp_path / "messages.jsonl").exists()
 
