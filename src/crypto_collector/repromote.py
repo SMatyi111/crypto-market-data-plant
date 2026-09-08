@@ -68,6 +68,7 @@ class RepromoteRun:
     promoted_rows: int
     raw_rows: int | None = None
     raw_dir: str | None = None
+    raw_count_source: str | None = None
     replayable: bool | None = None
     summary_event_count: int | None = None
     curated_files: list[str] = field(default_factory=list)
@@ -163,6 +164,46 @@ def count_clean_rows(run_dir: Path) -> int | None:
     return count
 
 
+def raw_row_count(run_dir: Path) -> tuple[int | None, str]:
+    """Raw clean-row count with a fast path.
+
+    The collector appends a progress row to `metrics/summary.jsonl` every ~1000
+    events and once more at segment close; the final row carries the exact
+    `clean_events` total and `partial: false`. Reading that (a few KB) instead of
+    the whole events file (up to hundreds of MB, often on the cold HDD) turns a
+    43k-run inventory from hours into minutes. Verified live 2026-09-08 on
+    binance_trades: `clean_events` == line count on every sampled run.
+
+    Falls back to counting lines when the summary is missing, torn, or its last
+    row is still `partial` (a killed segment). The apply path re-parses the
+    events file in full anyway, so a wrong fast-path count can only cause a
+    fail-closed "row count changed" on that run, never a bad repair.
+
+    Returns (count or None when the events file is absent, source label)."""
+    events = run_dir / "clean" / "events.jsonl"
+    if not events.exists():
+        return None, "missing"
+    summary = run_dir / "metrics" / "summary.jsonl"
+    if summary.exists():
+        try:
+            last_line = ""
+            with summary.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.strip():
+                        last_line = line
+            last = json.loads(last_line) if last_line else None
+        except (OSError, ValueError):
+            last = None
+        if (
+            isinstance(last, dict)
+            and last.get("partial") is False
+            and isinstance(last.get("clean_events"), int)
+            and not isinstance(last.get("clean_events"), bool)
+        ):
+            return int(last["clean_events"]), "summary"
+    return count_clean_rows(run_dir), "lines"
+
+
 def read_clean_rows(run_dir: Path) -> tuple[list[dict[str, Any]], bool]:
     """Parse clean/events.jsonl. Returns (rows, torn_tail). Only the FINAL
     non-blank line may fail to parse (torn tail after a hard kill); any other
@@ -252,13 +293,21 @@ def repromote_short_runs(
         if raw_dir is None:
             runs.append(RepromoteRun(run_path, lane, "skipped_raw_missing", promoted_rows))
             continue
-        raw_rows = count_clean_rows(raw_dir)
+        raw_rows, count_source = raw_row_count(raw_dir)
         if not raw_rows:
             continue  # nothing to compare against
         if promoted_rows >= raw_rows * min_ratio:
             continue  # complete enough
         candidates.append(
-            RepromoteRun(run_path, lane, "candidate", promoted_rows, raw_rows=raw_rows, raw_dir=str(raw_dir))
+            RepromoteRun(
+                run_path,
+                lane,
+                "candidate",
+                promoted_rows,
+                raw_rows=raw_rows,
+                raw_dir=str(raw_dir),
+                raw_count_source=count_source,
+            )
         )
 
     rows_removed = 0
