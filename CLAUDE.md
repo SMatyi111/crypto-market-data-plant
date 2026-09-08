@@ -26,7 +26,10 @@ Resolved-work narrative: [`docs/HISTORY.md`](docs/HISTORY.md). Runbook:
   test that the field survives dispatch.
 - **Exactly one promoter per lane.** `promote-replayable` jobs are the only thing
   that writes curated parquet; scorers must use `--score-only`. Two promoters
-  duplicate curated rows.
+  duplicate curated rows. Sole sanctioned exception: the owner-gated
+  `repromote-short-runs --apply` repair, which only rewrites runs the promoter
+  has already indexed (disjoint run sets, so no duplicates) and appends a
+  superseding index row per STANDARDS 2.3.
 - If you change a schema, partition layout, or the meaning of "replayable":
   **bump `STANDARDS_VERSION`** in both `src/crypto_collector/config.py` and
   `STANDARDS.md`, same change.

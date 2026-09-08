@@ -138,6 +138,7 @@ from .offload import (
     write_offload_report_latest,
 )
 from .promotion import promote_replayable_runs
+from .repromote import repromote_short_runs
 from .quality import MetadataQualityGate, QualityGate
 from .text_normalizers import TextItemNormalizer, TextQualityGate
 from .quarantine import quarantine_bad_runs
@@ -1441,6 +1442,49 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     backfill_parser.add_argument("--format", choices=["json", "text"], default="text")
+
+    repromote_parser = subparsers.add_parser(
+        "repromote-short-runs",
+        help=(
+            "Repair curated runs whose promotion captured only part of the raw "
+            "segment (2026-09-07 audit): re-promote them from raw (hot or cold) and "
+            "append a superseding promotion-index row. Dry-run unless --apply."
+        ),
+    )
+    repromote_parser.add_argument(
+        "--target-root",
+        type=Path,
+        required=True,
+        help="Curated dataset root holding _promotion_index.jsonl (e.g. .../trades_replayable).",
+    )
+    repromote_parser.add_argument(
+        "--lane",
+        action="append",
+        default=None,
+        help="Raw lane dir name(s) to repair (e.g. hyperliquid_wallet_flow). Repeatable; default all.",
+    )
+    repromote_parser.add_argument(
+        "--cold-root",
+        type=Path,
+        default=None,
+        help="Cold-tier raw root (the archive-offload cold_root, e.g. D:\\market_archive_cold\\raw\\market) "
+        "searched when a run has already been offloaded from the hot tier.",
+    )
+    repromote_parser.add_argument(
+        "--min-ratio",
+        type=float,
+        default=0.98,
+        help="A run is short when promoted_rows < min_ratio x raw clean rows (default 0.98).",
+    )
+    repromote_parser.add_argument("--min-age-hours", type=float, default=1.0)
+    repromote_parser.add_argument("--limit", type=int, default=1000)
+    repromote_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Delete the run's curated part-files, re-promote from raw, append the index row. "
+        "Without it: read-only report. Curated data change - owner-gated per lane.",
+    )
+    repromote_parser.add_argument("--format", choices=["json", "text"], default="text")
 
     subparsers.add_parser("state", help="Show archive and package state")
     return parser
@@ -5045,6 +5089,40 @@ def run_backfill_stream_depth(args: argparse.Namespace) -> None:
         )
 
 
+def run_repromote_short_runs(args: argparse.Namespace) -> None:
+    """Repair truncated promotions (see crypto_collector.repromote). Dry-run unless
+    --apply; --apply is a curated-data change and is owner-gated per lane."""
+    report = repromote_short_runs(
+        target_root=args.target_root,
+        lanes=args.lane,
+        cold_root=args.cold_root,
+        min_ratio=float(args.min_ratio),
+        min_age_hours=float(args.min_age_hours),
+        limit=int(args.limit),
+        apply=bool(args.apply),
+    )
+    if args.format == "json":
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+        return
+    print(f"repromote-short-runs mode={report.mode} status={report.status}")
+    print(f"target_root={report.target_root}")
+    print(
+        f"index_runs={report.index_runs} candidates={report.candidate_count} "
+        f"repromoted={report.repromoted_count} removed_not_replayable={report.removed_count} "
+        f"skipped={report.skipped_count} failed={report.failed_count}"
+    )
+    print(f"rows_removed={report.rows_removed} rows_written={report.rows_written}")
+    by_lane: dict[str, dict[str, int]] = {}
+    for run in report.runs:
+        lane_counts = by_lane.setdefault(run.lane, {})
+        lane_counts[run.action] = lane_counts.get(run.action, 0) + 1
+    for lane in sorted(by_lane):
+        actions = ", ".join(f"{k}={v}" for k, v in sorted(by_lane[lane].items()))
+        print(f"  {lane:30s} {actions}")
+    if report.mode == "dry_run" and report.candidate_count:
+        print("Dry run only (no files written or deleted). Re-run with --apply to repair.")
+
+
 def run_quarantine_runs(args: argparse.Namespace) -> None:
     report = quarantine_bad_runs(args.source_root, quarantine_root=args.quarantine_root, limit=args.limit, max_age_hours=args.max_age_hours)
     if args.format == "json":
@@ -5564,6 +5642,8 @@ def main() -> None:
         run_backfill_text_replay(args)
     elif args.command == "backfill-stream-depth":
         run_backfill_stream_depth(args)
+    elif args.command == "repromote-short-runs":
+        run_repromote_short_runs(args)
     elif args.command == "quarantine-runs":
         run_quarantine_runs(args)
     elif args.command == "promote-replayable":

@@ -2046,7 +2046,10 @@ def _binance_trades_quality(
 
 
 def _promoted_rows_by_run(index_path: Path) -> dict[str, int]:
+    """Latest-wins per run_path (STANDARDS 2.3: the index may hold a superseding
+    row per run after a `repromote-short-runs` repair; summing would double-count)."""
     rows: dict[str, int] = {}
+    latest_at: dict[str, str] = {}
     if not index_path.exists():
         return rows
     try:
@@ -2065,12 +2068,18 @@ def _promoted_rows_by_run(index_path: Path) -> dict[str, int]:
             continue
         run_path = payload.get("run_path")
         promoted_rows = _number_or_none(payload.get("promoted_rows"))
-        if (
-            isinstance(run_path, str)
-            and "binance_trades" in Path(run_path).parts
-            and promoted_rows
-        ):
-            rows[run_path] = rows.get(run_path, 0) + int(promoted_rows)
+        if not (isinstance(run_path, str) and "binance_trades" in Path(run_path).parts):
+            continue
+        if promoted_rows is None:
+            continue
+        promoted_at = str(payload.get("promoted_at") or "")
+        if run_path in latest_at and promoted_at < latest_at[run_path]:
+            continue
+        latest_at[run_path] = promoted_at
+        if int(promoted_rows) > 0:
+            rows[run_path] = int(promoted_rows)
+        else:
+            rows.pop(run_path, None)
     return rows
 
 

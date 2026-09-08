@@ -233,7 +233,13 @@ left in place — read both if you need history across the boundary.
 Only runs whose `replay_summary.json` says `replayable: true` are promoted here.
 **This is what an analyst should read** — pull by `(venue, instrument, event_date)`
 straight off the path. `_promotion_index.jsonl` records each promoted run
-(`run_path`, `promoted_rows`, `promoted_at`).
+(`run_path`, `promoted_rows`, `promoted_at`). The index is append-only and may
+hold more than one row per `run_path`: a later row supersedes earlier ones
+(readers keep the latest `promoted_at`). Rows written by the
+`repromote-short-runs` repair carry `repromoted: true` (or
+`removed_not_replayable: true` with `promoted_rows: 0`), `previous_promoted_rows`
+and `removed_rows`; the curated part-files of the superseded promotion are gone,
+so the dataset itself never holds two copies of a run.
 
 ### 2.4 Quarantine
 
