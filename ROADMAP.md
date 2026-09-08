@@ -196,6 +196,33 @@ start and a runner-process crash would leave no trace (open item 17). V1 tasks
 `BinanceIV Collect History` / `Collect Deribit` still run (cutover step 4,
 owner).
 
+**Deployed 2026-09-08 00:29Z** (owner, elevated `redeploy_runner.ps1` on
+`main 50f44d7` = PRs #54/#55/#56 merged 09-07 17:03Z), **verified 09:30Z (9 h):**
+runner pid 35660, 112 jobs / 31 pooled, health `status=warn` with the single
+finding `offload_stuck_above_baseline:4`. 3,861 job results, 3,859 success /
+2 error (both fapi transport exits, self-healed). **Every 09-02 and 09-07
+defect that the redeploy could fix is fixed live:** (a) the four liquidation
+lanes have run 9.02 h continuously — no `timed out after 7200s` since the
+restart; (b) the OI lanes write to `binance_perp_open_interest_{btcusdt,ethusdt,solusdt}/`
+(18 runs each, single product, 0 torn lines, 17/17 successes, 0 errors); the
+legacy shared dir and `bybit_perp_liquidations/` stopped receiving runs at
+00:23Z / 00:10Z; the Bybit lanes write to `bybit_perp_liquidations_<symbol>/`;
+(c) the OI curated dataset exists: `curated/research/open_interest` holds 408
+promotions / 12,841 rows (357 legacy-dir runs + 17 per symbol dir), 321
+legacy runs quarantined (the mixed-symbol / torn ones, by design), the 12 OI
+curation jobs run on cadence; (d) **trades-lane truncation has stopped**: 0 of
+73 runs promoted after 01:30Z on `binance_trades`, `bybit_perp_trades`,
+`okx_trades`, `hyperliquid_wallet_flow` are short. **Depth lanes still truncate
+as predicted** (7/15 `binance_depth`, 6/16 `coinbase_depth`, 6/16 `okx_depth`
+since 01:30Z) — the two depth scorers have no minimum age; autonomous fix
+queued (open item 18). Owner also **disabled the V1 options tasks** — cutover
+step (4) done, plant lanes are the sole options collectors. Residue: the 4
+stuck runs are 3 restart partials (08-30 ×2, 09-01) plus the torn OI run
+`20260902_203608`; the three new `bybit_perp_liquidations_<symbol>` dirs (and
+`okx_perp_liquidations`) have no offload row → Decision queue; `runner.log`
+still not written (item 17). D: free fell 908 → 830 GB in a day from
+`D:\open-weights` (owner activity, not the plant).
+
 **Previous ops audit:** 2026-09-02 — **runner healthy, options-IV cutover live; the
 three lanes added 2026-08-25 have been defective since deploy day.** SYSTEM
 runner redeployed by the owner 2026-09-01 ~12:32Z (PR #51 merged 12:30Z), so
@@ -569,6 +596,17 @@ owner ask (safe-shaping directive above).
     the 08-25 boot start and a runner-process crash after a manual redeploy
     leaves no trace; the script's own "check runner.log" warning is misleading.
     Autonomous fix (ASCII-only `.ps1`, parse-check).
+18. **Minimum-age floor for the two depth scorers (found 2026-09-07, still
+    live after the 09-08 redeploy).** `backfill-replay` (`score-binance-depth`,
+    `score-binance-depth-usdc`) and `backfill-stream-depth` (`score-stream-depth`,
+    8 lanes) score the live 1800 s segment every ~77 min; the promoter then
+    indexes the partial run for good. ~40 % of depth runs promoted since the
+    redeploy are short. Fix = the same `min_age_hours` (default 1 h) PR #54 gave
+    the trades/text scorers, threaded through `backfill_replay_summaries` and
+    `run_backfill_stream_depth` + arg-survival tests; config needs no change
+    (default applies) but the runner must restart to pick up the code for the
+    scheduler-thread jobs — collector subprocesses import the checkout, the
+    maintenance jobs run in-process. Autonomous PR; deploy at the next redeploy.
 13. ~~Verify OKX/Bybit trades subscribe-replay behavior over live frames~~
     **DONE — verified 2026-07-06, no code change needed.** Live probe (2
     independent runs, 8 connections: OKX spot + swap, Bybit spot + linear,
@@ -655,38 +693,16 @@ owner ask (safe-shaping directive above).
 Decisions waiting on the owner; agents must not act on these without an explicit OK
 (see `CLAUDE.md` Governance):
 
-- **Options-IV cutover step (4) is ready (2026-09-02). Owner 2026-09-02: not yet —
-  keep both V1 tasks running in parallel for now.** Both plant lanes have
-  run 24 h+ clean in parallel with V1; disabling `BinanceIV Collect History`
-  and `BinanceIV Collect Deribit` (there is no task literally named
-  `Binance IV Collector`) is now purely the owner's call. Step (5) (repoint the
-  V1 surface-history builder at the archive) stays V1-side.
-- **Options-IV lane reassignment (2026-08-29, PR `feat/options-iv-snapshot-lanes`).**
-  *Status 2026-09-02: merged (#51) and deployed 09-01; steps (1)–(3) done.*
-  Collection of the Binance eapi options chain + Deribit options snapshots moves
-  from `G:\Binance_IV_V1` into two raw-only reference lanes here (STANDARDS §4.9;
-  keyless public endpoints; cadences match what the V1 series has run since
-  2026-05: 15 min Binance / 5 min Deribit). Owner steps, in order: (1) merge the
-  PR; (2) copy THREE things from `ops.live.example.json` into
-  `ops.live.local.json` — the two lane entries, the two `archive-offload-cold`
-  `age_only` lane rows, AND the two cleanup `raw_policy` pins
-  (`market/*_options*=3650`; without the pins the cleanup default `raw_days: 14`
-  would eventually delete unrecoverable snapshots) — then run
-  `scripts/redeploy_runner.ps1` (merged != deployed; CollectorConcurrency is now
-  37); (3) run OLD and NEW collectors in parallel ~24 h and check both lanes in
-  the health report's `poll_lanes` table; also glance at hot-tier run-dir counts
-  after any offload backlog — the shared 200-runs/pass offload budget drains
-  lanes in config order and these two sit last; (4) only then disable the three
-  `Binance_IV_V1` scheduled tasks (`Binance IV Collector`,
-  `BinanceIV Collect History`, `BinanceIV Collect Deribit`) — overlap beats a
-  gap, dedup at read time is trivial, backfill is impossible. Note
-  `BinanceIV Collect History` only DERIVES the surface-history CSV from the same
-  chain pull, so nothing is lost by disabling it once step (5) lands; (5)
-  repoint the V1 repo's surface-history builder at the archive (V1-side work,
-  tracked in that repo's `NEXT_STEP.md`). Open cadence choice: the earliest V1
-  weeks sampled the Binance chain at ~2 min; if intraday IV research wants that
-  resolution back, it is one `interval_seconds` edit on the lane (payload is
-  ~2 MB raw per snapshot — ~1 GB/day raw at 2-min).
+- **Offload rows for the per-symbol liquidation dirs (2026-09-08).** Since the
+  redeploy the Bybit lanes write `bybit_perp_liquidations_{btcusdt,ethusdt,solusdt}/`;
+  together with `okx_perp_liquidations/` and the two legacy shared dirs they
+  have no `archive-offload-cold` row, so they surface as `unconfigured_lane`
+  every pass and accumulate on the SSD with no retention bound (day-long
+  segments, so slowly). The lanes are raw-only (no promoter) → the fitting row
+  is `gate: age_only`, mirroring the options lanes; the legacy shared dirs can
+  take the same row once their 09-02..09-08 runs are judged (mixed-symbol runs
+  are replayable per-product since v11, but nothing promotes liquidations).
+  Config-only; takes effect at the next redeploy.
 - **Text-capture P2 probes (from the 2026-07-16 feasibility doc — see
   `docs/text_source_p2_feasibility.md` §7; none urgent, no rationale here per
   the public-safe contract).** Four calls: (1) approve the 72 h keyless
@@ -731,15 +747,24 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   the truncation for consumers. Either way the bleeding stops only when a
   minimum-age floor reaches ALL scorers: PR #54 covers trades + text, the two
   depth scorers (`backfill-replay`, `backfill-stream-depth`) still need it
-  (comment on #54).
-- **Merge PR #54 BEFORE the next redeploy (2026-09-07).** The live config on
-  disk already carries #54's jobs and args; `main` drops `min_age_hours`
-  silently and has no 25 h liquidation timeout rule, so redeploying `main`
-  with this config deploys the OI curation chain with live-segment scoring and
-  leaves the 7200 s kills in place. Order: merge #54 (and #55) → elevated
-  `redeploy_runner.ps1` → confirm the OI lanes write to `_<symbol>` dirs, the
-  liquidation lanes stop logging `timed out after 7200s`, and the 12 OI
-  curation jobs clear their `stale_job` findings.
+  (comment on #54). *Status 2026-09-08: trades + text + wallet-flow truncation
+  stopped at the 00:29Z redeploy (0 short runs since); depth lanes still
+  truncating ~40 % of runs until open item 18 deploys. The repair decision
+  itself is still open.*
+
+Decided 2026-09-08 (recorded, closed):
+- **Merge #54/#55/#56 then redeploy — DONE.** Owner approved the merges 09-07
+  (squash-merged 17:01–17:03Z; one trivial ROADMAP conflict on #54 resolved in
+  a worktree) and ran the elevated redeploy 2026-09-08 00:29Z on `50f44d7`.
+  Verification in the 09-08 deploy note above: liquidation kills gone, per-symbol
+  dirs live, OI curated dataset filling, trades truncation stopped.
+- **Options-IV cutover step (4) — DONE.** `BinanceIV Collect History` and
+  `BinanceIV Collect Deribit` disabled 2026-09-08 (all V1 tasks now Disabled);
+  the plant's `binance-options-chain-snapshot` + `deribit-options-snapshot`
+  lanes are the sole options collectors. Step (5) — repoint the V1
+  surface-history builder at the archive — stays V1-side (that repo's
+  `NEXT_STEP.md`). Cadence option unchanged: a 2-min Binance chain is one
+  `interval_seconds` edit (~1 GB/day raw).
 
 Decided 2026-08-01 (implemented locally; elevated restart pending):
 - **Aged unaccounted runs: quarantine-preserve plus durable backstop.** The owner
