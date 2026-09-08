@@ -53,6 +53,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from .ops import _read_latest_summary_row
 from .promotion import _parse_run_started_at, _read_json_file
 from .storage import JsonlSink, ParquetDatasetSink
 
@@ -183,25 +184,37 @@ def raw_row_count(run_dir: Path) -> tuple[int | None, str]:
     events = run_dir / "clean" / "events.jsonl"
     if not events.exists():
         return None, "missing"
-    summary = run_dir / "metrics" / "summary.jsonl"
-    if summary.exists():
-        try:
-            last_line = ""
-            with summary.open("r", encoding="utf-8") as handle:
-                for line in handle:
-                    if line.strip():
-                        last_line = line
-            last = json.loads(last_line) if last_line else None
-        except (OSError, ValueError):
-            last = None
-        if (
-            isinstance(last, dict)
-            and last.get("partial") is False
-            and isinstance(last.get("clean_events"), int)
-            and not isinstance(last.get("clean_events"), bool)
-        ):
-            return int(last["clean_events"]), "summary"
+    last = _read_latest_summary_row(run_dir)
+    if isinstance(last, dict):
+        clean_events = last.get("clean_events")
+        # Final row: the pipeline marks it `partial: false`; the Binance depth
+        # finalizer writes a single closing row with no `partial` key at all but
+        # always with `deadline_reached`. In-flight pipeline rows are `partial: true`.
+        is_final = last.get("partial") is False or ("partial" not in last and "deadline_reached" in last)
+        if is_final and isinstance(clean_events, int) and not isinstance(clean_events, bool):
+            return int(clean_events), "summary"
     return count_clean_rows(run_dir), "lines"
+
+
+def _summary_is_stale(cand: RepromoteRun) -> bool:
+    """The replay verdict was computed on a prefix: its event_count does not match
+    the raw rows (tolerating exactly one torn final line, never counted by the
+    collector)."""
+    return (
+        bool(cand.replayable)
+        and cand.summary_event_count is not None
+        and cand.summary_event_count not in (cand.raw_rows, (cand.raw_rows or 0) - 1)
+    )
+
+
+def _recount_from_lines(cand: RepromoteRun, raw_dir: Path) -> None:
+    """Replace a summary-derived raw count with the on-disk line count. Used when a
+    count-based check is about to skip or fail a run: after an OS crash the
+    collector's in-memory total can exceed what reached disk (STANDARDS 2.1 allows
+    one lost batch), and labelling such a run stale/failed would be wrong."""
+    if cand.raw_count_source == "summary":
+        cand.raw_rows = count_clean_rows(raw_dir)
+        cand.raw_count_source = "lines"
 
 
 def read_clean_rows(run_dir: Path) -> tuple[list[dict[str, Any]], bool]:
@@ -351,11 +364,9 @@ def repromote_short_runs(
                 cand.action = "skipped_shared_part_file"
                 runs.append(cand)
                 continue
-            if (
-                cand.replayable
-                and cand.summary_event_count is not None
-                and cand.summary_event_count not in (cand.raw_rows, (cand.raw_rows or 0) - 1)
-            ):
+            if _summary_is_stale(cand) and cand.raw_count_source == "summary":
+                _recount_from_lines(cand, raw_dir)  # the summary total may exceed what reached disk
+            if _summary_is_stale(cand):
                 # The verdict was computed on the partial prefix (the very defect
                 # being repaired): re-score the run with --overwrite first. The
                 # line count may exceed event_count by exactly one when the final
@@ -377,7 +388,9 @@ def repromote_short_runs(
                 if cand.replayable:
                     parsed, torn_tail = read_clean_rows(raw_dir)
                     cand.torn_tail = torn_tail
-                    expected = cand.raw_rows - (1 if torn_tail else 0)
+                    if cand.raw_count_source == "summary" and len(parsed) != (cand.raw_rows or 0) - (1 if torn_tail else 0):
+                        _recount_from_lines(cand, raw_dir)  # compare against disk, not the collector's total
+                    expected = (cand.raw_rows or 0) - (1 if torn_tail else 0)
                     if len(parsed) != expected:
                         raise ValueError(
                             f"raw row count changed while repairing: counted {cand.raw_rows}, parsed {len(parsed)}"
