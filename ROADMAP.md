@@ -590,6 +590,10 @@ owner ask (safe-shaping directive above).
     warning. Fix: an autouse `conftest.py` fixture pointing every
     `MARKET_DATA_*_ROOT` at `tmp_path` (hermetic by construction), then delete
     the `mock` lane dir (owner nod — it is test debris, not data). Autonomous.
+    *2026-09-08: fixture landed on `fix/test-hermetic-roots` (`tests/conftest.py`
+    points `MARKET_DATA_ARCHIVE_ROOT` at a per-test temp dir and clears inherited
+    per-root overrides; `test_suite_default_roots_are_hermetic` pins it). The 60
+    existing `raw/market/mock/` run dirs still await the owner's delete nod.*
 17. **`redeploy_runner.ps1` discards runner stdout/stderr (found 2026-09-07).**
     Its `Start-Process` has no `-RedirectStandardOutput/-RedirectStandardError`,
     unlike `run_ops_runner.ps1` (`*>> runner.log`), so `runner.log` last grew at
