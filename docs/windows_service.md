@@ -175,6 +175,35 @@ is promoted on its OLD-logic verdict. The backfill does **not** touch
 the live collector; it only reads raw runs and writes curated Parquet, so it is safe
 to run while collection continues.
 
+## Repairing truncated promotions
+
+Until 2026-09-08 the hourly score jobs could score a segment the collector was
+still writing, and the promoter then indexed that partial run for good (about a
+third of promoted runs on every trades/depth lane; see the 2026-09-07 audit in
+`ROADMAP.md`). Raw is intact, so `repromote-short-runs` repairs a lane from it:
+
+```powershell
+# Dry run: which runs are short (promoted_rows < 98 % of raw clean rows) and
+# what would happen. Reads raw from the hot tier, then the cold tier.
+market-data-plant repromote-short-runs --target-root G:\market_archive\curated\research\trades_replayable `
+  --lane hyperliquid_wallet_flow --cold-root D:\market_archive_cold\raw\market
+
+# Apply (owner-gated per lane): delete the run's curated part-files, re-promote
+# every raw row, append a superseding _promotion_index row.
+market-data-plant repromote-short-runs --target-root G:\market_archive\curated\research\trades_replayable `
+  --lane hyperliquid_wallet_flow --cold-root D:\market_archive_cold\raw\market --apply
+```
+
+Safety properties: a run is skipped (never partially edited) when any of its
+part-files also holds another run's rows, when the rows found on disk do not
+equal the index's `promoted_rows`, or when raw is missing on both tiers. The
+apply order is delete-then-write, so an interrupted repair leaves the run
+absent from curated with a stale index count and the next dry-run shows it
+short again. Runs younger than `--min-age-hours` (1 h) are left to the live
+scorer floor. Safe to run while the plant is up: part-file names are unique
+and the index append is line-atomic; a research reader scanning the exact
+partition at that moment may see the run vanish and reappear within seconds.
+
 ## Remove
 
 ```powershell

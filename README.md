@@ -326,6 +326,8 @@ market-data-plant quarantine-runs --source-root G:\market_archive\raw\market\bin
 market-data-plant promote-replayable --source-root G:\market_archive\raw\market\binance_depth --target-root G:\market_archive\curated\research\market_replayable
 market-data-plant research-manifest --archive-root G:\market_archive --output-root G:\market_archive\curated\research\manifests
 market-data-plant cleanup --raw-days 14
+# repair runs promoted from a partial segment (dry-run; add --apply per lane after reading the report)
+market-data-plant repromote-short-runs --target-root G:\market_archive\curated\research\trades_replayable --cold-root D:\market_archive_cold\raw\market
 ```
 
 The quarantine → promote chain is per-lane: point `--source-root` at any lane
