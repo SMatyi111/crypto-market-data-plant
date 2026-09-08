@@ -595,7 +595,12 @@ owner ask (safe-shaping directive above).
     unlike `run_ops_runner.ps1` (`*>> runner.log`), so `runner.log` last grew at
     the 08-25 boot start and a runner-process crash after a manual redeploy
     leaves no trace; the script's own "check runner.log" warning is misleading.
-    Autonomous fix (ASCII-only `.ps1`, parse-check).
+    Autonomous fix (ASCII-only `.ps1`, parse-check). *2026-09-08: fixed on
+    `fix/redeploy-runner-log` — the relaunch goes through a hidden PowerShell
+    child that appends stdout+stderr to `runner.log` (same `*>>` posture as the
+    boot script) and writes a dated relaunch marker first; hygiene test pins
+    the redirect in both scripts. Takes effect at the NEXT manual redeploy (the
+    current runner was launched by the old script and stays unlogged).*
 18. **Minimum-age floor for the two depth scorers (found 2026-09-07, still
     live after the 09-08 redeploy).** `backfill-replay` (`score-binance-depth`,
     `score-binance-depth-usdc`) and `backfill-stream-depth` (`score-stream-depth`,

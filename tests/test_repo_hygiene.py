@@ -189,3 +189,16 @@ def test_config_strings_have_no_control_characters(config_name: str) -> None:
     cannot be enabled into the failure later."""
     offenders = find_control_characters(_job_specs(config_name))
     assert not offenders, f"{config_name}: control characters in job args: {offenders}"
+
+
+def test_redeploy_runner_appends_runner_output_to_runner_log() -> None:
+    """The manual redeploy path must log like the boot path. A bare Start-Process of
+    python discards stdout/stderr, so after the 2026-09-01..09-08 redeploys
+    runner.log had not grown since the 08-25 boot start and a runner-process crash
+    would have left no trace (2026-09-07 audit, ROADMAP item 17). Pin the append
+    redirect so a refactor cannot quietly drop it again."""
+    body = (REPO_ROOT / "scripts" / "redeploy_runner.ps1").read_text(encoding="ascii")
+    assert "*>> '$logPath'" in body, "redeploy_runner.ps1 no longer appends the runner's output to runner.log"
+    assert 'Join-Path $OpsRoot "runner.log"' in body
+    run_body = (REPO_ROOT / "scripts" / "run_ops_runner.ps1").read_text(encoding="ascii")
+    assert "*>> $LogPath" in run_body, "run_ops_runner.ps1 lost its runner.log redirect"

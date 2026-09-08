@@ -173,9 +173,19 @@ Remove-Item (Join-Path $OpsRoot "standalone_workers\*.lock") -Force -ErrorAction
 Remove-Item (Join-Path $OpsRoot "standalone_workers\*.lock.stale-*") -Force -ErrorAction SilentlyContinue
 
 # 3. Relaunch directly (no wrapper mutex), loading this repo's src via PYTHONPATH.
+#    Launch through a hidden PowerShell child that APPENDS the runner's stdout+stderr
+#    to runner.log, mirroring run_ops_runner.ps1's `*>> $LogPath`. A bare
+#    Start-Process discards both streams: after the 2026-09-01/02/08 manual
+#    redeploys runner.log had not grown since the 08-25 boot start, so a runner-
+#    process crash would have left no trace (2026-09-07 audit). Start-Process's own
+#    -RedirectStandard* switches are not used because they truncate instead of
+#    appending and cannot share one file between the two streams.
 $env:PYTHONPATH = Join-Path $repo "src"
-Start-Process -WindowStyle Hidden -WorkingDirectory $repo -FilePath $python `
-    -ArgumentList '-m','crypto_collector.cli','ops-runner','--config',$config,'--ops-root',$OpsRoot,'--collector-concurrency',$CollectorConcurrency
+$logPath = Join-Path $OpsRoot "runner.log"
+"[$(Get-Date -Format o)] redeploy_runner.ps1 relaunching ops runner with $config" | Out-File -FilePath $logPath -Append -Encoding utf8
+$runnerCommand = "& '$python' -m crypto_collector.cli ops-runner --config '$config' --ops-root '$OpsRoot' --collector-concurrency $CollectorConcurrency *>> '$logPath'"
+Start-Process -WindowStyle Hidden -WorkingDirectory $repo -FilePath "powershell.exe" `
+    -ArgumentList '-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-Command',$runnerCommand
 
 # 4. Verify it came up. Three proofs, all required: a lock whose pid is ALIVE, a
 #    heartbeat STRICTLY NEWER than the pre-kill baseline (the dead runner's last
