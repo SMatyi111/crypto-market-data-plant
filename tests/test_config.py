@@ -7,6 +7,9 @@ from crypto_collector import config
 
 def test_default_output_root_uses_archive_when_present(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv("CRYPTO_COLLECTOR_OUTPUT_ROOT", raising=False)
+    # This test covers the DEFAULT_* constant fallback, below the env chain the
+    # suite-wide hermetic fixture (conftest.py) sits on - clear that layer here.
+    monkeypatch.delenv("MARKET_DATA_ARCHIVE_ROOT", raising=False)
     archive_root = tmp_path / "archive-root"
     archive_root.mkdir()
     monkeypatch.setattr(config, "DEFAULT_ARCHIVE_ROOT", archive_root)
@@ -26,6 +29,7 @@ def test_default_curated_root_uses_env_override(monkeypatch) -> None:
 
 def test_default_normalized_root_prefers_archive_root_when_available(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv("CRYPTO_COLLECTOR_NORMALIZED_ROOT", raising=False)
+    monkeypatch.delenv("MARKET_DATA_ARCHIVE_ROOT", raising=False)  # constant-fallback path
     archive_root = tmp_path / "archive-root"
     archive_root.mkdir()
     monkeypatch.setattr(config, "DEFAULT_ARCHIVE_ROOT", archive_root)
@@ -36,6 +40,7 @@ def test_default_normalized_root_prefers_archive_root_when_available(tmp_path: P
 def test_default_output_root_emits_warning_when_no_env_override_is_set(monkeypatch, recwarn) -> None:
     monkeypatch.delenv("MARKET_DATA_OUTPUT_ROOT", raising=False)
     monkeypatch.delenv("CRYPTO_COLLECTOR_OUTPUT_ROOT", raising=False)
+    monkeypatch.delenv("MARKET_DATA_ARCHIVE_ROOT", raising=False)  # the warning fires only on the constant fallback
     config._FALLBACK_WARNED.clear()
     config.default_output_root()
     fallback_warnings = [w for w in recwarn.list if "MARKET_DATA_OUTPUT_ROOT" in str(w.message)]
@@ -52,6 +57,7 @@ def test_default_output_root_does_not_warn_when_env_override_is_set(monkeypatch,
 
 def test_default_ops_root_prefers_archive_root_when_available(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv("CRYPTO_COLLECTOR_OPS_ROOT", raising=False)
+    monkeypatch.delenv("MARKET_DATA_ARCHIVE_ROOT", raising=False)  # constant-fallback path
     archive_root = tmp_path / "archive-root"
     archive_root.mkdir()
     monkeypatch.setattr(config, "DEFAULT_ARCHIVE_ROOT", archive_root)
@@ -75,3 +81,44 @@ def test_configured_archive_root_is_honored_even_when_missing(tmp_path: Path, mo
     assert config.default_normalized_root("market") == missing / "normalized" / "market"
     assert config.default_curated_root("trades") == missing / "curated" / "research" / "trades"
     assert config.default_ops_root() == missing / "ops"
+
+
+def test_suite_default_roots_are_hermetic(hermetic_archive_root: Path) -> None:
+    """Pins the conftest guard: with no test-local env, every implicit root resolves
+    inside the per-test temp dir, never the live archive. Regression for the
+    2026-09-07 audit finding that `pytest` wrote `mock` run dirs into the live
+    G: archive's `raw/market` tree."""
+    assert config.default_archive_root() == hermetic_archive_root
+    for resolved in (
+        config.default_output_root(),
+        config.default_text_output_root(),
+        config.default_normalized_root("trades"),
+        config.default_curated_root("market_replayable"),
+        config.default_ops_root(),
+    ):
+        assert hermetic_archive_root in resolved.parents, resolved
+        assert config.DEFAULT_ARCHIVE_ROOT not in resolved.parents, resolved
+
+
+def test_hermetic_env_scrubs_inherited_per_root_overrides(hermetic_env, tmp_path: Path) -> None:
+    """The half of the guard the autouse test cannot see: a developer shell that
+    exports per-root overrides pointing at the live archive must not leak into the
+    suite. Pre-seed every override with a fake live path, apply the guard, and
+    check every implicit root lands under the temp root."""
+    import pytest as _pytest
+
+    root = tmp_path / "guarded_root"
+    with _pytest.MonkeyPatch.context() as mp:
+        for name in hermetic_env.overrides:
+            mp.setenv(name, "Z:/live_archive_from_shell")
+        hermetic_env.apply(mp, root)
+        assert config.default_archive_root() == root
+        for resolved in (
+            config.default_output_root(),
+            config.default_text_output_root(),
+            config.default_normalized_root("trades"),
+            config.default_curated_root("market_replayable"),
+            config.default_ops_root(),
+        ):
+            assert root in resolved.parents, resolved
+            assert "live_archive_from_shell" not in str(resolved), resolved
