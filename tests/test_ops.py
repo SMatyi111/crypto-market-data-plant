@@ -2479,6 +2479,7 @@ def test_stream_depth_score_only_skips_already_scored_runs(tmp_path, capsys):
         target_root=tmp_path / "curated",
         limit=50,
         max_age_hours=24.0,
+        min_age_hours=0.0,  # fixture runs are dated 2099 - the live-segment floor would skip them
         apply=False,
         score_only=True,
         overwrite=False,
@@ -2524,6 +2525,7 @@ def test_stream_depth_limit_counts_unscored_runs_after_skips(tmp_path, capsys):
             target_root=tmp_path / "curated",
             limit=1,
             max_age_hours=1_000_000.0,
+            min_age_hours=0.0,  # fixture runs are dated 2099 - the live-segment floor would skip them
             apply=False,
             score_only=True,
             overwrite=False,

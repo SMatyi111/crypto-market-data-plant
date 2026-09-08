@@ -382,7 +382,11 @@ def test_backfill_replay_summaries_skips_existing_without_overwrite(tmp_path: Pa
         overwrite=False,
     )
 
-    assert report.status == "warn"
+    # A pass that saw runs and skipped every one is the healthy steady state of the
+    # hourly catch-up jobs (the collector already summarised them); `warn` +
+    # `no_backfill_changes` is reserved for an empty window (PR #58 review).
+    assert report.status == "ok"
+    assert report.findings == []
     assert report.created_count == 0
     assert report.updated_count == 0
     assert report.skipped_count == 1
