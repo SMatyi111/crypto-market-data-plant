@@ -98,3 +98,27 @@ def test_suite_default_roots_are_hermetic(hermetic_archive_root: Path) -> None:
     ):
         assert hermetic_archive_root in resolved.parents, resolved
         assert config.DEFAULT_ARCHIVE_ROOT not in resolved.parents, resolved
+
+
+def test_hermetic_env_scrubs_inherited_per_root_overrides(hermetic_env, tmp_path: Path) -> None:
+    """The half of the guard the autouse test cannot see: a developer shell that
+    exports per-root overrides pointing at the live archive must not leak into the
+    suite. Pre-seed every override with a fake live path, apply the guard, and
+    check every implicit root lands under the temp root."""
+    import pytest as _pytest
+
+    root = tmp_path / "guarded_root"
+    with _pytest.MonkeyPatch.context() as mp:
+        for name in hermetic_env.overrides:
+            mp.setenv(name, "Z:/live_archive_from_shell")
+        hermetic_env.apply(mp, root)
+        assert config.default_archive_root() == root
+        for resolved in (
+            config.default_output_root(),
+            config.default_text_output_root(),
+            config.default_normalized_root("trades"),
+            config.default_curated_root("market_replayable"),
+            config.default_ops_root(),
+        ):
+            assert root in resolved.parents, resolved
+            assert "live_archive_from_shell" not in str(resolved), resolved

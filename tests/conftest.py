@@ -19,10 +19,11 @@ env chain itself set or clear these variables on top via `monkeypatch`.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-_PER_ROOT_OVERRIDES = (
+PER_ROOT_OVERRIDES = (
     "MARKET_DATA_OUTPUT_ROOT",
     "CRYPTO_COLLECTOR_OUTPUT_ROOT",
     "MARKET_DATA_NORMALIZED_ROOT",
@@ -35,6 +36,19 @@ _PER_ROOT_OVERRIDES = (
 )
 
 
+def apply_hermetic_env(monkeypatch: pytest.MonkeyPatch, root: Path) -> None:
+    """Scrub inherited per-root overrides, then pin the archive root at `root`.
+
+    Kept as a plain function (not only a fixture body) so a test can exercise it
+    against a deliberately polluted environment - the autouse fixture has already
+    run by the time a test body executes, which would otherwise make the scrubbing
+    loop untestable.
+    """
+    for name in PER_ROOT_OVERRIDES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("MARKET_DATA_ARCHIVE_ROOT", str(root))
+
+
 @pytest.fixture(autouse=True)
 def hermetic_archive_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     """Route every implicit archive path at a per-test temp dir.
@@ -43,8 +57,12 @@ def hermetic_archive_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Pa
     `prepare_run_paths` and friends mkdir on first write, exactly as they do on a
     fresh production disk.
     """
-    for name in _PER_ROOT_OVERRIDES:
-        monkeypatch.delenv(name, raising=False)
     root = tmp_path / "hermetic_archive"
-    monkeypatch.setenv("MARKET_DATA_ARCHIVE_ROOT", str(root))
+    apply_hermetic_env(monkeypatch, root)
     return root
+
+
+@pytest.fixture
+def hermetic_env() -> SimpleNamespace:
+    """Expose the guard's parts to the test that pins them (tests/test_config.py)."""
+    return SimpleNamespace(apply=apply_hermetic_env, overrides=PER_ROOT_OVERRIDES)
