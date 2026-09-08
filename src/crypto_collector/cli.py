@@ -4750,13 +4750,31 @@ def run_book_sync_health(args: argparse.Namespace) -> None:
     print(f"findings={','.join(report.findings) if report.findings else 'none'}")
 
 
+DEFAULT_MIN_AGE_HOURS = 1.0
+"""Live-segment floor shared by every score job: 2x the 1800 s live segment, so the
+run the collector is still writing is never scored (and then partially promoted
+for good). tests/test_repo_hygiene.py pins floor > longest max_segment_seconds."""
+
+
+def _effective_min_age_hours(args: argparse.Namespace) -> float:
+    """Resolve the floor from CLI/job args with SAFE semantics: an absent attribute
+    or an explicit `null` in the ops config means the default, not "disabled";
+    only an explicit `0` disables it, and negatives clamp to 0. Every scorer
+    (depth, stream-depth, trades, text) goes through here so the four paths cannot
+    disagree on the same config key."""
+    value = getattr(args, "min_age_hours", None)
+    if value is None:
+        return DEFAULT_MIN_AGE_HOURS
+    return max(0.0, float(value))
+
+
 def run_backfill_replay(args: argparse.Namespace) -> None:
     report = backfill_replay_summaries(
         args.source_root,
         limit=args.limit,
         max_age_hours=args.max_age_hours,
         overwrite=args.overwrite,
-        min_age_hours=float(getattr(args, "min_age_hours", 1.0) or 0.0),
+        min_age_hours=_effective_min_age_hours(args),
     )
     if args.format == "json":
         print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
@@ -4796,7 +4814,7 @@ def run_backfill_trades_replay(args: argparse.Namespace) -> None:
         max_age_hours=args.max_age_hours,
         overwrite=args.overwrite,
         replay_fn=replay_fn,
-        min_age_hours=float(getattr(args, "min_age_hours", 1.0) or 0.0),
+        min_age_hours=_effective_min_age_hours(args),
     )
     if args.format == "json":
         print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
@@ -4824,7 +4842,7 @@ def run_backfill_text_replay(args: argparse.Namespace) -> None:
         # text run and must end up scored (no_events -> quarantined), not stranded
         # as a permanent unaccounted offload orphan (the funding-lane lesson).
         require_events=False,
-        min_age_hours=float(getattr(args, "min_age_hours", 1.0)),
+        min_age_hours=_effective_min_age_hours(args),
     )
     if args.format == "json":
         print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
@@ -4911,7 +4929,7 @@ def run_backfill_stream_depth(args: argparse.Namespace) -> None:
         # promote-replayable job indexes for good (the promotion index is
         # run-keyed and never revisited) - the 2026-09-07 audit measured ~1/3 of
         # depth runs truncated this way. Default 1 h = 2x the 1800 s segment.
-        min_age_hours = float(getattr(args, "min_age_hours", 1.0) or 0.0)
+        min_age_hours = _effective_min_age_hours(args)
         min_age_cutoff = now - timedelta(hours=min_age_hours)
         run_dirs: list[Path] = []
         candidate_limit = max(0, int(args.limit))
@@ -4924,9 +4942,6 @@ def run_backfill_stream_depth(args: argparse.Namespace) -> None:
                 started_at = _backfill_run_started_at(run_dir)
                 if started_at is not None and started_at < cutoff:
                     continue
-                if min_age_hours > 0 and started_at is not None and started_at > min_age_cutoff:
-                    skipped_too_recent += 1
-                    continue
                 if not (run_dir / "clean" / "events.jsonl").exists():
                     continue
                 # Apply the work limit AFTER excluding already-scored runs. Otherwise,
@@ -4937,6 +4952,12 @@ def run_backfill_stream_depth(args: argparse.Namespace) -> None:
                     and (run_dir / "metrics" / "replay_summary.json").exists()
                 ):
                     skipped_scored += 1
+                    continue
+                # Floor check AFTER the already-scored check, so a finished run the
+                # collector summarised at segment close counts as already scored and
+                # `skipped_too_recent` means exactly "unscored run still being written".
+                if min_age_hours > 0 and started_at is not None and started_at > min_age_cutoff:
+                    skipped_too_recent += 1
                     continue
                 run_dirs.append(run_dir)
                 if len(run_dirs) >= candidate_limit:
@@ -5004,7 +5025,8 @@ def run_backfill_stream_depth(args: argparse.Namespace) -> None:
     for row in summary_rows:
         print(
             f"  {row['source']:16s} scanned={row['scanned']:4d} "
-            f"replayable={row['replayable']:4d} not_replayable={row['not_replayable']:4d}"
+            f"replayable={row['replayable']:4d} not_replayable={row['not_replayable']:4d} "
+            f"already_scored={row['skipped_already_scored']:4d} too_recent={row['skipped_too_recent']:3d}"
         )
         if row["findings"]:
             findings_str = ", ".join(f"{k}={v}" for k, v in sorted(row["findings"].items()))

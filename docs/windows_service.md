@@ -163,7 +163,15 @@ market-data-plant backfill-stream-depth --raw-root G:\market_archive\raw\market 
 
 Defaults cover `coinbase_depth`, `bybit_depth`, `kraken_depth` (override with
 `--source`), the most recent `--limit 200` runs within `--max-age-hours 720`, and
-promote into the curated `market_replayable` root. The backfill does **not** touch
+promote into the curated `market_replayable` root. Runs younger than
+`--min-age-hours` (default 1 h) are left alone — they may still be receiving
+events, and a premature summary gets promoted partially and permanently. So a
+one-shot re-score after a replay-logic change does NOT regenerate the newest
+1–2 finished runs; either run the command again an hour later or pass
+`--min-age-hours 0` once you are sure no segment in the lane is still open
+(`backfill-replay` for Binance depth has the same flag and default). Note that
+`--apply` promotes on whatever summary a run carries, so a run the floor skipped
+is promoted on its OLD-logic verdict. The backfill does **not** touch
 the live collector; it only reads raw runs and writes curated Parquet, so it is safe
 to run while collection continues.
 

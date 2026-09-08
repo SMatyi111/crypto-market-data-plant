@@ -206,3 +206,82 @@ def test_backfill_stream_depth_floor_defaults_to_1h_when_attribute_absent(tmp_pa
     src = json.loads(capsys.readouterr().out)["sources"][0]
     assert src["scanned"] == 0
     assert src["skipped_too_recent"] == 1
+
+
+# --- semantics pinned by the PR #58 review --------------------------------------
+
+
+def test_effective_min_age_treats_null_as_default_and_clamps_negatives() -> None:
+    from crypto_collector.cli import DEFAULT_MIN_AGE_HOURS, _effective_min_age_hours
+
+    assert _effective_min_age_hours(SimpleNamespace()) == DEFAULT_MIN_AGE_HOURS
+    # An ops config that "unsets" the key with null must NOT disable the floor.
+    assert _effective_min_age_hours(SimpleNamespace(min_age_hours=None)) == DEFAULT_MIN_AGE_HOURS
+    null_from_config = _job_args(
+        JobSpec(name="x", job_type="backfill-stream-depth", interval_seconds=3600, args={"min_age_hours": None})
+    )
+    assert _effective_min_age_hours(null_from_config) == DEFAULT_MIN_AGE_HOURS
+    assert _effective_min_age_hours(SimpleNamespace(min_age_hours=0)) == 0.0
+    assert _effective_min_age_hours(SimpleNamespace(min_age_hours=-3)) == 0.0
+    assert _effective_min_age_hours(SimpleNamespace(min_age_hours="2.5")) == 2.5
+
+
+def test_finished_young_run_with_summary_counts_as_already_scored_not_too_recent(tmp_path: Path, capsys) -> None:
+    """Ordering: the already-scored check runs before the floor, so the counter
+    means exactly 'unscored run still being written'."""
+    raw_root = tmp_path / "raw"
+    lane = raw_root / "bybit_depth"
+    young_scored = lane / _run_name(datetime.now(tz=UTC) - timedelta(minutes=40))
+    young_unscored = lane / _run_name(datetime.now(tz=UTC) - timedelta(minutes=10))
+    _write_bybit_stream_run(young_scored)
+    _write_bybit_stream_run(young_unscored)
+    (young_scored / "metrics").mkdir()
+    (young_scored / "metrics" / "replay_summary.json").write_text(
+        json.dumps({"replayable": True, "findings": []}), encoding="utf-8"
+    )
+    run_backfill_stream_depth(
+        SimpleNamespace(
+            raw_root=raw_root,
+            source=["bybit_depth"],
+            target_root=tmp_path / "curated",
+            limit=200,
+            max_age_hours=24.0,
+            apply=False,
+            score_only=True,
+            format="text",
+        )
+    )
+    out = capsys.readouterr().out
+    assert "already_scored=   1" in out
+    assert "too_recent=  1" in out
+
+
+def test_backfill_replay_summaries_orders_existing_before_too_recent(tmp_path: Path) -> None:
+    from crypto_collector.replay import backfill_replay_summaries
+
+    source_root = tmp_path / "raw" / "market" / "binance_depth"
+    young_scored = source_root / _run_name(datetime.now(tz=UTC) - timedelta(minutes=40))
+    young_unscored = source_root / _run_name(datetime.now(tz=UTC) - timedelta(minutes=10))
+    _write_binance_depth_run(young_scored)
+    _write_binance_depth_run(young_unscored)
+    (young_scored / "metrics").mkdir()
+    (young_scored / "metrics" / "replay_summary.json").write_text(
+        json.dumps({"replayable": True, "findings": []}), encoding="utf-8"
+    )
+    report = backfill_replay_summaries(source_root, limit=10, max_age_hours=24.0, min_age_hours=1.0)
+    actions = {Path(row.run_path).name: row.action for row in report.runs}
+    assert actions[young_scored.name] == "skipped_existing"
+    assert actions[young_unscored.name] == "skipped_too_recent"
+    # Two runs seen and skipped is the healthy steady state, not a warning.
+    assert report.status == "ok"
+    assert "no_backfill_changes" not in report.findings
+
+
+def test_backfill_replay_summaries_warns_only_when_nothing_in_window(tmp_path: Path) -> None:
+    from crypto_collector.replay import backfill_replay_summaries
+
+    empty = tmp_path / "raw" / "market" / "binance_depth"
+    empty.mkdir(parents=True)
+    report = backfill_replay_summaries(empty, limit=10, max_age_hours=24.0, min_age_hours=1.0)
+    assert report.status == "warn"
+    assert "no_backfill_changes" in report.findings
