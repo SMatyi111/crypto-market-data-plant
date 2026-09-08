@@ -604,12 +604,29 @@ owner ask (safe-shaping directive above).
     warning. Fix: an autouse `conftest.py` fixture pointing every
     `MARKET_DATA_*_ROOT` at `tmp_path` (hermetic by construction), then delete
     the `mock` lane dir (owner nod — it is test debris, not data). Autonomous.
+    *2026-09-08: fixture landed on `fix/test-hermetic-roots` (`tests/conftest.py`
+    points `MARKET_DATA_ARCHIVE_ROOT` at a per-test temp dir and clears inherited
+    per-root overrides; `test_suite_default_roots_are_hermetic` pins it). The 60
+    existing `raw/market/mock/` run dirs still await the owner's delete nod.*
 17. **`redeploy_runner.ps1` discards runner stdout/stderr (found 2026-09-07).**
     Its `Start-Process` has no `-RedirectStandardOutput/-RedirectStandardError`,
     unlike `run_ops_runner.ps1` (`*>> runner.log`), so `runner.log` last grew at
     the 08-25 boot start and a runner-process crash after a manual redeploy
     leaves no trace; the script's own "check runner.log" warning is misleading.
-    Autonomous fix (ASCII-only `.ps1`, parse-check).
+    Autonomous fix (ASCII-only `.ps1`, parse-check). *2026-09-08: fixed on
+    `fix/redeploy-runner-log` — the relaunch goes through a hidden PowerShell
+    child that appends stdout+stderr to `runner.log` (same `*>>` posture as the
+    boot script) and writes a dated relaunch marker first; hygiene test pins
+    the redirect in both scripts. Takes effect at the NEXT manual redeploy (the
+    current runner was launched by the old script and stays unlogged).* Review
+    residue, not fixed here: PS 5.1 `*>>` writes UTF-16LE while both scripts'
+    `Out-File -Encoding utf8` markers are UTF-8, so `runner.log` from the BOOT
+    path is already a mixed-encoding file (Get-Content renders the python output
+    spaced). The redeploy path now writes all its lines under one redirect;
+    aligning `run_ops_runner.ps1` the same way is a one-line follow-up. The
+    reviewer's altitude suggestion — have the redeploy child run
+    `run_ops_runner.ps1` itself instead of a hand-copied launch line — is
+    recorded as an option; it needs a `-SkipMutex` switch for non-elevated use.
 18. **Minimum-age floor for the two depth scorers (found 2026-09-07, still
     live after the 09-08 redeploy).** `backfill-replay` (`score-binance-depth`,
     `score-binance-depth-usdc`) and `backfill-stream-depth` (`score-stream-depth`,
@@ -621,6 +638,19 @@ owner ask (safe-shaping directive above).
     (default applies) but the runner must restart to pick up the code for the
     scheduler-thread jobs — collector subprocesses import the checkout, the
     maintenance jobs run in-process. Autonomous PR; deploy at the next redeploy.
+    *2026-09-08: fix on `fix/depth-scorer-min-age` — `--min-age-hours` (default
+    1 h, `0` disables) on both `backfill-replay` and `backfill-stream-depth`,
+    runner dispatch defaults pinned, `skipped_too_recent` surfaced in the
+    stream-depth report; 6 regression tests in `tests/test_scorer_min_age.py`.
+    Merged != deployed: the depth lanes keep truncating until the runner
+    restarts on this code.* **Follow-up idea (from the PR review, not built):**
+    the floor guards the two hourly summary writers, but the root cause is that
+    `promote_replayable_runs` promotes any run with a replayable summary and
+    the run-keyed index never revisits — a manual `replay-depth` on a live run,
+    or `--min-age-hours 0`, re-opens the hole. A segment-close marker that the
+    promoter requires (or the scorer refuses runs without) would close every
+    path at once. Contract-adjacent (touches what "promotable" means) → needs an
+    owner nod before building.
 13. ~~Verify OKX/Bybit trades subscribe-replay behavior over live frames~~
     **DONE — verified 2026-07-06, no code change needed.** Live probe (2
     independent runs, 8 connections: OKX spot + swap, Bybit spot + linear,

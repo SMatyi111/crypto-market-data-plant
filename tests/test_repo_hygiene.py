@@ -189,3 +189,56 @@ def test_config_strings_have_no_control_characters(config_name: str) -> None:
     cannot be enabled into the failure later."""
     offenders = find_control_characters(_job_specs(config_name))
     assert not offenders, f"{config_name}: control characters in job args: {offenders}"
+
+
+def test_redeploy_runner_appends_runner_output_to_runner_log() -> None:
+    """The manual redeploy path must log like the boot path. A bare Start-Process of
+    python discards stdout/stderr, so after the 2026-09-01..09-08 redeploys
+    runner.log had not grown since the 08-25 boot start and a runner-process crash
+    would have left no trace (2026-09-07 audit, ROADMAP item 17). Pin the append
+    redirect so a refactor cannot quietly drop it again."""
+    body = (REPO_ROOT / "scripts" / "redeploy_runner.ps1").read_text(encoding="ascii")
+    # Comments must not satisfy the pin (a reverted launch line with the explanatory
+    # comment block left in place would otherwise pass).
+    code = "\n".join(line for line in body.splitlines() if not line.lstrip().startswith("#"))
+    assert 'Join-Path $OpsRoot "runner.log"' in code
+    command_lines = [line for line in code.splitlines() if "crypto_collector.cli ops-runner" in line]
+    assert command_lines, "redeploy_runner.ps1 no longer builds the ops-runner launch command"
+    assert all("*>> {0}" in line for line in command_lines), (
+        "redeploy_runner.ps1 launch command no longer appends the runner's output to runner.log"
+    )
+    assert "-EncodedCommand" in code, "launch must go through -EncodedCommand (no argv re-tokenisation)"
+    run_body = (REPO_ROOT / "scripts" / "run_ops_runner.ps1").read_text(encoding="ascii")
+    assert "*>> $LogPath" in run_body, "run_ops_runner.ps1 lost its runner.log redirect"
+_SCORED_CONFIGS = [
+    name for name in ("ops.live.example.json", "ops.live.local.json") if (REPO_ROOT / name).exists()
+]
+
+
+@pytest.mark.parametrize("config_name", _SCORED_CONFIGS)
+def test_score_job_min_age_floor_exceeds_longest_live_segment(config_name: str) -> None:
+    """The live-segment floor (min_age_hours, default 1 h in code) only protects
+    curated data if it is longer than the longest segment any scored lane can keep
+    open. Raising a lane's max_segment_seconds without raising the floor would
+    silently bring back partial promotions (2026-09-07 audit finding 1)."""
+    from crypto_collector.cli import DEFAULT_MIN_AGE_HOURS
+
+    payload = json.loads((REPO_ROOT / config_name).read_text(encoding="utf-8"))
+    jobs = [job for job in payload["jobs"] if job.get("enabled", True)]
+    segment_seconds = [
+        int(job["args"]["max_segment_seconds"])
+        for job in jobs
+        if isinstance(job.get("args"), dict) and job["args"].get("max_segment_seconds") is not None
+    ]
+    assert segment_seconds, f"{config_name}: no lane declares max_segment_seconds"
+    longest = max(segment_seconds)
+    score_jobs = [job for job in jobs if str(job["job_type"]).startswith("backfill-")]
+    assert score_jobs, f"{config_name}: no backfill-* score jobs found"
+    for job in score_jobs:
+        args = job.get("args") if isinstance(job.get("args"), dict) else {}
+        floor = args.get("min_age_hours")
+        floor_hours = DEFAULT_MIN_AGE_HOURS if floor is None else float(floor)
+        assert floor_hours * 3600 > longest, (
+            f"{config_name}: {job['name']} has min_age_hours={floor_hours} but a lane keeps "
+            f"segments open for {longest} s; the scorer would score a live run again"
+        )

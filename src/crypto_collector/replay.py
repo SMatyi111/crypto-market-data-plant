@@ -821,22 +821,6 @@ def backfill_replay_summaries(
         started_at = _parse_run_started_at(run_dir)
         if started_at is not None and started_at < cutoff:
             continue
-        if (
-            min_age_hours > 0
-            and started_at is not None
-            and started_at > min_age_cutoff
-        ):
-            skipped_count += 1
-            runs.append(
-                ReplayBackfillRun(
-                    run_path=str(run_dir),
-                    action="skipped_too_recent",
-                    replay_summary_path=None,
-                    replayable=None,
-                    findings=[],
-                )
-            )
-            continue
         replay_summary_path = run_dir / "metrics" / "replay_summary.json"
         events_path = run_dir / "clean" / "events.jsonl"
         if require_events and not events_path.exists():
@@ -861,6 +845,25 @@ def backfill_replay_summaries(
                     replay_summary_path=str(replay_summary_path),
                     replayable=bool(existing.get("replayable")) if "replayable" in existing else None,
                     findings=[str(item) for item in existing.get("findings", [])],
+                )
+            )
+            continue
+        # Floor check AFTER the already-scored check: a finished run the collector
+        # summarised at segment close is "skipped_existing", so "skipped_too_recent"
+        # means exactly one thing - an unscored run that may still be written to.
+        if (
+            min_age_hours > 0
+            and started_at is not None
+            and started_at > min_age_cutoff
+        ):
+            skipped_count += 1
+            runs.append(
+                ReplayBackfillRun(
+                    run_path=str(run_dir),
+                    action="skipped_too_recent",
+                    replay_summary_path=None,
+                    replayable=None,
+                    findings=[],
                 )
             )
             continue
@@ -902,7 +905,12 @@ def backfill_replay_summaries(
     if failed_count:
         findings.append("backfill_failures")
         status = "error"
-    elif created_count == 0 and updated_count == 0:
+    elif created_count == 0 and updated_count == 0 and skipped_count == 0:
+        # Nothing in the window at all. A pass that SAW runs and skipped every one
+        # (already summarised at segment close, or still being written) is the
+        # healthy steady state of the hourly catch-up jobs, not a warning - before
+        # the live-segment floor that state was masked by (wrongly) scoring the
+        # live run every hour.
         findings.append("no_backfill_changes")
         status = "warn"
 
