@@ -276,3 +276,79 @@ def test_raw_moved_mid_scan_without_cold_root_is_reported_as_raw_missing(tmp_pat
     (run,) = report.runs
     assert run.action == "skipped_raw_missing"  # not the misleading missing-summary label
     assert len(_curated_rows_for(target_root, str(run_dir))) == 4
+
+
+# --- raw row-count fast path (metrics/summary.jsonl) --------------------------------
+
+
+def _write_summary(run_dir: Path, *, clean_events: int, partial: bool) -> None:
+    rows = [
+        {"clean_events": max(0, clean_events - 3), "partial": True, "deadline_reached": False},
+        {"clean_events": clean_events, "partial": partial, "deadline_reached": not partial},
+    ]
+    (run_dir / "metrics" / "summary.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+
+def test_fast_path_uses_final_summary_count_without_reading_events(tmp_path: Path, monkeypatch) -> None:
+    from crypto_collector import repromote as mod
+
+    _, target_root, run_dir = _truncated_setup(tmp_path)
+    _write_summary(run_dir, clean_events=10, partial=False)
+    monkeypatch.setattr(mod, "count_clean_rows", lambda _d: (_ for _ in ()).throw(AssertionError("events file was read")))
+    report = repromote_short_runs(target_root=target_root)
+    (run,) = report.runs
+    assert run.action == "would_repromote" and run.raw_rows == 10 and run.raw_count_source == "summary"
+
+
+def test_fast_path_falls_back_when_summary_partial_or_missing(tmp_path: Path) -> None:
+    _, target_root, run_dir = _truncated_setup(tmp_path)
+    _write_summary(run_dir, clean_events=7, partial=True)  # killed segment: last row not final
+    report = repromote_short_runs(target_root=target_root)
+    (run,) = report.runs
+    assert run.raw_rows == 10 and run.raw_count_source == "lines"
+    (run_dir / "metrics" / "summary.jsonl").unlink()
+    (run,) = repromote_short_runs(target_root=target_root).runs
+    assert run.raw_rows == 10 and run.raw_count_source == "lines"
+
+
+def test_wrong_fast_path_count_fails_closed_on_apply(tmp_path: Path) -> None:
+    """A summary that under-reports (should not happen) can only make the apply
+    fail closed on the parsed-count check, never write a bad repair."""
+    _, target_root, run_dir = _truncated_setup(tmp_path)
+    _write_summary(run_dir, clean_events=9, partial=False)  # events has 10
+    _set_summary(run_dir, event_count=9)  # replay summary agrees with the wrong count
+    report = repromote_short_runs(target_root=target_root, apply=True)
+    (run,) = report.runs
+    # The parsed rows (10) disagree with the summary-derived count: the tool recounts
+    # from disk, then the replay summary (event_count 9) no longer matches the disk
+    # rows -> stale, skip. Curated and index untouched either way.
+    assert run.action == "skipped_stale_replay_summary" and run.raw_count_source == "lines"
+    assert len(_curated_rows_for(target_root, str(run_dir))) == 4
+    assert len((target_root / "_promotion_index.jsonl").read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_summary_count_above_disk_after_crash_is_recounted_and_repaired(tmp_path: Path) -> None:
+    """OS-crash window: the collector's final summary says 12 rows but only 10
+    reached disk (STANDARDS 2.1 allows one lost batch). The replay summary was
+    scored later on the 10 rows. The run must be repaired, not labelled stale."""
+    _, target_root, run_dir = _truncated_setup(tmp_path)
+    _write_summary(run_dir, clean_events=12, partial=False)  # events has 10, replay event_count 10
+    dry = repromote_short_runs(target_root=target_root)
+    (run,) = dry.runs
+    assert run.action == "would_repromote" and run.raw_rows == 10 and run.raw_count_source == "lines"
+    report = repromote_short_runs(target_root=target_root, apply=True)
+    assert report.repromoted_count == 1
+    assert len(_curated_rows_for(target_root, str(run_dir))) == 10
+
+
+def test_depth_finalizer_summary_row_without_partial_key_takes_fast_path(tmp_path: Path, monkeypatch) -> None:
+    from crypto_collector import repromote as mod
+
+    _, target_root, run_dir = _truncated_setup(tmp_path)
+    (run_dir / "metrics" / "summary.jsonl").write_text(
+        json.dumps({"raw_messages": 12, "clean_events": 10, "quarantined_events": 0, "deadline_reached": True, "replayable": True}) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(mod, "count_clean_rows", lambda _d: (_ for _ in ()).throw(AssertionError("events file was read")))
+    (run,) = repromote_short_runs(target_root=target_root).runs
+    assert run.raw_rows == 10 and run.raw_count_source == "summary"

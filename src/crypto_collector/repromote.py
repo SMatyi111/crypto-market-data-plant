@@ -53,6 +53,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from .ops import _read_latest_summary_row
 from .promotion import _parse_run_started_at, _read_json_file
 from .storage import JsonlSink, ParquetDatasetSink
 
@@ -68,6 +69,7 @@ class RepromoteRun:
     promoted_rows: int
     raw_rows: int | None = None
     raw_dir: str | None = None
+    raw_count_source: str | None = None
     replayable: bool | None = None
     summary_event_count: int | None = None
     curated_files: list[str] = field(default_factory=list)
@@ -163,6 +165,58 @@ def count_clean_rows(run_dir: Path) -> int | None:
     return count
 
 
+def raw_row_count(run_dir: Path) -> tuple[int | None, str]:
+    """Raw clean-row count with a fast path.
+
+    The collector appends a progress row to `metrics/summary.jsonl` every ~1000
+    events and once more at segment close; the final row carries the exact
+    `clean_events` total and `partial: false`. Reading that (a few KB) instead of
+    the whole events file (up to hundreds of MB, often on the cold HDD) turns a
+    43k-run inventory from hours into minutes. Verified live 2026-09-08 on
+    binance_trades: `clean_events` == line count on every sampled run.
+
+    Falls back to counting lines when the summary is missing, torn, or its last
+    row is still `partial` (a killed segment). The apply path re-parses the
+    events file in full anyway, so a wrong fast-path count can only cause a
+    fail-closed "row count changed" on that run, never a bad repair.
+
+    Returns (count or None when the events file is absent, source label)."""
+    events = run_dir / "clean" / "events.jsonl"
+    if not events.exists():
+        return None, "missing"
+    last = _read_latest_summary_row(run_dir)
+    if isinstance(last, dict):
+        clean_events = last.get("clean_events")
+        # Final row: the pipeline marks it `partial: false`; the Binance depth
+        # finalizer writes a single closing row with no `partial` key at all but
+        # always with `deadline_reached`. In-flight pipeline rows are `partial: true`.
+        is_final = last.get("partial") is False or ("partial" not in last and "deadline_reached" in last)
+        if is_final and isinstance(clean_events, int) and not isinstance(clean_events, bool):
+            return int(clean_events), "summary"
+    return count_clean_rows(run_dir), "lines"
+
+
+def _summary_is_stale(cand: RepromoteRun) -> bool:
+    """The replay verdict was computed on a prefix: its event_count does not match
+    the raw rows (tolerating exactly one torn final line, never counted by the
+    collector)."""
+    return (
+        bool(cand.replayable)
+        and cand.summary_event_count is not None
+        and cand.summary_event_count not in (cand.raw_rows, (cand.raw_rows or 0) - 1)
+    )
+
+
+def _recount_from_lines(cand: RepromoteRun, raw_dir: Path) -> None:
+    """Replace a summary-derived raw count with the on-disk line count. Used when a
+    count-based check is about to skip or fail a run: after an OS crash the
+    collector's in-memory total can exceed what reached disk (STANDARDS 2.1 allows
+    one lost batch), and labelling such a run stale/failed would be wrong."""
+    if cand.raw_count_source == "summary":
+        cand.raw_rows = count_clean_rows(raw_dir)
+        cand.raw_count_source = "lines"
+
+
 def read_clean_rows(run_dir: Path) -> tuple[list[dict[str, Any]], bool]:
     """Parse clean/events.jsonl. Returns (rows, torn_tail). Only the FINAL
     non-blank line may fail to parse (torn tail after a hard kill); any other
@@ -252,13 +306,21 @@ def repromote_short_runs(
         if raw_dir is None:
             runs.append(RepromoteRun(run_path, lane, "skipped_raw_missing", promoted_rows))
             continue
-        raw_rows = count_clean_rows(raw_dir)
+        raw_rows, count_source = raw_row_count(raw_dir)
         if not raw_rows:
             continue  # nothing to compare against
         if promoted_rows >= raw_rows * min_ratio:
             continue  # complete enough
         candidates.append(
-            RepromoteRun(run_path, lane, "candidate", promoted_rows, raw_rows=raw_rows, raw_dir=str(raw_dir))
+            RepromoteRun(
+                run_path,
+                lane,
+                "candidate",
+                promoted_rows,
+                raw_rows=raw_rows,
+                raw_dir=str(raw_dir),
+                raw_count_source=count_source,
+            )
         )
 
     rows_removed = 0
@@ -302,11 +364,9 @@ def repromote_short_runs(
                 cand.action = "skipped_shared_part_file"
                 runs.append(cand)
                 continue
-            if (
-                cand.replayable
-                and cand.summary_event_count is not None
-                and cand.summary_event_count not in (cand.raw_rows, (cand.raw_rows or 0) - 1)
-            ):
+            if _summary_is_stale(cand) and cand.raw_count_source == "summary":
+                _recount_from_lines(cand, raw_dir)  # the summary total may exceed what reached disk
+            if _summary_is_stale(cand):
                 # The verdict was computed on the partial prefix (the very defect
                 # being repaired): re-score the run with --overwrite first. The
                 # line count may exceed event_count by exactly one when the final
@@ -328,7 +388,9 @@ def repromote_short_runs(
                 if cand.replayable:
                     parsed, torn_tail = read_clean_rows(raw_dir)
                     cand.torn_tail = torn_tail
-                    expected = cand.raw_rows - (1 if torn_tail else 0)
+                    if cand.raw_count_source == "summary" and len(parsed) != (cand.raw_rows or 0) - (1 if torn_tail else 0):
+                        _recount_from_lines(cand, raw_dir)  # compare against disk, not the collector's total
+                    expected = (cand.raw_rows or 0) - (1 if torn_tail else 0)
                     if len(parsed) != expected:
                         raise ValueError(
                             f"raw row count changed while repairing: counted {cand.raw_rows}, parsed {len(parsed)}"
