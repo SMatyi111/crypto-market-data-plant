@@ -606,8 +606,9 @@ owner ask (safe-shaping directive above).
     the `mock` lane dir (owner nod — it is test debris, not data). Autonomous.
     *2026-09-08: fixture landed on `fix/test-hermetic-roots` (`tests/conftest.py`
     points `MARKET_DATA_ARCHIVE_ROOT` at a per-test temp dir and clears inherited
-    per-root overrides; `test_suite_default_roots_are_hermetic` pins it). The 60
-    existing `raw/market/mock/` run dirs still await the owner's delete nod.*
+    per-root overrides; `test_suite_default_roots_are_hermetic` pins it).
+    Merged as PR #59; the debris (72 run dirs by then) was deleted with the
+    owner's nod the same day — item CLOSED.*
 17. **`redeploy_runner.ps1` discards runner stdout/stderr (found 2026-09-07).**
     Its `Start-Process` has no `-RedirectStandardOutput/-RedirectStandardError`,
     unlike `run_ops_runner.ps1` (`*>> runner.log`), so `runner.log` last grew at
@@ -737,26 +738,19 @@ owner ask (safe-shaping directive above).
 Decisions waiting on the owner; agents must not act on these without an explicit OK
 (see `CLAUDE.md` Governance):
 
-- **Dispose of the 5.8 GB `heartbeat_history.jsonl` backlog (2026-09-08).** Once
-  the rotation PR deploys, the first heartbeat rolls the whole 5.8 GB file into
-  `heartbeat_history.1.jsonl`, where it counts as one of the 8 kept parts and
-  is pruned automatically only after ~4 weeks. (The steady-state policy itself —
-  keep the newest 8 x 256 MB parts, delete older — is approved by merging
-  PR #61; this item is only about the one-off backlog.) It holds no data
-  (heartbeat snapshots since 2026-06-08, all already summarised in the audit
-  stamps). Options: (a) delete the rotated file right after the redeploy
-  (reclaims 5.8 GB on the SSD today); (b) move it to `D:\market_archive_cold\ops\`
-  as history; (c) let the rotation prune it. Ops-log deletion → owner call.
-- **Offload rows for the per-symbol liquidation dirs (2026-09-08).** Since the
-  redeploy the Bybit lanes write `bybit_perp_liquidations_{btcusdt,ethusdt,solusdt}/`;
-  together with `okx_perp_liquidations/` and the two legacy shared dirs they
-  have no `archive-offload-cold` row, so they surface as `unconfigured_lane`
-  every pass and accumulate on the SSD with no retention bound (day-long
-  segments, so slowly). The lanes are raw-only (no promoter) → the fitting row
-  is `gate: age_only`, mirroring the options lanes; the legacy shared dirs can
-  take the same row once their 09-02..09-08 runs are judged (mixed-symbol runs
-  are replayable per-product since v11, but nothing promotes liquidations).
-  Config-only; takes effect at the next redeploy.
+- **Next elevated redeploy — owner checklist (2026-09-08).** `main d5516aa`
+  carries PRs #58–#61 (depth-scorer floor, hermetic tests, redeploy logging,
+  heartbeat rotation) and `ops.live.local.json` carries the five new `age_only`
+  liquidation offload rows (backup `ops.live.local.json.bak-20260908-liq-offload`).
+  After `scripts/redeploy_runner.ps1`: (1) `runner.log` grows again (relaunch
+  marker + runner output, one encoding); (2) within ~2 h the depth lanes stop
+  producing short promotions (`promoted_rows` == raw clean rows on new runs);
+  (3) the offload pass stops listing the liquidation dirs as
+  `unconfigured_lane` and starts moving their aged runs; (4) the first heartbeat
+  rolls the 5.8 GB history into `heartbeat_history.1.jsonl` — **delete that file
+  right away (owner decision 2026-09-08)**; `heartbeat_history.jsonl` restarts
+  small. Then the truncated-history repair (below) can run against a stable
+  plant.
 - **Text-capture P2 probes (from the 2026-07-16 feasibility doc — see
   `docs/text_source_p2_feasibility.md` §7; none urgent, no rationale here per
   the public-safe contract).** Four calls: (1) approve the 72 h keyless
@@ -803,10 +797,29 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   depth scorers (`backfill-replay`, `backfill-stream-depth`) still need it
   (comment on #54). *Status 2026-09-08: trades + text + wallet-flow truncation
   stopped at the 00:29Z redeploy (0 short runs since); depth lanes still
-  truncating ~40 % of runs until open item 18 deploys. The repair decision
-  itself is still open.*
+  truncating ~40 % of runs until PR #58 (merged) deploys.* **DECIDED 2026-09-08:
+  option (a) — build the re-promote tool.** ACTIVE on `feat/repromote-short-runs`:
+  `repromote-short-runs` CLI, dry-run by default, `--apply` per lane after the
+  owner reads the dry-run report; wallet-flow lane first. The apply itself is
+  a curated-data change and stays owner-gated per lane; the decision here only
+  authorises building the tool and running dry-runs.
 
 Decided 2026-09-08 (recorded, closed):
+- **Liquidation raw dirs get `age_only` offload rows.** Owner approved 2026-09-08;
+  rows for `bybit_perp_liquidations_{btcusdt,ethusdt,solusdt}`,
+  `okx_perp_liquidations` and the legacy shared `bybit_perp_liquidations` added
+  to `ops.live.local.json` (backup `.bak-20260908-liq-offload`) and to
+  `ops.live.example.json`; `binance_perp_liquidations` already had one. Runs
+  older than 4 days move to the cold tier from the first offload pass after the
+  next redeploy.
+- **`raw/market/mock/` test debris deleted.** Owner approved 2026-09-08 after
+  PR #59 (hermetic test roots) merged: 72 run dirs / 56.7 KB removed; the
+  standing `unconfigured_lane:mock` offload warning clears at the next pass.
+- **5.8 GB heartbeat-history backlog: delete after the redeploy.** Owner chose
+  option (a) 2026-09-08; the action rides the redeploy checklist above (the file
+  only becomes `heartbeat_history.1.jsonl` once the rotation code is running).
+- **Truncated curated history: build the re-promote tool** (see the ACTIVE
+  entry above; the per-lane apply remains gated).
 - **Merge #54/#55/#56 then redeploy — DONE.** Owner approved the merges 09-07
   (squash-merged 17:01–17:03Z; one trivial ROADMAP conflict on #54 resolved in
   a worktree) and ran the elevated redeploy 2026-09-08 00:29Z on `50f44d7`.
