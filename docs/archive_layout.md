@@ -89,7 +89,9 @@ G:\market_archive\ops
 Important files:
 
 - `heartbeat.json`
-- `heartbeat_history.jsonl`
+- `heartbeat_history.jsonl` — rolled by the runner at 256 MB into numbered
+  parts `heartbeat_history.<n>.jsonl` (same layout as the collectors' raw
+  `messages.<n>.jsonl`); the newest 8 parts are kept, older ones pruned
 - `job_runs.jsonl`
 - `worker_events.jsonl`
 - `runner.log`

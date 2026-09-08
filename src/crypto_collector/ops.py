@@ -16,7 +16,7 @@ from typing import Any, Callable
 
 from .config import default_normalized_root
 from .offload import OFFLOAD_REPORT_FILENAME
-from .storage import JsonlSink
+from .storage import JsonlSink, RotatingJsonlSink
 
 logger = logging.getLogger(__name__)
 
@@ -642,6 +642,16 @@ class StandaloneWorkerRuntime:
         return stop_event, thread
 
 
+HEARTBEAT_HISTORY_MAX_BYTES = 256 * 1024 * 1024
+HEARTBEAT_HISTORY_KEEP = 8
+"""Retention for heartbeat_history.jsonl (ROADMAP item 12; policy approved by the
+owner at the merge of PR #61). Each row is the full heartbeat (~27 KB with ~100
+jobs) appended every 30 s, ~80 MB/day; the live file reached 5.8 GB on the SSD
+before rotation existed. 256 MB x 8 numbered parts bounds it at ~2.3 GB (~4 weeks
+of history). The rotating sink owns its handle, so the roll is safe in either
+fsync posture; a roll blocked by a reader (Windows) is deferred, never fatal."""
+
+
 class OpsRunner:
     def __init__(
         self,
@@ -659,7 +669,13 @@ class OpsRunner:
         self.collector_concurrency = max(1, int(collector_concurrency))
         self.ops_root.mkdir(parents=True, exist_ok=True)
         self.runs_sink = JsonlSink(self.ops_root, "job_runs.jsonl")
-        self.heartbeat_history = JsonlSink(self.ops_root, "heartbeat_history.jsonl")
+        self.heartbeat_history = RotatingJsonlSink(
+            self.ops_root,
+            "heartbeat_history.jsonl",
+            max_bytes=HEARTBEAT_HISTORY_MAX_BYTES,
+            max_files=HEARTBEAT_HISTORY_KEEP,
+            on_rotate_error="warn",
+        )
         self.heartbeat_path = self.ops_root / "heartbeat.json"
         self._last_heartbeat_status: str | None = None
         self._last_heartbeat_write: datetime | None = None

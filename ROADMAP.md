@@ -582,6 +582,20 @@ owner ask (safe-shaping directive above).
     is 5.8 GB (each row embeds the full 100-job counter map, ~27 KB, ~2,900
     rows/day = ~80 MB/day on the SSD), `job_runs.jsonl` 554 MB, `worker_events`
     150 MB — the ops root is 7 GB. No longer minor; autonomous fix.*
+    *2026-09-08: `heartbeat_history.jsonl` rotation on
+    `fix/heartbeat-history-rotation` — the history now uses the existing
+    `RotatingJsonlSink` (numbered parts `heartbeat_history.<n>.jsonl`, roll at
+    256 MB) extended with `max_files=8` retention and a non-fatal
+    `on_rotate_error="warn"` mode (a roll blocked by a reader on Windows is
+    deferred 10 min with one warning line, never a traceback per heartbeat).
+    ~2.3 GB / ~4 weeks bound, no config change; collectors keep the old
+    defaults (no pruning, fail-loud). **Retention = deletion, so the policy is
+    the owner's: merging PR #61 is the approval.** Merged != deployed (runner
+    code). NOTE for the first post-deploy heartbeat: the live 5.8 GB file becomes
+    part 1 whole and is pruned only after 8 further rolls (~4 weeks); disposing
+    of it earlier is a separate Decision-queue item. `job_runs.jsonl` (554 MB) is deliberately NOT rotated yet: health
+    tail-reads it and the audits use it for since-restart success rates; a
+    rotation there needs the health reader to follow the rotated files.*
 16. **Test suite writes into the live archive (found 2026-09-07).** The
     `run_ops_runner` tests in `tests/test_ops.py` dispatch `mock` jobs without
     an `output_root`, so `run_mock` falls back to `default_output_root()` =
@@ -723,6 +737,16 @@ owner ask (safe-shaping directive above).
 Decisions waiting on the owner; agents must not act on these without an explicit OK
 (see `CLAUDE.md` Governance):
 
+- **Dispose of the 5.8 GB `heartbeat_history.jsonl` backlog (2026-09-08).** Once
+  the rotation PR deploys, the first heartbeat rolls the whole 5.8 GB file into
+  `heartbeat_history.1.jsonl`, where it counts as one of the 8 kept parts and
+  is pruned automatically only after ~4 weeks. (The steady-state policy itself —
+  keep the newest 8 x 256 MB parts, delete older — is approved by merging
+  PR #61; this item is only about the one-off backlog.) It holds no data
+  (heartbeat snapshots since 2026-06-08, all already summarised in the audit
+  stamps). Options: (a) delete the rotated file right after the redeploy
+  (reclaims 5.8 GB on the SSD today); (b) move it to `D:\market_archive_cold\ops\`
+  as history; (c) let the rotation prune it. Ops-log deletion → owner call.
 - **Offload rows for the per-symbol liquidation dirs (2026-09-08).** Since the
   redeploy the Bybit lanes write `bybit_perp_liquidations_{btcusdt,ethusdt,solusdt}/`;
   together with `okx_perp_liquidations/` and the two legacy shared dirs they
