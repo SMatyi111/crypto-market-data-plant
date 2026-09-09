@@ -7,6 +7,51 @@ git log + the merged PR descriptions; this file keeps the *why*.
 
 ---
 
+## 2026-09-08 — a third of curated runs had been truncated for three months; repaired from raw in one day
+
+**Root cause.** Every hourly `backfill-*` score job carried `max_age_hours: 6`
+and no minimum age. Running on the single maintenance slot they landed every
+~77 min and scored whichever 1800 s segment the collector was still writing;
+the 300 s promoter then indexed the partial rows, and because the promotion
+index is run-keyed it never revisited the run when the collector wrote its full
+close-of-segment summary minutes later. Found by the 2026-09-07 audit by
+comparing `promoted_rows` with raw `clean/` line counts: 58–71 of ~190 promoted
+runs per trades lane and ~40 % of depth runs were short, back to at least
+2026-06-20; the wallet-flow lane was missing 7.5 % of its fills. Funding
+(inline summary) and text (`min_age_hours: 1`) were unaffected.
+
+**Stopping it.** PR #54 gave the trades/text scorers a 1 h floor (deployed at
+the 09-08 00:29Z redeploy: 0 short trades runs since); PR #58 gave the two
+depth scorers the same floor (merged, live at the next redeploy) with a
+hygiene test pinning `min_age_hours * 3600 > longest max_segment_seconds`.
+
+**Repairing history.** PR #63 added `repromote-short-runs`: latest index row
+per run vs raw row count (hot, then cold), locate the run's part-files by the
+`source_run_path` column (the promoter flushes once per run, so part-files are
+run-pure — verified 300/300), refuse anything it cannot attribute cleanly
+(shared file, missing raw, stale summary whose `event_count` != raw), parse and
+validate raw BEFORE deleting, delete-then-write with one flush per run,
+append a superseding index row. Reviews (#63, #65, #66) added: unconditional
+raw re-resolution at apply time (the offload job moved a run mid-scan on the
+first live apply), the collector's final `summary.jsonl` row as a fast row
+count (26 min instead of hours for 43k runs), a disk recount before any
+count-based skip, and latest-wins in the health index reader.
+
+**Outcome (owner-approved per lane).** Wallet-flow first (229 runs, 92.5 % →
+99.95 % of raw), then all ten trades lanes in one detached 2 h job: 11,272 runs
+re-promoted, 109.9 M partial rows replaced by 197.4 M, 0 failures; 79 runs whose
+current summaries are not replayable had 387,900 partial rows removed; 41 runs
+with prefix-scored summaries were re-scored on the full segment (39 replayable)
+and repaired in a second pass. Verification against raw afterwards: every trades
+lane at 99.93–99.99 % of its raw rows, 786.4 M of 786.7 M rows dataset-wide.
+Curated part-files stayed run-pure throughout (0 shared files in 51,593). Side
+finding: 350 torn part-files (176–643 bytes, header without footer) dated
+2026-06-19..23 — promoter flushes that died when G: hit 0 bytes in the Kalshi
+incident week; their runs were never indexed and were re-promoted whole later,
+so the files are debris that breaks whole-partition pyarrow scans. Left in place
+pending the owner's delete nod (Decision queue). Depth lanes
+(`market_replayable`) follow the same path once their inventory has run.
+
 ## 2026-09-02 — the three 2026-08-25 lanes were defective since deploy day; OI becomes a curated dataset (v11)
 
 The session-start audit found the runner healthy and the options-IV cutover live,

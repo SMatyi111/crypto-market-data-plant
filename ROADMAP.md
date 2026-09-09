@@ -808,9 +808,35 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   prefix; re-scored with `--wallet-flow --overwrite` the same hour, repairable
   on the next pass) and `20260904_124639` (moved to cold by the offload job
   during the 13-min scan — the race PR #65 fixes; repairable on the next pass).
-  Remaining: the other 10 trades lanes and the 10 depth lanes, each `--apply`
-  owner-gated after its dry-run; the all-lanes trades inventory dry-run is in
-  progress.
+  **All ten trades lanes REPAIRED 2026-09-08 18:24–20:27 local (owner-approved
+  after the read-only inventory):** 11,272 runs re-promoted (10,751 from the
+  cold tier), 109.9 M partial rows replaced by 197.4 M, 0 failures; 79 runs whose
+  current summaries are not replayable had 387,900 partial rows removed; 41 runs
+  with prefix-scored summaries re-scored on the full segment (39 replayable, 2
+  not) and picked up by a second pass. Verified against raw: every trades lane
+  at 99.93–99.99 % of its raw rows (786.4 M of 786.7 M dataset-wide), part-files
+  still run-pure. Narrative in `docs/HISTORY.md` 2026-09-08. **Remaining: the
+  10 depth lanes** (`market_replayable`) — inventory dry-run next (fast path
+  covers the depth finalizer's summary row since PR #66), then per-lane
+  `--apply` on the owner's OK.
+- **350 torn curated part-files from the June G:-full week (found 2026-09-08 by
+  the post-repair integrity scan of all 51,593 `trades_replayable` part-files).**
+  Every one is 176–643 bytes (Parquet header, no footer — a promoter flush that
+  died when the disk hit 0 bytes), mtime 2026-06-19 (199 files), 06-21 (16),
+  06-22 (64), 06-23 (71); 75.7 KB in total, spread over all seven sources
+  (okx 86, bybit 63, mexc 52, binance 43, coinbase 38, kraken 38,
+  binance-futures 30). They
+  hold no readable rows, but any reader that opens a whole partition with a
+  pyarrow dataset scan fails on them (`Parquet magic bytes not found`). The
+  promoter writes its index row only after a successful flush, so the runs
+  these belonged to were never indexed and were re-promoted whole on a later
+  pass — the files are pure debris. The repair tool leaves unreadable files
+  alone by design. **DECIDED + DONE 2026-09-08 (owner approved the deletion):**
+  each of the 350 files was re-checked (< 2 KB and no readable Parquet metadata)
+  and removed — 350 deleted, 75,701 bytes, 0 skipped; the integrity re-scan
+  after deletion confirms the count (see the 2026-09-09 verification note when it
+  lands). Follow-up idea: make the integrity scan a `health` finding so torn
+  part-files surface within a day instead of at the next repair.
 
 Decided 2026-09-08 (recorded, closed):
 - **Liquidation raw dirs get `age_only` offload rows.** Owner approved 2026-09-08;
