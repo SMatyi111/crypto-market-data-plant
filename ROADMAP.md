@@ -751,6 +751,30 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   right away (owner decision 2026-09-08)**; `heartbeat_history.jsonl` restarts
   small. Then the truncated-history repair (below) can run against a stable
   plant.
+- **OKX liquidation lane: replay verdict is wrong for this feed (2026-09-09).**
+  The first full OKX day-run (`okx_perp_liquidations/20260908_002925`, 11,564
+  rows, 340 swap products) scores `replayable: false` with
+  `non_monotonic_event_time` (1,744) and `excessive_clock_skew` (186 rows > 60 s,
+  max 897 s), while the three per-symbol Bybit day-runs pass. Diagnosis from the
+  raw rows (read-only): (a) the lane is scored by the *trades stream* replayer,
+  whose GLOBAL event-time monotonicity is meaningless for a channel that
+  interleaves 340 instruments — the same lesson as the multi-wallet wallet-flow
+  scorer (v9) and the per-product OI ordering (v11); (b) even per product there
+  are 691 backward steps across 71 products, and 186 rows arrive 60 s–15 min
+  after their `exchange_time`, concentrated in illiquid alt swaps (SOPH 82,
+  CP 21, CNPY 10) and NOT clustered in time — so this is OKX's own delayed /
+  batched delivery of `liquidation-orders` details (one push carries details
+  whose `ts` spread up to 246 s), not a reconnect replay or a capture defect.
+  Receipt delay is otherwise tight (p50 1.2 s, p90 2.4 s). BTC-USDT-SWAP: 407
+  rows, in order. **Proposal (STANDARDS change → owner):** score the
+  `liquidations` channel with a liquidation-aware verdict — per-product
+  ordering, venue delivery lag recorded as a non-gating finding
+  (`delayed_delivery_count`, threshold per venue, OKX 15 min) instead of
+  `excessive_clock_skew`, structural validity as the gate; document in the
+  liquidations section that OKX details are venue-delayed and that
+  `received_at` is the availability clock for research. STANDARDS_VERSION bump
+  (v12). Until then the lane is capture-complete but not research-ready by the
+  current label; raw is untouched.
 - **Text-capture P2 probes (from the 2026-07-16 feasibility doc — see
   `docs/text_source_p2_feasibility.md` §7; none urgent, no rationale here per
   the public-safe contract).** Four calls: (1) approve the 72 h keyless
@@ -833,9 +857,13 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   pass — the files are pure debris. The repair tool leaves unreadable files
   alone by design. **DECIDED + DONE 2026-09-08 (owner approved the deletion):**
   each of the 350 files was re-checked (< 2 KB and no readable Parquet metadata)
-  and removed — 350 deleted, 75,701 bytes, 0 skipped; the integrity re-scan
-  after deletion confirms the count (see the 2026-09-09 verification note when it
-  lands). Follow-up idea: make the integrity scan a `health` finding so torn
+  and removed — 350 deleted, 75,701 bytes, 0 skipped. **Re-scan 2026-09-09
+  22:17 (run by the parallel Codex session): 51,936 part-files, 0 corrupt, 0
+  shared-run files, 795,994,667 rows.** Coordination note: the owner had also
+  approved a *reversible* quarantine of the same files to Codex, which prepared
+  (but had not run) a move-to-quarantine script; the files were already deleted
+  by then, so that script is moot — two agents, one owner, two approvals for one
+  action. Follow-up idea: make the integrity scan a `health` finding so torn
   part-files surface within a day instead of at the next repair.
 
 Decided 2026-09-08 (recorded, closed):
