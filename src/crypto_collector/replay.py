@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import zlib
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
@@ -962,6 +962,16 @@ class TradesReplaySummary:
     # gaplessness is NOT proven (STANDARDS §4.3).
     gap_detection: str = "sequence"
     summary_path: str | None = None
+    # v12 (liquidations channel, replay_liquidations_run): venue behaviour that the
+    # capture cannot be blamed for is RECORDED here and never gates `replayable`.
+    # `findings` keeps only gating failures so the quarantine/promote chain and the
+    # lanes view read the verdict exactly as before.
+    informational_findings: list[str] = field(default_factory=list)
+    delayed_delivery_count: int = 0
+    max_delivery_delay_ms: float | None = None
+    product_count: int = 0
+    non_monotonic_received_at_count: int = 0
+    wrong_channel_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1241,6 +1251,199 @@ def replay_trades_stream_run(
         findings=findings,
         gap_detection="none_native",
         summary_path=str(summary_path) if summary_path is not None else None,
+    )
+
+    if write_summary and summary_path is not None:
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_json_atomic(summary_path, summary.to_dict())
+
+    return summary
+
+
+def replay_liquidations_run(
+    run_path: Path,
+    *,
+    max_clock_skew_ms: float = 60_000.0,
+    write_summary: bool = True,
+) -> TradesReplaySummary:
+    """Replay-validate a **liquidations** channel run (STANDARDS section 4.10, v12).
+
+    Forced closes are not a trade tape and the trades-stream verdict is wrong for
+    them in two ways that the first OKX day-runs made concrete (2026-09-08/09,
+    `okx_perp_liquidations`): (a) one OKX `liquidation-orders` subscription
+    interleaves every swap on the venue, so GLOBAL exchange-time monotonicity is
+    meaningless (1,744 "violations" over 340 products) - the same lesson as the
+    per-wallet (v9) and per-product OI (v11) scorers; (b) OKX delivers liquidation
+    details late and in batches - rows arrive up to ~15 min after their
+    `exchange_time`, one push carries details whose `ts` spread over minutes, and
+    even per product the exchange clock steps backward - so exchange->receipt skew
+    is a property of the VENUE's delivery, not of the capture, and cannot gate.
+
+    What gates `replayable` here is what the capture itself can vouch for:
+
+    - `event_count > 0`
+    - every row is `channel == "liquidations"` (a shape collision that files trades
+      as liquidations, or vice versa, must fail closed - STANDARDS liquidations
+      section)
+    - `price` and `size` are finite and positive
+    - `received_at` present and monotonic non-decreasing - the collector's own
+      clock is the ordering the plant guarantees for this channel
+
+    Recorded but **non-gating** (surfaced in `informational_findings`, never in
+    `findings`, so the quarantine/promote chain and the lanes view stay unchanged):
+
+    - `delayed_delivery`: rows whose |received_at - exchange_time| exceeds
+      `max_clock_skew_ms` (the lane's configured threshold; OKX lanes should set it
+      to the venue's observed ~15 min). Count in `delayed_delivery_count`, maximum
+      in `max_delivery_delay_ms` (also mirrored into `max_clock_skew_ms`).
+    - `per_product_reorder`: exchange_time stepping backward WITHIN a product.
+      Count in `non_monotonic_count`.
+
+    `excessive_clock_skew_count` stays 0 by construction: the skew gate does not
+    apply to this channel. `gap_detection="none_native"` as for every venue here
+    (no liquidation id exists), so `replayable` means structurally clean, NOT
+    complete. `received_at` is the availability clock for research on this data.
+    Writes the same `metrics/replay_summary.json` contract as the trades scorers.
+    """
+    resolved_run_path, events_path, summary_path = _resolve_run_paths(run_path)
+    event_count = 0
+    first_event_time: str | None = None
+    last_event_time: str | None = None
+    wrong_channel_count = 0
+    invalid_price_count = 0
+    invalid_size_count = 0
+    missing_received_at_count = 0
+    non_monotonic_received_at_count = 0
+    per_product_reorder_count = 0
+    delayed_delivery_count = 0
+    max_delivery_delay_ms: float | None = None
+    source: str | None = None
+    products: set[str] = set()
+    instrument_ids: set[str] = set()
+    previous_received_dt: datetime | None = None
+    last_exchange_dt_by_product: dict[str, datetime] = {}
+
+    for row in _read_jsonl(events_path):
+        event_count += 1
+        source = source or _optional_str(row.get("source"))
+        product = _optional_str(row.get("product"))
+        if product is not None:
+            products.add(product)
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        instrument_id = _optional_str(metadata.get("instrument_id"))
+        if instrument_id is not None:
+            instrument_ids.add(instrument_id)
+
+        if _optional_str(row.get("channel")) != "liquidations":
+            wrong_channel_count += 1
+
+        exchange_time_str = _optional_str(row.get("exchange_time"))
+        if first_event_time is None:
+            first_event_time = exchange_time_str
+        last_event_time = exchange_time_str
+
+        # Per-product exchange-time order is informational only: OKX batches
+        # details out of order per product too (691 backward steps across 71
+        # products on the 2026-09-08 day-run) and that is the venue, not us.
+        exchange_dt = _parse_iso_dt(exchange_time_str)
+        if exchange_dt is not None:
+            product_key = product or ""
+            previous_exchange_dt = last_exchange_dt_by_product.get(product_key)
+            if previous_exchange_dt is not None and exchange_dt < previous_exchange_dt:
+                per_product_reorder_count += 1
+            else:
+                last_exchange_dt_by_product[product_key] = exchange_dt
+
+        # Receipt order IS gating: it is the only clock the capture owns.
+        received_at_str = _optional_str(row.get("received_at"))
+        received_dt = _parse_iso_dt(received_at_str)
+        if received_dt is None:
+            missing_received_at_count += 1
+        else:
+            if previous_received_dt is not None and received_dt < previous_received_dt:
+                non_monotonic_received_at_count += 1
+            if previous_received_dt is None or received_dt >= previous_received_dt:
+                previous_received_dt = received_dt
+
+        price = _optional_float(row.get("price"))
+        if price is None or not _is_finite_positive(price):
+            invalid_price_count += 1
+        size = _optional_float(row.get("size"))
+        if size is None or not _is_finite_positive(size):
+            invalid_size_count += 1
+
+        delay_ms = _abs_skew_ms(exchange_time_str, received_at_str)
+        if delay_ms is not None:
+            if max_delivery_delay_ms is None or delay_ms > max_delivery_delay_ms:
+                max_delivery_delay_ms = delay_ms
+            if delay_ms > max_clock_skew_ms:
+                delayed_delivery_count += 1
+
+    findings: list[str] = []
+    if event_count == 0:
+        findings.append("no_events")
+    if wrong_channel_count:
+        findings.append("wrong_channel")
+    if invalid_price_count:
+        findings.append("invalid_prices")
+    if invalid_size_count:
+        findings.append("invalid_sizes")
+    if missing_received_at_count:
+        findings.append("missing_received_at")
+    if non_monotonic_received_at_count:
+        findings.append("non_monotonic_received_at")
+
+    informational_findings: list[str] = []
+    if delayed_delivery_count:
+        informational_findings.append("delayed_delivery")
+    if per_product_reorder_count:
+        informational_findings.append("per_product_reorder")
+
+    replayable = (
+        event_count > 0
+        and wrong_channel_count == 0
+        and invalid_price_count == 0
+        and invalid_size_count == 0
+        and missing_received_at_count == 0
+        and non_monotonic_received_at_count == 0
+    )
+
+    summary = TradesReplaySummary(
+        replay_type="trades",
+        mode="liquidation_stream_none_native",
+        run_path=str(resolved_run_path),
+        events_path=str(events_path),
+        source=source,
+        # A single-instrument lane (Bybit per-symbol) keeps its product; an
+        # all-venue lane (OKX SWAP) has no single product - partition by row.
+        product=next(iter(products)) if len(products) == 1 else None,
+        instrument_id=next(iter(instrument_ids)) if len(instrument_ids) == 1 else None,
+        event_count=event_count,
+        first_trade_id=None,
+        last_trade_id=None,
+        first_event_time=first_event_time,
+        last_event_time=last_event_time,
+        # Per-product exchange-time backward steps, informational (see docstring).
+        non_monotonic_count=per_product_reorder_count,
+        trade_id_gap_count=0,
+        trade_id_gap_total_missing=0,
+        invalid_price_count=invalid_price_count,
+        invalid_size_count=invalid_size_count,
+        # The skew GATE does not apply to this channel; the lag is reported via
+        # delayed_delivery_count / max_delivery_delay_ms instead.
+        excessive_clock_skew_count=0,
+        max_clock_skew_ms=max_delivery_delay_ms,
+        duplicate_trade_id_count=0,
+        replayable=replayable,
+        findings=findings,
+        gap_detection="none_native",
+        summary_path=str(summary_path) if summary_path is not None else None,
+        informational_findings=informational_findings,
+        delayed_delivery_count=delayed_delivery_count,
+        max_delivery_delay_ms=max_delivery_delay_ms,
+        product_count=len(products),
+        non_monotonic_received_at_count=non_monotonic_received_at_count,
+        wrong_channel_count=wrong_channel_count,
     )
 
     if write_summary and summary_path is not None:

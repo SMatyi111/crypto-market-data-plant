@@ -775,6 +775,17 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   `received_at` is the availability clock for research. STANDARDS_VERSION bump
   (v12). Until then the lane is capture-complete but not research-ready by the
   current label; raw is untouched.
+  *2026-09-10: PR open on `feat/liquidation-replay-v12` implementing exactly
+  this - `replay_liquidations_run` (STANDARDS 4.10), the three liquidation
+  collectors wired to it, `backfill-trades-replay --liquidations` for the
+  re-score, `STANDARDS_VERSION = 12`, 11 tests. Owner decisions: (1) merge
+  (contract change); (2) after redeploy, re-score the OKX history with
+  `backfill-trades-replay --liquidations --overwrite --source-root
+  <raw>/okx_perp_liquidations --min-age-hours 24` (labels only - the lanes are
+  raw-only, nothing is promoted or deleted); (3) optionally set the OKX lane's
+  `max_clock_skew_ms` to 900000 so `delayed_delivery_count` means "worse than
+  the venue's usual". Merged != deployed: collectors pick up the scorer at
+  the next runner restart.*
 - **Text-capture P2 probes (from the 2026-07-16 feasibility doc — see
   `docs/text_source_p2_feasibility.md` §7; none urgent, no rationale here per
   the public-safe contract).** Four calls: (1) approve the 72 h keyless

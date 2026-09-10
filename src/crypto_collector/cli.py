@@ -148,6 +148,7 @@ from .replay import (
     replay_depth_run,
     replay_depth_stream_run,
     replay_funding_run,
+    replay_liquidations_run,
     replay_text_run,
     replay_trades_run,
     replay_trades_stream_run,
@@ -1322,6 +1323,15 @@ def build_parser() -> argparse.ArgumentParser:
         "replayer mis-scored as invalid_mark_price.",
     )
     backfill_trades_parser.add_argument(
+        "--liquidations",
+        action="store_true",
+        help="Score with the liquidations-channel replay (replay_liquidations_run, STANDARDS 4.10): "
+        "receipt-time order and row shape gate, venue delivery lag and per-product "
+        "exchange-time order are recorded as non-gating findings. Overrides the other "
+        "scorer flags. With --overwrite this re-issues the pre-v12 summaries that "
+        "scored the OKX all-swap day-runs with the trades-stream verdict.",
+    )
+    backfill_trades_parser.add_argument(
         "--min-age-hours",
         type=float,
         default=1.0,
@@ -2125,7 +2135,9 @@ async def collect_binance_liquidations_segment(args: argparse.Namespace) -> dict
         subscription_style="binance",
         normalizer=BinanceLiquidationNormalizer(),
         source_base="binance_perp_liquidations",
-        replay_fn=replay_trades_stream_run,
+        # v12: liquidation-aware verdict (STANDARDS 4.10) - receipt order and shape
+        # gate, venue delivery lag and per-product exchange-time order are recorded.
+        replay_fn=replay_liquidations_run,
     )
 
 
@@ -2140,7 +2152,9 @@ async def collect_okx_liquidations_segment(args: argparse.Namespace) -> dict[str
         subscription_style="okx",
         normalizer=OkxLiquidationNormalizer(),
         source_base="okx_perp_liquidations",
-        replay_fn=replay_trades_stream_run,
+        # v12: liquidation-aware verdict (STANDARDS 4.10) - receipt order and shape
+        # gate, venue delivery lag and per-product exchange-time order are recorded.
+        replay_fn=replay_liquidations_run,
         ping_message=_OKX_PING_MESSAGE,
         ping_interval_seconds=_OKX_PING_INTERVAL_SECONDS,
         okx_subscription_key="instType",
@@ -2162,7 +2176,9 @@ async def collect_bybit_liquidations_segment(args: argparse.Namespace) -> dict[s
             instrument_type=_bybit_instrument_type(market)
         ),
         source_base="bybit_liquidations" if market == "spot" else "bybit_perp_liquidations",
-        replay_fn=replay_trades_stream_run,
+        # v12: liquidation-aware verdict (STANDARDS 4.10) - receipt order and shape
+        # gate, venue delivery lag and per-product exchange-time order are recorded.
+        replay_fn=replay_liquidations_run,
         ping_message=_BYBIT_PING_MESSAGE,
         ping_interval_seconds=_BYBIT_PING_INTERVAL_SECONDS,
     )
@@ -4410,7 +4426,8 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
         # promotion. stream=True selects the none_native UUID scorer (Bybit/MEXC);
         # wallet_flow=True selects the per-wallet Hyperliquid scorer (overrides
         # stream); funding=True selects the funding/open-interest metric scorer
-        # (overrides both); default is the dense sequence-bearing scorer
+        # (overrides both); liquidations=True selects the liquidations-channel
+        # scorer (v12, overrides all); default is the dense sequence-bearing scorer
         # (Binance/Coinbase/Kraken). max_clock_skew_ms=None keeps each scorer's
         # own default gate.
         return SimpleNamespace(
@@ -4421,6 +4438,7 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             stream=raw_args.get("stream", False),
             wallet_flow=raw_args.get("wallet_flow", False),
             funding=raw_args.get("funding", False),
+            liquidations=raw_args.get("liquidations", False),
             # 1 h floor by default (2x the 1800 s live segments): scoring the run a
             # collector is still writing mints a premature summary that promote acts
             # on permanently (run-keyed index). Same posture as backfill-text-replay.
@@ -4831,7 +4849,12 @@ def run_backfill_replay(args: argparse.Namespace) -> None:
 
 
 def run_backfill_trades_replay(args: argparse.Namespace) -> None:
-    if getattr(args, "funding", False):
+    if getattr(args, "liquidations", False):
+        # Liquidations channel (bybit_perp_liquidations_*, okx_perp_liquidations,
+        # binance_perp_liquidations): receipt order gates, venue lag is recorded
+        # (STANDARDS 4.10, v12). Overrides every other scorer flag.
+        scorer = replay_liquidations_run
+    elif getattr(args, "funding", False):
         # Metric lanes (binance_perp_funding / binance_perp_open_interest). Until
         # 2026-09-02 no score job could re-issue a funding-family summary, so the
         # 245 OI runs mis-scored before the replayer fix had no path back.

@@ -1,7 +1,24 @@
 # Data Standards
 
-`STANDARDS_VERSION = 11`
+`STANDARDS_VERSION = 12`
 
+> **v12 (2026-09-10, owner-gated):** replay verdict for the **`liquidations`**
+> channel (section 4.10). Liquidation runs are scored by `replay_liquidations_run`
+> instead of the trades-stream verdict, which was wrong for this channel in two
+> venue-driven ways: OKX `liquidation-orders` interleaves every swap on the
+> venue, so global exchange-time order is meaningless, and OKX delivers details
+> late and in batches (rows up to ~15 min after `exchange_time`, backward steps
+> even per product). The gate is now what the capture can vouch for: row shape
+> (`channel == "liquidations"`), finite positive `price`/`size`, and
+> `received_at` present and monotonic. Venue delivery lag and per-product
+> exchange-time reorders are RECORDED (`informational_findings`,
+> `delayed_delivery_count`, `max_delivery_delay_ms`, `non_monotonic_count`) and
+> never gate. `excessive_clock_skew_count` is 0 by construction on this mode;
+> `mode = "liquidation_stream_none_native"`. `received_at` is the availability
+> clock for research on this channel. Bybit per-symbol day-runs keep passing;
+> the OKX all-swap day-runs become replayable with the lag on record. Trades,
+> depth, funding, OI, text and wallet-flow verdicts unchanged; liquidation
+> lanes stay raw-only (no promoter), so no curated dataset changes.
 > **v11 (2026-09-02, owner-approved):** new **`open_interest` dataset** — the
 > Binance USDT-M `/fapi/v1/openInterest` metric lane (`binance_perp_open_interest/`,
 > §4.5) is now curated to `curated/research/open_interest` through the standard
@@ -338,6 +355,7 @@ frozen history.
 | `price`/`size` | float \| None   | liquidation print price and quantity |
 | `trade_id`     | None            | venues expose no liquidation id |
 | `sequence`     | None            | no dense counter -> non-sequence (`none_native`) feed, structurally clean but NOT gap-proof (4.3) |
+| `received_at`  | ISO-8601        | collector receipt time; **the availability clock and the ordering the plant guarantees for this channel** (4.10) |
 
 **OKX shape differs from Bybit.** `liquidation-orders` is scoped by instrument
 TYPE (`instType: SWAP`), so one subscription covers every swap and `product`
@@ -346,6 +364,17 @@ carry a market suffix, so resolution must use the OKX-specific helper or every
 row partitions as `instrument=unknown`. OKX additionally reports `posSide` (the
 liquidated side, stated rather than inferred) and `bkPx`/`bkLoss`, kept in
 metadata.
+
+**OKX delivery is venue-delayed and batched** (measured on the first all-swap
+day-runs, 2026-09-08/09): one push carries `details[]` whose `ts` spread over
+minutes, rows arrive up to ~15 min after their `exchange_time` (186 of 11,564
+rows > 60 s on 09-08, max 898 s; 250 of 6,408 on 09-09), concentrated in
+illiquid alt swaps and not clustered in time, and even per product the
+exchange clock steps backward (691 steps across 71 products). BTC-USDT-SWAP
+itself arrived in order. This is how the venue publishes the channel, not a
+capture defect; the verdict in 4.10 records it and does not fail on it.
+Research on this channel MUST use `received_at` as the availability clock and
+order events per product, never by global `exchange_time`.
 
 **Binance shape.** `!forceOrder@arr` is one liquidation per frame (no batching)
 wrapped in an `o` order object, all-market. It offers several near-synonyms and
@@ -903,6 +932,56 @@ Same raw-only contract as §4.8, multi-payload:
   2026-05-17) stays frozen in `G:\Binance_IV_V1\data\` — it is V1-schema CSV,
   not this contract, and is deliberately NOT imported into the archive (same
   policy as the Vision open-interest backfill kept in reference-data).
+
+---
+
+### 4.10 `liquidations` channel - receipt-ordered verdict (v12)
+
+Scorer: `replay_liquidations_run` (`mode = "liquidation_stream_none_native"`,
+`gap_detection = "none_native"`, `replay_type = "trades"` so the run-dir
+contract and the tooling that reads `metrics/replay_summary.json` are
+unchanged). It replaces the trades-stream verdict (4.3) on every lane that
+emits `channel = "liquidations"` (Bybit `allLiquidation` per symbol, OKX
+`liquidation-orders` all swaps, Binance `!forceOrder@arr` when collectable).
+Re-score history with `backfill-trades-replay --liquidations --overwrite`.
+
+Why not 4.3: a liquidations channel is not a trade tape. The all-venue OKX
+subscription interleaves hundreds of products (global exchange-time order is
+meaningless - the per-wallet v9 and per-product OI v11 lesson again), and OKX
+publishes liquidation details late and in batches, so exchange->receipt skew
+measures the venue, not the collector. Under 4.3 every OKX day-run failed
+with `non_monotonic_event_time` + `excessive_clock_skew` while the capture was
+complete.
+
+`replayable` iff **all** hold (these are the capture's own guarantees):
+
+- `event_count > 0`
+- every row has `channel == "liquidations"` (finding `wrong_channel`; the
+  Bybit `allLiquidation`/`publicTrade` shape collision must fail closed)
+- `price` and `size` finite and positive (`invalid_prices`, `invalid_sizes`)
+- `received_at` present on every row (`missing_received_at`) and monotonic
+  non-decreasing across the run (`non_monotonic_received_at`) - the
+  collector's clock is the ordering the plant guarantees for this channel
+
+Recorded, **never gating**, in `informational_findings` (kept out of
+`findings` so quarantine, promote and the lanes view read the verdict as
+before):
+
+- `delayed_delivery`: rows with |`received_at` - `exchange_time`| above the
+  lane's `max_clock_skew_ms` (default 60 s; set the OKX lane to the venue's
+  observed ~15 min = 900000 if the count should mean "worse than usual").
+  `delayed_delivery_count`, `max_delivery_delay_ms` (mirrored into
+  `max_clock_skew_ms`).
+- `per_product_reorder`: `exchange_time` stepping backward within one
+  product; count in `non_monotonic_count`.
+
+`excessive_clock_skew_count` is 0 by construction on this mode. `product` /
+`instrument_id` are set only when the run holds a single product (Bybit
+per-symbol lanes); all-venue runs report `product = null` and `product_count`.
+No liquidation id exists on any venue, so completeness is NOT proven -
+consumers treat the data as best-effort (4.3 policy) and use `received_at`
+as the availability clock. Liquidation lanes are raw-only (no promoter, offload
+by age per section 7), so this verdict labels runs; it does not curate them.
 
 ---
 
