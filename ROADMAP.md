@@ -796,19 +796,27 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   more machinery to keep a layer nothing reads. What Claude does on OK: the
   config edit + example-config PR + STANDARDS PR; the redeploy and the
   robocopy launch are the owner's (elevated, and a state change).
-- **Next elevated redeploy — owner checklist (2026-09-08).** `main d5516aa`
-  carries PRs #58–#61 (depth-scorer floor, hermetic tests, redeploy logging,
-  heartbeat rotation) and `ops.live.local.json` carries the five new `age_only`
-  liquidation offload rows (backup `ops.live.local.json.bak-20260908-liq-offload`).
-  After `scripts/redeploy_runner.ps1`: (1) `runner.log` grows again (relaunch
-  marker + runner output, one encoding); (2) within ~2 h the depth lanes stop
-  producing short promotions (`promoted_rows` == raw clean rows on new runs);
-  (3) the offload pass stops listing the liquidation dirs as
-  `unconfigured_lane` and starts moving their aged runs; (4) the first heartbeat
-  rolls the 5.8 GB history into `heartbeat_history.1.jsonl` — **delete that file
-  right away (owner decision 2026-09-08)**; `heartbeat_history.jsonl` restarts
-  small. Then the truncated-history repair (below) can run against a stable
-  plant.
+  *2026-09-10 15:00: owner approved step 1 - `normalized_parquet: false` set on
+  all 21 collector lanes in `ops.live.local.json` (backup
+  `.bak-20260910-normalized-off`) and in the example config; STANDARDS 2.2
+  retired (v13) in the same PR. Live at the next redeploy (checklist above).
+  Step 2 (robocopy move to D:) after that redeploy confirms no new writes.*
+- **Next elevated redeploy — owner checklist (rewritten 2026-09-10 after the
+  crash).** The 09-08 checklist is done (redeploys 09-08/09-09, the 09-10 boot).
+  Pending config in `ops.live.local.json` (backup
+  `ops.live.local.json.bak-20260910-normalized-off`): `normalized_parquet: false`
+  on all 21 collector lanes and `max_delay_ms: 3600000` on `okx-swap-liquidations`
+  (owner decisions 2026-09-10). Before running: `main` must be at or past
+  `9c9204d` (#74, pid-identity guard) - check `Test-PlantProcess` exists in
+  `scripts/redeploy_runner.ps1`. After `scripts/redeploy_runner.ps1` (elevated,
+  at the PC): (1) the script prints `Lock names runner pid=... ` followed by a
+  kill of a python, never of anything else, then `Redeploy OK`; (2) lock pid ==
+  a live plant python, heartbeat advancing, 37 slots; (3) no new files under
+  `G:\market_archive\normalized\{market,trades}` after the restart (newest
+  mtime stays at the restart time) - then the robocopy move (Decision queue
+  item above, step 2) can start; (4) the next OKX liquidation day-run's
+  `quarantine/events.jsonl` no longer collects `stale_or_clock_skew` rows for
+  15 min..1 h lags.
 - **OKX liquidation lane: replay verdict is wrong for this feed (2026-09-09).**
   The first full OKX day-run (`okx_perp_liquidations/20260908_002925`, 11,564
   rows, 340 swap products) scores `replayable: false` with
@@ -855,8 +863,9 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   24 hot runs scanned, 23 scored (19 had no summary at all - the 7200 s-kill
   era runs of 09-06/07 and the two runs ended by the 09-09 redeploy and the
   09-10 crash - and 4 pre-v12 summaries replaced), all 23 replayable, only the
-  live run skipped, 0 failures. `docs/lanes.md` OKX lane -> B. Still open for
-  the owner: raising the OKX lane's `max_delay_ms` (item 3 above); cold-tier
+  live run skipped, 0 failures. `docs/lanes.md` OKX lane -> B. Owner decided
+  2026-09-10 15:00: `max_delay_ms: 3600000` on the OKX lane (both configs, v13),
+  live at the next redeploy; cold-tier
   runs from 08-25..09-05 keep their pre-v12 summaries (re-score there is a
   read of the cold tier, not proposed).*
 - **Text-capture P2 probes (from the 2026-07-16 feasibility doc — see

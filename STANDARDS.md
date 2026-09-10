@@ -1,7 +1,19 @@
 # Data Standards
 
-`STANDARDS_VERSION = 12`
+`STANDARDS_VERSION = 13`
 
+> **v13 (2026-09-10, owner decision):** the **hot-path normalized Parquet layer
+> (section 2.2) is retired.** `normalized_parquet: false` is set on every
+> collector lane in the live and example configs (20 enabled lanes were still
+> writing; the Binance spot trades, Binance REST, wallet-flow and text lanes were
+> already off). Section 2.2 becomes optional-per-lane, default off; nothing in
+> the plant reads that tree (curation runs raw -> replay -> curated), and it had
+> grown to 229 GB / 15.4 M files on G: at ~2.4 GB/day. The existing tree is to
+> be verify-moved to the cold tier (owner step, pending), not deleted. Same
+> change: the OKX liquidation lane's live stale gate `max_delay_ms` goes from the
+> 900 s default to 3600000 ms so venue-delayed details reach `clean/` (4.10).
+> Both take effect at the next runner restart (merged != deployed). Raw, curated,
+> quarantine, manifests and every verdict are unchanged.
 > **v12 (2026-09-10, owner-gated):** replay verdict for the **`liquidations`**
 > channel (section 4.10). Liquidation runs are scored by `replay_liquidations_run`
 > instead of the trades-stream verdict, which was wrong for this channel in two
@@ -225,7 +237,17 @@ from. The normalized Parquet layer buffers up to `batch_size` (100) rows in
 memory, so on a hard kill it can briefly lag raw by up to ~100 events. Rebuild
 normalized from raw if they disagree.
 
-### 2.2 Normalized Parquet (all runs, pre-curation)
+### 2.2 Normalized Parquet (RETIRED 2026-09-10, v13 - optional per lane, default off)
+
+**Status:** no lane writes this layer any more (`normalized_parquet: false` on every
+collector lane since v13; the runner applies the flag centrally at dispatch). It
+was a live, pre-curation convenience copy that nothing in the plant or in any
+study read; curation is raw -> replay verdict -> curated (2.3). The tree that
+exists (`normalized/market` 197.6 GB / 11.3 M files, `normalized/trades` 31.7 GB /
+4.1 M files as of 2026-09-10) is to be verify-moved to `D:\market_archive_cold\normalized\`
+with the June robocopy recipe, not deleted; until that move it stays readable on G:.
+A lane can opt back in per lane (`normalized_parquet: true`), which resumes
+writes in the layout below. The layout is kept for readers of the history:
 
 ```
 <archive>/normalized/{market,trades}/
@@ -374,8 +396,10 @@ exchange clock steps backward (691 steps across 71 products). BTC-USDT-SWAP
 itself arrived in order. **The tail is longer than `clean/` shows:** the live
 quality gate (section 5, `max_delay_ms` = 900 s on these lanes) quarantined a
 further 307 rows of the 09-08 run as `stale_or_clock_skew`, i.e. details
-delivered more than 15 min late never reach the clean stream (raising the OKX
-lane's `max_delay_ms` is an owner decision, queued in ROADMAP). This is how
+delivered more than 15 min late never reached the clean stream. **v13: the OKX
+lane's `max_delay_ms` is 3600000 ms (1 h)** in both configs (owner decision
+2026-09-10, live from the next runner restart); runs before that restart are
+truncated at 15 min, Bybit lanes keep 900 s. This is how
 the venue publishes the channel, not a capture defect; the verdict in 4.10
 records what reaches clean and does not fail on it.
 Research on this channel MUST use `received_at` as the availability clock and
@@ -981,7 +1005,7 @@ before):
   lane's `max_clock_skew_ms` (default 60 s). `delayed_delivery_count`,
   `max_delivery_delay_ms` (mirrored into `max_clock_skew_ms`). **This is a
   censored statistic:** the live quality gate (section 5, `max_delay_ms`,
-  default 900 s) quarantines later rows as `stale_or_clock_skew` before they
+  default 900 s; 3600 s on the OKX lane since v13) quarantines later rows as `stale_or_clock_skew` before they
   reach `clean/`, so the observed maximum is the gate ceiling, not the
   venue's tail, and a threshold at or above `max_delay_ms` makes the count
   identically zero. Keep the informational threshold well below the gate.
@@ -1092,8 +1116,10 @@ gate instead — `missing_source_id` / `missing_content_hash` / `missing_raw_ite
   is retired. Every move is
   recorded in `_offload_index.jsonl`, so raw remains a locatable rebuild source
   after offload.
-- **Normalized / curated / quarantine / manifests**: retained indefinitely (no
-  auto-prune today). Curated is the long-lived research artifact.
+- **Curated / quarantine / manifests**: retained indefinitely (no auto-prune
+  today). Curated is the long-lived research artifact.
+- **Normalized** (2.2, retired v13): no new writes; the existing tree is moved to
+  the cold tier as an owner step and kept there, not deleted.
 - Cleanup runs in **dry-run by default** (`--apply` to act).
 
 ---
