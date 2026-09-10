@@ -246,10 +246,13 @@ was a live, pre-curation convenience copy whose data nothing in the plant or in
 any study consumed (the `research-manifest` job counts its files per day and
 `cleanup` scans it for zero-byte parquet - stats only, both fine on an empty
 tree, both made tolerant of files vanishing under them while it is moved);
-curation is raw -> replay verdict -> curated (2.3). The tree that
-exists (`normalized/market` 197.6 GB / 11.3 M files, `normalized/trades` 31.7 GB /
-4.1 M files as of 2026-09-10) is to be verify-moved to `D:\market_archive_cold\normalized\`
-with the June robocopy recipe, not deleted; until that move it stays readable on G:.
+curation is raw -> replay verdict -> curated (2.3). **The history lives on the
+cold tier:** `D:\market_archive_cold\normalized\market` (11,346,201 files /
+197.9 GB) and `...\trades` (4,085,440 files / 31.7 GB), robocopy /MOVE'd from G:
+on 2026-09-10/11 with FAILED 0 (logs in `ops/`); nothing of it remains on G:.
+Coverage of that history: 2026-06-08 .. 2026-09-10 15:06 for the lanes that
+wrote it (see the per-lane `normalized_parquet` flags in the configs for the
+lanes that stopped earlier).
 A lane can opt back in per lane (`normalized_parquet: true`), which resumes
 writes in the layout below. The layout is kept for readers of the history:
 
@@ -1124,8 +1127,9 @@ gate instead — `missing_source_id` / `missing_content_hash` / `missing_raw_ite
   after offload.
 - **Curated / quarantine / manifests**: retained indefinitely (no auto-prune
   today). Curated is the long-lived research artifact.
-- **Normalized** (2.2, retired v13): no new writes; the existing tree is moved to
-  the cold tier as an owner step and kept there, not deleted.
+- **Normalized** (2.2, retired v13): no new writes; the historical tree is on the
+  cold tier (`D:\market_archive_cold\normalized\`, moved 2026-09-10/11) and kept
+  there, not deleted.
 - Cleanup runs in **dry-run by default** (`--apply` to act).
 
 ---

@@ -7,6 +7,51 @@ git log + the merged PR descriptions; this file keeps the *why*.
 
 ---
 
+## 2026-09-10/11 - the hot-path normalized Parquet layer retired and archived (v13)
+
+**What it was.** Every WebSocket lane wrote a second, pre-curation Parquet copy of
+its clean events under `normalized/{market,trades}` as it collected (STANDARDS
+2.2). Nothing consumed it: curation runs raw -> replay verdict -> curated, the
+manifest lists curated, both studies read curated. Two maintenance jobs walked it
+for stats (manifest per-day file counts, cleanup zero-byte scan). It had been the
+plant-side G: burn since July (open item 2): 66 GB on 07-04, 83 GB on 07-12,
+**229 GB / 15.4 M files on 2026-09-10** (~2.4 GB and ~165 k files a day), with G:
+down to 131 GB free after the curated repair. The Binance spot trades, Binance
+REST, wallet-flow and text lanes had already run without it since June.
+
+**Decision (owner, 2026-09-10, from the phone, one question at a time).**
+(1) `normalized_parquet: false` on all 21 collector lanes in the live config
+(backup `.bak-20260910-normalized-off`) and the example config, applied by a
+text-level script that keeps the hand-formatted layout; STANDARDS 2.2 retired
+to optional-per-lane/default-off and `STANDARDS_VERSION` 13 (PR #76). Live at
+the 15:06 redeploy: last normalized file written 15:06:02. (2) Move, not delete:
+"Do it" at 17:06. A 155-file probe partition moved without elevation, so the
+move ran detached from Claude's session: robocopy `/MOVE /E /COPY:DAT /DCOPY:T
+/R:1 /W:1 /MT:8`, one tree at a time, each with its own log, a done-marker JSON
+after each tree, and a 15-min watch on G: free space, robocopy liveness and the
+plant's error counters.
+
+**Result.** `market`: 11,346,201 files / 197.9 GB, 17:08 -> 22:14. `trades`:
+4,085,440 files / 31.7 GB, 22:19 -> 00:12. FAILED 0 on both, 0 files left on G:
+(robocopy removed the source directories). **G: 131 -> 391 GB free**, more than
+the logical 229 GB because 15 M tiny files returned their cluster slack; D:
+776 -> 491 GB free. Throughput ~0.65 GB/min on the depth tree, slower on the
+small-file trades tree. Every lane kept collecting; the only casualty was the
+in-process `research-manifest` job, which stat'ed files after listing them and
+died with WinError 2 seven times when robocopy removed a file in between - fixed
+(scandir walk tolerant of vanishing entries, same guard on cleanup's zero-byte
+scan, PR #79) and live at the next runner restart.
+
+**Lessons.** A convenience layer with no reader is still a liability at 2 GB a
+day; the per-lane flag existed since June and half the lanes already used it.
+Long moves are launched detached with a done-marker and a sparse watch, never
+inside a tool call (the June lesson, reapplied). Any walker over a tree another
+job deletes from must tolerate vanishing entries. And "nothing reads it" needs
+the qualifier "no data consumer": the two stats walkers were found by the move,
+not by the grep that preceded the proposal.
+
+---
+
 ## 2026-09-10 - the redeploy script blue-screened the box by killing a recycled pid
 
 **What happened.** At 13:48:28 local the owner ran the elevated
