@@ -839,10 +839,17 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   with prefix-scored summaries re-scored on the full segment (39 replayable, 2
   not) and picked up by a second pass. Verified against raw: every trades lane
   at 99.93–99.99 % of its raw rows (786.4 M of 786.7 M dataset-wide), part-files
-  still run-pure. Narrative in `docs/HISTORY.md` 2026-09-08. **Remaining: the
-  10 depth lanes** (`market_replayable`) — inventory dry-run next (fast path
-  covers the depth finalizer's summary row since PR #66), then per-lane
-  `--apply` on the owner's OK.
+  still run-pure. Narrative in `docs/HISTORY.md` 2026-09-08. **All ten depth
+  lanes REPAIRED 2026-09-09 22:52 → 2026-09-10 09:07 local (owner-approved after
+  Codex's read-only inventory; 36 prefix-scored summaries re-scored first):**
+  12,684 runs re-promoted (12,009 from the cold tier), 186.9 M partial rows
+  replaced by 337.1 M, 2 not-replayable partial runs removed, 0 failures, 0
+  skips. Verified against raw: every depth lane at 99.99–100 % (1,148.7 M of
+  1,148.8 M rows), 12 near-threshold runs remain short by a few rows, part-files
+  run-pure (0 shared in 51,121). **The curated tier is complete again on all 21
+  trades/depth lanes; this item is CLOSED.** Residue: G: fell to 138 GB free
+  after absorbing ~30 GB of repaired parquet — open item 2 (normalized-tree
+  retention) is now the headroom lever.
 - **350 torn curated part-files from the June G:-full week (found 2026-09-08 by
   the post-repair integrity scan of all 51,593 `trades_replayable` part-files).**
   Every one is 176–643 bytes (Parquet header, no footer — a promoter flush that
