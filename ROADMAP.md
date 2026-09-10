@@ -532,6 +532,10 @@ owner ask (safe-shaping directive above).
    as the Kalshi normalized tree that caused the 06-17 G:-full incident, just
    ~20x slower. Needs an offload/retention policy (code change; data-lifecycle
    -> owner sign-off on the policy, implementation is autonomous).
+   *2026-09-10: measured 229 GB / 15.4 M files (market 197.6 GB, trades 31.7
+   GB), ~2.4 GB/day, G: 136 GB free; no in-plant reader. Proposal in the
+   Decision queue: stop writing (config, 20 lanes) + verify-move the tree to
+   the cold tier + retire section 2.2 in STANDARDS. Waiting on the owner.*
 3. ~~Surface `stuck_unaccounted_count` in monitoring~~ **DONE — PR #28**
    (offload report persisted + growth-gated `health` finding; root-cause
    narrative in `docs/HISTORY.md` 2026-07-04). **Deployed at the 07-11 boot and
@@ -738,6 +742,42 @@ owner ask (safe-shaping directive above).
 Decisions waiting on the owner; agents must not act on these without an explicit OK
 (see `CLAUDE.md` Governance):
 
+- **`normalized/{market,trades}` retention - the G: headroom lever (measured
+  2026-09-10, open item 2).** Full walk of `G:\market_archive\normalized`:
+  `market` (depth) **197.6 GB / 11.33 M files**, `trades` **31.7 GB / 4.07 M
+  files**, `funding` 1 file; **229 GB / 15.4 M files total**. It was 83.2 GB on
+  07-12, so the tree grows **~2.4 GB and ~165 k files per day**. G: is at
+  **136 GB free** (468 GB on 07-12; 30 GB of that went to the curated repair) -
+  at this burn the normalized tree alone consumes the remaining headroom in
+  under two months, before raw and curated growth. Facts that frame the
+  options: (a) **nothing in the plant reads this tree** - `cli.py` only
+  writes it (`_resolve_normalized_root`); curation runs raw -> replay ->
+  curated, the manifest lists curated only, and both studies to date read
+  curated; (b) it is unmanaged by design today - `archive-offload` is
+  raw-only and `cleanup` removes only `zero_byte_parquet` (STANDARDS section 7:
+  "retained indefinitely"); (c) **20 enabled lanes still write it** (9 depth,
+  7 WebSocket trades, 4 liquidation lanes) while 9 already run with
+  `normalized_parquet: false` (Binance spot trades x2, the 6 Binance REST
+  lanes, wallet-flow) and text is opt-in - the plant has run half its lanes
+  without the layer since June with no consumer noticing; (d) the June
+  precedent: 555 GB / 45 M files of normalized partitions were verify-moved
+  G: -> `D:\market_archive_cold` with a detached `robocopy /MOV` (06-24,
+  0 failures); D: has 782 GB free today. **Proposal (recommended, in this
+  order; none of it deletes data):** (1) *stop the bleed* - set
+  `normalized_parquet: false` on the 20 lanes in `ops.live.local.json` (+ the
+  example config) and redeploy; reversible per lane, zero effect on raw or
+  curated; (2) *recover the 229 GB* - detached `robocopy /MOV` of
+  `normalized/{market,trades}` to `D:\market_archive_cold\normalized\`, same
+  recipe and verification as June, G: back to ~365 GB free; (3) *contract* -
+  STANDARDS section 2.2 becomes "optional per lane, default off; hot-path
+  layer retired 2026-09; history on the cold tier" and section 7 says so,
+  `STANDARDS_VERSION` 13 (docs PR after the decision). Alternatives the owner
+  may prefer instead of (2): keep the tree on G: (buys nothing), or delete it
+  (no in-plant reader; unknown external readers - the owner's call, not
+  proposed). Alternative to (1): a `normalized_days` retention job (code) -
+  more machinery to keep a layer nothing reads. What Claude does on OK: the
+  config edit + example-config PR + STANDARDS PR; the redeploy and the
+  robocopy launch are the owner's (elevated, and a state change).
 - **Next elevated redeploy — owner checklist (2026-09-08).** `main d5516aa`
   carries PRs #58–#61 (depth-scorer floor, hermetic tests, redeploy logging,
   heartbeat rotation) and `ops.live.local.json` carries the five new `age_only`
