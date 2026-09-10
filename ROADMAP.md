@@ -525,7 +525,11 @@ owner ask (safe-shaping directive above).
    --score-only`, then let the promote jobs pick them up) or declare it cold history
    and leave it. Blocks nothing, but the disjoint pre-cutover data limits historical
    research coverage.
-2. **`normalized/{market,trades}` retention (no longer minor).** 66.2 GB as of
+2. ~~**`normalized/{market,trades}` retention (no longer minor).**~~ **DONE
+   2026-09-10/11: layer retired (v13, `normalized_parquet: false` everywhere,
+   live 15:06) and the 229.7 GB / 15.43 M-file tree verify-moved to
+   `D:\market_archive_cold\normalized\`, FAILED 0; G: 131 -> 391 GB free. Details
+   in the Decision queue entry.** Original item: 66.2 GB as of
    2026-07-04, growing ~3 GB/day, and still unmanaged: `archive-offload` is
    raw-only and `cleanup` only removes zero-byte parquet. This was the primary
    plant-side driver of the -56 GB G: burn 06-30..07-04. Same blind-spot shape
@@ -536,7 +540,8 @@ owner ask (safe-shaping directive above).
    GB), ~2.4 GB/day, G: 136 GB free; no in-plant data consumer (two maintenance
    jobs only walk it for stats: manifest, cleanup). Proposal in the
    Decision queue: stop writing (config, 20 lanes) + verify-move the tree to
-   the cold tier + retire section 2.2 in STANDARDS. Waiting on the owner.*
+   the cold tier + retire section 2.2 in STANDARDS. All three done by 2026-09-11
+   00:12.*
 3. ~~Surface `stuck_unaccounted_count` in monitoring~~ **DONE — PR #28**
    (offload report persisted + growth-gated `health` finding; root-cause
    narrative in `docs/HISTORY.md` 2026-07-04). **Deployed at the 07-11 boot and
@@ -808,16 +813,23 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   `.bak-20260910-normalized-off`) and in the example config; STANDARDS 2.2
   retired (v13) in the same PR. LIVE since the 15:06 redeploy - no normalized
   file written after 15:06:02 (verified 16:58).*
-  *Step 2 is ready for the owner (elevated, detached, at the PC; ~229 GB / 15.4 M
-  files, hours). Same recipe as 06-24; robocopy checks size + timestamp per file,
-  not a hash, and deletes each source file only after its copy succeeded. Run one
-  tree at a time, `market` first (197.6 GB), and read the log's FAILED line:*
+  *Step 2 DONE 2026-09-11 00:12 local (owner: "Do it", 17:06; launched detached
+  from Claude's non-elevated session after a 155-file probe move proved the
+  permissions): `market` 11,346,201 files / 197.9 GB in 5 h 06 min, `trades`
+  4,085,440 files / 31.7 GB in 1 h 53 min, **FAILED 0 on both**, 0 files left on
+  G: (robocopy /MOVE removed the source directories too; `G:\market_archive\
+  normalized` now holds only the June `binary_options` leftover and `funding`).
+  Logs `ops/robocopy-normalized-{market,trades}-20260910.log`, marker
+  `ops/robocopy-normalized-20260910.done.json`. **G: 131 -> 391 GB free** (more
+  than the 229 GB logical size: 15 M small files gave back their cluster slack);
+  D: 491 GB free. Side effect: the in-process `research-manifest` job errored 7
+  times on files vanishing under its walk (see the redeploy item below; fix on
+  `main`). The recipe that ran, kept for the next such move:*
   ```powershell
   Start-Process robocopy -WindowStyle Hidden -ArgumentList 'G:\market_archive\normalized\market','D:\market_archive_cold\normalized\market','/MOVE','/E','/COPY:DAT','/DCOPY:T','/R:1','/W:1','/MT:8','/NP','/NFL','/NDL','/LOG:G:\market_archive\ops\robocopy-normalized-market-20260910.log'
   ```
-  *then the same with `trades` and its own log. Verify: `FAILED : 0` in the log's
-  summary, then the source dirs are empty (robocopy /MOVE leaves the empty
-  directory skeleton; delete it afterwards). Not launched by Claude.*
+  *then the same with `trades` and its own log. Verify `FAILED : 0` in each
+  summary and that the source is gone.*
 - **Next elevated redeploy (no urgency, bundle with the next real need):** the
   manifest/cleanup walk-tolerance fix runs IN-PROCESS in the runner, so until a
   restart the live `research-manifest` job errors once per 15 min while a move
