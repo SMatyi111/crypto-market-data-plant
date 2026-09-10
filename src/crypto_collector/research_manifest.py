@@ -487,17 +487,19 @@ def _iter_parquet_sizes(root: Path):
         try:
             with os.scandir(directory) as entries:
                 listed = list(entries)
-        except (FileNotFoundError, NotADirectoryError, PermissionError):
+        except OSError:
+            # Same breadth as the pathlib 3.12 rglob this replaced (it swallowed any
+            # OSError from scandir): a directory we cannot list is not counted.
             continue
         for entry in listed:
             try:
                 if entry.is_dir(follow_symlinks=False):
                     stack.append(Path(entry.path))
                     continue
-                if not entry.name.endswith(".parquet"):
-                    continue
+                if not entry.name.lower().endswith(".parquet"):
+                    continue  # case-insensitive like rglob("*.parquet") on Windows
                 size = entry.stat(follow_symlinks=False).st_size
-            except (FileNotFoundError, PermissionError):
+            except OSError:
                 continue
             yield Path(entry.path), size
 

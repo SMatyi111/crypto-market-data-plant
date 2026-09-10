@@ -3151,3 +3151,29 @@ def test_load_ops_config_rejects_control_characters_in_string_args(tmp_path):
     with pytest.raises(ValueError, match="control characters") as excinfo:
         load_ops_config(path)
     assert "hyperliquid-leaderboard-snapshot.args.output_root" in str(excinfo.value)
+
+
+def test_cleanup_zero_byte_scan_tolerates_files_vanishing_mid_walk(tmp_path, monkeypatch) -> None:
+    """Same listing-then-stat race as the manifest walk (2026-09-10 normalized move):
+    a parquet deleted between rglob and stat must be skipped, not abort the pass."""
+    from pathlib import Path as _P
+
+    from crypto_collector.ops import _find_cleanup_candidates
+
+    part = tmp_path / "normalized" / "market" / "schema_version=v2" / "source=x" / "instrument=y" / "event_date=2026-09-01"
+    part.mkdir(parents=True)
+    (part / "empty.parquet").write_bytes(b"")
+    (part / "vanishing.parquet").write_bytes(b"")
+    (part / "full.parquet").write_bytes(b"abc")
+    real_stat = _P.stat
+
+    def fake_stat(self, *args, **kwargs):
+        if self.name == "vanishing.parquet":
+            raise FileNotFoundError(2, "vanished", str(self))
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(_P, "stat", fake_stat)
+    candidates = _find_cleanup_candidates(archive_root=tmp_path, raw_days=14)
+    zero = sorted(c.path for c in candidates if c.reason == "zero_byte_parquet")
+    assert zero == [str(part / "empty.parquet")]
+

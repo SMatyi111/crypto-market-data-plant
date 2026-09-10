@@ -772,8 +772,10 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   options: (a) **nothing in the plant consumes this tree's data** (correction
   2026-09-10 17:40: the `research-manifest` job walks it for per-day file
   counts and `cleanup` scans it for zero-byte parquet - both tolerate an empty
-  tree; the manifest walk errored on files vanishing mid-move and was made
-  tolerant, see the redeploy checklist item) - `cli.py` only
+  tree; both walks had a listing-then-stat race that the move exposed - the
+  manifest errored every 15 min from 17:30 - fixed in the manifest-tolerance
+  PR, which needs the NEXT runner restart to take effect, see the new redeploy
+  item below) - `cli.py` only
   writes it (`_resolve_normalized_root`); curation runs raw -> replay ->
   curated, the manifest lists curated only, and both studies to date read
   curated; (b) it is unmanaged by design today - `archive-offload` is
@@ -816,6 +818,12 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   *then the same with `trades` and its own log. Verify: `FAILED : 0` in the log's
   summary, then the source dirs are empty (robocopy /MOVE leaves the empty
   directory skeleton; delete it afterwards). Not launched by Claude.*
+- **Next elevated redeploy (no urgency, bundle with the next real need):** the
+  manifest/cleanup walk-tolerance fix runs IN-PROCESS in the runner, so until a
+  restart the live `research-manifest` job errors once per 15 min while a move
+  or offload deletes files under it (harmless: nothing else fails, the manifest
+  just does not refresh during the 2026-09-10 normalized move). After the
+  restart: `research-manifest` `error_count` stops growing.
 - ~~**Next elevated redeploy — owner checklist**~~ **DONE 2026-09-10 15:06 local,
   verified 16:58:** `redeploy_runner.ps1` (guarded, `main` >= `5b6f440`) wrote its
   relaunch marker to `runner.log` at 15:06:08; the new runner (pid 10432, python,
