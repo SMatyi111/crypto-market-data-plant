@@ -12,7 +12,7 @@
 > be verify-moved to the cold tier (owner step, pending), not deleted. Same
 > change: the OKX liquidation lane's live stale gate `max_delay_ms` goes from the
 > 900 s default to 3600000 ms so venue-delayed details reach `clean/` (4.10).
-> Both take effect at the next runner restart (merged != deployed). Raw, curated,
+> Both live since the 2026-09-10 15:06 local redeploy. Raw, curated,
 > quarantine, manifests and every verdict are unchanged.
 > **v12 (2026-09-10, owner-gated):** replay verdict for the **`liquidations`**
 > channel (section 4.10). Liquidation runs are scored by `replay_liquidations_run`
@@ -240,7 +240,8 @@ normalized from raw if they disagree.
 ### 2.2 Normalized Parquet (RETIRED 2026-09-10, v13 - optional per lane, default off)
 
 **Status:** no lane writes this layer any more (`normalized_parquet: false` on every
-collector lane since v13; the runner applies the flag centrally at dispatch). It
+collector lane since v13, live 2026-09-10 15:06; the runner applies the flag
+centrally at dispatch; last file written 15:06:02). It
 was a live, pre-curation convenience copy that nothing in the plant or in any
 study read; curation is raw -> replay verdict -> curated (2.3). The tree that
 exists (`normalized/market` 197.6 GB / 11.3 M files, `normalized/trades` 31.7 GB /
@@ -398,8 +399,10 @@ quality gate (section 5, `max_delay_ms` = 900 s on these lanes) quarantined a
 further 307 rows of the 09-08 run as `stale_or_clock_skew`, i.e. details
 delivered more than 15 min late never reached the clean stream. **v13: the OKX
 lane's `max_delay_ms` is 3600000 ms (1 h)** in both configs (owner decision
-2026-09-10, live from the next runner restart); runs before that restart are
-truncated at 15 min, Bybit lanes keep 900 s. This is how
+2026-09-10, live since the 15:06 local redeploy that day); runs before that are
+truncated at 15 min, Bybit lanes keep 900 s. The venue tail runs past 1 h as
+well (57 rows in the first 1 h 50 min of the first 1 h-gate run); those stay in
+quarantine by design. This is how
 the venue publishes the channel, not a capture defect; the verdict in 4.10
 records what reaches clean and does not fail on it.
 Research on this channel MUST use `received_at` as the availability clock and
