@@ -30,7 +30,11 @@ DEFAULT_ARCHIVE_ROOT = Path(r"G:\market_archive")
 # and no OI run could be replayable. Funding rows unchanged.
 # v11 (2026-09-02): new `open_interest` curated dataset (binance_perp_open_interest
 # promoted to curated/research/open_interest); existing datasets unchanged.
-STANDARDS_VERSION = 11
+# v12 (2026-09-10): `liquidations` channel scored by `replay_liquidations_run`
+# (STANDARDS 4.10): receipt-time order + row shape gate, venue delivery lag and
+# per-product exchange-time reorders recorded as non-gating findings. Raw-only
+# lanes, so no curated dataset changes.
+STANDARDS_VERSION = 12
 
 _FALLBACK_WARNED: set[str] = set()
 
