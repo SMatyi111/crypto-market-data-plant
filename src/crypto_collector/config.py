@@ -34,7 +34,10 @@ DEFAULT_ARCHIVE_ROOT = Path(r"G:\market_archive")
 # (STANDARDS 4.10): receipt-time order + row shape gate, venue delivery lag and
 # per-product exchange-time reorders recorded as non-gating findings. Raw-only
 # lanes, so no curated dataset changes.
-STANDARDS_VERSION = 12
+# v13 (2026-09-10): hot-path normalized Parquet layer retired (normalized_parquet
+# false on every lane; STANDARDS 2.2 optional per lane, default off); OKX
+# liquidation lane max_delay_ms 3600000. Datasets and verdicts unchanged.
+STANDARDS_VERSION = 13
 
 _FALLBACK_WARNED: set[str] = set()
 

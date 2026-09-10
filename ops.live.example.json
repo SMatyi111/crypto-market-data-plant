@@ -5,6 +5,8 @@
       "job_type": "binance-depth-worker",
       "interval_seconds": 5,
       "args": {
+        "// normalized_parquet": "Hot-path normalized Parquet retired 2026-09-10 (owner decision, ROADMAP Decision queue / STANDARDS 2.2 v13): the tree had no reader, 229 GB / 15.4 M files on G:, ~2.4 GB/day. Raw + curated unaffected; flip back per lane to resume.",
+        "normalized_parquet": false,
         "symbol": "btcusdt",
         "speed": "100ms",
         "segment_count": 100000,
@@ -1558,6 +1560,7 @@
       "job_type": "bybit-liquidations-worker",
       "interval_seconds": 5,
       "args": {
+        "normalized_parquet": false,
         "symbol": "BTCUSDT",
         "source_suffix": "btcusdt",
         "channel": "allLiquidation",
@@ -1578,6 +1581,7 @@
       "job_type": "bybit-liquidations-worker",
       "interval_seconds": 5,
       "args": {
+        "normalized_parquet": false,
         "symbol": "ETHUSDT",
         "source_suffix": "ethusdt",
         "channel": "allLiquidation",
@@ -1598,6 +1602,7 @@
       "job_type": "bybit-liquidations-worker",
       "interval_seconds": 5,
       "args": {
+        "normalized_parquet": false,
         "symbol": "SOLUSDT",
         "source_suffix": "solusdt",
         "channel": "allLiquidation",
@@ -1618,6 +1623,9 @@
       "job_type": "okx-liquidations-worker",
       "interval_seconds": 5,
       "args": {
+        "normalized_parquet": false,
+        "// max_delay_ms": "OKX publishes liquidation-orders details late and in batches; the 900 s default quarantined 307 rows of the 2026-09-08 day-run as stale_or_clock_skew. 1 h keeps the venue tail in clean/ (owner decision 2026-09-10; STANDARDS 4.10, received_at is the availability clock).",
+        "max_delay_ms": 3600000,
         "symbol": "SWAP",
         "channel": "liquidation-orders",
         "segment_count": 100000,
@@ -1636,6 +1644,7 @@
       "job_type": "binance-liquidations-worker",
       "interval_seconds": 5,
       "args": {
+        "normalized_parquet": false,
         "symbol": "!forceOrder@arr",
         "channel": "!forceOrder@arr",
         "segment_count": 100000,
