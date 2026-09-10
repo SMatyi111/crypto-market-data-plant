@@ -7,6 +7,44 @@ git log + the merged PR descriptions; this file keeps the *why*.
 
 ---
 
+## 2026-09-10 - the redeploy script blue-screened the box by killing a recycled pid
+
+**What happened.** At 13:48:28 local the owner ran the elevated
+`scripts/redeploy_runner.ps1`. Step 1 read `ops-runner.lock`, took `pid: 1668`
+and called `Stop-Process -Id 1668 -Force`. By then 1668 belonged to a critical
+Windows `svchost.exe`; Windows bugchecked `CRITICAL_PROCESS_DIED (0xEF)` within
+the second (Kernel-Power 41 at 13:48:50, boot 13:49:58). The minidump names
+the terminated process (svchost.exe 1668) and the terminator (powershell.exe
+25208, started four seconds earlier = the script). The plant relaunched from
+the boot task at 13:49:36 on `main c041c4e`; the reboot gap is the only loss.
+
+**Root cause.** The script treated the lock's pid as an identity. It is a
+number Windows reuses aggressively. The Python runner has guarded its own
+locks against exactly this since 2026-06-11 (`_break_stale_lock`, after stale
+locks pointed at svchost.exe and at sibling workers); the PowerShell kill path
+never got the same guard, and its `-ErrorAction SilentlyContinue` posture
+(chosen in June so an unkillable pid could not abort the redeploy) meant it
+killed whatever it was pointed at. `job_runs.jsonl` shows the runner finishing
+a job 35 s before the kill, so the lock's pid did not match the live runner;
+why the lock named a wrong pid is not established - the guard makes the
+mismatch harmless either way.
+
+**Fix (PR on `fix/redeploy-stale-pid-guard`).** `Stop-PlantProcessTree` now
+resolves the pid to a process and refuses to kill unless (a) it is `python.exe`
+whose command line or executable path is this plant's (the same matcher the
+straggler sweep already trusted, now shared as `Test-PlantProcess`), and (b) it
+started before the lock naming it was written. Children are re-verified with
+the same test. A non-plant pid is reported and left alone; step 2 then clears
+the stale lock once no plant python is running, exactly as before. A hygiene
+test pins the guard's shape and that no unguarded `Stop-Process` exists in the
+script; a non-elevated harness against self-spawned processes confirmed: decoy
+powershell survives, plant python started before the lock time is killed with
+its child, plant python started after the lock time survives the lock path.
+
+**Lesson.** Any script that kills by a pid read from disk must prove the pid's
+identity first. This is not the recurring 0x133 `nvlddmkm` BSOD; different
+bugcheck, different cause, fully explained.
+
 ## 2026-09-08 — a third of curated runs had been truncated for three months; repaired from raw in one day
 
 **Root cause.** Every hourly `backfill-*` score job carried `max_age_hours: 6`

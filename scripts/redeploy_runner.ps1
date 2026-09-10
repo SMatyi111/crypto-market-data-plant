@@ -15,6 +15,9 @@
 .NOTES
   Run from an ELEVATED PowerShell if the current runner is elevated/SYSTEM (so Stop-Process
   can terminate it). Interrupts every lane briefly (clean segment boundary, not data loss).
+  Never kills a pid it cannot prove is a plant python started before the lock was written
+  (2026-09-10: a stale lock pid had been reused by svchost.exe and the old unconditional
+  kill blue-screened the machine, CRITICAL_PROCESS_DIED).
 #>
 param(
     [string]$OpsRoot = "G:\market_archive\ops",
@@ -68,7 +71,43 @@ if ($dupNames.Count -gt 0) {
 #    children-first sweep and the root kill survived with its lane lock and forced
 #    an abort with NO runner running), then sweep the snapshot. Any straggler that
 #    slipped the snapshot is caught by the Select-PlantPython sweep below.
-function Stop-PlantProcessTree([int]$RootPid) {
+#    PID-IDENTITY GUARD (2026-09-10 CRITICAL_PROCESS_DIED): the lock's pid is a
+#    number, not an identity. Windows reuses pids aggressively; on 2026-09-10 the
+#    lock named pid 1668, which by then belonged to a Windows svchost.exe, and the
+#    unconditional Stop-Process -Force below blue-screened the box (bugcheck 0xEF,
+#    minidump: terminated svchost.exe 1668, terminator powershell.exe = this script).
+#    The Python runner has had a recycled-pid guard on its own locks since
+#    2026-06-11 (ops.py, stale locks that pointed at svchost.exe); this script never
+#    did. Nothing is killed unless it is a plant python (same matcher as the sweep in
+#    step 2) that started BEFORE the lock naming it was written; children are
+#    re-verified the same way. A non-plant pid means the lock is stale: it is
+#    reported and left alone, and step 2 clears the lock once no plant python runs.
+$repoPattern = "*$([System.Management.Automation.WildcardPattern]::Escape($repo))*"
+function Test-PlantProcess([object]$Proc) {
+    if ($null -eq $Proc) { return $false }
+    if ($Proc.Name -ne 'python.exe') { return $false }
+    return (($Proc.CommandLine -like '*crypto_collector*') -or
+            ($Proc.CommandLine -like $repoPattern) -or
+            ($Proc.ExecutablePath -like $repoPattern))
+}
+function Stop-PlantProcessTree([int]$RootPid, [object]$NotStartedAfterUtc = $null) {
+    $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$RootPid" -ErrorAction SilentlyContinue
+    if ($null -eq $proc) {
+        Write-Host "pid $RootPid is not running -- nothing to stop."
+        return
+    }
+    if (-not (Test-PlantProcess $proc)) {
+        Write-Warning ("pid $RootPid is '$($proc.Name)' (" + $(if ($proc.CommandLine) { $proc.CommandLine } else { 'command line unreadable' }) + 
+            "), not a plant python -- the lock is stale and the pid was reused. NOT killing it.")
+        return
+    }
+    if ($null -ne $NotStartedAfterUtc -and $null -ne $proc.CreationDate) {
+        $startedUtc = ([DateTime]$proc.CreationDate).ToUniversalTime()
+        if ($startedUtc -gt [DateTime]$NotStartedAfterUtc) {
+            Write-Warning "pid $RootPid (python) started at $($startedUtc.ToString('o')), AFTER the lock naming it was written -- pid reused by a later plant process. NOT killing it by lock; the step 2 sweep decides."
+            return
+        }
+    }
     $children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$RootPid" -ErrorAction SilentlyContinue)
     Stop-Process -Id $RootPid -Force -ErrorAction SilentlyContinue
     foreach ($child in $children) { Stop-PlantProcessTree ([int]$child.ProcessId) }
@@ -91,8 +130,10 @@ if (Test-Path $lockPath) {
         $lock = $null  # torn/garbage lock: nothing to kill by pid; the sweep below still runs
     }
     if ($lock -and $lock.pid) {
-        Write-Host "Current runner: pid=$($lock.pid) created_at=$($lock.created_at)"
-        Stop-PlantProcessTree ([int]$lock.pid)
+        Write-Host "Lock names runner pid=$($lock.pid) created_at=$($lock.created_at)"
+        $lockCreatedUtc = $null
+        try { $lockCreatedUtc = [DateTime]::Parse($lock.created_at).ToUniversalTime() } catch { $lockCreatedUtc = $null }
+        Stop-PlantProcessTree ([int]$lock.pid) $lockCreatedUtc
         Start-Sleep -Seconds 3
     }
 }
@@ -105,13 +146,8 @@ if (Test-Path $lockPath) {
 #    every worker it spawns run `-m crypto_collector.cli ...` via this repo's venv
 #    python (cli.py _run_collector_in_subprocess), so plant processes are matched by
 #    'crypto_collector' in the command line or the repo root in either path field.
-$repoPattern = "*$([System.Management.Automation.WildcardPattern]::Escape($repo))*"
 function Select-PlantPython([object[]]$Processes) {
-    @($Processes | Where-Object {
-        $_.CommandLine -like '*crypto_collector*' -or
-        $_.CommandLine -like $repoPattern -or
-        $_.ExecutablePath -like $repoPattern
-    })
+    @($Processes | Where-Object { Test-PlantProcess $_ })
 }
 # A python whose CommandLine AND ExecutablePath are both unreadable (null) belongs to
 # another principal (typically SYSTEM -- e.g. the boot-task runner seen from a
