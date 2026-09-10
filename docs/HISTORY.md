@@ -48,9 +48,24 @@ Curated part-files stayed run-pure throughout (0 shared files in 51,593). Side
 finding: 350 torn part-files (176–643 bytes, header without footer) dated
 2026-06-19..23 — promoter flushes that died when G: hit 0 bytes in the Kalshi
 incident week; their runs were never indexed and were re-promoted whole later,
-so the files are debris that breaks whole-partition pyarrow scans. Left in place
-pending the owner's delete nod (Decision queue). Depth lanes
-(`market_replayable`) follow the same path once their inventory has run.
+so the files are debris that breaks whole-partition pyarrow scans. The owner
+approved deletion the same evening; a re-scan by the parallel Codex session
+confirmed 0 corrupt.
+
+**Depth lanes (2026-09-09/10).** Same path, one detached job: after Codex's
+read-only inventory (12,641 candidates at `--min-ratio 1.0`) and a re-score of
+the 36 prefix-scored summaries, `repromote-short-runs --apply` ran 22:52 → 09:07
+on `market_replayable`: 12,684 runs re-promoted (12,009 from cold), 186.9 M
+partial rows replaced by 337.1 M, 2 not-replayable runs removed, 0 failures.
+Verification: every depth lane at 99.99–100 % of raw (1,148.7 M of 1,148.8 M
+rows), 0 shared part-files. The integrity scan found 385 more torn part-files
+(21–46 bytes, same June week, all seven sources); deleted with the owner's nod,
+re-scan pending at the time of writing. Operational lesson recorded in memory:
+a venv's `python.exe` is a launcher stub with no I/O of its own — the first
+launch was killed as "hung" after 15 minutes while its child interpreter was
+working; the restart cost 15 minutes and nothing else because the job was still
+in its read-only candidate pass. **With this the curated tier is complete on
+all 21 trades/depth lanes; per-lane research grades are in `docs/lanes.md`.**
 
 ## 2026-09-02 — the three 2026-08-25 lanes were defective since deploy day; OI becomes a curated dataset (v11)
 
