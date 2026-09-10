@@ -24,9 +24,13 @@ This repo is a data plant, not a trading bot. It runs public collectors, writes 
 
 ## Supported Production Feeds
 
-The maintainer deployment has **23 enabled collection lanes** across eight venues
-plus Kalshi: the existing BTC market/text lanes and one frozen-cohort Hyperliquid
-wallet-flow lane for BTC, ETH and SOL. The public `ops.live.example.json` ships with only the
+**Current lane table with research-grade status:** [`docs/lanes.md`](docs/lanes.md)
+(33 enabled lanes as of 2026-09-09; owner directive: stabilize this set).
+
+The maintainer deployment has **33 enabled collection lanes** across eight venues:
+the BTC market/text lanes, Binance open interest and Bybit/OKX liquidations for
+BTC/ETH/SOL, two options-snapshot reference lanes, and one frozen-cohort
+Hyperliquid wallet-flow lane for BTC, ETH and SOL plus a daily leaderboard snapshot. The public `ops.live.example.json` ships with only the
 Binance `BTCUSDT` spot lanes enabled — every other lane is included
 `enabled: false` as the recipe, except the Hyperliquid wallet-flow lane, which
 requires a local cohort file and therefore ships with no public recipe; flip
