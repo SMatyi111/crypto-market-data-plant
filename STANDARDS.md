@@ -242,8 +242,10 @@ normalized from raw if they disagree.
 **Status:** no lane writes this layer any more (`normalized_parquet: false` on every
 collector lane since v13, live 2026-09-10 15:06; the runner applies the flag
 centrally at dispatch; last file written 15:06:02). It
-was a live, pre-curation convenience copy that nothing in the plant or in any
-study read; curation is raw -> replay verdict -> curated (2.3). The tree that
+was a live, pre-curation convenience copy whose data nothing in the plant or in
+any study consumed (the `research-manifest` job counts its files per day and
+`cleanup` scans it for zero-byte parquet - stats only, both fine on an empty
+tree); curation is raw -> replay verdict -> curated (2.3). The tree that
 exists (`normalized/market` 197.6 GB / 11.3 M files, `normalized/trades` 31.7 GB /
 4.1 M files as of 2026-09-10) is to be verify-moved to `D:\market_archive_cold\normalized\`
 with the June robocopy recipe, not deleted; until that move it stays readable on G:.

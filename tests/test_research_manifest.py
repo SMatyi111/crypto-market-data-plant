@@ -448,3 +448,59 @@ def test_manifest_torn_replay_summary_counts_as_missing(tmp_path: Path) -> None:
 
     assert depth["days"][0]["raw_quality"]["missing_summaries"] == 1
     assert depth["days"][0]["readiness"] == "ready_with_quarantine"
+
+
+def test_collect_partition_files_tolerates_entries_vanishing_mid_walk(tmp_path, monkeypatch) -> None:
+    """2026-09-10: the robocopy move of the retired normalized tree deleted files
+    between the manifest's listing and its stat -> WinError 2 killed the job on every
+    15-min run for the duration of the move. A vanished file or directory is simply
+    not counted; the manifest must still be produced from what is there."""
+    import os as _os
+
+    from crypto_collector import research_manifest as rm
+
+    root = tmp_path / "normalized" / "market"
+    keep = root / "schema_version=v2" / "source=bybit" / "instrument=BTC-USDT" / "event_date=2026-09-01"
+    gone_file_dir = root / "schema_version=v2" / "source=okx" / "instrument=BTC-USDT" / "event_date=2026-09-02"
+    gone_dir = root / "schema_version=v2" / "source=kraken" / "instrument=BTC-USD" / "event_date=2026-09-03"
+    for d in (keep, gone_file_dir, gone_dir):
+        d.mkdir(parents=True)
+    (keep / "part-a.parquet").write_bytes(b"x" * 10)
+    (keep / "part-b.parquet").write_bytes(b"x" * 5)
+    (gone_file_dir / "part-c.parquet").write_bytes(b"x" * 7)
+    (gone_dir / "part-d.parquet").write_bytes(b"x" * 3)
+
+    real_scandir = _os.scandir
+
+    class _VanishingEntry:
+        """Wraps a DirEntry so stat() raises like a file deleted after listing."""
+
+        def __init__(self, entry):
+            self._entry = entry
+
+        def __getattr__(self, name):
+            return getattr(self._entry, name)
+
+        def stat(self, follow_symlinks=True):
+            raise FileNotFoundError(2, "vanished", self._entry.path)
+
+    def fake_scandir(directory):
+        if Path(directory) == gone_dir:
+            raise FileNotFoundError(2, "directory vanished", str(directory))
+        it = real_scandir(directory)
+        if Path(directory) == gone_file_dir:
+            entries = [(_VanishingEntry(e) if e.name == "part-c.parquet" else e) for e in it]
+
+            class _Ctx:
+                def __enter__(self_inner):
+                    return iter(entries)
+
+                def __exit__(self_inner, *exc):
+                    return False
+
+            return _Ctx()
+        return it
+
+    monkeypatch.setattr(rm.os, "scandir", fake_scandir)
+    result = rm.collect_partition_files(root)
+    assert result == {"2026-09-01": {"parquet_files": 2, "parquet_bytes": 15}}

@@ -533,7 +533,8 @@ owner ask (safe-shaping directive above).
    ~20x slower. Needs an offload/retention policy (code change; data-lifecycle
    -> owner sign-off on the policy, implementation is autonomous).
    *2026-09-10: measured 229 GB / 15.4 M files (market 197.6 GB, trades 31.7
-   GB), ~2.4 GB/day, G: 136 GB free; no in-plant reader. Proposal in the
+   GB), ~2.4 GB/day, G: 136 GB free; no in-plant data consumer (two maintenance
+   jobs only walk it for stats: manifest, cleanup). Proposal in the
    Decision queue: stop writing (config, 20 lanes) + verify-move the tree to
    the cold tier + retire section 2.2 in STANDARDS. Waiting on the owner.*
 3. ~~Surface `stuck_unaccounted_count` in monitoring~~ **DONE — PR #28**
@@ -768,7 +769,11 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   **136 GB free** (468 GB on 07-12; 30 GB of that went to the curated repair) -
   at this burn the normalized tree alone consumes the remaining headroom in
   under two months, before raw and curated growth. Facts that frame the
-  options: (a) **nothing in the plant reads this tree** - `cli.py` only
+  options: (a) **nothing in the plant consumes this tree's data** (correction
+  2026-09-10 17:40: the `research-manifest` job walks it for per-day file
+  counts and `cleanup` scans it for zero-byte parquet - both tolerate an empty
+  tree; the manifest walk errored on files vanishing mid-move and was made
+  tolerant, see the redeploy checklist item) - `cli.py` only
   writes it (`_resolve_normalized_root`); curation runs raw -> replay ->
   curated, the manifest lists curated only, and both studies to date read
   curated; (b) it is unmanaged by design today - `archive-offload` is
@@ -791,7 +796,7 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   layer retired 2026-09; history on the cold tier" and section 7 says so,
   `STANDARDS_VERSION` 13 (docs PR after the decision). Alternatives the owner
   may prefer instead of (2): keep the tree on G: (buys nothing), or delete it
-  (no in-plant reader; unknown external readers - the owner's call, not
+  (no in-plant data consumer; unknown external readers - the owner's call, not
   proposed). Alternative to (1): a `normalized_days` retention job (code) -
   more machinery to keep a layer nothing reads. What Claude does on OK: the
   config edit + example-config PR + STANDARDS PR; the redeploy and the
