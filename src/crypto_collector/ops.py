@@ -2209,7 +2209,15 @@ def _find_cleanup_candidates(
     normalized_root = archive_root / "normalized"
     if normalized_root.exists():
         for parquet_file in normalized_root.rglob("*.parquet"):
-            if parquet_file.is_file() and parquet_file.stat().st_size == 0:
+            # Listing-then-stat race: another job (archive-offload, the 2026-09-10
+            # robocopy move of the retired normalized tree) may delete the file in
+            # between. A vanished file is not a candidate; it must not abort the
+            # whole cleanup pass (same fix as research_manifest._iter_parquet_sizes).
+            try:
+                is_empty = parquet_file.is_file() and parquet_file.stat().st_size == 0
+            except OSError:
+                continue
+            if is_empty:
                 candidates.append(
                     CleanupCandidate(
                         path=str(parquet_file),

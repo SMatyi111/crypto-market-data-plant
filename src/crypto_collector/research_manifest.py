@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from collections import Counter, defaultdict
 from datetime import UTC, date, datetime
 import json
@@ -473,16 +475,45 @@ def read_replay_summaries(root: Path) -> dict[str, dict[str, Any]]:
     return dict(by_day)
 
 
+def _iter_parquet_sizes(root: Path):
+    """Yield (path, size) for every *.parquet under root, tolerating files and
+    directories that vanish between listing and stat. The manifest runs every 15
+    min against trees other jobs (offload, and on 2026-09-10 the robocopy move of
+    the retired normalized layer) are deleting from; a vanished entry is simply not
+    counted, it must not abort the whole manifest (WinError 2 did, 2026-09-10)."""
+    stack = [root]
+    while stack:
+        directory = stack.pop()
+        try:
+            with os.scandir(directory) as entries:
+                listed = list(entries)
+        except OSError:
+            # Same breadth as the pathlib 3.12 rglob this replaced (it swallowed any
+            # OSError from scandir): a directory we cannot list is not counted.
+            continue
+        for entry in listed:
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    stack.append(Path(entry.path))
+                    continue
+                if not entry.name.lower().endswith(".parquet"):
+                    continue  # case-insensitive like rglob("*.parquet") on Windows
+                size = entry.stat(follow_symlinks=False).st_size
+            except OSError:
+                continue
+            yield Path(entry.path), size
+
+
 def collect_partition_files(root: Path) -> dict[str, dict[str, int]]:
     by_day: dict[str, dict[str, int]] = defaultdict(lambda: {"parquet_files": 0, "parquet_bytes": 0})
     if not root.exists():
         return {}
-    for path in root.rglob("*.parquet"):
+    for path, size in _iter_parquet_sizes(root):
         day_value = partition_value(path, "event_date")
         if day_value is None:
             continue
         by_day[day_value]["parquet_files"] += 1
-        by_day[day_value]["parquet_bytes"] += path.stat().st_size
+        by_day[day_value]["parquet_bytes"] += size
     return dict(by_day)
 
 

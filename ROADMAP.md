@@ -533,7 +533,8 @@ owner ask (safe-shaping directive above).
    ~20x slower. Needs an offload/retention policy (code change; data-lifecycle
    -> owner sign-off on the policy, implementation is autonomous).
    *2026-09-10: measured 229 GB / 15.4 M files (market 197.6 GB, trades 31.7
-   GB), ~2.4 GB/day, G: 136 GB free; no in-plant reader. Proposal in the
+   GB), ~2.4 GB/day, G: 136 GB free; no in-plant data consumer (two maintenance
+   jobs only walk it for stats: manifest, cleanup). Proposal in the
    Decision queue: stop writing (config, 20 lanes) + verify-move the tree to
    the cold tier + retire section 2.2 in STANDARDS. Waiting on the owner.*
 3. ~~Surface `stuck_unaccounted_count` in monitoring~~ **DONE — PR #28**
@@ -768,7 +769,13 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   **136 GB free** (468 GB on 07-12; 30 GB of that went to the curated repair) -
   at this burn the normalized tree alone consumes the remaining headroom in
   under two months, before raw and curated growth. Facts that frame the
-  options: (a) **nothing in the plant reads this tree** - `cli.py` only
+  options: (a) **nothing in the plant consumes this tree's data** (correction
+  2026-09-10 17:40: the `research-manifest` job walks it for per-day file
+  counts and `cleanup` scans it for zero-byte parquet - both tolerate an empty
+  tree; both walks had a listing-then-stat race that the move exposed - the
+  manifest errored every 15 min from 17:30 - fixed in the manifest-tolerance
+  PR, which needs the NEXT runner restart to take effect, see the new redeploy
+  item below) - `cli.py` only
   writes it (`_resolve_normalized_root`); curation runs raw -> replay ->
   curated, the manifest lists curated only, and both studies to date read
   curated; (b) it is unmanaged by design today - `archive-offload` is
@@ -791,7 +798,7 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   layer retired 2026-09; history on the cold tier" and section 7 says so,
   `STANDARDS_VERSION` 13 (docs PR after the decision). Alternatives the owner
   may prefer instead of (2): keep the tree on G: (buys nothing), or delete it
-  (no in-plant reader; unknown external readers - the owner's call, not
+  (no in-plant data consumer; unknown external readers - the owner's call, not
   proposed). Alternative to (1): a `normalized_days` retention job (code) -
   more machinery to keep a layer nothing reads. What Claude does on OK: the
   config edit + example-config PR + STANDARDS PR; the redeploy and the
@@ -811,6 +818,12 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   *then the same with `trades` and its own log. Verify: `FAILED : 0` in the log's
   summary, then the source dirs are empty (robocopy /MOVE leaves the empty
   directory skeleton; delete it afterwards). Not launched by Claude.*
+- **Next elevated redeploy (no urgency, bundle with the next real need):** the
+  manifest/cleanup walk-tolerance fix runs IN-PROCESS in the runner, so until a
+  restart the live `research-manifest` job errors once per 15 min while a move
+  or offload deletes files under it (harmless: nothing else fails, the manifest
+  just does not refresh during the 2026-09-10 normalized move). After the
+  restart: `research-manifest` `error_count` stops growing.
 - ~~**Next elevated redeploy — owner checklist**~~ **DONE 2026-09-10 15:06 local,
   verified 16:58:** `redeploy_runner.ps1` (guarded, `main` >= `5b6f440`) wrote its
   relaunch marker to `runner.log` at 15:06:08; the new runner (pid 10432, python,
