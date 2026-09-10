@@ -971,6 +971,7 @@ class TradesReplaySummary:
     max_delivery_delay_ms: float | None = None
     product_count: int = 0
     non_monotonic_received_at_count: int = 0
+    received_at_jitter_count: int = 0
     wrong_channel_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
@@ -1260,6 +1261,12 @@ def replay_trades_stream_run(
     return summary
 
 
+# Backward `received_at` steps up to this size are host clock jitter (a w32time
+# correction mid day-run), recorded but not gating; larger steps mean two writers
+# or a capture defect and fail the run (STANDARDS 4.10).
+RECEIVED_AT_STEP_TOLERANCE_MS = 1_000.0
+
+
 def replay_liquidations_run(
     run_path: Path,
     *,
@@ -1286,16 +1293,29 @@ def replay_liquidations_run(
       as liquidations, or vice versa, must fail closed - STANDARDS liquidations
       section)
     - `price` and `size` are finite and positive
-    - `received_at` present and monotonic non-decreasing - the collector's own
-      clock is the ordering the plant guarantees for this channel
+    - `received_at` present and monotonic non-decreasing beyond a
+      `RECEIVED_AT_STEP_TOLERANCE_MS` (1 s) tolerance - the collector's own clock
+      is the ordering the plant guarantees for this channel; the tolerance keeps
+      a sub-second w32time correction from failing a whole day-run, while the
+      seconds-scale interleaving of two workers appending to one run dir (the
+      2026-09-02 shared-dir incident) still fails closed
 
     Recorded but **non-gating** (surfaced in `informational_findings`, never in
     `findings`, so the quarantine/promote chain and the lanes view stay unchanged):
 
     - `delayed_delivery`: rows whose |received_at - exchange_time| exceeds
-      `max_clock_skew_ms` (the lane's configured threshold; OKX lanes should set it
-      to the venue's observed ~15 min). Count in `delayed_delivery_count`, maximum
-      in `max_delivery_delay_ms` (also mirrored into `max_clock_skew_ms`).
+      `max_clock_skew_ms` (the lane's configured threshold, default 60 s). Count
+      in `delayed_delivery_count`, maximum in `max_delivery_delay_ms` (mirrored
+      into `max_clock_skew_ms`). CENSORED statistic: the live QualityGate
+      (`max_delay_ms`, default `_TRADES_STALE_WINDOW_MS` = 900 s) quarantines
+      later rows as `stale_or_clock_skew` before they reach clean, so the
+      observed maximum is the gate ceiling, not the venue's tail (the OKX
+      2026-09-08 day-run quarantined 307 rows this way, more than the 186 late
+      rows that reached clean). A threshold at or above `max_delay_ms` makes the
+      count identically zero.
+    - `received_at_jitter`: backward `received_at` steps within
+      `RECEIVED_AT_STEP_TOLERANCE_MS` (host wall-clock corrections mid day-run).
+      Count in `received_at_jitter_count`.
     - `per_product_reorder`: exchange_time stepping backward WITHIN a product.
       Count in `non_monotonic_count`.
 
@@ -1314,6 +1334,7 @@ def replay_liquidations_run(
     invalid_size_count = 0
     missing_received_at_count = 0
     non_monotonic_received_at_count = 0
+    received_at_jitter_count = 0
     per_product_reorder_count = 0
     delayed_delivery_count = 0
     max_delivery_delay_ms: float | None = None
@@ -1361,7 +1382,11 @@ def replay_liquidations_run(
             missing_received_at_count += 1
         else:
             if previous_received_dt is not None and received_dt < previous_received_dt:
-                non_monotonic_received_at_count += 1
+                step_ms = (previous_received_dt - received_dt).total_seconds() * 1000.0
+                if step_ms > RECEIVED_AT_STEP_TOLERANCE_MS:
+                    non_monotonic_received_at_count += 1
+                else:
+                    received_at_jitter_count += 1
             if previous_received_dt is None or received_dt >= previous_received_dt:
                 previous_received_dt = received_dt
 
@@ -1398,6 +1423,8 @@ def replay_liquidations_run(
         informational_findings.append("delayed_delivery")
     if per_product_reorder_count:
         informational_findings.append("per_product_reorder")
+    if received_at_jitter_count:
+        informational_findings.append("received_at_jitter")
 
     replayable = (
         event_count > 0
@@ -1443,6 +1470,7 @@ def replay_liquidations_run(
         max_delivery_delay_ms=max_delivery_delay_ms,
         product_count=len(products),
         non_monotonic_received_at_count=non_monotonic_received_at_count,
+        received_at_jitter_count=received_at_jitter_count,
         wrong_channel_count=wrong_channel_count,
     )
 

@@ -367,12 +367,17 @@ metadata.
 
 **OKX delivery is venue-delayed and batched** (measured on the first all-swap
 day-runs, 2026-09-08/09): one push carries `details[]` whose `ts` spread over
-minutes, rows arrive up to ~15 min after their `exchange_time` (186 of 11,564
-rows > 60 s on 09-08, max 898 s; 250 of 6,408 on 09-09), concentrated in
-illiquid alt swaps and not clustered in time, and even per product the
+minutes, rows arrive many minutes after their `exchange_time` (186 of 11,564
+clean rows > 60 s on 09-08, max 898 s; 250 of 6,408 on 09-09), concentrated
+in illiquid alt swaps and not clustered in time, and even per product the
 exchange clock steps backward (691 steps across 71 products). BTC-USDT-SWAP
-itself arrived in order. This is how the venue publishes the channel, not a
-capture defect; the verdict in 4.10 records it and does not fail on it.
+itself arrived in order. **The tail is longer than `clean/` shows:** the live
+quality gate (section 5, `max_delay_ms` = 900 s on these lanes) quarantined a
+further 307 rows of the 09-08 run as `stale_or_clock_skew`, i.e. details
+delivered more than 15 min late never reach the clean stream (raising the OKX
+lane's `max_delay_ms` is an owner decision, queued in ROADMAP). This is how
+the venue publishes the channel, not a capture defect; the verdict in 4.10
+records what reaches clean and does not fail on it.
 Research on this channel MUST use `received_at` as the availability clock and
 order events per product, never by global `exchange_time`.
 
@@ -943,7 +948,8 @@ contract and the tooling that reads `metrics/replay_summary.json` are
 unchanged). It replaces the trades-stream verdict (4.3) on every lane that
 emits `channel = "liquidations"` (Bybit `allLiquidation` per symbol, OKX
 `liquidation-orders` all swaps, Binance `!forceOrder@arr` when collectable).
-Re-score history with `backfill-trades-replay --liquidations --overwrite`.
+Re-score history with `backfill-trades-replay --liquidations --overwrite
+--max-age-hours <hours>` (the default 24 h window silently skips older runs).
 
 Why not 4.3: a liquidations channel is not a trade tape. The all-venue OKX
 subscription interleaves hundreds of products (global exchange-time order is
@@ -960,20 +966,29 @@ complete.
   Bybit `allLiquidation`/`publicTrade` shape collision must fail closed)
 - `price` and `size` finite and positive (`invalid_prices`, `invalid_sizes`)
 - `received_at` present on every row (`missing_received_at`) and monotonic
-  non-decreasing across the run (`non_monotonic_received_at`) - the
-  collector's clock is the ordering the plant guarantees for this channel
+  non-decreasing across the run beyond a 1 s tolerance
+  (`non_monotonic_received_at`; `RECEIVED_AT_STEP_TOLERANCE_MS`) - the
+  collector's clock is the ordering the plant guarantees for this channel,
+  absent host clock steps larger than that. Sub-second backward steps are
+  recorded as `received_at_jitter` (below); a seconds-scale one means two
+  writers on one run dir or a capture defect and fails closed
 
 Recorded, **never gating**, in `informational_findings` (kept out of
 `findings` so quarantine, promote and the lanes view read the verdict as
 before):
 
 - `delayed_delivery`: rows with |`received_at` - `exchange_time`| above the
-  lane's `max_clock_skew_ms` (default 60 s; set the OKX lane to the venue's
-  observed ~15 min = 900000 if the count should mean "worse than usual").
-  `delayed_delivery_count`, `max_delivery_delay_ms` (mirrored into
-  `max_clock_skew_ms`).
+  lane's `max_clock_skew_ms` (default 60 s). `delayed_delivery_count`,
+  `max_delivery_delay_ms` (mirrored into `max_clock_skew_ms`). **This is a
+  censored statistic:** the live quality gate (section 5, `max_delay_ms`,
+  default 900 s) quarantines later rows as `stale_or_clock_skew` before they
+  reach `clean/`, so the observed maximum is the gate ceiling, not the
+  venue's tail, and a threshold at or above `max_delay_ms` makes the count
+  identically zero. Keep the informational threshold well below the gate.
 - `per_product_reorder`: `exchange_time` stepping backward within one
   product; count in `non_monotonic_count`.
+- `received_at_jitter`: backward `received_at` steps within the 1 s
+  tolerance; count in `received_at_jitter_count`.
 
 `excessive_clock_skew_count` is 0 by construction on this mode. `product` /
 `instrument_id` are set only when the run holds a single product (Bybit

@@ -1329,7 +1329,9 @@ def build_parser() -> argparse.ArgumentParser:
         "receipt-time order and row shape gate, venue delivery lag and per-product "
         "exchange-time order are recorded as non-gating findings. Overrides the other "
         "scorer flags. With --overwrite this re-issues the pre-v12 summaries that "
-        "scored the OKX all-swap day-runs with the trades-stream verdict.",
+        "scored the OKX all-swap day-runs with the trades-stream verdict - pass "
+        "--max-age-hours wide enough to reach them (default 24 h silently skips "
+        "older runs).",
     )
     backfill_trades_parser.add_argument(
         "--min-age-hours",

@@ -145,7 +145,7 @@ def test_receipt_time_going_backwards_blocks(tmp_path: Path) -> None:
         run,
         [
             _row(exchange_time=_t(0.0), received_at=_t(5.0)),
-            _row(exchange_time=_t(1.0), received_at=_t(4.0)),
+            _row(exchange_time=_t(1.0), received_at=_t(2.0)),  # -3 s: beyond tolerance
             _row(exchange_time=_t(2.0), received_at=_t(6.0)),
         ],
     )
@@ -153,6 +153,39 @@ def test_receipt_time_going_backwards_blocks(tmp_path: Path) -> None:
     assert summary.replayable is False
     assert summary.findings == ["non_monotonic_received_at"]
     assert summary.non_monotonic_received_at_count == 1
+
+
+def test_sub_second_receipt_jitter_is_recorded_not_gating(tmp_path: Path) -> None:
+    """A host wall-clock correction of < 1 s mid day-run must not fail the run;
+    a seconds-scale step (two writers on one run dir) still does."""
+    run = tmp_path / "okx_perp_liquidations" / "20260908_000000"
+    _write_run(
+        run,
+        [
+            _row(exchange_time=_t(0.0), received_at=_t(5.0)),
+            _row(exchange_time=_t(1.0), received_at=_t(4.5)),  # -500 ms: jitter
+            _row(exchange_time=_t(2.0), received_at=_t(6.0)),
+        ],
+    )
+    summary = replay_liquidations_run(run, write_summary=False)
+    assert summary.replayable is True, summary
+    assert summary.findings == []
+    assert summary.informational_findings == ["received_at_jitter"]
+    assert summary.received_at_jitter_count == 1
+    assert summary.non_monotonic_received_at_count == 0
+
+    run2 = tmp_path / "okx_perp_liquidations" / "20260908_000001"
+    _write_run(
+        run2,
+        [
+            _row(exchange_time=_t(0.0), received_at=_t(5.0)),
+            _row(exchange_time=_t(1.0), received_at=_t(3.9)),  # -1.1 s: gating
+        ],
+    )
+    summary = replay_liquidations_run(run2, write_summary=False)
+    assert summary.replayable is False
+    assert summary.findings == ["non_monotonic_received_at"]
+    assert summary.received_at_jitter_count == 0
 
 
 def test_missing_received_at_blocks(tmp_path: Path) -> None:
