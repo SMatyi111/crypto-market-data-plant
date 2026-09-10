@@ -742,6 +742,24 @@ owner ask (safe-shaping directive above).
 Decisions waiting on the owner; agents must not act on these without an explicit OK
 (see `CLAUDE.md` Governance):
 
+- **DO NOT run `scripts/redeploy_runner.ps1` from `main` before the pid-identity
+  guard PR is merged (incident 2026-09-10 13:48 local).** The elevated redeploy
+  read `ops-runner.lock`, which named pid 1668, and ran `Stop-Process -Force` on it
+  without checking what the pid was. Windows had reused 1668 for a critical
+  `svchost.exe`; the kernel bugchecked `CRITICAL_PROCESS_DIED (0xEF)` (minidump:
+  terminated svchost.exe 1668, terminator powershell.exe 25208 = the script,
+  started 4 s earlier). The plant came back at boot (13:49:36, runner on `main`
+  `c041c4e`, so STANDARDS v12 is now fully deployed) and no data was lost beyond
+  the reboot gap. `job_runs.jsonl` shows the runner alive 35 s before the kill,
+  so the lock's pid did not match the live runner - WHY the lock named a wrong pid
+  is not established (the runner has guarded its own locks against recycled pids
+  since 2026-06-11; the script never did). Fix on `fix/redeploy-stale-pid-guard`:
+  nothing is killed unless it is a plant python (repo path or `crypto_collector`
+  in the command line); children are re-verified; a non-plant pid is reported
+  and left alone; an unreadable (other-principal) python or a CIM miss with a
+  live pid refuses instead of guessing. Hygiene test pins the gating form;
+  harness-verified non-elevated against self-spawned processes. Owner:
+  merge, then redeploys are safe again. Nothing needs a redeploy right now.
 - **`normalized/{market,trades}` retention - the G: headroom lever (measured
   2026-09-10, open item 2).** Full walk of `G:\market_archive\normalized`:
   `market` (depth) **197.6 GB / 11.33 M files**, `trades` **31.7 GB / 4.07 M

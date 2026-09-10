@@ -242,3 +242,43 @@ def test_score_job_min_age_floor_exceeds_longest_live_segment(config_name: str) 
             f"{config_name}: {job['name']} has min_age_hours={floor_hours} but a lane keeps "
             f"segments open for {longest} s; the scorer would score a live run again"
         )
+
+
+def test_redeploy_runner_verifies_pid_identity_before_killing() -> None:
+    """2026-09-10: the lock named pid 1668, which Windows had reused for a critical
+    svchost.exe; the unconditional Stop-Process -Force blue-screened the machine
+    (CRITICAL_PROCESS_DIED). The kill-tree must prove the pid is a plant python
+    (same matcher as the straggler sweep) and must re-verify every child before any
+    kill primitive runs. Pin the GATING form, not just the presence of the words."""
+    body = (REPO_ROOT / "scripts" / "redeploy_runner.ps1").read_text(encoding="ascii")
+    # Drop the <# .SYNOPSIS #> header block and every # comment line: the pins below
+    # must be satisfied by code, not by the prose that explains the code.
+    if "#>" in body:
+        body = body[body.index("#>") + 2 :]
+    code = "\n".join(line for line in body.splitlines() if not line.lstrip().startswith("#"))
+    assert "function Test-PlantProcess" in code
+    assert "$Proc.Name -ne 'python.exe'" in code, "only python.exe may ever be killed by the redeploy"
+    start = code.index("function Stop-PlantProcessTree")
+    end = code.index("\n}\n", start)
+    tree = code[start:end]
+    kill = tree.index("Stop-Process -Id $RootPid -Force")
+    # The gate must be an early-return `if (-not (Test-PlantProcess $proc)) { ... return }`
+    # placed before the kill - evaluating the predicate without acting on it must fail.
+    gate = re.search(r"if \(-not \(Test-PlantProcess \$proc\)\) \{[^}]*?\breturn\b", tree, re.S)
+    assert gate is not None, "Stop-PlantProcessTree must early-return when the pid is not a plant python"
+    assert gate.start() < kill, "the plant-python gate must precede Stop-Process"
+    unreadable = re.search(r"if \(Test-UnreadablePython \$proc\) \{[^}]*?\breturn\b", tree, re.S)
+    assert unreadable is not None and unreadable.start() < kill, (
+        "an unreadable (other-principal) python must be refused, not killed or called stale"
+    )
+    assert "Get-Process -Id $RootPid" in tree[:kill], "a CIM miss must be cross-checked before treating the pid as dead"
+    # Every kill primitive in the script must be that one guarded line.
+    kills = [
+        line for line in code.splitlines()
+        if re.search(r"taskkill|\.Kill\(|Stop-Process|TerminateProcess", line, re.I)
+        and "Stop-Process -Id $RootPid -Force" not in line
+    ]
+    assert kills == [], f"unguarded kill primitive in redeploy_runner.ps1: {kills}"
+    assert code.count("Stop-Process -Id $RootPid -Force") == 1, "exactly one guarded kill site"
+    # The lock path must go through the guarded tree kill.
+    assert "Stop-PlantProcessTree ([int]$lock.pid)" in code
