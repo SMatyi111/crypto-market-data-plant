@@ -30,16 +30,21 @@ why the lock named a wrong pid is not established - the guard makes the
 mismatch harmless either way.
 
 **Fix (PR on `fix/redeploy-stale-pid-guard`).** `Stop-PlantProcessTree` now
-resolves the pid to a process and refuses to kill unless (a) it is `python.exe`
+resolves the pid to a process and refuses to kill unless it is `python.exe`
 whose command line or executable path is this plant's (the same matcher the
-straggler sweep already trusted, now shared as `Test-PlantProcess`), and (b) it
-started before the lock naming it was written. Children are re-verified with
-the same test. A non-plant pid is reported and left alone; step 2 then clears
-the stale lock once no plant python is running, exactly as before. A hygiene
-test pins the guard's shape and that no unguarded `Stop-Process` exists in the
-script; a non-elevated harness against self-spawned processes confirmed: decoy
-powershell survives, plant python started before the lock time is killed with
-its child, plant python started after the lock time survives the lock path.
+straggler sweep already trusted, now shared as `Test-PlantProcess`). Children
+are re-verified with the same test. A non-plant pid is reported and left alone;
+a python whose command line is unreadable from the shell (another principal) is
+refused with "rerun elevated", not called stale; a CIM miss on a pid that
+`Get-Process` still sees is refused rather than treated as dead, and step 2
+aborts if CIM lists no python while `Get-Process` does (a faulting WMI provider
+must not read as "no runner"). Step 2 then clears the stale lock once no plant
+python is running, exactly as before. A started-before-the-lock check was tried
+and dropped after review: the step 2 sweep kills every plant python anyway, so
+it protected nothing. A hygiene test pins the gating form and that the one
+guarded line is the only kill primitive in the script; a non-elevated harness
+against self-spawned processes confirmed: decoy powershell survives, plant
+python is killed with its children, missing pid is a no-op.
 
 **Lesson.** Any script that kills by a pid read from disk must prove the pid's
 identity first. This is not the recurring 0x133 `nvlddmkm` BSOD; different

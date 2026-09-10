@@ -755,9 +755,10 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   is not established (the runner has guarded its own locks against recycled pids
   since 2026-06-11; the script never did). Fix on `fix/redeploy-stale-pid-guard`:
   nothing is killed unless it is a plant python (repo path or `crypto_collector`
-  in the command line) that started before the lock was written; children are
-  re-verified; a non-plant pid is reported and left alone. Hygiene test pins the
-  guard; harness-verified non-elevated against self-spawned processes. Owner:
+  in the command line); children are re-verified; a non-plant pid is reported
+  and left alone; an unreadable (other-principal) python or a CIM miss with a
+  live pid refuses instead of guessing. Hygiene test pins the gating form;
+  harness-verified non-elevated against self-spawned processes. Owner:
   merge, then redeploys are safe again. Nothing needs a redeploy right now.
 - **`normalized/{market,trades}` retention - the G: headroom lever (measured
   2026-09-10, open item 2).** Full walk of `G:\market_archive\normalized`:

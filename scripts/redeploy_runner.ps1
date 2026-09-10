@@ -15,9 +15,9 @@
 .NOTES
   Run from an ELEVATED PowerShell if the current runner is elevated/SYSTEM (so Stop-Process
   can terminate it). Interrupts every lane briefly (clean segment boundary, not data loss).
-  Never kills a pid it cannot prove is a plant python started before the lock was written
-  (2026-09-10: a stale lock pid had been reused by svchost.exe and the old unconditional
-  kill blue-screened the machine, CRITICAL_PROCESS_DIED).
+  Never kills a pid it cannot prove is a plant python (2026-09-10: a stale lock pid had
+  been reused by svchost.exe and the old unconditional kill blue-screened the machine,
+  CRITICAL_PROCESS_DIED).
 #>
 param(
     [string]$OpsRoot = "G:\market_archive\ops",
@@ -79,9 +79,10 @@ if ($dupNames.Count -gt 0) {
 #    The Python runner has had a recycled-pid guard on its own locks since
 #    2026-06-11 (ops.py, stale locks that pointed at svchost.exe); this script never
 #    did. Nothing is killed unless it is a plant python (same matcher as the sweep in
-#    step 2) that started BEFORE the lock naming it was written; children are
-#    re-verified the same way. A non-plant pid means the lock is stale: it is
-#    reported and left alone, and step 2 clears the lock once no plant python runs.
+#    step 2); children are re-verified the same way. A non-plant pid means the lock
+#    is stale: it is reported and left alone, and step 2 clears the lock once no
+#    plant python runs. (A start-time-vs-lock check was considered and dropped: the
+#    step 2 sweep kills every plant python regardless, so it protected nothing.)
 $repoPattern = "*$([System.Management.Automation.WildcardPattern]::Escape($repo))*"
 function Test-PlantProcess([object]$Proc) {
     if ($null -eq $Proc) { return $false }
@@ -90,23 +91,32 @@ function Test-PlantProcess([object]$Proc) {
             ($Proc.CommandLine -like $repoPattern) -or
             ($Proc.ExecutablePath -like $repoPattern))
 }
-function Stop-PlantProcessTree([int]$RootPid, [object]$NotStartedAfterUtc = $null) {
+# A python whose CommandLine AND ExecutablePath are both unreadable (null) belongs to
+# another principal (typically SYSTEM -- the boot-task runner seen from a non-elevated
+# shell). It may well be the live runner: never kill it, never call it stale.
+function Test-UnreadablePython([object]$Proc) {
+    return ($null -ne $Proc -and $Proc.Name -eq 'python.exe' -and -not $Proc.CommandLine -and -not $Proc.ExecutablePath)
+}
+function Stop-PlantProcessTree([int]$RootPid) {
     $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$RootPid" -ErrorAction SilentlyContinue
     if ($null -eq $proc) {
+        # CIM says gone. Cross-check with Get-Process: a CIM/WMI fault must not read
+        # as 'dead' (step 2 would then clear the lock beside a live runner).
+        if ($null -ne (Get-Process -Id $RootPid -ErrorAction SilentlyContinue)) {
+            Write-Warning "pid $RootPid is alive per Get-Process but CIM returned nothing -- cannot verify what it is. NOT killing it."
+            return
+        }
         Write-Host "pid $RootPid is not running -- nothing to stop."
         return
     }
-    if (-not (Test-PlantProcess $proc)) {
-        Write-Warning ("pid $RootPid is '$($proc.Name)' (" + $(if ($proc.CommandLine) { $proc.CommandLine } else { 'command line unreadable' }) + 
-            "), not a plant python -- the lock is stale and the pid was reused. NOT killing it.")
+    if (Test-UnreadablePython $proc) {
+        Write-Warning "pid $RootPid is a python.exe whose command line is unreadable from this shell (owned by another principal, e.g. the SYSTEM boot runner). NOT killing it -- rerun from an elevated shell."
         return
     }
-    if ($null -ne $NotStartedAfterUtc -and $null -ne $proc.CreationDate) {
-        $startedUtc = ([DateTime]$proc.CreationDate).ToUniversalTime()
-        if ($startedUtc -gt [DateTime]$NotStartedAfterUtc) {
-            Write-Warning "pid $RootPid (python) started at $($startedUtc.ToString('o')), AFTER the lock naming it was written -- pid reused by a later plant process. NOT killing it by lock; the step 2 sweep decides."
-            return
-        }
+    if (-not (Test-PlantProcess $proc)) {
+        Write-Warning ("pid $RootPid is '$($proc.Name)' ($($proc.CommandLine)), not a plant python -- " +
+            "the lock is stale and the pid was reused. NOT killing it.")
+        return
     }
     $children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$RootPid" -ErrorAction SilentlyContinue)
     Stop-Process -Id $RootPid -Force -ErrorAction SilentlyContinue
@@ -131,9 +141,7 @@ if (Test-Path $lockPath) {
     }
     if ($lock -and $lock.pid) {
         Write-Host "Lock names runner pid=$($lock.pid) created_at=$($lock.created_at)"
-        $lockCreatedUtc = $null
-        try { $lockCreatedUtc = [DateTime]::Parse($lock.created_at).ToUniversalTime() } catch { $lockCreatedUtc = $null }
-        Stop-PlantProcessTree ([int]$lock.pid) $lockCreatedUtc
+        Stop-PlantProcessTree ([int]$lock.pid)
         Start-Sleep -Seconds 3
     }
 }
@@ -149,12 +157,10 @@ if (Test-Path $lockPath) {
 function Select-PlantPython([object[]]$Processes) {
     @($Processes | Where-Object { Test-PlantProcess $_ })
 }
-# A python whose CommandLine AND ExecutablePath are both unreadable (null) belongs to
-# another principal (typically SYSTEM -- e.g. the boot-task runner seen from a
-# non-elevated shell). It could be the live runner, and step 1's taskkill would have
-# failed against it for the same reason, so it must still block the redeploy.
+# Unreadable pythons (see Test-UnreadablePython) could be the live runner, and step 1
+# refused to touch them for the same reason, so they must still block the redeploy.
 function Select-UnreadablePython([object[]]$Processes) {
-    @($Processes | Where-Object { -not $_.CommandLine -and -not $_.ExecutablePath })
+    @($Processes | Where-Object { Test-UnreadablePython $_ })
 }
 
 # Kill fan-out has latency, so poll briefly: a closing process must not read as a
@@ -195,6 +201,12 @@ if ($unreadable.Count -gt 0) {
 # deleting a LIVE runner's locks would let two collectors per lane double-write
 # and double-promote.
 $pythons = @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue)
+# CIM-blind guard: if CIM lists no python at all while Get-Process sees one, the CIM
+# provider is faulting and every 'no plant python' conclusion above is unverified.
+if ($pythons.Count -eq 0 -and @(Get-Process -Name python -ErrorAction SilentlyContinue).Count -gt 0) {
+    Write-Warning "Get-Process sees python.exe but CIM returned none -- cannot verify plant state. Aborting without touching locks."
+    exit 1
+}
 if ((Select-PlantPython $pythons).Count -gt 0 -or (Select-UnreadablePython $pythons).Count -gt 0) {
     Write-Warning "A plant (or unreadable) python appeared after the kill sweep -- likely the boot task. Aborting without touching locks."
     exit 1
