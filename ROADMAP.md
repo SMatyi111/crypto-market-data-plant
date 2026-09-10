@@ -799,10 +799,31 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   *2026-09-10 15:00: owner approved step 1 - `normalized_parquet: false` set on
   all 21 collector lanes in `ops.live.local.json` (backup
   `.bak-20260910-normalized-off`) and in the example config; STANDARDS 2.2
-  retired (v13) in the same PR. Live at the next redeploy (checklist above).
-  Step 2 (robocopy move to D:) after that redeploy confirms no new writes.*
-- **Next elevated redeploy — owner checklist (rewritten 2026-09-10 after the
-  crash).** The 09-08 checklist is done (redeploys 09-08/09-09, the 09-10 boot).
+  retired (v13) in the same PR. LIVE since the 15:06 redeploy - no normalized
+  file written after 15:06:02 (verified 16:58).*
+  *Step 2 is ready for the owner (elevated, detached, at the PC; ~229 GB / 15.4 M
+  files, hours). Same recipe as 06-24; robocopy checks size + timestamp per file,
+  not a hash, and deletes each source file only after its copy succeeded. Run one
+  tree at a time, `market` first (197.6 GB), and read the log's FAILED line:*
+  ```powershell
+  Start-Process robocopy -WindowStyle Hidden -ArgumentList 'G:\market_archive\normalized\market','D:\market_archive_cold\normalized\market','/MOVE','/E','/COPY:DAT','/DCOPY:T','/R:1','/W:1','/MT:8','/NP','/NFL','/NDL','/LOG:G:\market_archive\ops\robocopy-normalized-market-20260910.log'
+  ```
+  *then the same with `trades` and its own log. Verify: `FAILED : 0` in the log's
+  summary, then the source dirs are empty (robocopy /MOVE leaves the empty
+  directory skeleton; delete it afterwards). Not launched by Claude.*
+- ~~**Next elevated redeploy — owner checklist**~~ **DONE 2026-09-10 15:06 local,
+  verified 16:58:** `redeploy_runner.ps1` (guarded, `main` >= `5b6f440`) wrote its
+  relaunch marker to `runner.log` at 15:06:08; the new runner (pid 10432, python,
+  started 15:06:08, lock `created_at` 13:06:09Z) has a fresh heartbeat, all 31
+  worker lanes running under it, 0 job errors. **Normalized writes stopped:** the
+  newest file under `normalized/{market,trades}` is stamped 15:06:02 (the old
+  runner's last flush), nothing since -> step 2 of the normalized item is
+  unblocked. **OKX 1 h gate live:** the first post-redeploy day-run
+  (`okx_perp_liquidations/20260910_130610`) quarantined 57 `stale_or_clock_skew`
+  rows in its first 1 h 50 min, ALL later than 3600 s (min 3667 s, max 4443 s),
+  none in 900..3600 s - so the venue's tail runs past 1 h too; those rows stay
+  quarantined by design (raw keeps them). Kept below for the record:
+  The 09-08 checklist is done (redeploys 09-08/09-09, the 09-10 boot).
   Pending config in `ops.live.local.json` (backup
   `ops.live.local.json.bak-20260910-normalized-off`): `normalized_parquet: false`
   on all 21 collector lanes and `max_delay_ms: 3600000` on `okx-swap-liquidations`
@@ -865,7 +886,8 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   09-10 crash - and 4 pre-v12 summaries replaced), all 23 replayable, only the
   live run skipped, 0 failures. `docs/lanes.md` OKX lane -> B. Owner decided
   2026-09-10 15:00: `max_delay_ms: 3600000` on the OKX lane (both configs, v13),
-  live at the next redeploy; cold-tier
+  live since the 15:06 redeploy (57 rows > 1 h late quarantined in the first
+  1 h 50 min - the venue tail runs past 1 h, by design left in quarantine); cold-tier
   runs from 08-25..09-05 keep their pre-v12 summaries (re-score there is a
   read of the cold tier, not proposed).*
 - **Text-capture P2 probes (from the 2026-07-16 feasibility doc — see
