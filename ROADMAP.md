@@ -850,6 +850,14 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   min. /code-review on the PR found (1)-(3); a 1 s `received_at` tolerance was
   added so a host clock correction cannot fail a whole day-run. Merged !=
   deployed: collectors pick up the scorer at the next runner restart.*
+  *2026-09-10 14:40: DONE - #72 merged, deployed by the 13:49 reboot, and the
+  hot OKX history re-scored (`--liquidations --overwrite --max-age-hours 720`):
+  24 runs scanned, 21 scored (18 had no summary at all - the 7200 s-kill era
+  runs of 09-06/07 - and 3 pre-v12 summaries replaced), all 21 replayable, 3
+  live runs skipped, 0 failures. `docs/lanes.md` OKX lane -> B. Still open for
+  the owner: raising the OKX lane's `max_delay_ms` (item 3 above); cold-tier
+  runs from 08-25..09-05 keep their pre-v12 summaries (re-score there is a
+  read of the cold tier, not proposed).*
 - **Text-capture P2 probes (from the 2026-07-16 feasibility doc — see
   `docs/text_source_p2_feasibility.md` §7; none urgent, no rationale here per
   the public-safe contract).** Four calls: (1) approve the 72 h keyless
