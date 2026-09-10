@@ -852,9 +852,10 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   deployed: collectors pick up the scorer at the next runner restart.*
   *2026-09-10 14:40: DONE - #72 merged, deployed by the 13:49 reboot, and the
   hot OKX history re-scored (`--liquidations --overwrite --max-age-hours 720`):
-  24 runs scanned, 21 scored (18 had no summary at all - the 7200 s-kill era
-  runs of 09-06/07 - and 3 pre-v12 summaries replaced), all 21 replayable, 3
-  live runs skipped, 0 failures. `docs/lanes.md` OKX lane -> B. Still open for
+  24 hot runs scanned, 23 scored (19 had no summary at all - the 7200 s-kill
+  era runs of 09-06/07 and the two runs ended by the 09-09 redeploy and the
+  09-10 crash - and 4 pre-v12 summaries replaced), all 23 replayable, only the
+  live run skipped, 0 failures. `docs/lanes.md` OKX lane -> B. Still open for
   the owner: raising the OKX lane's `max_delay_ms` (item 3 above); cold-tier
   runs from 08-25..09-05 keep their pre-v12 summaries (re-score there is a
   read of the cold tier, not proposed).*
