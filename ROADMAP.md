@@ -8,7 +8,7 @@ changes scope or state. Companion docs:
 - [`STANDARDS.md`](STANDARDS.md) — the data contract (schemas, replayability, retention)
 - [`docs/HISTORY.md`](docs/HISTORY.md) — resolved-work narrative (what was fixed, and why)
 
-Last updated: **2026-09-07**.
+Last updated: **2026-09-14**.
 
 > **Operating mode — safe shaping (owner directive, 2026-07-04).** No extended
 > building on Claude's initiative: no new venues, lanes, or instruments, no big
@@ -18,6 +18,48 @@ Last updated: **2026-09-07**.
 > explicit owner ask to start.
 
 ---
+
+## Finding — wallet lane: one cohort wallet silently stalled since 2026-08-25 (PR #82, 2026-09-14)
+
+**Mechanism.** The PR #42 capped-page paging advanced the high-water to the page
+boundary but let the next poll re-enter at `boundary - overlap` (5 min). A wallet
+with >= 2,000 fills inside one five-minute window therefore got the *same* 2,000-row
+page back on every poll: zero poll errors, ~2,000 duplicates per poll, high-water
+frozen. The error counters cannot see it - only `last_response_capped` +
+`duplicate_count` do.
+
+**Live evidence (2026-09-14 12:06Z, `raw/market/hyperliquid_wallet_flow/_collector_state.json`).**
+Wallet `0x1367df28c0681431b8a8f3d887576a1cad85560e` (cohort_rank 9, candidate_rank 18):
+`last_response_rows` 2000, `last_response_capped` true, `last_new_rows` 0,
+high-water **2026-08-25T00:47:03.573Z**, unchanged poll after poll; the run's
+`duplicate_count` grows ~2,000 per poll (58,288 over a 28-poll segment) while the
+other nine wallets are fresh (max high-water 12:02Z). So this wallet has captured
+nothing for ~20 days. **Consequence:** `userFillsByTime` serves only a wallet's most
+recent 10,000 fills, so the fix will page through what is still exposed (<= 5
+pages) and the earlier part of 08-25 -> 09-14 is a permanent gap in the lane -
+see Decision queue (S3 node-data backfill vs accept-and-document).
+
+**Fix (PR #82, Codex draft + review fixes).** Continuation re-enters at the exact
+inclusive boundary (in-memory `page_starts`); after the uncapped page that ends a
+continuation, ordinary overlap re-entry is clamped to that page's start
+(`resume_floors`) so a dense region is never re-walked (the review found the
+un-clamped version oscillated capped/uncapped forever after any burst). Neither
+cursor is persisted - restart recovers from durable rows. Additive diagnostics:
+`metrics/wallet_poll_history.jsonl` per poll (via the metrics `JsonlSink`; a
+failed append is counted, never aborts capture), `capped_response_count` /
+`incomplete_poll_count` / `last_poll_complete` in the segment summary. Event
+schema, partitions, replay verdict, cohort and request cadence unchanged; no
+STANDARDS version bump.
+
+**Deployment.** Collector-side code: the lane's `run-job` subprocess imports the
+shared checkout, so the fix is live at the wallet lane's next segment (<= 30 min)
+once the checkout is on the merged `main` - no runner restart. **Verify** at the
+next segment: wallet 9 `last_poll_status` = `response_uncapped`, high-water
+current, `capped_response_count` 0 in `metrics/summary.jsonl`, `duplicate_count`
+back to the low hundreds per segment. The last full ops-audit stamp below is not
+refreshed by this fix (health spot-check 2026-09-14: 17,710 / 18,327 job runs OK
+in 24 h; the 611 failures are the long-standing `binance-futures-rest-depth`
+DNS/TLS flaps, present since June).
 
 
 ## Finding — Binance fstream delivers no data from this host (2026-08-25)
@@ -774,7 +816,15 @@ Decisions waiting on the owner; agents must not act on these without an explicit
     changes are authorized by this memo. Research designs/results stay in the
     private research workspace, outside this public collection repository.
   - Example official source: [Bybit risk-limit adjustment, 2026-09-04](https://announcements.bybit.com/en/article/risk-limit-adjustment-for-selected-perpetual-contracts-avaxusdt-xlmusdt-sep-4-2026--art453915b9e8fd/).
-
+- **Wallet-flow gap 2026-08-25 -> 2026-09-14 for cohort wallet 9
+  (`0x1367df28c0681431b8a8f3d887576a1cad85560e`)** - see the 2026-09-14 finding.
+  The public API keeps only the last 10,000 fills per wallet, so the code fix cannot
+  recover the rest. Options: (a) backfill that wallet's fills from the Hyperliquid
+  requester-pays S3 node data (spends money; same source as the cohort-study
+  archive) and land them via the sanctioned re-score path; (b) accept the gap and
+  record it in `docs/lanes.md` so the lane's prospective log is read as
+  9-of-10 wallets complete over that window. Recommendation: (b) unless the wallet
+  matters to a registered evaluation.
 - **DO NOT run `scripts/redeploy_runner.ps1` from `main` before the pid-identity
   guard PR is merged (incident 2026-09-10 13:48 local).** The elevated redeploy
   read `ops-runner.lock`, which named pid 1668, and ran `Stop-Process -Force` on it

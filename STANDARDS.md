@@ -881,6 +881,37 @@ Per-wallet attempts, successes, response counts, high-water timestamps, global
 duplicates/errors, cohort hash, and prospective boundary are atomically persisted
 in `_collector_state.json`.
 
+Implementation correction (2026-09-14): capped-page continuation uses a separate
+in-memory cursor at the inclusive boundary, without reapplying the ordinary
+overlap. After an uncapped response, ordinary overlapping polling resumes.
+The continuation cursor is never restored from the state file: prepared batches
+may be only partly delivered when a segment ends, so restart still recovers
+dedup/high-water from durable clean rows. No extra requests per sweep or faster
+catch-up loop is introduced. Once a continuation ends, ordinary overlap re-entry
+is clamped to the start of the page that ended it (in-memory `resume_floor`,
+reported per wallet as `resume_floor_timestamp_ms`): the capped pages before it
+were consumed whole, and re-entering them would re-cap and re-walk the same dense
+region on every poll cycle. Late rows are still covered on the tail page and,
+as before, over the full overlap once the high-water has moved past the burst.
+A cap-sized tail page counts as capped, so a new fill that makes the tail page
+exactly `response_cap` rows is delivered one poll later, never dropped.
+
+Per-run operational diagnostics at `metrics/wallet_poll_history.jsonl` retain
+each sweep's request bounds, response/cap/error status and cohort identity.
+`diagnostic_version=1`, `delivery_status="prepared_not_acknowledged"` and
+`historical_capture_complete=null` distinguish a fetched batch from rows durably
+written or complete historical coverage. Final metrics include capped-response
+and incomplete-poll counts plus the last poll status. These are additive
+operational diagnostics; the event schema, partitions and replay verdict are
+unchanged. An uncapped response does not prove historical completeness: the
+official endpoint exposes only the most recent 10,000 fills, and earlier gaps
+may no longer be recoverable. A page-sized single-timestamp group remains an
+explicit error rather than being skipped. The history file is written through
+the metrics `JsonlSink` (per-line fsync, like `summary.jsonl`); a failed append
+never aborts the poll - it is counted in `_collector_state.json`
+(`poll_history_error_count`, `last_poll_history_error`) and the prepared rows
+are still returned to the pipeline.
+
 Consumers performing the registered causal evaluation MUST filter on the frozen
 cohort's `prospective_start_at` and join using event time plus an explicit
 receipt/availability delay. Rows from earlier scratch or snapshot work are

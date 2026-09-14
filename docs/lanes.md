@@ -23,7 +23,7 @@ curated data complete against raw. History lengths are as of 2026-09-10.
 | Open interest | Binance BTC, ETH, SOL | **A** | 2026-09-08 (v11 per-symbol) | 2 d clean; 08-25..09-08 quarantined | daily 5-min history 2020→ outside the plant (`G:\03-reference-data\binance_futures_metrics`) |
 | Liquidations | Bybit BTC/ETH/SOL; OKX all swaps | **B** Bybit (clean, not gap-proof); **B** OKX (v12 receipt-ordered verdict, deployed + history re-scored 2026-09-10) | Bybit 2026-09-08; OKX 2026-09-06 (hot history) | 2 d / 4 d hot + cold since 08-25 | raw only; OKX: use `received_at` and per-product order (venue-delayed batches); details later than 1 h are quarantined by the live gate (15 min before 2026-09-10 15:06) |
 | Options snapshots | Binance BTC/ETH chain 15 min; Deribit BTC/ETH 5 min | **R** reference | 2026-09-01 in the plant | 9 d here + V1 series since 2026-05 in `G:\Binance_IV_V1` | missed snapshots permanent; V1 Deribit gap 08-11..27 |
-| Hyperliquid wallet flow | 10 frozen wallets, BTC/ETH/SOL | **A** (prospective) | 2026-08-09 | 32 d | 60 s poll; frozen cohort |
+| Hyperliquid wallet flow | 10 frozen wallets, BTC/ETH/SOL | **A** (prospective) | 2026-08-09 | 32 d | 60 s poll; frozen cohort. **Known gap:** wallet 9 (`0x1367...560e`) captured nothing 2026-08-25 -> 2026-09-14 (capped-page stall, fixed PR #82); backfill vs accept is in the ROADMAP Decision queue |
 | Hyperliquid leaderboard | daily | **R** | 2026-08-17 | 24 d | point-in-time reference |
 | Text | RSS, 5 feeds | **A** for what it is | 2026-07-16 | 56 d, ~74 items/day | thin; `ingestion_ts` is the clock |
 

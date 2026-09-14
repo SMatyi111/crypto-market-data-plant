@@ -147,7 +147,6 @@ def test_capped_response_pages_forward_instead_of_stalling(tmp_path: Path) -> No
         state_path=tmp_path / "state.json",
         fetch=fetch,
         request_pause_seconds=0,
-        overlap_seconds=0,
         response_cap=3,
         clock=lambda: now,
     )
@@ -425,3 +424,233 @@ def test_backfill_trades_replay_threads_wallet_flow_scorer(
     # as globally non-monotonic), with the threaded skew gate recorded.
     assert summary["mode"] == "wallet_flow_none_native"
     assert summary["replayable"] is True
+
+
+def _paging_poller(tmp_path, ledger, *, cap=3, history=False):
+    cohort_path = tmp_path / "cohort.json"
+    if not cohort_path.exists():
+        _write_cohort(cohort_path)
+    requests = []
+
+    def fetch(request):
+        requests.append(dict(request))
+        if request["user"] != ADDRESS_A:
+            return []
+        return [dict(fill) for fill in ledger
+                if request["startTime"] <= fill["time"] <= request["endTime"]][:cap]
+
+    poller = HyperliquidWalletFlowPoller(
+        cohort=load_wallet_flow_cohort(cohort_path),
+        source_root=tmp_path / "source", state_path=tmp_path / "state.json",
+        poll_history_path=tmp_path / "history.jsonl" if history else None,
+        fetch=fetch, request_pause_seconds=0, response_cap=cap,
+        clock=lambda: datetime(2026, 8, 9, 0, 10, tzinfo=UTC),
+    )
+    return poller, requests
+
+
+def test_default_overlap_collects_dense_2000_row_page_without_stalling(tmp_path):
+    base = int(START.timestamp() * 1000)
+    ledger = [_fill(trade_id=i, timestamp_ms=base + i * 100) for i in range(2100)]
+    poller, requests = _paging_poller(tmp_path, ledger, cap=2000)
+    first, more = asyncio.run(poller.poll())
+    second, more_second = asyncio.run(poller.poll())
+    assert more is False and more_second is False  # no faster polling loop
+    assert len(first) == 1999 and len(second) == 101
+    assert {row["tid"] for row in first + second} == set(range(2100))
+    starts = [r["startTime"] for r in requests if r["user"] == ADDRESS_A]
+    assert starts == [base, base + 199900]
+    assert poller.last_poll_complete is True
+    assert poller.capped_response_count == 1
+    assert poller.incomplete_poll_count == 1
+
+
+def test_capped_boundary_keeps_all_tied_fills_and_resumes_overlap_from_tail_page(tmp_path):
+    base = int(START.timestamp() * 1000)
+    ledger = [_fill(trade_id=i, timestamp_ms=base + t)
+              for i, t in enumerate([1000, 2000, 2000, 2000, 3000, 4000])]
+    poller, requests = _paging_poller(tmp_path, ledger, cap=4)
+    first, _ = asyncio.run(poller.poll())
+    second, _ = asyncio.run(poller.poll())
+    third, _ = asyncio.run(poller.poll())
+    assert [x['tid'] for x in first] == [0]
+    assert [x['tid'] for x in second] == [1, 2, 3]
+    assert [x['tid'] for x in third] == [4, 5]
+    assert ADDRESS_A not in poller.page_starts
+    # A late overlapping fill must still be fetched after continuation completes.
+    ledger.append(_fill(trade_id=99, timestamp_ms=base + 3500))
+    ledger.sort(key=lambda x: (x['time'], x['tid']))
+    later = []
+    for _ in range(3):
+        emitted, _ = asyncio.run(poller.poll())
+        later.extend(emitted)
+    assert [x['tid'] for x in later] == [99]
+    starts = [r['startTime'] for r in requests if r['user'] == ADDRESS_A]
+    # Overlap resumes from the page that ended the continuation (base + 3000),
+    # not from highwater - overlap (= base), which would re-cap the consumed pages.
+    assert starts[:4] == [base, base + 2000, base + 3000, base + 3000]
+    assert poller.resume_floors[ADDRESS_A] == base + 3000
+
+
+def test_finished_continuation_does_not_rewalk_consumed_dense_pages(tmp_path):
+    # A burst denser than the cap, then a quiet wallet: without the resume floor
+    # every ordinary poll re-entered at highwater - overlap, re-capped the first
+    # page and oscillated capped/uncapped forever (duplicates += cap per poll).
+    base = int(START.timestamp() * 1000)
+    ledger = [_fill(trade_id=i, timestamp_ms=base + (i + 1) * 1000) for i in range(6)]
+    poller, requests = _paging_poller(tmp_path, ledger, cap=4)
+    first, _ = asyncio.run(poller.poll())
+    second, _ = asyncio.run(poller.poll())
+    assert [x['tid'] for x in first] == [0, 1, 2]
+    assert [x['tid'] for x in second] == [3, 4, 5]
+    dups_after_catch_up = poller.duplicate_count
+    for _ in range(4):
+        emitted, _ = asyncio.run(poller.poll())
+        assert emitted == []
+        assert poller.last_poll_complete is True
+    assert poller.capped_response_count == 1
+    assert poller.incomplete_poll_count == 1
+    assert poller.duplicate_count == dups_after_catch_up + 4 * 3
+    starts = [r['startTime'] for r in requests if r['user'] == ADDRESS_A]
+    assert starts == [base, base + 4000] + [base + 4000] * 4
+    # New activity is still picked up: the tail page is now exactly cap-sized
+    # (4000..7000), so it is treated as capped and the new fill lands one
+    # poll later from the inclusive boundary - never lost, never re-walked.
+    ledger.append(_fill(trade_id=6, timestamp_ms=base + 7000))
+    emitted = []
+    for _ in range(2):
+        rows, _ = asyncio.run(poller.poll())
+        emitted.extend(rows)
+    assert [x['tid'] for x in emitted] == [6]
+    assert poller.resume_floors[ADDRESS_A] == base + 7000
+
+
+def test_poll_history_write_failure_never_aborts_capture(tmp_path):
+    base = int(START.timestamp() * 1000)
+    ledger = [_fill(trade_id=i, timestamp_ms=base + (i + 1) * 1000) for i in range(2)]
+    cohort_path = tmp_path / 'cohort.json'
+    _write_cohort(cohort_path)
+    blocker = tmp_path / 'not-a-dir'
+    blocker.write_text('x', encoding='utf-8')
+    poller = HyperliquidWalletFlowPoller(
+        cohort=load_wallet_flow_cohort(cohort_path),
+        source_root=tmp_path / 'source', state_path=tmp_path / 'state.json',
+        poll_history_path=blocker / 'history.jsonl',
+        fetch=lambda request: [dict(f) for f in ledger] if request['user'] == ADDRESS_A else [],
+        request_pause_seconds=0, response_cap=2000,
+        clock=lambda: datetime(2026, 8, 9, 0, 10, tzinfo=UTC),
+    )
+    emitted, _ = asyncio.run(poller.poll())
+    assert [x['tid'] for x in emitted] == [0, 1]
+    assert poller.poll_error_count == 0
+    assert poller.poll_history_error_count == 1
+    state = json.loads((tmp_path / 'state.json').read_text(encoding='utf-8'))
+    assert state['poll_history_error_count'] == 1
+    assert state['last_poll_history_error'].startswith(('FileExistsError', 'NotADirectoryError', 'FileNotFoundError'))
+
+
+def test_non_target_dense_page_still_advances_to_target_fills(tmp_path):
+    base = int(START.timestamp() * 1000)
+    ledger = [_fill(trade_id=i, timestamp_ms=base + i * 1000,
+                    coin='DOGE' if i < 3 else 'BTC') for i in range(1, 5)]
+    poller, _ = _paging_poller(tmp_path, ledger)
+    first, _ = asyncio.run(poller.poll())
+    second, _ = asyncio.run(poller.poll())
+    assert first == []
+    assert [x['tid'] for x in second] == [3, 4]
+
+
+def test_restart_ignores_prepared_cursor_and_recovers_undelivered_rows(tmp_path):
+    base = int(START.timestamp() * 1000)
+    ledger = [_fill(trade_id=i, timestamp_ms=base + i * 100) for i in range(2100)]
+    poller, _ = _paging_poller(tmp_path, ledger, cap=2000)
+    prepared, _ = asyncio.run(poller.poll())
+    # Simulate the pipeline writing only a prefix before an interruption.
+    durable = prepared[:100]
+    normalizer = HyperliquidWalletFillNormalizer()
+    received = datetime(2026, 8, 9, 0, 10, tzinfo=UTC)
+    clean = [normalizer.normalize(RawMessage(source='hyperliquid', received_at=received,
+                                             payload=x)) for x in durable]
+    _write_clean_run(tmp_path / 'source' / '20260809_000001', [
+        {'trade_id':x.trade_id,'metadata':x.metadata} for x in clean])
+    restarted, requests = _paging_poller(tmp_path, ledger, cap=2000)
+    assert restarted.highwater[ADDRESS_A] == base + 9900
+    assert restarted.page_starts == {}
+    recovered = []
+    for _ in range(2):
+        rows, _ = asyncio.run(restarted.poll())
+        recovered.extend(rows)
+    assert len(durable) + len(recovered) == 2100
+    assert {x['tid'] for x in durable}.isdisjoint(x['tid'] for x in recovered)
+    assert {x['tid'] for x in durable + recovered} == set(range(2100))
+    assert requests[0]['startTime'] == base
+
+
+def test_failed_continuation_preserves_cursor_and_records_each_attempt(tmp_path):
+    base = int(START.timestamp() * 1000)
+    ledger = [_fill(trade_id=i, timestamp_ms=base + i * 1000) for i in range(1, 5)]
+    poller, _ = _paging_poller(tmp_path, ledger, history=True)
+    first, _ = asyncio.run(poller.poll())
+    real_fetch = poller.fetch
+
+    def broken(request):
+        if request['user'] == ADDRESS_A:
+            raise RuntimeError('synthetic outage')
+        return []
+
+    poller.fetch = broken
+    assert asyncio.run(poller.poll())[0] == []
+    assert poller.page_starts[ADDRESS_A] == base + 3000
+    poller.fetch = real_fetch
+    recovered, _ = asyncio.run(poller.poll())
+    assert [x['tid'] for x in first + recovered] == [1, 2, 3, 4]
+    history = [json.loads(line) for line in (tmp_path/'history.jsonl').read_text(encoding='utf-8').splitlines()]
+    assert len(history) == 3
+    statuses = [x['per_wallet'][ADDRESS_A]['last_poll_status'] for x in history]
+    assert statuses == ['capped', 'failed', 'response_uncapped']
+    failed = history[1]['per_wallet'][ADDRESS_A]
+    assert failed['last_response_capped'] is None  # never reuse prior response status
+    assert failed['last_response_rows'] is None
+    assert all(x['delivery_status'] == 'prepared_not_acknowledged' for x in history)
+    assert all(x['historical_capture_complete'] is None for x in history)
+    assert history[-1]['incomplete_poll_count'] == 2
+
+
+def test_single_timestamp_cap_remains_visible_and_does_not_skip(tmp_path):
+    base = int(START.timestamp() * 1000)
+    ledger = [_fill(trade_id=i, timestamp_ms=base + 1000) for i in range(4)]
+    poller, _ = _paging_poller(tmp_path, ledger, history=True)
+    for _ in range(2):
+        assert asyncio.run(poller.poll())[0] == []
+    assert poller.highwater == {} and poller.page_starts == {}
+    assert poller.capped_response_count == 2
+    assert poller.incomplete_poll_count == 2
+    assert poller.per_wallet[ADDRESS_A]['last_poll_status'] == 'unpageable_timestamp'
+
+
+def test_segment_persists_poll_diagnostics_without_claiming_batch_delivery(tmp_path, monkeypatch):
+    cohort_path = tmp_path/'cohort.json'
+    _write_cohort(cohort_path)
+    base = int(datetime.now(tz=UTC).timestamp() * 1000) - 2000
+
+    def fake_poller(**kwargs):
+        return HyperliquidWalletFlowPoller(**kwargs, fetch=lambda request: [
+            _fill(trade_id=1, timestamp_ms=base),
+            _fill(trade_id=2, timestamp_ms=base + 1000),
+        ] if request['user'] == ADDRESS_A else [])
+
+    monkeypatch.setattr(cli, 'HyperliquidWalletFlowPoller', fake_poller)
+    result = asyncio.run(cli.collect_hyperliquid_wallet_flow_segment(SimpleNamespace(
+        cohort_path=cohort_path, output_root=tmp_path/'raw', count=1,
+        request_pause_seconds=0, poll_interval_seconds=0,
+        normalized_parquet=False, jsonl_fsync=False,
+    )))
+    run = Path(result['run_path'])
+    history = [json.loads(x) for x in (run/'metrics/wallet_poll_history.jsonl').read_text(encoding='utf-8').splitlines()]
+    summary = [json.loads(x) for x in (run/'metrics/summary.jsonl').read_text(encoding='utf-8').splitlines()]
+    assert len(history) == 1
+    assert history[0]['emitted_count'] == 2
+    assert history[0]['delivery_status'] == 'prepared_not_acknowledged'
+    assert result['raw_messages'] == 1 and result['clean_events'] == 1
+    assert summary[-1]['last_poll_complete'] is True
+    assert summary[-1]['capped_response_count'] == 0
