@@ -8,7 +8,7 @@ changes scope or state. Companion docs:
 - [`STANDARDS.md`](STANDARDS.md) — the data contract (schemas, replayability, retention)
 - [`docs/HISTORY.md`](docs/HISTORY.md) — resolved-work narrative (what was fixed, and why)
 
-Last updated: **2026-09-07**.
+Last updated: **2026-09-14**.
 
 > **Operating mode — safe shaping (owner directive, 2026-07-04).** No extended
 > building on Claude's initiative: no new venues, lanes, or instruments, no big
@@ -18,6 +18,25 @@ Last updated: **2026-09-07**.
 > explicit owner ask to start.
 
 ---
+
+## In review — wallet capped-page continuation (2026-09-14)
+
+The wallet poller can repeat the same dense capped page when its normal
+five-minute overlap is subtracted again at each continuation. An isolated fix
+keeps a separate inclusive page cursor until an uncapped response, then
+restores normal overlap. Restart continues to use durable rows, not prepared
+cursor state. Request cadence, cohort, event schema and replay gates stay the
+same. Per-run poll diagnostics expose caps/errors and distinguish prepared
+batches from delivery acknowledgements.
+
+Local validation: 624 tests passed, five skipped; lint passed. New cases cover
+the default 2,000-row cap with overlap, tied timestamps, non-target pages,
+transient failures, partial-delivery restart recovery and diagnostic wiring.
+Remote CI and the required review/handoff gates must be recorded before merge.
+No live restart or deployment is part of this change. After deployment in an
+appropriate owner-controlled window, verify paging progress and capture
+coverage; do not claim that a code fix repairs historical endpoint retention
+gaps. The last full ops-audit stamp below is not refreshed by this focused fix.
 
 
 ## Finding — Binance fstream delivers no data from this host (2026-08-25)

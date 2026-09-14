@@ -178,6 +178,7 @@ class HyperliquidWalletFlowPoller:
         overlap_seconds: float = DEFAULT_OVERLAP_SECONDS,
         response_cap: int = DEFAULT_RESPONSE_CAP,
         clock: Callable[[], datetime] = utc_now,
+        poll_history_path: Path | None = None,
     ) -> None:
         self.cohort = cohort
         self.source_root = Path(source_root)
@@ -187,6 +188,7 @@ class HyperliquidWalletFlowPoller:
         self.overlap_ms = max(0, int(float(overlap_seconds) * 1000))
         self.response_cap = max(1, int(response_cap))
         self.clock = clock
+        self.poll_history_path = poll_history_path
         self.seen, self.highwater = scan_durable_wallet_fills(
             self.source_root,
             prospective_start_at=cohort.prospective_start_at,
@@ -195,6 +197,14 @@ class HyperliquidWalletFlowPoller:
         self.poll_error_count = 0
         self.emitted_count = 0
         self.duplicate_count = 0
+        # A capped page continues at its inclusive boundary, without subtracting
+        # the normal overlap again. This is deliberately in-memory only: a poll
+        # prepares rows before the pipeline writes them, so restoring this cursor
+        # from _collector_state.json could skip an interrupted batch on restart.
+        self.page_starts: dict[str, int] = {}
+        self.capped_response_count = 0
+        self.incomplete_poll_count = 0
+        self.last_poll_complete: bool | None = None
         self.per_wallet: dict[str, dict[str, Any]] = {
             wallet.address: {"candidate_rank": wallet.candidate_rank, "cohort_rank": wallet.cohort_rank}
             for wallet in cohort.wallets
@@ -209,6 +219,7 @@ class HyperliquidWalletFlowPoller:
         for index, wallet in enumerate(self.cohort.wallets):
             highwater = self.highwater.get(wallet.address)
             start_ms = start_floor_ms if highwater is None else max(start_floor_ms, highwater - self.overlap_ms)
+            start_ms = self.page_starts.get(wallet.address, start_ms)
             request_payload = {
                 "type": "userFillsByTime",
                 "user": wallet.address,
@@ -219,12 +230,25 @@ class HyperliquidWalletFlowPoller:
             attempted_at = self.clock().astimezone(UTC)
             state = self.per_wallet[wallet.address]
             state["last_attempt_at"] = attempted_at.isoformat()
+            state.update(
+                last_request_start_ms=start_ms,
+                last_request_end_ms=end_ms,
+                last_response_rows=None,
+                last_response_capped=None,
+                last_response_complete=False,
+                last_new_rows=0,
+                last_poll_status="failed",
+            )
             try:
                 response = await asyncio.to_thread(self.fetch, request_payload)
                 if not isinstance(response, list):
                     raise ValueError("userFillsByTime response is not a list")
                 fills = [fill for fill in response if isinstance(fill, dict)]
                 capped = len(response) >= self.response_cap
+                state["last_response_rows"] = len(response)
+                state["last_response_capped"] = capped
+                if capped:
+                    self.capped_response_count += 1
                 boundary_ms: int | None = None
                 if capped:
                     # The server truncated the window. Page forward instead of
@@ -233,8 +257,9 @@ class HyperliquidWalletFlowPoller:
                     # error on every subsequent poll forever. Keep only fills
                     # strictly older than the newest returned timestamp (that
                     # millisecond may be cut mid-batch), advance the high-water to
-                    # that boundary, and let the next poll re-enter at
-                    # boundary - overlap. A page whose fills all share a single
+                    # that boundary, and let the next poll re-enter at the exact
+                    # boundary. Subtracting overlap here can repeat the same dense
+                    # page forever. A page whose fills all share a single
                     # timestamp has no safe boundary — error as before rather than
                     # silently dropping same-millisecond fills beyond the cap.
                     stamps = {
@@ -243,6 +268,7 @@ class HyperliquidWalletFlowPoller:
                         if stamp is not None
                     }
                     if len(stamps) < 2:
+                        state["last_poll_status"] = "unpageable_timestamp"
                         raise RuntimeError(
                             f"response_cap_reached:{len(response)}; "
                             "single-timestamp page cannot advance"
@@ -268,6 +294,7 @@ class HyperliquidWalletFlowPoller:
                 state["last_response_rows"] = len(response)
                 state["last_response_complete"] = not capped
                 state["last_response_capped"] = capped
+                state["last_poll_status"] = "capped" if capped else "response_uncapped"
                 state.pop("last_error", None)
                 for fill in fills:
                     timestamp_ms = _optional_int(fill.get("time"))
@@ -303,8 +330,14 @@ class HyperliquidWalletFlowPoller:
                     self.highwater[wallet.address] = max(
                         boundary_ms, self.highwater.get(wallet.address, boundary_ms)
                     )
+                    self.page_starts[wallet.address] = boundary_ms
+                else:
+                    # An uncapped page finishes this continuation. Subsequent
+                    # ordinary polls recover the configured overlap for late rows.
+                    self.page_starts.pop(wallet.address, None)
                 state["last_new_rows"] = wallet_new
                 state["highwater_timestamp_ms"] = self.highwater.get(wallet.address)
+            state["page_start_timestamp_ms"] = self.page_starts.get(wallet.address)
             if index + 1 < len(self.cohort.wallets) and self.request_pause_seconds:
                 await asyncio.sleep(self.request_pause_seconds)
 
@@ -316,22 +349,32 @@ class HyperliquidWalletFlowPoller:
         )
         self.poll_count += 1
         self.emitted_count += len(emitted)
-        write_wallet_flow_state(
-            self.state_path,
-            {
-                "updated_at": self.clock().astimezone(UTC).isoformat(),
-                "prospective_start_at": self.cohort.prospective_start_at.isoformat(),
-                "cohort_sha256": self.cohort.sha256,
-                "wallet_count": len(self.cohort.wallets),
-                "target_coins": sorted(self.cohort.target_coins),
-                "last_poll_complete": complete,
-                "poll_count": self.poll_count,
-                "poll_error_count": self.poll_error_count,
-                "emitted_count": self.emitted_count,
-                "duplicate_count": self.duplicate_count,
-                "per_wallet": self.per_wallet,
-            },
-        )
+        self.last_poll_complete = complete
+        if not complete:
+            self.incomplete_poll_count += 1
+        snapshot = {
+            "updated_at": self.clock().astimezone(UTC).isoformat(),
+            "prospective_start_at": self.cohort.prospective_start_at.isoformat(),
+            "cohort_sha256": self.cohort.sha256,
+            "wallet_count": len(self.cohort.wallets),
+            "target_coins": sorted(self.cohort.target_coins),
+            "last_poll_complete": complete,
+            "poll_count": self.poll_count,
+            "poll_error_count": self.poll_error_count,
+            "emitted_count": self.emitted_count,
+            "duplicate_count": self.duplicate_count,
+            "capped_response_count": self.capped_response_count,
+            "incomplete_poll_count": self.incomplete_poll_count,
+            "per_wallet": self.per_wallet,
+        }
+        if self.poll_history_path is not None:
+            append_wallet_poll_history(self.poll_history_path, {
+                "diagnostic_version": 1,
+                "delivery_status": "prepared_not_acknowledged",
+                "historical_capture_complete": None,
+                **snapshot,
+            })
+        write_wallet_flow_state(self.state_path, snapshot)
         return emitted, False
 
 
@@ -407,6 +450,15 @@ def wallet_trade_key(wallet: str, fill: dict[str, Any]) -> str:
         str(fill.get(key, "")) for key in ("time", "coin", "side", "px", "sz", "oid", "hash")
     )
     return f"{wallet.lower()}:fallback:{hashlib.sha256(fallback.encode('utf-8')).hexdigest()}"
+
+
+def append_wallet_poll_history(path: Path, payload: dict[str, Any]) -> None:
+    """Persist capture diagnostics, never a delivery ack or endpoint completeness proof."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def write_wallet_flow_state(path: Path | str, payload: dict[str, Any]) -> None:
