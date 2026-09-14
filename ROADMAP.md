@@ -790,6 +790,32 @@ owner ask (safe-shaping directive above).
 Decisions waiting on the owner; agents must not act on these without an explicit OK
 (see `CLAUDE.md` Governance):
 
+- **Proposed next data-feasibility memo: official exchange rule changes
+  (2026-09-10; owner requested this memo, not a new collector).** Assess whether
+  a small, timestamped archive of margin/risk-limit, collateral-eligibility,
+  and contract-status notices would add useful coverage beyond existing lanes.
+  This remains **PARKED for collection** under the stabilize-current-set
+  directive. Finish and verify the active normalized-tree transfer before any
+  substantial new data work; do not interrupt it for this proposal.
+  - First step: a bounded, read-only feasibility inventory of official Binance
+    and Bybit sources. Count independent notices by category and affected
+    contracts, grouping multiple contracts from the same announcement as one
+    event. Check access, cadence, revisions, historical coverage, and gaps.
+    Historical publication dates are not proof of when a notice was observable.
+  - Proposed capture contract: source URL, immutable original payload and hash,
+    first-seen receipt time, stated publication and effective times, revision
+    history, affected contracts, old/new rules, and applicability to existing
+    positions. Preserve uncertainty and missing fields; do not infer them.
+  - Feasibility deliverable: a source matrix, independent-event counts, join
+    coverage against existing market data, and a bounded request/storage budget.
+    Decide whether the evidence supports a small pilot; do not prescribe a
+    profitability verdict from collection quality or event counts alone.
+  - Only after that review: propose any missing market coverage as a fixed,
+    small instrument panel, with historical membership recorded. No blanket
+    altcoin tick expansion, subscriptions, paid data, or live configuration
+    changes are authorized by this memo. Research designs/results stay in the
+    private research workspace, outside this public collection repository.
+  - Example official source: [Bybit risk-limit adjustment, 2026-09-04](https://announcements.bybit.com/en/article/risk-limit-adjustment-for-selected-perpetual-contracts-avaxusdt-xlmusdt-sep-4-2026--art453915b9e8fd/).
 - **Wallet-flow gap 2026-08-25 -> 2026-09-14 for cohort wallet 9
   (`0x1367df28c0681431b8a8f3d887576a1cad85560e`)** - see the 2026-09-14 finding.
   The public API keeps only the last 10,000 fills per wallet, so the code fix cannot
