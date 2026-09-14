@@ -904,8 +904,11 @@ written or complete historical coverage. Final metrics include capped-response
 and incomplete-poll counts plus the last poll status. These are additive
 operational diagnostics; the event schema, partitions and replay verdict are
 unchanged. An uncapped response does not prove historical completeness: the
-official endpoint exposes only the most recent 10,000 fills, and earlier gaps
-may no longer be recoverable. A page-sized single-timestamp group remains an
+official endpoint documents a window of the most recent 10,000 fills, so earlier
+gaps may not be recoverable (observed 2026-09-14: a 62k-fill window was served in
+full - treat the limit as a risk, not a guarantee either way; completeness is
+measured against the node archive, see Backfill provenance below). A page-sized
+single-timestamp group remains an
 explicit error rather than being skipped. The history file is written through
 the metrics `JsonlSink` (per-line fsync, like `summary.jsonl`); a failed append
 never aborts the poll - it is counted in `_collector_state.json`

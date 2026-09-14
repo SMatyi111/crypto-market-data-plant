@@ -7,7 +7,7 @@ git log + the merged PR descriptions; this file keeps the *why*.
 
 ---
 
-## 2026-09-14 - one wallet-flow cohort wallet had been silently stalled for 20 days
+## 2026-09-14 - the wallet-flow lane audited against the chain: a 20-day stall, 12.4 % missing, backfilled
 
 **What happened.** The PR #42 (2026-08-17) capped-page paging fixed the "raise
 forever" stall but let the next poll re-enter at `boundary - overlap`. For a wallet
@@ -28,13 +28,34 @@ still recovers from durable clean rows. Additive per-poll diagnostics
 append can never abort capture) and cap/incomplete counters in the segment summary.
 No schema, partition, verdict or STANDARDS-version change.
 
-**Why it matters / lesson.** `poll_error_count == 0` is not evidence a poller is
-progressing; a stalled-but-successful page looks healthy to every existing
-counter. Cap-aware pollers need a progress metric (high-water age per wallet,
-duplicates per poll) in the health report, not just an error count. The public
-endpoint only exposes a wallet's most recent 10,000 fills, so most of the 08-25 ->
-09-14 window for that wallet is not recoverable from the API (Decision queue:
-S3 node-data backfill vs accept-and-document).
+**What the fix did live.** Deployed at the 12:44:58Z segment (collector-side code,
+no restart). Wallet 9 paged its whole 08-25 -> 09-07 window at 2,000 fills per
+poll, 36 polls, 0 errors. The endpoint's documented 10,000-fill window did NOT
+bind - the earlier note that most of the window was lost was wrong.
+
+**Owner decision: backfill from the node archive (PR #83).** The
+`node_fills_by_block` S3 mirror is on disk and current, so the gap could be
+measured against the chain at zero cost. The first audit, deduplicating against
+hot raw runs only, said 280k fills were missing - wrong, because this lane's runs
+are offloaded after ~4 days. Against hot + cold + curated the real number is
+39,852 of 322,529 target fills (12.4 %) across five wallets: the stall (wallet 9,
+closed by the fixed poller itself), the 08-10..08-17 outage window for wallets 3
+and 9 (recorded on 08-17 as "fully recovered" - it was not), one 30-minute burst
+for wallet 6, and 12.7k fills for wallet 4 lost over nine burst days while its
+high-water kept advancing (a loss path that is not explained). All 39,852 were
+written as five ordinary lane runs (`raw_type=node_fills_by_block`, `received_at`
+= 2026-09-14T17:31Z) and promoted by the live promoter; the follow-up dry-run is
+clean. Tool review added two guards worth remembering: never write inside the live
+poller's re-fetch window (its dedup set is loaded once per segment, so both sides
+can land the same fill), and never write a row the scorer's 90-day skew gate will
+reject (it would be quarantined and re-written on every pass).
+
+**Lessons.** (1) `poll_error_count == 0` is not evidence a poller is progressing; a
+stalled-but-successful page looks healthy to every existing counter. (2) "Recovered"
+is a claim until it is measured against an independent source; the lane now has
+one (the node archive) and a tool that measures it. (3) A hot-tier scan is never a
+completeness audit on an offloaded lane. (4) The audit tool's dry-run belongs in the
+ops-audit ritual for this lane.
 
 ## 2026-09-10/11 - the hot-path normalized Parquet layer retired and archived (v13)
 
