@@ -281,6 +281,7 @@ def test_cli_handler_defaults_to_every_cohort_wallet_dry_run(tmp_path, capsys):
     cli.run_backfill_wallet_flow_from_node(
         SimpleNamespace(
             node_root=node_root, cohort_path=cohort_path, source_root=source_root,
+            cold_root=None, curated_root=None,
             wallet=None, start=None, end=None, apply=False, format="json",
         )
     )
@@ -296,9 +297,43 @@ def test_cli_handler_text_output_and_iso_window(tmp_path, capsys):
     cli.run_backfill_wallet_flow_from_node(
         SimpleNamespace(
             node_root=node_root, cohort_path=cohort_path, source_root=source_root,
+            cold_root=None, curated_root=None,
             wallet=[ADDRESS_A], start=GAP_START.isoformat(),
             end=(GAP_START + timedelta(hours=1)).isoformat(), apply=False, format="text",
         )
     )
     out = capsys.readouterr().out
     assert "mode=dry-run" in out and ADDRESS_A in out and "missing=1" in out
+
+
+def test_offloaded_and_promoted_rows_count_as_durable(tmp_path):
+    """The lane's runs are offloaded after ~4 days, so a hot-only scan would report
+    every older fill as missing. Cold raw and curated parquet must both count."""
+    cohort_path, node_root, source_root = _setup(tmp_path)
+    # tid 2 lives only in an offloaded (cold) run; tid 7 only in curated parquet.
+    cold_root = tmp_path / "cold" / "raw" / "market"
+    _write_durable_run(cold_root / source_root.name, wallet=ADDRESS_A, tid=2, at=GAP_START + timedelta(minutes=1))
+    curated_root = tmp_path / "curated" / "trades_replayable"
+    staging = tmp_path / "staging" / source_root.name
+    _write_durable_run(staging, wallet=ADDRESS_A, tid=7, at=GAP_START + timedelta(days=1))
+    run_dir = next(p for p in staging.iterdir() if p.is_dir())
+    (run_dir / "metrics").mkdir()
+    (run_dir / "metrics" / "replay_summary.json").write_text(
+        json.dumps({"replayable": True, "findings": []}), encoding="utf-8"
+    )
+    assert promote_replayable_runs(staging, curated_root, limit=10, max_age_hours=24 * 365 * 100).promoted_row_count == 1
+
+    hot_only = backfill_wallet_flow_from_node(
+        node_root=node_root, cohort_path=cohort_path, source_root=source_root, wallet=ADDRESS_A, now=NOW,
+    )
+    assert hot_only.missing_count == 3
+    assert hot_only.durable_cold_count == 0 and hot_only.durable_curated_count == 0
+
+    full = backfill_wallet_flow_from_node(
+        node_root=node_root, cohort_path=cohort_path, source_root=source_root, wallet=ADDRESS_A,
+        cold_root=cold_root, curated_root=curated_root, now=NOW,
+    )
+    assert full.durable_hot_count == 1 and full.durable_cold_count == 1 and full.durable_curated_count == 1
+    assert full.already_durable_count == 3
+    assert full.missing_count == 1 and full.missing_per_coin == {"ETH": 1}
+    assert full.cold_root == str(cold_root / source_root.name)

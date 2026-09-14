@@ -912,6 +912,23 @@ never aborts the poll - it is counted in `_collector_state.json`
 (`poll_history_error_count`, `last_poll_history_error`) and the prepared rows
 are still returned to the pipeline.
 
+Backfill provenance (owner decision 2026-09-14). A gap the poller can no longer
+reach may be recovered from the owner-held mirror of the chain's
+`node_fills_by_block` stream with `backfill-wallet-flow-from-node`. The tool writes
+an ordinary lane run (raw + clean + metrics) under the lane's raw root so the one
+sanctioned promoter lands it; rows are produced by the lane's own normalizer and
+carry the same metadata keys. Two fields differ from a polled row and are the
+contract for telling them apart: `raw_type="node_fills_by_block"` (polled rows say
+`userFillsByTime`) and `received_at` = the moment of the backfill, because the plant
+did not hold the row before then - under the availability join above a backfilled
+fill is late data, which is the truth. `exchange_time` and the per-wallet ordering
+gate are unchanged. Dedup is the same `(wallet, trade_id)` key against every durable
+clean row, so a backfill never duplicates a fill the poller recovered, and re-running
+it is a no-op. Backfilled rows are admissible for completeness-oriented work
+(positions, PnL, flow totals) and MUST be excluded from any evaluation that relies
+on receipt-time availability. The run's `metrics/summary.jsonl` row records
+`capture_source`, the source window and the dedup counts.
+
 Consumers performing the registered causal evaluation MUST filter on the frozen
 cohort's `prospective_start_at` and join using event time plus an explicit
 receipt/availability delay. Rows from earlier scratch or snapshot work are

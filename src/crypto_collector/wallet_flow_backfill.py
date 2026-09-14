@@ -2,11 +2,13 @@
 
 Background (ROADMAP finding 2026-09-14): cohort wallet 9 of the
 `hyperliquid-wallet-flow` lane sat on a repeating capped page from 2026-08-25 until
-PR #82 fixed the paging. The public `userFillsByTime` endpoint exposes only a
-wallet's most recent 10,000 fills, so the code fix cannot recover the older part of
-that gap. The owner-held mirror of the chain's `node_fills_by_block` stream (the
-requester-pays S3 archive, kept current daily under the reference-data tree) holds
-every fill, so the gap is recoverable from disk without another API or S3 call.
+PR #82 fixed the paging. The public `userFillsByTime` endpoint documents a window of
+a wallet's most recent 10,000 fills, so a stall that long risks permanent loss and the
+poller cannot be relied on to close it. The owner-held mirror of the chain's
+`node_fills_by_block` stream (the requester-pays S3 archive, kept current daily under
+the reference-data tree) holds every fill, so whatever the poller does not reach is
+recoverable from disk without another API or S3 call - and the same comparison is a
+completeness audit of the lane against the chain.
 
 What this writes, and how it stays honest:
 
@@ -21,9 +23,13 @@ What this writes, and how it stays honest:
    unchanged) and `received_at` = the backfill moment. The plant genuinely did not
    hold these rows before then; a consumer joining on availability sees them as
    late data, which is the truth. Event time is the venue fill time, untouched.
-3. Dedup runs against EVERY durable clean row of the lane (the same scan the
-   collector performs at start-up), so re-running is idempotent and fills the fixed
-   poller has already recovered are never duplicated.
+3. Dedup runs against every durable row the plant holds for the lane: hot raw runs
+   (the same scan the collector performs at start-up), the cold-tier raw runs the
+   archive offload has already moved (`cold_root`), and the curated parquet
+   (`curated_root`, the research surface, which keeps rows of runs whose raw is on
+   either tier). Re-running is therefore idempotent, and fills the fixed poller has
+   already recovered are never duplicated. A hot-only scan is NOT a completeness
+   audit: this lane's runs are offloaded after ~4 days.
 4. Only the cohort's target coins, only fills at or after the cohort's prospective
    boundary, only the requested window.
 
@@ -41,6 +47,7 @@ from pathlib import Path
 from typing import Any
 
 import pyarrow.compute as pc
+import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
 from .collectors.hyperliquid_wallet_flow import (
@@ -105,8 +112,13 @@ class WalletBackfillReport:
     cohort_rank: int | None
     node_root: str
     source_root: str
+    cold_root: str | None
+    curated_root: str | None
     start_ms: int
     end_ms: int
+    durable_hot_count: int = 0
+    durable_cold_count: int = 0
+    durable_curated_count: int = 0
     node_files_scanned: int = 0
     node_fill_count: int = 0
     target_fill_count: int = 0
@@ -194,6 +206,21 @@ def iter_node_fills(
                 yield file, _node_row_to_fill(row)
 
 
+def curated_trade_keys(curated_root: Path, *, wallet: str, source: str = "hyperliquid") -> set[str]:
+    """`trade_id` values already promoted for one wallet (`<wallet>:<tid>` keys)."""
+    if not curated_root.exists():
+        return set()
+    dataset = ds.dataset(curated_root, format="parquet", partitioning="hive")
+    if "source" in dataset.schema.names:
+        table = dataset.to_table(columns=["trade_id"], filter=ds.field("source") == source)
+    else:
+        table = dataset.to_table(columns=["trade_id"])
+    prefix = wallet.lower() + ":"
+    return {
+        key for key in table["trade_id"].to_pylist() if isinstance(key, str) and key.startswith(prefix)
+    }
+
+
 def _wallet_entry(cohort: WalletFlowCohort, wallet: str):
     wallet_lower = wallet.lower()
     for entry in cohort.wallets:
@@ -208,6 +235,8 @@ def backfill_wallet_flow_from_node(
     cohort_path: Path | str,
     source_root: Path | str,
     wallet: str,
+    cold_root: Path | str | None = None,
+    curated_root: Path | str | None = None,
     start_ms: int | None = None,
     end_ms: int | None = None,
     apply: bool = False,
@@ -216,6 +245,8 @@ def backfill_wallet_flow_from_node(
 ) -> WalletBackfillReport:
     node_root = Path(node_root)
     source_root = Path(source_root)
+    cold_lane_root = Path(cold_root) / source_root.name if cold_root is not None else None
+    curated_root_path = Path(curated_root) if curated_root is not None else None
     checked_at = (now or datetime.now(tz=UTC)).astimezone(UTC)
     cohort = load_wallet_flow_cohort(cohort_path)
     entry = _wallet_entry(cohort, wallet)
@@ -233,6 +264,8 @@ def backfill_wallet_flow_from_node(
         cohort_rank=entry.cohort_rank,
         node_root=str(node_root),
         source_root=str(source_root),
+        cold_root=str(cold_lane_root) if cold_lane_root is not None else None,
+        curated_root=str(curated_root_path) if curated_root_path is not None else None,
         start_ms=window_start,
         end_ms=window_end,
     )
@@ -243,6 +276,18 @@ def backfill_wallet_flow_from_node(
     seen, _highwater = scan_durable_wallet_fills(
         source_root, prospective_start_at=cohort.prospective_start_at
     )
+    prefix = wallet + ":"
+    report.durable_hot_count = sum(1 for key in seen if key.startswith(prefix))
+    if cold_lane_root is not None and cold_lane_root.exists():
+        cold_seen, _ = scan_durable_wallet_fills(
+            cold_lane_root, prospective_start_at=cohort.prospective_start_at
+        )
+        report.durable_cold_count = sum(1 for key in cold_seen if key.startswith(prefix))
+        seen |= cold_seen
+    if curated_root_path is not None:
+        curated_seen = curated_trade_keys(curated_root_path, wallet=wallet)
+        report.durable_curated_count = len(curated_seen)
+        seen |= curated_seen
 
     files_seen: set[Path] = set()
     missing: dict[str, dict[str, Any]] = {}

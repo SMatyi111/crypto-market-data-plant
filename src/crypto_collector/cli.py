@@ -1514,6 +1514,11 @@ def build_parser() -> argparse.ArgumentParser:
     wallet_backfill_parser.add_argument("--cohort-path", type=Path, required=True)
     wallet_backfill_parser.add_argument("--source-root", type=Path, required=True,
                                         help="The lane's raw root (.../raw/market/hyperliquid_wallet_flow).")
+    wallet_backfill_parser.add_argument("--cold-root", type=Path, default=None,
+                                        help="Cold-tier raw root (the archive-offload cold_root): offloaded runs "
+                                        "count as durable. Without it older fills look missing.")
+    wallet_backfill_parser.add_argument("--curated-root", type=Path, default=None,
+                                        help="Curated dataset root (.../trades_replayable): promoted rows count as durable.")
     wallet_backfill_parser.add_argument("--wallet", action="append", default=None,
                                         help="Cohort wallet address; repeatable. Default: every cohort wallet.")
     wallet_backfill_parser.add_argument("--start", default=None,
@@ -5159,6 +5164,8 @@ def run_backfill_wallet_flow_from_node(args: argparse.Namespace) -> None:
             node_root=args.node_root,
             cohort_path=args.cohort_path,
             source_root=args.source_root,
+            cold_root=getattr(args, "cold_root", None),
+            curated_root=getattr(args, "curated_root", None),
             wallet=wallet,
             start_ms=start_ms,
             end_ms=end_ms,
@@ -5177,7 +5184,9 @@ def run_backfill_wallet_flow_from_node(args: argparse.Namespace) -> None:
         print(
             f"  window={report.start_ms}..{report.end_ms} node_files={report.node_files_scanned} "
             f"node_fills={report.node_fill_count} target={report.target_fill_count} "
-            f"durable={report.already_durable_count} missing={report.missing_count}"
+            f"durable={report.already_durable_count} (hot={report.durable_hot_count} "
+            f"cold={report.durable_cold_count} curated={report.durable_curated_count}) "
+            f"missing={report.missing_count}"
         )
         if report.missing_count:
             print(f"  missing {report.missing_first_time} .. {report.missing_last_time} per_coin={report.missing_per_coin}")
