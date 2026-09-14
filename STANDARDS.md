@@ -904,13 +904,33 @@ written or complete historical coverage. Final metrics include capped-response
 and incomplete-poll counts plus the last poll status. These are additive
 operational diagnostics; the event schema, partitions and replay verdict are
 unchanged. An uncapped response does not prove historical completeness: the
-official endpoint exposes only the most recent 10,000 fills, and earlier gaps
-may no longer be recoverable. A page-sized single-timestamp group remains an
+official endpoint documents a window of the most recent 10,000 fills, so earlier
+gaps may not be recoverable (observed 2026-09-14: a 62k-fill window was served in
+full - treat the limit as a risk, not a guarantee either way; completeness is
+measured against the node archive, see Backfill provenance below). A page-sized
+single-timestamp group remains an
 explicit error rather than being skipped. The history file is written through
 the metrics `JsonlSink` (per-line fsync, like `summary.jsonl`); a failed append
 never aborts the poll - it is counted in `_collector_state.json`
 (`poll_history_error_count`, `last_poll_history_error`) and the prepared rows
 are still returned to the pipeline.
+
+Backfill provenance (owner decision 2026-09-14). A gap the poller can no longer
+reach may be recovered from the owner-held mirror of the chain's
+`node_fills_by_block` stream with `backfill-wallet-flow-from-node`. The tool writes
+an ordinary lane run (raw + clean + metrics) under the lane's raw root so the one
+sanctioned promoter lands it; rows are produced by the lane's own normalizer and
+carry the same metadata keys. Two fields differ from a polled row and are the
+contract for telling them apart: `raw_type="node_fills_by_block"` (polled rows say
+`userFillsByTime`) and `received_at` = the moment of the backfill, because the plant
+did not hold the row before then - under the availability join above a backfilled
+fill is late data, which is the truth. `exchange_time` and the per-wallet ordering
+gate are unchanged. Dedup is the same `(wallet, trade_id)` key against every durable
+clean row, so a backfill never duplicates a fill the poller recovered, and re-running
+it is a no-op. Backfilled rows are admissible for completeness-oriented work
+(positions, PnL, flow totals) and MUST be excluded from any evaluation that relies
+on receipt-time availability. The run's `metrics/summary.jsonl` row records
+`capture_source`, the source window and the dedup counts.
 
 Consumers performing the registered causal evaluation MUST filter on the frozen
 cohort's `prospective_start_at` and join using event time plus an explicit

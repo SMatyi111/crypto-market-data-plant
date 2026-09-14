@@ -139,6 +139,10 @@ from .offload import (
 )
 from .promotion import promote_replayable_runs
 from .repromote import repromote_short_runs
+from .wallet_flow_backfill import (
+    DEFAULT_MAX_CLOCK_SKEW_MS as WALLET_BACKFILL_MAX_CLOCK_SKEW_MS,
+    audit_wallet_flow_against_node,
+)
 from .quality import MetadataQualityGate, QualityGate
 from .text_normalizers import TextItemNormalizer, TextQualityGate
 from .quarantine import quarantine_bad_runs
@@ -1497,6 +1501,41 @@ def build_parser() -> argparse.ArgumentParser:
         "Without it: read-only report. Curated data change - owner-gated per lane.",
     )
     repromote_parser.add_argument("--format", choices=["json", "text"], default="text")
+
+    wallet_backfill_parser = subparsers.add_parser(
+        "backfill-wallet-flow-from-node",
+        help=(
+            "Recover a frozen-cohort wallet's fills from the local Hyperliquid node archive "
+            "(node_fills_by_block parquet) into a normal wallet-flow lane run that the "
+            "existing score/promote chain lands (raw_type=node_fills_by_block provenance, "
+            "received_at = backfill time). Dedups against every durable clean row. "
+            "Dry-run unless --apply (owner-gated: adds rows to a curated lane)."
+        ),
+    )
+    wallet_backfill_parser.add_argument("--node-root", type=Path, required=True,
+                                        help="Archive root holding date=YYYYMMDD/hour=H.parquet.")
+    wallet_backfill_parser.add_argument("--cohort-path", type=Path, required=True)
+    wallet_backfill_parser.add_argument("--source-root", type=Path, required=True,
+                                        help="The lane's raw root (.../raw/market/hyperliquid_wallet_flow).")
+    wallet_backfill_parser.add_argument("--cold-root", type=Path, default=None,
+                                        help="Cold-tier raw root (the archive-offload cold_root): offloaded runs "
+                                        "count as durable. Without it older fills look missing.")
+    wallet_backfill_parser.add_argument("--curated-root", type=Path, default=None,
+                                        help="Curated dataset root (.../trades_replayable): promoted rows count as durable.")
+    wallet_backfill_parser.add_argument("--wallet", action="append", default=None,
+                                        help="Cohort wallet address; repeatable. Default: every cohort wallet.")
+    wallet_backfill_parser.add_argument("--start", default=None,
+                                        help="ISO-8601 window start (clamped to the prospective boundary).")
+    wallet_backfill_parser.add_argument("--end", default=None, help="ISO-8601 window end (default now).")
+    wallet_backfill_parser.add_argument("--max-clock-skew-ms", type=float, default=None,
+                                        help="Scorer skew gate; fills older than this vs now are excluded, never "
+                                        "written (default: the lane scorer's 90 days).")
+    wallet_backfill_parser.add_argument("--no-poller-guard", action="store_true",
+                                        help="Also write fills inside the live poller's re-fetch window / for wallets "
+                                        "with no hot rows. Only sane while the lane is stopped.")
+    wallet_backfill_parser.add_argument("--apply", action="store_true",
+                                        help="Write the lane run(s). Without it: read-only report.")
+    wallet_backfill_parser.add_argument("--format", choices=["json", "text"], default="text")
 
     subparsers.add_parser("state", help="Show archive and package state")
     return parser
@@ -5121,6 +5160,63 @@ def run_backfill_stream_depth(args: argparse.Namespace) -> None:
         )
 
 
+def run_backfill_wallet_flow_from_node(args: argparse.Namespace) -> None:
+    """Node-archive audit / backfill of cohort wallet fills (see
+    crypto_collector.wallet_flow_backfill). Dry-run unless --apply; --apply adds rows
+    to a curated lane and is owner-gated."""
+    max_skew = getattr(args, "max_clock_skew_ms", None)
+    reports = audit_wallet_flow_against_node(
+        node_root=args.node_root,
+        cohort_path=args.cohort_path,
+        source_root=args.source_root,
+        cold_root=getattr(args, "cold_root", None),
+        curated_root=getattr(args, "curated_root", None),
+        wallets=list(args.wallet) if args.wallet else None,
+        start_ms=_iso_to_ms(getattr(args, "start", None)),
+        end_ms=_iso_to_ms(getattr(args, "end", None)),
+        apply=bool(args.apply),
+        max_clock_skew_ms=float(max_skew) if max_skew is not None else WALLET_BACKFILL_MAX_CLOCK_SKEW_MS,
+        poller_guard=not bool(getattr(args, "no_poller_guard", False)),
+    )
+    if args.format == "json":
+        print(json.dumps([report.to_dict() for report in reports], indent=2, sort_keys=True))
+        return
+    for report in reports:
+        print(
+            f"backfill-wallet-flow-from-node mode={report.mode} status={report.status} "
+            f"wallet={report.wallet} cohort_rank={report.cohort_rank}"
+        )
+        print(
+            f"  window={report.start_ms}..{report.end_ms} node_files={report.node_files_scanned} "
+            f"node_fills={report.node_fill_count} target={report.target_fill_count} "
+            f"durable={report.already_durable_count} (hot={report.durable_hot_count} "
+            f"cold={report.durable_cold_count} curated={report.durable_curated_count}) "
+            f"missing={report.missing_count} writable={report.writable_count} "
+            f"deferred_recent={report.deferred_recent_count} skew_excluded={report.skew_excluded_count}"
+        )
+        if report.missing_count:
+            print(
+                f"  missing {report.missing_first_time} .. {report.missing_last_time} "
+                f"per_coin={report.missing_per_coin} poller_safe_end_ms={report.poller_safe_end_ms}"
+            )
+        if report.run_path:
+            print(
+                f"  run={report.run_path} written={report.written_rows} "
+                f"replayable={report.replayable} findings={report.replay_findings}"
+            )
+
+
+def _iso_to_ms(value: str | None) -> int | None:
+    """Timezone-aware ISO-8601 -> epoch ms. Naive values are refused, matching the
+    lane's cohort loader (a local-clock habit would silently shift the window)."""
+    if value in (None, ""):
+        return None
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError(f"timezone-aware ISO-8601 timestamp required, got {value!r}")
+    return int(parsed.timestamp() * 1000)
+
+
 def run_repromote_short_runs(args: argparse.Namespace) -> None:
     """Repair truncated promotions (see crypto_collector.repromote). Dry-run unless
     --apply; --apply is a curated-data change and is owner-gated per lane."""
@@ -5676,6 +5772,8 @@ def main() -> None:
         run_backfill_stream_depth(args)
     elif args.command == "repromote-short-runs":
         run_repromote_short_runs(args)
+    elif args.command == "backfill-wallet-flow-from-node":
+        run_backfill_wallet_flow_from_node(args)
     elif args.command == "quarantine-runs":
         run_quarantine_runs(args)
     elif args.command == "promote-replayable":
