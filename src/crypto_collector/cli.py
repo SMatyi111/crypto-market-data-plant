@@ -139,6 +139,7 @@ from .offload import (
 )
 from .promotion import promote_replayable_runs
 from .repromote import repromote_short_runs
+from .wallet_flow_backfill import backfill_wallet_flow_from_node
 from .quality import MetadataQualityGate, QualityGate
 from .text_normalizers import TextItemNormalizer, TextQualityGate
 from .quarantine import quarantine_bad_runs
@@ -1497,6 +1498,30 @@ def build_parser() -> argparse.ArgumentParser:
         "Without it: read-only report. Curated data change - owner-gated per lane.",
     )
     repromote_parser.add_argument("--format", choices=["json", "text"], default="text")
+
+    wallet_backfill_parser = subparsers.add_parser(
+        "backfill-wallet-flow-from-node",
+        help=(
+            "Recover a frozen-cohort wallet's fills from the local Hyperliquid node archive "
+            "(node_fills_by_block parquet) into a normal wallet-flow lane run that the "
+            "existing score/promote chain lands (raw_type=node_fills_by_block provenance, "
+            "received_at = backfill time). Dedups against every durable clean row. "
+            "Dry-run unless --apply (owner-gated: adds rows to a curated lane)."
+        ),
+    )
+    wallet_backfill_parser.add_argument("--node-root", type=Path, required=True,
+                                        help="Archive root holding date=YYYYMMDD/hour=H.parquet.")
+    wallet_backfill_parser.add_argument("--cohort-path", type=Path, required=True)
+    wallet_backfill_parser.add_argument("--source-root", type=Path, required=True,
+                                        help="The lane's raw root (.../raw/market/hyperliquid_wallet_flow).")
+    wallet_backfill_parser.add_argument("--wallet", action="append", default=None,
+                                        help="Cohort wallet address; repeatable. Default: every cohort wallet.")
+    wallet_backfill_parser.add_argument("--start", default=None,
+                                        help="ISO-8601 window start (clamped to the prospective boundary).")
+    wallet_backfill_parser.add_argument("--end", default=None, help="ISO-8601 window end (default now).")
+    wallet_backfill_parser.add_argument("--apply", action="store_true",
+                                        help="Write the lane run. Without it: read-only report.")
+    wallet_backfill_parser.add_argument("--format", choices=["json", "text"], default="text")
 
     subparsers.add_parser("state", help="Show archive and package state")
     return parser
@@ -5121,6 +5146,57 @@ def run_backfill_stream_depth(args: argparse.Namespace) -> None:
         )
 
 
+def run_backfill_wallet_flow_from_node(args: argparse.Namespace) -> None:
+    """Node-archive backfill of a cohort wallet's fills (see
+    crypto_collector.wallet_flow_backfill). Dry-run unless --apply; --apply adds rows
+    to a curated lane and is owner-gated."""
+    cohort = load_wallet_flow_cohort(args.cohort_path)
+    wallets = list(args.wallet) if args.wallet else [entry.address for entry in cohort.wallets]
+    start_ms = _iso_to_ms(getattr(args, "start", None))
+    end_ms = _iso_to_ms(getattr(args, "end", None))
+    reports = [
+        backfill_wallet_flow_from_node(
+            node_root=args.node_root,
+            cohort_path=args.cohort_path,
+            source_root=args.source_root,
+            wallet=wallet,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            apply=bool(args.apply),
+        )
+        for wallet in wallets
+    ]
+    if args.format == "json":
+        print(json.dumps([report.to_dict() for report in reports], indent=2, sort_keys=True))
+        return
+    for report in reports:
+        print(
+            f"backfill-wallet-flow-from-node mode={report.mode} status={report.status} "
+            f"wallet={report.wallet} cohort_rank={report.cohort_rank}"
+        )
+        print(
+            f"  window={report.start_ms}..{report.end_ms} node_files={report.node_files_scanned} "
+            f"node_fills={report.node_fill_count} target={report.target_fill_count} "
+            f"durable={report.already_durable_count} missing={report.missing_count}"
+        )
+        if report.missing_count:
+            print(f"  missing {report.missing_first_time} .. {report.missing_last_time} per_coin={report.missing_per_coin}")
+        if report.run_path:
+            print(
+                f"  run={report.run_path} written={report.written_rows} "
+                f"replayable={report.replayable} findings={report.replay_findings}"
+            )
+
+
+def _iso_to_ms(value: str | None) -> int | None:
+    if value in (None, ""):
+        return None
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return int(parsed.timestamp() * 1000)
+
+
 def run_repromote_short_runs(args: argparse.Namespace) -> None:
     """Repair truncated promotions (see crypto_collector.repromote). Dry-run unless
     --apply; --apply is a curated-data change and is owner-gated per lane."""
@@ -5676,6 +5752,8 @@ def main() -> None:
         run_backfill_stream_depth(args)
     elif args.command == "repromote-short-runs":
         run_repromote_short_runs(args)
+    elif args.command == "backfill-wallet-flow-from-node":
+        run_backfill_wallet_flow_from_node(args)
     elif args.command == "quarantine-runs":
         run_quarantine_runs(args)
     elif args.command == "promote-replayable":
