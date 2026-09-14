@@ -3,10 +3,11 @@ node archive into a normal lane run that the existing score/promote chain lands.
 
 Fixtures reproduce the live shape in miniature: a hive-partitioned
 `date=YYYYMMDD/hour=H.parquet` archive with the extractor's string-decimal schema,
-a frozen two-wallet cohort, and a lane raw root that already holds some durable
-rows (the dedup source). The tool must take only the cohort's target coins for the
-named wallet, skip rows already durable, mark provenance via `raw_type`, keep
-event time untouched, and be idempotent.
+a frozen two-wallet cohort, and a lane raw root whose durable rows put the poller's
+high-water PAST the gap (the real post-catch-up situation). The tool must take only
+the cohort's target coins, skip rows already durable on any tier, never write into
+the live poller's re-fetch window or past the scorer's skew gate, mark provenance via
+`raw_type`, keep event time untouched, and be idempotent.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from crypto_collector import cli
 from crypto_collector.promotion import promote_replayable_runs
 from crypto_collector.wallet_flow_backfill import (
     BACKFILL_RAW_TYPE,
+    audit_wallet_flow_against_node,
     backfill_wallet_flow_from_node,
     node_date_dirs,
 )
@@ -32,6 +34,8 @@ from crypto_collector.wallet_flow_backfill import (
 ADDRESS_A = "0x" + "a1" * 20
 ADDRESS_B = "0x" + "b2" * 20
 START = datetime(2026, 8, 9, 0, 45, 48, tzinfo=UTC)
+GAP_START = datetime(2026, 8, 25, 0, 47, 3, tzinfo=UTC)
+HIGHWATER = datetime(2026, 9, 7, 15, 48, 6, tzinfo=UTC)  # poller caught up to here
 NOW = datetime(2026, 9, 14, 13, 0, tzinfo=UTC)
 
 
@@ -119,7 +123,7 @@ def _write_node_archive(root: Path, rows: list[dict]) -> None:
         pq.write_table(pa.Table.from_pylist(group, schema=_SCHEMA), target)
 
 
-def _write_durable_run(source_root: Path, *, wallet: str, tid: int, at: datetime) -> None:
+def _write_durable_run(source_root: Path, *, wallet: str, tid: int, at: datetime) -> Path:
     run_dir = source_root / (at - timedelta(minutes=1)).strftime("%Y%m%d_%H%M%S")
     (run_dir / "clean").mkdir(parents=True, exist_ok=True)
     row = {
@@ -129,10 +133,9 @@ def _write_durable_run(source_root: Path, *, wallet: str, tid: int, at: datetime
         "trade_id": f"{wallet}:{tid}",
         "metadata": {"wallet": wallet, "hyperliquid_timestamp_ms": int(at.timestamp() * 1000)},
     }
-    (run_dir / "clean" / "events.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
-
-
-GAP_START = datetime(2026, 8, 25, 0, 47, 3, tzinfo=UTC)
+    with (run_dir / "clean" / "events.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row) + "\n")
+    return run_dir
 
 
 def _setup(tmp_path: Path):
@@ -142,9 +145,9 @@ def _setup(tmp_path: Path):
     source_root = tmp_path / "raw" / "market" / "hyperliquid_wallet_flow"
     source_root.mkdir(parents=True)
     rows = [
-        # already durable in the lane -> must be skipped
+        # already durable in the lane -> skipped
         _node_row(user=ADDRESS_A, tid=1, at=GAP_START - timedelta(hours=2)),
-        # the gap: two target-coin fills on different days, one with a liquidation blob
+        # the gap: target-coin fills on different days, one with a liquidation blob
         _node_row(user=ADDRESS_A, tid=2, at=GAP_START + timedelta(minutes=1)),
         _node_row(
             user=ADDRESS_A,
@@ -155,16 +158,25 @@ def _setup(tmp_path: Path):
         ),
         # non-target coin -> ignored
         _node_row(user=ADDRESS_A, tid=3, at=GAP_START + timedelta(minutes=2), coin="PUMP"),
-        # other cohort wallet -> not this wallet's backfill
+        # other cohort wallet, its own gap
         _node_row(user=ADDRESS_B, tid=5, at=GAP_START + timedelta(minutes=3)),
         # before the prospective boundary -> ignored even if requested
         _node_row(user=ADDRESS_A, tid=6, at=START - timedelta(days=1)),
         # mixed-case address in the archive must still match
-        {**_node_row(user=ADDRESS_A.upper().replace("0X", "0x"), tid=7, at=GAP_START + timedelta(days=1), coin="SOL")},
+        _node_row(user=ADDRESS_A.upper().replace("0X", "0x"), tid=7, at=GAP_START + timedelta(days=1), coin="SOL"),
+        # the poller's high-water fill itself (durable) and a fill inside its re-fetch window
+        _node_row(user=ADDRESS_A, tid=8, at=HIGHWATER),
+        _node_row(user=ADDRESS_A, tid=9, at=HIGHWATER - timedelta(seconds=90), coin="SOL"),
     ]
     _write_node_archive(node_root, rows)
     _write_durable_run(source_root, wallet=ADDRESS_A, tid=1, at=GAP_START - timedelta(hours=2))
+    _write_durable_run(source_root, wallet=ADDRESS_A, tid=8, at=HIGHWATER)
+    _write_durable_run(source_root, wallet=ADDRESS_B, tid=50, at=HIGHWATER)
     return cohort_path, node_root, source_root
+
+
+def _hour_file_count(node_root: Path) -> int:
+    return len(list(node_root.glob("date=*/hour=*.parquet")))
 
 
 def test_node_date_dirs_selects_inclusive_day_range(tmp_path):
@@ -180,8 +192,9 @@ def test_node_date_dirs_selects_inclusive_day_range(tmp_path):
     ]
 
 
-def test_dry_run_reports_only_missing_target_fills_and_writes_nothing(tmp_path):
+def test_dry_run_reports_missing_target_fills_and_writes_nothing(tmp_path):
     cohort_path, node_root, source_root = _setup(tmp_path)
+    before = sorted(p.name for p in source_root.iterdir())
     report = backfill_wallet_flow_from_node(
         node_root=node_root,
         cohort_path=cohort_path,
@@ -192,16 +205,20 @@ def test_dry_run_reports_only_missing_target_fills_and_writes_nothing(tmp_path):
     )
     assert report.mode == "dry-run" and report.status == "ok"
     assert report.start_ms == int(START.timestamp() * 1000)
-    assert report.node_fill_count == 5  # tids 1,2,3,4,7 (6 is before the boundary, 5 is wallet B)
-    assert report.target_fill_count == 4  # PUMP excluded
-    assert report.already_durable_count == 1
-    assert report.missing_count == 3
-    assert report.missing_per_coin == {"BTC": 1, "ETH": 1, "SOL": 1}
-    assert report.missing_per_day == {"2026-08-25": 1, "2026-08-26": 1, "2026-08-28": 1}
+    assert report.node_files_scanned == _hour_file_count(node_root) - 1  # the pre-boundary day is outside the window
+    assert report.node_fill_count == 7  # tids 1,2,3,4,7,8,9 (6 is before the boundary, 5 is wallet B)
+    assert report.target_fill_count == 6  # PUMP excluded
+    assert report.already_durable_count == 2  # tids 1 and 8
+    assert report.missing_count == 4  # 2, 7, 4, 9
+    assert report.missing_per_coin == {"BTC": 1, "ETH": 1, "SOL": 2}
+    assert report.missing_per_day == {"2026-08-25": 1, "2026-08-26": 1, "2026-08-28": 1, "2026-09-07": 1}
+    # tid 9 sits inside the poller's window (highwater - overlap - margin) -> deferred
+    assert report.hot_highwater_ms == int(HIGHWATER.timestamp() * 1000)
+    assert report.poller_safe_end_ms == report.hot_highwater_ms - 300_000 - 60_000
+    assert report.deferred_recent_count == 1 and report.skew_excluded_count == 0
+    assert report.writable_count == 3
     assert report.run_path is None and report.written_rows == 0
-    assert sorted(p.name for p in source_root.iterdir()) == [
-        (GAP_START - timedelta(hours=2, minutes=1)).strftime("%Y%m%d_%H%M%S")
-    ]
+    assert sorted(p.name for p in source_root.iterdir()) == before
 
 
 def test_apply_writes_a_lane_run_the_promoter_lands_with_provenance(tmp_path):
@@ -212,6 +229,7 @@ def test_apply_writes_a_lane_run_the_promoter_lands_with_provenance(tmp_path):
     )
     assert report.mode == "apply" and report.status == "ok"
     assert report.written_rows == 3 and report.replayable is True and report.replay_findings == []
+    assert report.deferred_recent_count == 1  # tid 9 left to the poller
     run_dir = Path(report.run_path)
     assert run_dir.parent == source_root and run_dir.name == NOW.strftime("%Y%m%d_%H%M%S")
 
@@ -237,7 +255,8 @@ def test_apply_writes_a_lane_run_the_promoter_lands_with_provenance(tmp_path):
     assert replay["replayable"] is True and replay["mode"] == "wallet_flow_none_native" and replay["event_count"] == 3
     summary = [json.loads(x) for x in (run_dir / "metrics" / "summary.jsonl").read_text(encoding="utf-8").splitlines()]
     assert summary[-1]["raw_messages"] == 3 and summary[-1]["clean_events"] == 3
-    assert summary[-1]["capture_source"] == BACKFILL_RAW_TYPE and summary[-1]["already_durable_count"] == 1
+    assert summary[-1]["capture_source"] == BACKFILL_RAW_TYPE and summary[-1]["already_durable_count"] == 2
+    assert summary[-1]["deferred_recent_count"] == 1
 
     # The ordinary promoter lands it; curated rows keep the provenance marker and
     # partition by the true fill date, not the backfill date.
@@ -248,62 +267,80 @@ def test_apply_writes_a_lane_run_the_promoter_lands_with_provenance(tmp_path):
     assert sorted(r["raw_type"] for r in curated) == [BACKFILL_RAW_TYPE] * 3
     assert sorted(str(r["event_date"]) for r in curated) == ["2026-08-25", "2026-08-26", "2026-08-28"]
 
-    # Idempotent: the run's rows are now durable, so a second pass finds nothing.
+    # Idempotent: the run's rows are now durable, so a second pass finds only the
+    # deferred fill and writes nothing.
     again = backfill_wallet_flow_from_node(
         node_root=node_root, cohort_path=cohort_path, source_root=source_root,
         wallet=ADDRESS_A, apply=True, now=NOW + timedelta(minutes=5),
     )
-    assert again.missing_count == 0 and again.status == "nothing_to_backfill"
-    assert again.already_durable_count == 4 and again.run_path is None
-    assert len([p for p in source_root.iterdir() if p.is_dir()]) == 2
+    assert again.missing_count == 1 and again.deferred_recent_count == 1 and again.writable_count == 0
+    assert again.status == "nothing_writable" and again.run_path is None
+    assert again.already_durable_count == 5
+    assert len([p for p in source_root.iterdir() if p.is_dir()]) == 3  # 2 fixture runs + 1 backfill
 
 
-def test_window_end_bounds_the_backfill(tmp_path):
+def test_fills_past_the_skew_gate_are_never_written(tmp_path):
     cohort_path, node_root, source_root = _setup(tmp_path)
+    late_now = GAP_START + timedelta(days=91)  # tid 2 (08-25) is now > 90 d old; 7 and 4 are not
     report = backfill_wallet_flow_from_node(
         node_root=node_root, cohort_path=cohort_path, source_root=source_root,
-        wallet=ADDRESS_A, end_ms=int((GAP_START + timedelta(hours=1)).timestamp() * 1000), now=NOW,
+        wallet=ADDRESS_A, apply=True, now=late_now,
     )
-    assert report.missing_count == 1 and report.missing_per_coin == {"BTC": 1}
+    assert report.missing_count == 4
+    assert report.skew_excluded_count == 1 and report.deferred_recent_count == 1
+    assert report.written_rows == 2 and report.replayable is True and report.status == "ok"
+    clean = [json.loads(x) for x in (Path(report.run_path) / "clean" / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert [c["metadata"]["hyperliquid_trade_id"] for c in clean] == [7, 4]
 
 
-def test_wallet_outside_cohort_is_refused(tmp_path):
+def test_wallet_without_hot_rows_is_not_written_unless_guard_disabled(tmp_path):
     cohort_path, node_root, source_root = _setup(tmp_path)
-    with pytest.raises(ValueError, match="not a member"):
-        backfill_wallet_flow_from_node(
-            node_root=node_root, cohort_path=cohort_path, source_root=source_root,
-            wallet="0x" + "9" * 40, now=NOW,
-        )
-
-
-def test_cli_handler_defaults_to_every_cohort_wallet_dry_run(tmp_path, capsys):
-    cohort_path, node_root, source_root = _setup(tmp_path)
-    cli.run_backfill_wallet_flow_from_node(
-        SimpleNamespace(
-            node_root=node_root, cohort_path=cohort_path, source_root=source_root,
-            cold_root=None, curated_root=None,
-            wallet=None, start=None, end=None, apply=False, format="json",
-        )
+    # wallet B has a durable row at HIGHWATER in the fixture; remove it to simulate "no hot rows"
+    for run_dir in source_root.iterdir():
+        events = run_dir / "clean" / "events.jsonl"
+        rows = [json.loads(x) for x in events.read_text(encoding="utf-8").splitlines()]
+        keep = [r for r in rows if r["metadata"]["wallet"] != ADDRESS_B]
+        events.write_text("".join(json.dumps(r) + "\n" for r in keep), encoding="utf-8")
+    guarded = backfill_wallet_flow_from_node(
+        node_root=node_root, cohort_path=cohort_path, source_root=source_root,
+        wallet=ADDRESS_B, apply=True, now=NOW,
     )
-    reports = json.loads(capsys.readouterr().out)
-    assert [r["wallet"] for r in reports] == [ADDRESS_A, ADDRESS_B]
-    assert [r["missing_count"] for r in reports] == [3, 1]
-    assert all(r["mode"] == "dry-run" and r["run_path"] is None for r in reports)
-    assert not any(p.is_dir() and p.name.startswith("2026091") for p in source_root.iterdir())
-
-
-def test_cli_handler_text_output_and_iso_window(tmp_path, capsys):
-    cohort_path, node_root, source_root = _setup(tmp_path)
-    cli.run_backfill_wallet_flow_from_node(
-        SimpleNamespace(
-            node_root=node_root, cohort_path=cohort_path, source_root=source_root,
-            cold_root=None, curated_root=None,
-            wallet=[ADDRESS_A], start=GAP_START.isoformat(),
-            end=(GAP_START + timedelta(hours=1)).isoformat(), apply=False, format="text",
-        )
+    assert guarded.missing_count == 1 and guarded.poller_safe_end_ms is None
+    assert guarded.status == "poller_window_unknown" and guarded.run_path is None
+    unguarded = backfill_wallet_flow_from_node(
+        node_root=node_root, cohort_path=cohort_path, source_root=source_root,
+        wallet=ADDRESS_B, apply=True, now=NOW, poller_guard=False,
     )
-    out = capsys.readouterr().out
-    assert "mode=dry-run" in out and ADDRESS_A in out and "missing=1" in out
+    assert unguarded.status == "ok" and unguarded.written_rows == 1
+
+
+def test_run_dir_name_never_collides_with_an_existing_run(tmp_path):
+    cohort_path, node_root, source_root = _setup(tmp_path)
+    taken = source_root / NOW.strftime("%Y%m%d_%H%M%S")
+    (taken / "clean").mkdir(parents=True)
+    (taken / "clean" / "events.jsonl").write_text("", encoding="utf-8")
+    reports = audit_wallet_flow_against_node(
+        node_root=node_root, cohort_path=cohort_path, source_root=source_root,
+        wallets=[ADDRESS_A, ADDRESS_B], apply=True, now=NOW,
+    )
+    names = [Path(r.run_path).name for r in reports]
+    assert names == [
+        (NOW + timedelta(seconds=1)).strftime("%Y%m%d_%H%M%S"),
+        (NOW + timedelta(seconds=2)).strftime("%Y%m%d_%H%M%S"),
+    ]
+    assert (taken / "clean" / "events.jsonl").read_text(encoding="utf-8") == ""
+    assert not (taken / "metrics").exists()
+
+
+def test_unknown_wallet_is_refused_before_anything_is_written(tmp_path):
+    cohort_path, node_root, source_root = _setup(tmp_path)
+    before = sorted(p.name for p in source_root.iterdir())
+    with pytest.raises(ValueError, match="not in the frozen cohort"):
+        audit_wallet_flow_against_node(
+            node_root=node_root, cohort_path=cohort_path, source_root=source_root,
+            wallets=[ADDRESS_A, "0x" + "9" * 40], apply=True, now=NOW,
+        )
+    assert sorted(p.name for p in source_root.iterdir()) == before
 
 
 def test_offloaded_and_promoted_rows_count_as_durable(tmp_path):
@@ -315,8 +352,7 @@ def test_offloaded_and_promoted_rows_count_as_durable(tmp_path):
     _write_durable_run(cold_root / source_root.name, wallet=ADDRESS_A, tid=2, at=GAP_START + timedelta(minutes=1))
     curated_root = tmp_path / "curated" / "trades_replayable"
     staging = tmp_path / "staging" / source_root.name
-    _write_durable_run(staging, wallet=ADDRESS_A, tid=7, at=GAP_START + timedelta(days=1))
-    run_dir = next(p for p in staging.iterdir() if p.is_dir())
+    run_dir = _write_durable_run(staging, wallet=ADDRESS_A, tid=7, at=GAP_START + timedelta(days=1))
     (run_dir / "metrics").mkdir()
     (run_dir / "metrics" / "replay_summary.json").write_text(
         json.dumps({"replayable": True, "findings": []}), encoding="utf-8"
@@ -326,14 +362,45 @@ def test_offloaded_and_promoted_rows_count_as_durable(tmp_path):
     hot_only = backfill_wallet_flow_from_node(
         node_root=node_root, cohort_path=cohort_path, source_root=source_root, wallet=ADDRESS_A, now=NOW,
     )
-    assert hot_only.missing_count == 3
+    assert hot_only.missing_count == 4
     assert hot_only.durable_cold_count == 0 and hot_only.durable_curated_count == 0
 
     full = backfill_wallet_flow_from_node(
         node_root=node_root, cohort_path=cohort_path, source_root=source_root, wallet=ADDRESS_A,
         cold_root=cold_root, curated_root=curated_root, now=NOW,
     )
-    assert full.durable_hot_count == 1 and full.durable_cold_count == 1 and full.durable_curated_count == 1
-    assert full.already_durable_count == 3
-    assert full.missing_count == 1 and full.missing_per_coin == {"ETH": 1}
+    assert full.durable_hot_count == 2 and full.durable_cold_count == 1 and full.durable_curated_count == 1
+    assert full.already_durable_count == 4
+    assert full.missing_count == 2 and full.missing_per_coin == {"ETH": 1, "SOL": 1}
     assert full.cold_root == str(cold_root / source_root.name)
+
+
+def test_cli_handler_defaults_to_every_cohort_wallet_dry_run(tmp_path, capsys):
+    cohort_path, node_root, source_root = _setup(tmp_path)
+    cli.run_backfill_wallet_flow_from_node(
+        SimpleNamespace(
+            node_root=node_root, cohort_path=cohort_path, source_root=source_root,
+            cold_root=None, curated_root=None, wallet=None, start=None, end=None,
+            apply=False, format="json", max_clock_skew_ms=None, no_poller_guard=False,
+        )
+    )
+    reports = json.loads(capsys.readouterr().out)
+    assert [r["wallet"] for r in reports] == [ADDRESS_A, ADDRESS_B]
+    assert [r["missing_count"] for r in reports] == [4, 1]
+    assert all(r["mode"] == "dry-run" and r["run_path"] is None for r in reports)
+
+
+def test_cli_handler_text_output_iso_window_and_naive_timestamp_rejected(tmp_path, capsys):
+    cohort_path, node_root, source_root = _setup(tmp_path)
+    args = SimpleNamespace(
+        node_root=node_root, cohort_path=cohort_path, source_root=source_root,
+        cold_root=None, curated_root=None, wallet=[ADDRESS_A], start=GAP_START.isoformat(),
+        end=(GAP_START + timedelta(hours=1)).isoformat(), apply=False, format="text",
+        max_clock_skew_ms=None, no_poller_guard=False,
+    )
+    cli.run_backfill_wallet_flow_from_node(args)
+    out = capsys.readouterr().out
+    assert "mode=dry-run" in out and ADDRESS_A in out and "missing=1" in out and "writable=1" in out
+    args.start = "2026-08-25T00:47"  # naive: the lane's own rule is timezone-aware or nothing
+    with pytest.raises(ValueError, match="timezone-aware"):
+        cli.run_backfill_wallet_flow_from_node(args)
