@@ -7,6 +7,35 @@ git log + the merged PR descriptions; this file keeps the *why*.
 
 ---
 
+## 2026-09-14 - one wallet-flow cohort wallet had been silently stalled for 20 days
+
+**What happened.** The PR #42 (2026-08-17) capped-page paging fixed the "raise
+forever" stall but let the next poll re-enter at `boundary - overlap`. For a wallet
+that once filled >= 2,000 times inside a five-minute window that re-entry returns
+the very same 2,000-row page on every poll: no poll error, ~2,000 duplicates per
+poll, high-water frozen. Cohort wallet 9 (`0x1367df28...560e`) sat like that from
+2026-08-25T00:47Z until the fix - visible only as `last_response_capped: true` plus
+a `duplicate_count` in the tens of thousands per segment, which nothing alerted on.
+
+**Fix (PR #82, Codex draft, reviewed and completed here).** Continue capped pages
+at the exact inclusive boundary (in-memory `page_starts`), and after the uncapped
+page that ends a continuation clamp ordinary overlap re-entry to that page's start
+(`resume_floors`): the review found the un-clamped draft oscillated capped/uncapped
+forever after any burst, re-walking the consumed pages each cycle. Neither cursor is
+persisted (prepared rows may not have been written when a segment ends), so restart
+still recovers from durable clean rows. Additive per-poll diagnostics
+(`metrics/wallet_poll_history.jsonl` via the metrics `JsonlSink`, guarded so a failed
+append can never abort capture) and cap/incomplete counters in the segment summary.
+No schema, partition, verdict or STANDARDS-version change.
+
+**Why it matters / lesson.** `poll_error_count == 0` is not evidence a poller is
+progressing; a stalled-but-successful page looks healthy to every existing
+counter. Cap-aware pollers need a progress metric (high-water age per wallet,
+duplicates per poll) in the health report, not just an error count. The public
+endpoint only exposes a wallet's most recent 10,000 fills, so most of the 08-25 ->
+09-14 window for that wallet is not recoverable from the API (Decision queue:
+S3 node-data backfill vs accept-and-document).
+
 ## 2026-09-10/11 - the hot-path normalized Parquet layer retired and archived (v13)
 
 **What it was.** Every WebSocket lane wrote a second, pre-curation Parquet copy of

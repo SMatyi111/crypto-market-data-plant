@@ -465,7 +465,7 @@ def test_default_overlap_collects_dense_2000_row_page_without_stalling(tmp_path)
     assert poller.incomplete_poll_count == 1
 
 
-def test_capped_boundary_keeps_all_tied_fills_and_resumes_overlap(tmp_path):
+def test_capped_boundary_keeps_all_tied_fills_and_resumes_overlap_from_tail_page(tmp_path):
     base = int(START.timestamp() * 1000)
     ledger = [_fill(trade_id=i, timestamp_ms=base + t)
               for i, t in enumerate([1000, 2000, 2000, 2000, 3000, 4000])]
@@ -486,7 +486,67 @@ def test_capped_boundary_keeps_all_tied_fills_and_resumes_overlap(tmp_path):
         later.extend(emitted)
     assert [x['tid'] for x in later] == [99]
     starts = [r['startTime'] for r in requests if r['user'] == ADDRESS_A]
-    assert starts[:4] == [base, base + 2000, base + 3000, base]
+    # Overlap resumes from the page that ended the continuation (base + 3000),
+    # not from highwater - overlap (= base), which would re-cap the consumed pages.
+    assert starts[:4] == [base, base + 2000, base + 3000, base + 3000]
+    assert poller.resume_floors[ADDRESS_A] == base + 3000
+
+
+def test_finished_continuation_does_not_rewalk_consumed_dense_pages(tmp_path):
+    # A burst denser than the cap, then a quiet wallet: without the resume floor
+    # every ordinary poll re-entered at highwater - overlap, re-capped the first
+    # page and oscillated capped/uncapped forever (duplicates += cap per poll).
+    base = int(START.timestamp() * 1000)
+    ledger = [_fill(trade_id=i, timestamp_ms=base + (i + 1) * 1000) for i in range(6)]
+    poller, requests = _paging_poller(tmp_path, ledger, cap=4)
+    first, _ = asyncio.run(poller.poll())
+    second, _ = asyncio.run(poller.poll())
+    assert [x['tid'] for x in first] == [0, 1, 2]
+    assert [x['tid'] for x in second] == [3, 4, 5]
+    dups_after_catch_up = poller.duplicate_count
+    for _ in range(4):
+        emitted, _ = asyncio.run(poller.poll())
+        assert emitted == []
+        assert poller.last_poll_complete is True
+    assert poller.capped_response_count == 1
+    assert poller.incomplete_poll_count == 1
+    assert poller.duplicate_count == dups_after_catch_up + 4 * 3
+    starts = [r['startTime'] for r in requests if r['user'] == ADDRESS_A]
+    assert starts == [base, base + 4000] + [base + 4000] * 4
+    # New activity is still picked up: the tail page is now exactly cap-sized
+    # (4000..7000), so it is treated as capped and the new fill lands one
+    # poll later from the inclusive boundary - never lost, never re-walked.
+    ledger.append(_fill(trade_id=6, timestamp_ms=base + 7000))
+    emitted = []
+    for _ in range(2):
+        rows, _ = asyncio.run(poller.poll())
+        emitted.extend(rows)
+    assert [x['tid'] for x in emitted] == [6]
+    assert poller.resume_floors[ADDRESS_A] == base + 7000
+
+
+def test_poll_history_write_failure_never_aborts_capture(tmp_path):
+    base = int(START.timestamp() * 1000)
+    ledger = [_fill(trade_id=i, timestamp_ms=base + (i + 1) * 1000) for i in range(2)]
+    cohort_path = tmp_path / 'cohort.json'
+    _write_cohort(cohort_path)
+    blocker = tmp_path / 'not-a-dir'
+    blocker.write_text('x', encoding='utf-8')
+    poller = HyperliquidWalletFlowPoller(
+        cohort=load_wallet_flow_cohort(cohort_path),
+        source_root=tmp_path / 'source', state_path=tmp_path / 'state.json',
+        poll_history_path=blocker / 'history.jsonl',
+        fetch=lambda request: [dict(f) for f in ledger] if request['user'] == ADDRESS_A else [],
+        request_pause_seconds=0, response_cap=2000,
+        clock=lambda: datetime(2026, 8, 9, 0, 10, tzinfo=UTC),
+    )
+    emitted, _ = asyncio.run(poller.poll())
+    assert [x['tid'] for x in emitted] == [0, 1]
+    assert poller.poll_error_count == 0
+    assert poller.poll_history_error_count == 1
+    state = json.loads((tmp_path / 'state.json').read_text(encoding='utf-8'))
+    assert state['poll_history_error_count'] == 1
+    assert state['last_poll_history_error'].startswith(('FileExistsError', 'NotADirectoryError', 'FileNotFoundError'))
 
 
 def test_non_target_dense_page_still_advances_to_target_fills(tmp_path):
