@@ -192,7 +192,37 @@ the same restart.
 | ~~2026-06-19~~ DONE 06-24 | The 06-17 `robocopy /MINAGE:3` move never finished (~88% of partitions still on G:), leaving G: at **3.9 GB free**. First retry (06-22) was killed by the Bash tool's 10-min timeout after freeing ~57 GB. Relaunched **detached via `Start-Process`** (pid 48444) so it survives session/tool teardown -> **COMPLETED 2026-06-24 16:19, FAILED: 0** (45.29 M files / 555 GB moved G:->`D:\market_archive_cold`). **G: now 489 GB free.** D: holds 113,407 normalized partitions (full set). 1 partition / 2 parquet files remain on G: -- robocopy *skipped* them (already byte-present on D: from the 06-17 partial), so redundant not stranded; immaterial (489 GB free). Lesson: long-running moves must be detached, never run inside a Bash call (10-min cap). |
 | ~~2026-07-26~~ DONE 08-01 | **Text raw offload wired for the next restart.** `archive-offload-text` is enabled in `ops.live.local.json` with the indexed promotion/quarantine gate, preserve-first aged-run backstop, byte-verified cold move, and `write_report:false` so it cannot replace the market health report. It remains inert until the guarded elevated runner restart. |
 
-**Last ops audit:** 2026-09-07 — **every lane capturing and fresh; health
+**Last ops audit:** 2026-09-15 — **runner healthy; every configured lane
+capturing and fresh; the PR #82 wallet-flow fix verified live; no new defect.**
+Runner `market-data-plant` up since the 09-10 15:06 local redeploy, heartbeat
+age 2 s, 112 jobs / 31 pooled, run_count 59,139. 24 h: 17,818 success / 27
+error (99.85 %); all 27 are collector-subprocess exits on
+`binance-futures-rest-{trades,depth,funding}` (21), the three OI lanes (4) and
+two Binance depth lanes (2) — the fapi DNS/TLS flap present since June; every
+lane's latest status is success. Newest raw run <= 30 min on all 30 segment
+lanes; the four liquidation day-runs started 00:00Z (23 h old by design);
+leaderboard daily on cadence (16:21Z); options lanes on cadence (Binance chain
+346 / Deribit 1,034 hot runs). Curated `market_replayable` newest file 0.2 h.
+Health `status=warn`, sole finding `offload_stuck_above_baseline:11` (7
+`binance_perp_funding` restart partials 09-05..09-10, 3 legacy
+`binance_perp_open_interest` 09-04..09-06, 1 `hyperliquid_wallet_flow` 09-05;
+the 10-day backstop classified 1 this pass); offload 22:15Z pass 67 moved / 0
+failed. Quarantine intake 7 d: `binance_perp_open_interest` 323 (legacy
+shared-dir runs quarantined by the 09-08 per-symbol fix), text_rss 141
+`no_events` (by design), kraken 16 / coinbase 14 `trade_id_gaps`,
+binance_perp_trades 10, others <= 4. **Wallet-flow lane:** all 10 cohort
+wallets `last_poll_status=response_uncapped`; wallet 9 `0x1367df28...` uncapped
+with a resume floor set, i.e. PR #82 behaves as designed; the #83 node-archive
+dry-run read 0 missing on 09-14. Disk: G: 410 GB free, D: 361 GB (D: fell
+830 -> 361 GB since 09-08: the 229 GB normalized move plus owner activity;
+plant cold tier grows ~2.4 GB/day, not urgent). `main 4343f49`: 642 tests pass
+(the suite still writes `raw/market/mock/` run dirs, open item 16).
+**Findings:** none new. Carried: item 12 (`heartbeat_history.jsonl` growth),
+item 17 (`runner.log` not written); add the wallet-flow node-audit dry-run
+(`backfill-wallet-flow-from-node` with `--cold-root`/`--curated-root`) to this
+ritual from the next audit on.
+
+**Previous ops audit:** 2026-09-07 — **every lane capturing and fresh; health
 `status=error` is entirely the two 09-02 defects still waiting on PR #54 + a
 redeploy; one NEW dataset-wide finding: roughly a third of curated runs are
 truncated because the hourly scorers score the live segment.** Runner pid 31808
