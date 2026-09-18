@@ -19,6 +19,51 @@ Last updated: **2026-09-14**.
 
 ---
 
+## Decision + build — ETH/SOL completeness build; the "no new lanes" directive superseded (PR #86, 2026-09-17/18)
+
+**Owner decision 2026-09-17**, superseding the 2026-09-09 "stabilize this set; no new
+lanes" directive: *"there is nothing to stabilize if nothing is complete."* Scope
+approved: tiers 1-3 and 5 of the expansion list; tier 5 (Hyperliquid universe
+positioning) is NOT in this build.
+
+**The gap it closes.** The plant recorded the cause without the effect. ETH and SOL
+liquidations and open interest have been collected since 2026-09-08 while all 14
+market-data lanes were BTC, so the return response to an ETH liquidation was not
+computable, nor dOI against return for two of three symbols. Liquidations trigger off
+**mark price**, which existed for BTC only - the trigger variable for the ETH/SOL
+liquidations already on disk did not exist.
+
+**Built.** Lanes 34-35 (Binance ETH/SOL mark-index-funding, LIVE 2026-09-17 20:48Z) and
+36-43 (ETH/SOL perp trades+depth on Bybit and OKX, configured, live at the next
+redeploy). Each landed with its promoter, scorer, `quarantine-runs` job and
+`archive-offload` entry in the same change; a completeness audit shows 37 promoters and
+37 quarantine jobs with no gaps, and every new lane present in all four lists. Also
+closed: `binance_perp_funding` was promoted but had NO scorer - the lane that minted 141
+of the 2026-09-13 orphans was only ever scored at graceful segment close. It, the two
+new funding lanes and the four liquidations lanes now have catch-up scorers.
+
+**Capacity.** Cold tier moved G: -> `I:\market_archive_cold` (KNOWLEDGE-DEEP-A,
+mirrored to J:) on 2026-09-17: runway ~9 days -> ~389 at the post-expansion rate, and
+the archive is mirrored for the first time. Deep's own STORAGE-IDENTITY purpose line
+covers datasets; CORE is excluded (compact text corpus, 50 GB cap, validation to
+~2026-10-05). Deliberate deviation from that plan's "one model Deep" intake cap,
+recorded rather than silent. **Runway is deferral, not retention** - the keep/expire
+decision is still owed.
+
+**Open.**
+1. **I/O-ceiling re-test.** Eight new websocket lanes are the first real test since the
+   2026-06-08 NVMe cut-over (D: could not keep up: Coinbase ~0.55 / Bybit ~1.0
+   quarantine ratios). Baseline on 2026-09-17 was clean (no `high_quarantine_ratio`).
+   Check per-lane quarantine ratio after the redeploy; back the lanes out if it moves.
+2. **Curated completeness check** for lanes 34-43 before their grades stop being
+   inherited guesses.
+3. **Tier 5** (Hyperliquid universe positioning) not started. It is the only
+   unrepeatable lane on the list: every hour not stored is gone.
+4. `binance_options_chain`, `deribit_options` and the disabled/legacy lanes still have
+   no catch-up scorer - snapshot-reference contract, decide separately.
+
+---
+
 ## Finding — undetected 12.5 h fapi outage on 2026-09-13 minted ~218 permanently unaccounted runs (PR #85, 2026-09-17)
 
 **The outage.** `job_runs.jsonl` records 663 errors on 2026-09-13 against 17,757

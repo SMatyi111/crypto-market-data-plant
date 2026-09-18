@@ -22,7 +22,7 @@
 param(
     [string]$OpsRoot = "G:\market_archive\ops",
     # Match run_ops_runner.ps1's live default (one slot per pooled lane; see the
-    # full 37-slot enumeration there, including the 2 options-IV snapshot lanes).
+    # full 45-slot enumeration there, including the 2 options-IV snapshot lanes).
     # Keep these in sync -- a
     # redeploy with a lower value silently throttles coverage until reboot.
     [int]$CollectorConcurrency = 45

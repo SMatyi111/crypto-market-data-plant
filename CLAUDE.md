@@ -19,7 +19,8 @@ Resolved-work narrative: [`docs/HISTORY.md`](docs/HISTORY.md). Runbook:
   delivering a change: merged ≠ deployed.
 - **When adding collector lanes, bump `-CollectorConcurrency`** in
   `scripts/run_ops_runner.ps1` AND `scripts/redeploy_runner.ps1` (one slot per
-  worker lane — currently 21). This has silently starved new lanes twice.
+  worker lane — currently 45, covering 43 enabled lanes). This has silently
+  starved new lanes twice.
 - **Thread new per-lane config fields centrally** through `_run_segmented_worker`
   in `cli.py`, never by extending a per-venue `build_segment_args` lambda — those
   lambdas silently dropped `market` and `jsonl_fsync` in the past. Add a regression

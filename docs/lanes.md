@@ -1,7 +1,9 @@
-# Active lanes and research-grade status (snapshot 2026-09-10)
+# Active lanes and research-grade status (snapshot 2026-09-18)
 
-Owner directive 2026-09-09: **stabilize this set; no new lanes.** 33 enabled
-lanes from `ops.live.local.json` (34 configured; `binance-perp-liquidations`
+Owner directive 2026-09-09 was **stabilize this set; no new lanes**; the owner
+SUPERSEDED it on 2026-09-17 ("there is nothing to stabilize if nothing is
+complete") and approved the ETH/SOL completeness build in lanes 34-43 below.
+43 enabled lanes from `ops.live.local.json` (47 configured; `binance-perp-liquidations`
 disabled because fstream delivers no frames from this host; Kalshi lanes off
 since the 2026-06-17 disk incident). "Grade" is what a research consumer can
 assume if the plant is left exactly as it is. The curated tier was repaired
@@ -91,12 +93,19 @@ Lanes 34-35 close that first and cost under 0.1 GB/day; lanes 36-43 give both sy
 a price series on the same venues whose liquidations are already recorded, so an event
 study shares the venue, the book and the clock.
 
+**Status 2026-09-18: lanes 34-35 are LIVE (since 2026-09-17 20:48Z). Lanes 36-43
+are CONFIGURED but NOT YET COLLECTING** - they start at the next runner redeploy,
+because the ops runner reads its config only at startup. Until then they have no
+raw dirs, and `archive-offload-cold` logs an hourly `missing_lane_dir` warning for
+each; that is expected and clears on redeploy.
+
 Grades above are inherited from the BTC lane of the same venue+type (same worker, same
 channel, same gap-detection class); each of the four venue/type combinations was probed
 live against a throwaway archive before going in, returning `replayable=True` with the
 correctly suffixed run dir. **Treat them as provisional until the first curated
-completeness check.** History starts 2026-09-18, so there is no pre-2026-09-18 ETH/SOL
-market data in the plant and none can be obtained retrospectively.
+completeness check.** History starts 2026-09-17 20:48Z for lanes 34-35 and at the
+next redeploy for lanes 36-43; there is no earlier ETH/SOL market data in the plant
+and none can be obtained retrospectively.
 
 Capacity note: the cold tier moved G: -> `I:\market_archive_cold` (KNOWLEDGE-DEEP-A,
 mirrored to J:) on 2026-09-17, taking runway from ~9 days to ~389 at the post-expansion
