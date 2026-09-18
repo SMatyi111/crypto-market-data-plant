@@ -5057,8 +5057,6 @@ def run_backfill_stream_depth(args: argparse.Namespace) -> None:
                 started_at = _backfill_run_started_at(run_dir)
                 if started_at is not None and started_at < cutoff:
                     continue
-                if not (run_dir / "clean" / "events.jsonl").exists():
-                    continue
                 # Apply the work limit AFTER excluding already-scored runs. Otherwise,
                 # N newer scored runs permanently hide an older cut-off run from this
                 # self-healing pass.
