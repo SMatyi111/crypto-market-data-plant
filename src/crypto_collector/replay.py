@@ -2011,9 +2011,14 @@ def _resolve_run_paths(run_path: Path) -> tuple[Path, Path, Path | None]:
     events_path = run_path / "clean" / "events.jsonl"
     # A run dir whose events file never appeared (worker died before its first
     # event) is scored, not rejected: the scorers read zero rows and write an
-    # unreplayable summary, which is what lets quarantine + offload account for
-    # it. Only a path that is not a run dir at all is still an error.
-    if not events_path.exists() and not run_path.is_dir():
+    # unreplayable summary, which is what lets quarantine + offload account for it.
+    # The `clean/` subdir is the structural proof that this IS a run dir - the
+    # collector creates clean/ metrics/ quarantine/ raw/ at run start, before the
+    # first event. Accepting any existing directory instead would let a mistyped
+    # lane root mint `<lane>/metrics/replay_summary.json`, which _recent_run_dirs
+    # would then see as a run dir whose unparseable name bypasses BOTH the max-age
+    # cutoff and the min-age floor - a permanent phantom run in the quarantine index.
+    if not events_path.exists() and not events_path.parent.is_dir():
         raise FileNotFoundError(f"replay run dir not found: {run_path}")
     return run_path, events_path, run_path / "metrics" / "replay_summary.json"
 
