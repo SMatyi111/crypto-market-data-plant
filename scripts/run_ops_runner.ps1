@@ -17,9 +17,14 @@ param(
     # frozen-cohort Hyperliquid worker + the daily Hyperliquid leaderboard
     # snapshot + 5 liquidation lanes (3 bybit symbols, okx all-swap, binance
     # all-market) + 3 Binance open-interest lanes + 2 options-IV snapshot lanes
-    # (binance-options-chain-snapshot, deribit-options-snapshot) = 37 slots,
-    # one per pooled lane.
-    [int]$CollectorConcurrency = 37
+    # (binance-options-chain-snapshot, deribit-options-snapshot) = 37, plus the
+    # 2026-09-17/18 ETH+SOL completeness build: 2 Binance mark/index/funding lanes
+    # (the liquidation TRIGGER variable, previously BTC-only while ETH and SOL
+    # liquidations were already being recorded) + 8 ETH/SOL perp lanes (Bybit and
+    # OKX x trades and depth) giving those two symbols a price series at last
+    # = 43 pooled lanes. 45 leaves 2 slots of headroom; raise it by one per lane
+    # added, in BOTH this script and redeploy_runner.ps1.
+    [int]$CollectorConcurrency = 45
 )
 
 $ErrorActionPreference = "Stop"

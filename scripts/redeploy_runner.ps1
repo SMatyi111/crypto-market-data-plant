@@ -25,7 +25,7 @@ param(
     # full 37-slot enumeration there, including the 2 options-IV snapshot lanes).
     # Keep these in sync -- a
     # redeploy with a lower value silently throttles coverage until reboot.
-    [int]$CollectorConcurrency = 37
+    [int]$CollectorConcurrency = 45
 )
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
