@@ -167,7 +167,12 @@ def test_backfill_text_replay_scores_eventless_runs(tmp_path: Path) -> None:
     assert quiet["replayable"] is False
     assert quiet["findings"] == ["no_events"]
 
-    # Default (market) semantics unchanged: require_events=True still skips it.
+    # The market lanes now get the same treatment (default flipped 2026-09-17).
+    # Scoping this to text was itself the bug: the 2026-09-13 fapi outage crash-looped
+    # the Binance REST workers for ~12.5 h and minted ~218 eventless run dirs that,
+    # being skipped here, could never be promoted OR quarantined - archive-offload was
+    # still reporting them as stuck_unaccounted four days later. Skipping a run never
+    # closes its accounting, so no lane should do it.
     (lane_root / "20260715_123000" / "metrics" / "replay_summary.json").unlink()
     report = backfill_replay_summaries(
         lane_root,
@@ -175,7 +180,11 @@ def test_backfill_text_replay_scores_eventless_runs(tmp_path: Path) -> None:
         max_age_hours=24 * 365 * 10,
         replay_fn=lambda run_dir, write_summary=True: scorer(run_dir, write_summary=write_summary),
     )
-    assert any(run.action == "skipped_missing_events" for run in report.runs)
+    assert not any(run.action == "skipped_missing_events" for run in report.runs)
+    rescored = json.loads(
+        (lane_root / "20260715_123000" / "metrics" / "replay_summary.json").read_text(encoding="utf-8")
+    )
+    assert rescored["replayable"] is False
 
 
 def test_backfill_min_age_floor_skips_the_live_run(tmp_path: Path) -> None:

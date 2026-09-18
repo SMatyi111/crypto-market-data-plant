@@ -784,7 +784,7 @@ def backfill_replay_summaries(
     max_age_hours: float = 24.0,
     overwrite: bool = False,
     replay_fn: Callable[..., Any] = replay_depth_run,
-    require_events: bool = True,
+    require_events: bool = False,
     min_age_hours: float = 0.0,
 ) -> ReplayBackfillReport:
     """Re-score archived runs missing a `metrics/replay_summary.json`.
@@ -794,11 +794,17 @@ def backfill_replay_summaries(
     `.findings`, and `.summary_path`. Defaults to `replay_depth_run` (Binance depth);
     pass `replay_trades_run` / `replay_trades_stream_run` to backfill a trades lane.
 
-    `require_events=False` (text lanes) also scores runs with NO clean/events.jsonl:
-    a quiet poll window or a crash-before-first-item legitimately leaves none, and
-    skipping those runs is exactly how the funding lane minted a permanent
-    unaccounted orphan per restart - the text scorer writes a `no_events` summary
-    instead, so quarantine + offload accounting always closes.
+    `require_events=False` (the default since 2026-09-17, previously text-only) also
+    scores runs with NO clean/events.jsonl: a quiet poll window or a crash-before-
+    first-item legitimately leaves none, and skipping those runs is exactly how the
+    funding lane minted a permanent unaccounted orphan per restart - the scorer writes
+    a `no_events` summary instead, so quarantine + offload accounting always closes.
+    Scoping this to text was the residual bug: the 2026-09-13 fapi outage crash-looped
+    the Binance REST workers for ~12.5 h (663 subprocess exits, WinError 10054 and
+    timeouts) and minted ~218 eventless run dirs that were still reported as
+    `stuck_unaccounted` four days later, because a run with no summary can be neither
+    promoted nor quarantined. Pass `require_events=True` only if a caller genuinely
+    wants such runs left unaccounted.
 
     `min_age_hours > 0` skips runs YOUNGER than that floor - i.e. the run the
     collector is (or may still be) actively writing. Scoring a live run mints a
@@ -2003,12 +2009,31 @@ def _resolve_run_paths(run_path: Path) -> tuple[Path, Path, Path | None]:
         return run_path.parent, events_path, None
 
     events_path = run_path / "clean" / "events.jsonl"
-    if not events_path.exists():
-        raise FileNotFoundError(f"replay events not found: {events_path}")
+    # A run dir whose events file never appeared (worker died before its first
+    # event) is scored, not rejected: the scorers read zero rows and write an
+    # unreplayable summary, which is what lets quarantine + offload account for it.
+    # The `clean/` subdir is the structural proof that this IS a run dir - the
+    # collector creates clean/ metrics/ quarantine/ raw/ at run start, before the
+    # first event. Accepting any existing directory instead would let a mistyped
+    # lane root mint `<lane>/metrics/replay_summary.json`, which _recent_run_dirs
+    # would then see as a run dir whose unparseable name bypasses BOTH the max-age
+    # cutoff and the min-age floor - a permanent phantom run in the quarantine index.
+    if not events_path.exists() and not events_path.parent.is_dir():
+        raise FileNotFoundError(f"replay run dir not found: {run_path}")
     return run_path, events_path, run_path / "metrics" / "replay_summary.json"
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    # A run that died before writing its first event has no clean/events.jsonl at
+    # all. Returning no rows (instead of raising FileNotFoundError) lets every
+    # scorer mint a zero-event, unreplayable summary for it, so the quarantine +
+    # offload accounting closes. Skipping such runs is how the funding lane minted
+    # permanent unaccounted orphans: the 2026-09-13 fapi outage (663 worker exits,
+    # WinError 10054 / timeouts over ~12.5 h) left ~218 of them, and they were
+    # still stuck four days later because a run with no summary can be neither
+    # promoted nor quarantined.
+    if not path.exists():
+        return []
     rows: list[dict[str, Any]] = []
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():

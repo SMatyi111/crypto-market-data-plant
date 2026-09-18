@@ -3,13 +3,18 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from crypto_collector.replay import (
     _kraken_book_crc32,
     backfill_replay_summaries,
     replay_depth_run,
     replay_depth_stream_run,
+    replay_funding_run,
+    replay_liquidations_run,
     replay_trades_run,
     replay_trades_stream_run,
+    replay_wallet_flow_run,
 )
 
 
@@ -1652,4 +1657,63 @@ def test_replay_trades_run_blocks_runs_with_missing_trade_ids(tmp_path):
     summary = replay_trades_run(run_dir, write_summary=False)
     assert summary.missing_trade_id_count == 1
     assert "missing_trade_ids" in summary.findings
+    assert summary.replayable is False
+
+
+def _run_dir_without_events(tmp_path: Path, name: str) -> Path:
+    """A run dir exactly as a collector leaves it when the worker dies before its
+    first event: the dir and its metrics/ exist, clean/events.jsonl never appeared."""
+    run_dir = tmp_path / name
+    (run_dir / "metrics").mkdir(parents=True)
+    (run_dir / "clean").mkdir()
+    return run_dir
+
+
+def test_market_scorers_summarise_a_run_that_died_before_its_first_event(tmp_path: Path) -> None:
+    """Regression for the unaccounted-orphan class (2026-09-13).
+
+    A run with NO clean/events.jsonl must still get a replay summary. Without one it
+    can be neither promoted nor quarantined, so archive-offload strands it forever as
+    `stuck_unaccounted` - the 12.5 h fapi outage minted ~218 such dirs across the
+    Binance REST lanes and they were still stuck four days later.
+    """
+    for index, scorer in enumerate(
+        (
+            replay_depth_run,
+            replay_trades_run,
+            replay_trades_stream_run,
+            replay_depth_stream_run,
+            replay_funding_run,  # the lane that minted 141 of the ~218 orphan dirs
+            replay_liquidations_run,
+            replay_wallet_flow_run,
+        )
+    ):
+        run_dir = _run_dir_without_events(tmp_path, f"run_{index}")
+        summary = scorer(run_dir)
+
+        summary_path = run_dir / "metrics" / "replay_summary.json"
+        assert summary_path.exists(), f"{scorer.__name__} wrote no summary"
+        payload = json.loads(summary_path.read_text(encoding="utf-8"))
+        assert payload["replayable"] is False, f"{scorer.__name__} called an empty run replayable"
+        assert summary.replayable is False
+        assert payload.get("findings"), f"{scorer.__name__} recorded no finding"
+
+
+def test_scoring_a_path_that_is_not_a_run_dir_still_raises(tmp_path: Path) -> None:
+    """The eventless-run tolerance must not degrade into "score any directory".
+
+    A lane root has no clean/ subdir. If it were accepted, scoring it would mint
+    <lane>/metrics/replay_summary.json; _recent_run_dirs would then treat that new
+    metrics dir as a run whose unparseable name bypasses both the max-age cutoff and
+    the min-age floor, leaving a permanent phantom run in the quarantine index.
+    """
+    lane_root = tmp_path / "binance_perp_funding"
+    (lane_root / "20260913_115704" / "clean").mkdir(parents=True)
+
+    with pytest.raises(FileNotFoundError):
+        replay_funding_run(lane_root)
+    assert not (lane_root / "metrics").exists()
+
+    # The real run dir underneath it still scores, because it has clean/.
+    summary = replay_funding_run(lane_root / "20260913_115704")
     assert summary.replayable is False

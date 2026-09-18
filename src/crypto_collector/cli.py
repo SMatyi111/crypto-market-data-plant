@@ -1916,19 +1916,10 @@ def _finalize_depth_segment(
 ) -> dict[str, object]:
     if parquet_sink is not None:
         parquet_sink.flush()
-    events_path = run_paths.base / "clean" / "events.jsonl"
-    if events_path.exists():
-        replay_summary = replay_depth_run(run_paths.base, write_summary=True)
-        replayable = replay_summary.replayable
-        findings = list(replay_summary.findings)
-        summary_path = replay_summary.summary_path
-    else:
-        # Segment ended with zero clean events (e.g., immediate alignment break on
-        # reconnect). No data to replay — flag the run as unreplayable so downstream
-        # quarantine + promotion treat it as a no-op rather than crashing.
-        replayable = False
-        findings = ["no_clean_events"]
-        summary_path = None
+    replay_summary = replay_depth_run(run_paths.base, write_summary=True)
+    replayable = replay_summary.replayable
+    findings = list(replay_summary.findings)
+    summary_path = replay_summary.summary_path
     metrics_sink.write(
         {
             "raw_messages": message_count,
@@ -2320,21 +2311,14 @@ async def _collect_trades_segment(
     # Write the trades replay summary so the existing quarantine + promote chain
     # (which keys off `metrics/replay_summary.json`) can curate trades runs the
     # same way it curates depth runs.
-    events_path = run_paths.base / "clean" / "events.jsonl"
-    if events_path.exists():
-        replay_summary = replay_fn(
-            run_paths.base,
-            max_clock_skew_ms=float(getattr(args, "max_clock_skew_ms", 60_000.0)),
-            write_summary=True,
-        )
-        replayable = replay_summary.replayable
-        replay_findings = list(replay_summary.findings)
-        replay_summary_path = replay_summary.summary_path
-    else:
-        replayable = False
-        replay_findings = ["no_clean_events"]
-        replay_summary_path = None
-
+    replay_summary = replay_fn(
+        run_paths.base,
+        max_clock_skew_ms=float(getattr(args, "max_clock_skew_ms", 60_000.0)),
+        write_summary=True,
+    )
+    replayable = replay_summary.replayable
+    replay_findings = list(replay_summary.findings)
+    replay_summary_path = replay_summary.summary_path
     return {
         "raw_messages": pipeline_summary.raw_messages,
         "clean_events": pipeline_summary.clean_events,
@@ -2536,26 +2520,19 @@ async def _collect_depth_stream_segment(
         deadline_utc=getattr(args, "deadline_utc", None),
     )
 
-    events_path = run_paths.base / "clean" / "events.jsonl"
-    if events_path.exists():
-        replay_summary = replay_depth_stream_run(
-            run_paths.base,
-            write_summary=True,
-            sequence_metadata_key=sequence_metadata_key,
-            chain_sequence=chain_sequence,
-            checksum_metadata_key=checksum_metadata_key,
-            checksum_price_precision=checksum_price_precision,
-            checksum_qty_precision=checksum_qty_precision,
-            book_depth=book_depth,
-        )
-        replayable = replay_summary.replayable
-        replay_findings = list(replay_summary.findings)
-        replay_summary_path = replay_summary.summary_path
-    else:
-        replayable = False
-        replay_findings = ["no_clean_events"]
-        replay_summary_path = None
-
+    replay_summary = replay_depth_stream_run(
+        run_paths.base,
+        write_summary=True,
+        sequence_metadata_key=sequence_metadata_key,
+        chain_sequence=chain_sequence,
+        checksum_metadata_key=checksum_metadata_key,
+        checksum_price_precision=checksum_price_precision,
+        checksum_qty_precision=checksum_qty_precision,
+        book_depth=book_depth,
+    )
+    replayable = replay_summary.replayable
+    replay_findings = list(replay_summary.findings)
+    replay_summary_path = replay_summary.summary_path
     return {
         "raw_messages": pipeline_summary.raw_messages,
         "clean_events": pipeline_summary.clean_events,
@@ -2702,29 +2679,23 @@ async def collect_binance_futures_rest_segment(args: argparse.Namespace) -> dict
     )
 
     events_path = run_paths.base / "clean" / "events.jsonl"
-    if events_path.exists():
-        if stream == "depth":
-            replay_summary = replay_depth_stream_run(run_paths.base, write_summary=True)
-        elif stream in ("funding", "open_interest"):
-            replay_summary = replay_funding_run(
-                run_paths.base,
-                max_clock_skew_ms=float(getattr(args, "max_clock_skew_ms", 60_000.0)),
-                write_summary=True,
-            )
-        else:
-            replay_summary = replay_trades_run(
-                run_paths.base,
-                max_clock_skew_ms=float(getattr(args, "max_clock_skew_ms", 60_000.0)),
-                write_summary=True,
-            )
-        replayable = replay_summary.replayable
-        replay_findings = list(replay_summary.findings)
-        replay_summary_path = replay_summary.summary_path
+    if stream == "depth":
+        replay_summary = replay_depth_stream_run(run_paths.base, write_summary=True)
+    elif stream in ("funding", "open_interest"):
+        replay_summary = replay_funding_run(
+            run_paths.base,
+            max_clock_skew_ms=float(getattr(args, "max_clock_skew_ms", 60_000.0)),
+            write_summary=True,
+        )
     else:
-        replayable = False
-        replay_findings = ["no_clean_events"]
-        replay_summary_path = None
-
+        replay_summary = replay_trades_run(
+            run_paths.base,
+            max_clock_skew_ms=float(getattr(args, "max_clock_skew_ms", 60_000.0)),
+            write_summary=True,
+        )
+    replayable = replay_summary.replayable
+    replay_findings = list(replay_summary.findings)
+    replay_summary_path = replay_summary.summary_path
     # Advance the lane cursor only after this segment's clean events are durably on disk,
     # to the highest id actually written (not the pager's fetched high-water, which can run
     # ahead of what was persisted when a segment ends mid-batch). This keeps resume
@@ -2833,20 +2804,14 @@ async def collect_hyperliquid_wallet_flow_segment(
         limit=args.count,
         deadline_utc=getattr(args, "deadline_utc", None),
     )
-    events_path = run_paths.clean / "events.jsonl"
-    if events_path.exists():
-        replay_summary = replay_wallet_flow_run(
-            run_paths.base,
-            max_clock_skew_ms=float(getattr(args, "max_clock_skew_ms", 7_776_000_000.0)),
-            write_summary=True,
-        )
-        replayable = replay_summary.replayable
-        replay_findings = list(replay_summary.findings)
-        replay_summary_path = replay_summary.summary_path
-    else:
-        replayable = False
-        replay_findings = ["no_clean_events"]
-        replay_summary_path = None
+    replay_summary = replay_wallet_flow_run(
+        run_paths.base,
+        max_clock_skew_ms=float(getattr(args, "max_clock_skew_ms", 7_776_000_000.0)),
+        write_summary=True,
+    )
+    replayable = replay_summary.replayable
+    replay_findings = list(replay_summary.findings)
+    replay_summary_path = replay_summary.summary_path
     JsonlSink(run_paths.metrics, "summary.jsonl").write(
         {
             "wallet_count": len(cohort.wallets),
@@ -5056,8 +5021,6 @@ def run_backfill_stream_depth(args: argparse.Namespace) -> None:
             ):
                 started_at = _backfill_run_started_at(run_dir)
                 if started_at is not None and started_at < cutoff:
-                    continue
-                if not (run_dir / "clean" / "events.jsonl").exists():
                     continue
                 # Apply the work limit AFTER excluding already-scored runs. Otherwise,
                 # N newer scored runs permanently hide an older cut-off run from this

@@ -19,6 +19,53 @@ Last updated: **2026-09-14**.
 
 ---
 
+## Finding — undetected 12.5 h fapi outage on 2026-09-13 minted ~218 permanently unaccounted runs (PR #85, 2026-09-17)
+
+**The outage.** `job_runs.jsonl` records 663 errors on 2026-09-13 against 17,757
+successes, every one a `binance-futures-rest-worker` exiting 1 between 11:23Z and
+23:57Z: 577 `URLError`, 657 `timed out`, 82 `TimeoutError`, representative tail
+`urllib.error.URLError: <urlopen error [WinError 10054] An existing connection was
+forcibly closed by the remote host>`. Binance fapi was resetting connections from this
+host and every REST lane crash-looped — trades 238, depth 210, funding 141,
+open-interest 24/23/23, options-chain 4. Consistent with the already-recorded fact that
+Binance fstream delivers nothing here: the venue is network-hostile to this IP.
+
+**Why it went unseen for four days.** A crashed worker leaves a run dir with `clean/`
+`metrics/` `quarantine/` `raw/` but no `clean/events.jsonl`. The market scorers skipped
+such runs, and a run with no `metrics/replay_summary.json` can be neither promoted nor
+quarantined — so `archive-offload` reported them as `stuck_unaccounted` indefinitely.
+That counter (111 -> 253 over the following hours) was the *only* trace the incident
+left. Nothing alerts on collection stopping; the health surface showed the aged
+side-effect days later, not the failure.
+
+**Fixed in PR #85.** Eventless runs are now scored on every lane, not just text:
+`_read_jsonl` tolerates a missing file, `_resolve_run_paths` accepts a run dir whose
+events file never appeared (proved by its `clean/` subdir, so a mistyped lane root
+still raises), `backfill_replay_summaries` defaults to `require_events=False`, and the
+five market collector finalizers call their scorer unconditionally instead of writing
+`summary_path = None`. Eventless runs score `replayable: false` / `no_events`, so
+quarantine + offload accounting closes.
+
+**Still open.**
+1. **The ~218 existing orphans are older than every score job's `max_age_hours`**
+   (6 h most trades lanes, 168 h binance_depth, 336 h OI), and both backfill loops
+   `continue` past `started_at < cutoff`. Merging PR #85 will NOT clear them — a
+   one-shot wide-window backfill is needed. The offload preserve-first backstop
+   (`quarantine_unaccounted_after_days: 10`, `apply: true`) would close them around
+   2026-09-23 on its own.
+2. **Lanes with no `score-*` job are still not reached by the backfill tolerance at
+   all** — `binance_perp_funding` (the lane that minted 141 of the orphans),
+   `binance_perp_liquidations`, `deribit_options`, `binance_options_chain`. They are
+   scored only as a side effect of their promote job. Add score jobs.
+3. **No alert on collection stopping.** A guard on unscored-run *rate* would have
+   fired on 2026-09-13 within the hour. The current signal is a counter that only
+   moves once runs age past the offload threshold.
+4. **Retry/backoff.** The REST worker retries HTTP 429 only (418 deliberately never);
+   transient network errors fail the segment. Retrying them would have kept lanes alive
+   through the blips inside the outage window.
+
+---
+
 ## Finding — wallet lane audited against the chain: 12.4 % of cohort fills were missing; 39,852 backfilled from the node archive (PR #82 fix, PR #83 tool, 2026-09-14)
 
 **The stall (fixed, PR #82).** The PR #42 capped-page paging advanced the high-water to
