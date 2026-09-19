@@ -99,13 +99,32 @@ because the ops runner reads its config only at startup. Until then they have no
 raw dirs, and `archive-offload-cold` logs an hourly `missing_lane_dir` warning for
 each; that is expected and clears on redeploy.
 
-Grades above are inherited from the BTC lane of the same venue+type (same worker, same
-channel, same gap-detection class); each of the four venue/type combinations was probed
-live against a throwaway archive before going in, returning `replayable=True` with the
-correctly suffixed run dir. **Treat them as provisional until the first curated
-completeness check.** History starts 2026-09-17 20:48Z for lanes 34-35 and at the
-next redeploy for lanes 36-43; there is no earlier ETH/SOL market data in the plant
-and none can be obtained retrospectively.
+Grades above were inherited from the BTC lane of the same venue+type when the lanes
+went in, and were **confirmed by the first curated completeness check on 2026-09-19**
+(readiness check for the multi-venue cascade study): every replayable raw run of all ten
+lanes since the 2026-09-18 11:11Z redeploy is in curated, raw replayable events =
+curated rows exactly (ratio 1.0000 on each lane: Bybit ETH/SOL trades 3,534,748 /
+976,728, depth 3,512,256 / 3,418,137; OKX ETH/SOL trades 2,393,529 / 440,958, depth
+1,053,180 / 1,046,729; Binance ETH/SOL funding 29,676 / 29,673), zero quarantined
+events, zero non-replayable runs (61-65 scored runs per lane, only the open live run
+unscored). The **I/O-ceiling re-test passed** in the same pass: across all 26
+websocket/REST market lanes the post-redeploy quarantine ratio is 0.0000 except
+`coinbase_trades` at 0.0001 (62 events), and the only non-replayable runs are the
+pre-existing Coinbase/Kraken `trade_id_gaps` pattern (3-8 runs/day since before the
+build) plus one Bybit BTC perp `excessive_clock_skew` run - no `high_quarantine_ratio`
+finding anywhere, so the 2026-06-08 slow-drive failure did not resurface. History
+starts 2026-09-17 20:48Z for lanes 34-35 and 2026-09-18 11:11Z for lanes 36-43; there
+is no earlier ETH/SOL market data in the plant and none can be obtained retrospectively.
+
+**Consumer caveat found in the same check - Bybit BTC trades:** curated
+`trades_replayable/source=bybit/instrument=BTCUSDT` holds BOTH the spot lane
+(`bybit_trades`) and the linear-perp lane (`bybit_perp_trades`) in one partition
+(2026-09-18: 2,583,145 perp + 762,498 spot rows) with no distinguishing column other
+than `source_run_path`. Raw never mixes (STANDARDS 4.x), but the curated partition key
+does; readers must split on `source_run_path` until the partition layout is fixed
+(ROADMAP open item). ETH/SOL are unaffected (no Bybit spot lane), OKX is unaffected
+(`BTC-USDT` vs `BTC-USDT-SWAP`), and `market_replayable` is unaffected (`BTC-USDT` vs
+`BTC-USDT-PERP`).
 
 Capacity note: the cold tier moved G: -> `I:\market_archive_cold` (KNOWLEDGE-DEEP-A,
 mirrored to J:) on 2026-09-17, taking runway from ~9 days to ~389 at the post-expansion
