@@ -4096,7 +4096,11 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
         return SimpleNamespace(
             output_root=Path(raw_args.get("output_root", default_output_root())),
             source_root=Path(raw_args.get("source_root", _HL_UNIVERSE_DEFAULT_SOURCE)),
-            manifest_path=Path(raw_args.get("manifest_path", _HL_UNIVERSE_DEFAULT_MANIFEST)),
+            manifest_path=(
+                None
+                if raw_args.get("manifest_path", _HL_UNIVERSE_DEFAULT_MANIFEST) is None
+                else Path(raw_args.get("manifest_path", _HL_UNIVERSE_DEFAULT_MANIFEST))
+            ),
             stale_after_seconds=float(
                 raw_args.get("stale_after_seconds", _HL_UNIVERSE_DEFAULT_STALE)
             ),

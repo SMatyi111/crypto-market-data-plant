@@ -3,7 +3,8 @@
 Owner directive 2026-09-09 was **stabilize this set; no new lanes**; the owner
 SUPERSEDED it on 2026-09-17 ("there is nothing to stabilize if nothing is
 complete") and approved the ETH/SOL completeness build in lanes 34-43 below.
-44 enabled lanes from `ops.live.local.json` (48 configured; `binance-perp-liquidations`
+44 enabled lanes from `ops.live.local.json` once the tier 5 job is staged after PR #89
+merges (43 until then; 48 configured; `binance-perp-liquidations`
 disabled because fstream delivers no frames from this host; Kalshi lanes off
 since the 2026-06-17 disk incident). "Grade" is what a research consumer can
 assume if the plant is left exactly as it is. The curated tier was repaired

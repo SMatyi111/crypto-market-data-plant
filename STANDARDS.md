@@ -1131,9 +1131,14 @@ Layout, same raw-only contract as §4.8:
 `metrics/summary.json` (`sweep_id`, `sweep_started_at`, `sweep_ended_at`,
 `source_path`, `manifest_path`, `ingested_at`, `raw_bytes`, `sha256`,
 `manifest_sha256_match`, `row_count`, `manifest_rows`). `run_id` is the sweep
-timestamp (`sweep=20260919T1702Z` → `20260919_170200`), so re-runs are
-idempotent: an archived sweep with a matching sha256 is skipped, nothing is
-rewritten or deleted. The job FAILS (after archiving what is available) when
+timestamp (`sweep=20260919T1702Z` → `20260919_170200`). "Archived" is
+defined by the lane's own ledger `<lane>/_ingested.jsonl` (run_id, sha256,
+ingested_at per archived sweep; the leading underscore keeps it out of
+offload's run enumeration), NOT by hot-tier presence: offload removes hot run
+directories after a few days while the source never rotates, so keying on
+the run directory would re-ingest every offloaded sweep hourly. A ledgered
+sweep is skipped; a ledgered sweep whose manifest hash later differs is a
+failure, never a rewrite; nothing is rewritten or deleted. The job FAILS (after archiving what is available) when
 the newest finished sweep is older than `stale_after_seconds` (default 3 h;
 a finished sweep appears ~1 h after its nominal hour, so this fires after two
 missed hours) — the freshness row lives in the health report's `poll_lanes`.
