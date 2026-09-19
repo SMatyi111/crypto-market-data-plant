@@ -57,8 +57,19 @@ decision is still owed.
    Check per-lane quarantine ratio after the redeploy; back the lanes out if it moves.
 2. **Curated completeness check** for lanes 34-43 before their grades stop being
    inherited guesses.
-3. **Tier 5** (Hyperliquid universe positioning) not started. It is the only
-   unrepeatable lane on the list: every hour not stored is gone.
+3. **Tier 5 BUILT 2026-09-19** (owner: "build") as `hyperliquid-universe-positions-snapshot`,
+   STANDARDS 4.11. Scoping changed the design: the ladder study's hourly sweep already
+   spends 720 of the venue's 1200 weight/min IP budget for ~55 min of every hour, so a
+   second clearinghouseState poller from this host was ruled out (it would starve a
+   preregistered study to duplicate its own readings). The lane INGESTS the sweep's
+   Parquet verbatim, sha256-verified against the sweep manifest, hourly, idempotent,
+   fails on a stale sweep, offloaded age_only to the cold tier (so mirrored). Dry-run
+   against the live source archived all 97 sweeps (148 MB) with manifest match on every
+   one. Caveats a reader must hold are in 4.11: derived rows not venue bytes, coverage
+   83-95 % of OI, series ends with the study on 2027-03-31. Live at the next redeploy
+   (concurrency 45 -> 46; live config staged after merge). OPEN owner decision: a raw
+   clearinghouseState tee in the study's collector (~250 MB/day gz, study amendment A3)
+   would turn this into a venue-bytes archive; not done.
 4. `binance_options_chain`, `deribit_options` and the disabled/legacy lanes still have
    no catch-up scorer - snapshot-reference contract, decide separately.
 5. **Curated Bybit BTC trades mix spot and perp.** `trades_replayable/source=bybit/

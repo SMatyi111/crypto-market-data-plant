@@ -22,10 +22,11 @@
 param(
     [string]$OpsRoot = "G:\market_archive\ops",
     # Match run_ops_runner.ps1's live default (one slot per pooled lane; see the
-    # full 45-slot enumeration there, including the 2 options-IV snapshot lanes).
+    # full 46-slot enumeration there, including the 2 options-IV snapshot lanes
+    # and the universe-positions ingest lane).
     # Keep these in sync -- a
     # redeploy with a lower value silently throttles coverage until reboot.
-    [int]$CollectorConcurrency = 45
+    [int]$CollectorConcurrency = 46
 )
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
@@ -43,7 +44,7 @@ if (-not (Test-Path $config)) { throw "ops config not found: $config" }
 # plus the pooled non-worker REST jobs, enumerated EXPLICITLY: a kalshi- prefix wildcard
 # also matched the maintenance job kalshi-summarize-crypto-quotes, so adding that to
 # the config would have tripped this preflight and refused a valid boot.
-$nonWorkerPoolTypes = @("kalshi-collect-crypto-quotes", "kalshi-discover-crypto", "hyperliquid-leaderboard-snapshot", "binance-options-chain-snapshot", "deribit-options-snapshot")
+$nonWorkerPoolTypes = @("kalshi-collect-crypto-quotes", "kalshi-discover-crypto", "hyperliquid-leaderboard-snapshot", "hyperliquid-universe-positions-snapshot", "binance-options-chain-snapshot", "deribit-options-snapshot")
 $configPayload = Get-Content -LiteralPath $config -Raw -Encoding utf8 | ConvertFrom-Json
 $collectorLanes = @($configPayload.jobs | Where-Object {
     ($_.job_type -like "*-worker" -or $nonWorkerPoolTypes -contains $_.job_type) -and ($null -eq $_.enabled -or $_.enabled)

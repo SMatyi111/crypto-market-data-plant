@@ -61,6 +61,12 @@ from .collectors.deribit_options import (
     snapshot_deribit_options,
 )
 from .collectors.hyperliquid_leaderboard import snapshot_leaderboard
+from .collectors.hyperliquid_universe_positions import (
+    DEFAULT_MANIFEST_PATH as _HL_UNIVERSE_DEFAULT_MANIFEST,
+    DEFAULT_SOURCE_ROOT as _HL_UNIVERSE_DEFAULT_SOURCE,
+    DEFAULT_STALE_AFTER_SECONDS as _HL_UNIVERSE_DEFAULT_STALE,
+    ingest_universe_positions,
+)
 from .collectors.hyperliquid_wallet_flow import (
     SOURCE_NAME as HYPERLIQUID_WALLET_FLOW_SOURCE,
     HyperliquidWalletFillNormalizer,
@@ -475,6 +481,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     hl_lb_parser.add_argument("--output-root", type=Path, default=default_output_root())
     hl_lb_parser.add_argument("--format", choices=["json", "text"], default="text")
+
+    hl_up_parser = subparsers.add_parser(
+        "hyperliquid-universe-positions-snapshot",
+        help="Archive, verbatim and sha256-verified against the sweep manifest, every "
+        "finished hourly Hyperliquid universe positioning sweep written by the "
+        "hl-liquidation-ladder study (raw-only reference lane, STANDARDS section 4.11). "
+        "Ingests, never polls: the sweep is the only clearinghouseState poller this "
+        "host can afford under the venue IP budget.",
+    )
+    hl_up_parser.add_argument("--output-root", type=Path, default=default_output_root())
+    hl_up_parser.add_argument("--source-root", type=Path, default=_HL_UNIVERSE_DEFAULT_SOURCE)
+    hl_up_parser.add_argument("--manifest-path", type=Path, default=_HL_UNIVERSE_DEFAULT_MANIFEST)
+    hl_up_parser.add_argument(
+        "--stale-after-seconds", type=float, default=_HL_UNIVERSE_DEFAULT_STALE
+    )
+    hl_up_parser.add_argument("--format", choices=["json", "text"], default="text")
 
     bo_chain_parser = subparsers.add_parser(
         "binance-options-chain-snapshot",
@@ -2888,6 +2910,30 @@ def run_hyperliquid_leaderboard_snapshot(args: argparse.Namespace) -> None:
     )
 
 
+def run_hyperliquid_universe_positions_snapshot(args: argparse.Namespace) -> None:
+    result = ingest_universe_positions(
+        args.output_root,
+        source_root=args.source_root,
+        manifest_path=args.manifest_path,
+        stale_after_seconds=args.stale_after_seconds,
+    )
+    payload = {
+        "archived": result.archived,
+        "skipped_existing": result.skipped_existing,
+        "pending_unlisted": result.pending_unlisted,
+        "newest_sweep_id": result.newest_sweep_id,
+        "newest_sweep_age_seconds": result.newest_sweep_age_seconds,
+    }
+    if getattr(args, "format", "text") == "json":
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    print(
+        "hyperliquid universe positions: "
+        f"archived={len(result.archived)} skipped={result.skipped_existing} "
+        f"pending={len(result.pending_unlisted)} newest={result.newest_sweep_id}"
+    )
+
+
 def run_binance_options_chain_snapshot(args: argparse.Namespace) -> None:
     result = snapshot_binance_options_chain(
         args.output_root, underlyings=tuple(args.underlying)
@@ -3809,6 +3855,9 @@ def _execute_ops_job_inprocess(job: JobSpec) -> JobExecutionResult | str | None:
     if job.job_type == "hyperliquid-leaderboard-snapshot":
         run_hyperliquid_leaderboard_snapshot(args)
         return "hyperliquid leaderboard snapshot completed"
+    if job.job_type == "hyperliquid-universe-positions-snapshot":
+        run_hyperliquid_universe_positions_snapshot(args)
+        return "hyperliquid universe positions snapshot completed"
     if job.job_type == "binance-options-chain-snapshot":
         run_binance_options_chain_snapshot(args)
         return "binance options chain snapshot completed"
@@ -4041,6 +4090,20 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
     if job.job_type == "hyperliquid-leaderboard-snapshot":
         return SimpleNamespace(
             output_root=Path(raw_args.get("output_root", default_output_root())),
+            format=raw_args.get("format", "text"),
+        )
+    if job.job_type == "hyperliquid-universe-positions-snapshot":
+        return SimpleNamespace(
+            output_root=Path(raw_args.get("output_root", default_output_root())),
+            source_root=Path(raw_args.get("source_root", _HL_UNIVERSE_DEFAULT_SOURCE)),
+            manifest_path=(
+                None
+                if raw_args.get("manifest_path", _HL_UNIVERSE_DEFAULT_MANIFEST) is None
+                else Path(raw_args.get("manifest_path", _HL_UNIVERSE_DEFAULT_MANIFEST))
+            ),
+            stale_after_seconds=float(
+                raw_args.get("stale_after_seconds", _HL_UNIVERSE_DEFAULT_STALE)
+            ),
             format=raw_args.get("format", "text"),
         )
     if job.job_type == "binance-options-chain-snapshot":
@@ -5669,6 +5732,8 @@ def main() -> None:
         run_hyperliquid_wallet_flow_worker(args)
     elif args.command == "hyperliquid-leaderboard-snapshot":
         run_hyperliquid_leaderboard_snapshot(args)
+    elif args.command == "hyperliquid-universe-positions-snapshot":
+        run_hyperliquid_universe_positions_snapshot(args)
     elif args.command == "binance-options-chain-snapshot":
         run_binance_options_chain_snapshot(args)
     elif args.command == "deribit-options-snapshot":
