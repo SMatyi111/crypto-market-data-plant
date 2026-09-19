@@ -28,7 +28,7 @@ param(
     # host). The preflight counts ENABLED lanes, so 43 is the number that must fit;
     # 45 leaves 2 slots of headroom. Raise it by one per lane added, in BOTH this
     # script and redeploy_runner.ps1.
-    [int]$CollectorConcurrency = 45
+    [int]$CollectorConcurrency = 46
 )
 
 $ErrorActionPreference = "Stop"
@@ -93,7 +93,7 @@ if ($invalidJobs.Count -gt 0) {
 # enumerated EXPLICITLY (pinned by tests/test_repo_hygiene.py): a kalshi- prefix wildcard
 # also matched the maintenance job kalshi-summarize-crypto-quotes, so adding that to
 # the config would have tripped this preflight and refused a valid boot.
-$nonWorkerPoolTypes = @("kalshi-collect-crypto-quotes", "kalshi-discover-crypto", "hyperliquid-leaderboard-snapshot", "binance-options-chain-snapshot", "deribit-options-snapshot")
+$nonWorkerPoolTypes = @("kalshi-collect-crypto-quotes", "kalshi-discover-crypto", "hyperliquid-leaderboard-snapshot", "hyperliquid-universe-positions-snapshot", "binance-options-chain-snapshot", "deribit-options-snapshot")
 $collectorLanes = @($configPayload.jobs | Where-Object {
     ($_.job_type -like "*-worker" -or $nonWorkerPoolTypes -contains $_.job_type) -and ($null -eq $_.enabled -or $_.enabled)
 })

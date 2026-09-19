@@ -1474,6 +1474,10 @@
             "gate": "age_only"
           },
           {
+            "source": "hyperliquid_universe_positions",
+            "gate": "age_only"
+          },
+          {
             "// binance_perp_liquidations": "Lane ships disabled (fstream delivers no frames from this host, ROADMAP 2026-08-25) but ran until the 2026-09-01 redeploy and left ~4.5k near-empty run dirs on the hot tier with no promoter. age_only so the offload drains them instead of flagging unconfigured_lane forever.",
             "source": "binance_perp_liquidations",
             "gate": "age_only"
@@ -1880,6 +1884,20 @@
       "interval_seconds": 86400,
       "args": {
         "output_root": "G:\\market_archive\\raw\\market",
+        "format": "text"
+      }
+    },
+    {
+      "// hyperliquid-universe-positions-snapshot": "Raw-only hourly reference lane (STANDARDS 4.11, owner-approved 2026-09-19, tier 5 of the completeness list). INGESTS the hl-liquidation-ladder study's hourly clearinghouseState sweeps (~22k wallets, BTC/ETH/SOL positions) verbatim, sha256-verified against the sweep's own manifest; it never polls the venue because the sweep already spends 720 of the 1200 weight/min IP budget. Fails the job when the newest finished sweep is older than stale_after_seconds. Disabled in the template because it counts toward CollectorConcurrency and needs the study's paths.",
+      "name": "hyperliquid-universe-positions-snapshot",
+      "job_type": "hyperliquid-universe-positions-snapshot",
+      "enabled": false,
+      "interval_seconds": 3600,
+      "args": {
+        "output_root": "G:\\market_archive\\raw\\market",
+        "source_root": "G:\\03-reference-data\\hyperliquid_ladder\\snapshots",
+        "manifest_path": "G:\\01-active\\research\\hl-liquidation-ladder-2026\\log\\snapshot_manifest.jsonl",
+        "stale_after_seconds": 10800,
         "format": "text"
       }
     },

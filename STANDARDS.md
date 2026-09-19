@@ -1084,6 +1084,66 @@ by age per section 7), so this verdict labels runs; it does not curate them.
 
 ---
 
+### 4.11 Hyperliquid universe positions — raw-only reference lane (ingest)
+
+The `hyperliquid-universe-positions-snapshot` job (owner-approved 2026-09-19 as
+tier 5 of the completeness list) archives, verbatim, every hourly positioning
+sweep of the Hyperliquid wallet universe produced by the preregistered
+`hl-liquidation-ladder-2026` study: ~22k wallets holding an open BTC/ETH/SOL
+perp position (universe = the node census `wallet_coin_fpos`, notional ≥ $1k),
+polled via `clearinghouseState`, one row per wallet × coin with signed size,
+entry price, liquidation price, position value, leverage type/value, margin
+used, account value and the poll timestamp, plus the venue mark/oracle/OI the
+sweep recorded at its start (`marks.jsonl`, not archived here). Purpose: the
+venue exposes only CURRENT positioning — the ladder of where forced sellers sit
+at a past hour cannot be reconstructed — so every unstored hour is gone.
+
+**This lane ingests; it never polls the venue.** The sweep already spends 720
+of the 1200 weight/min per-IP budget for ~55 min of every hour (0 HTTP 429 over
+97 sweeps as of 2026-09-19); a second poller from this host would starve a
+preregistered study to duplicate its own readings. Consequences a reader must
+hold:
+
+- **Provenance is the study's derivation, not venue bytes.** The archived
+  file is the sweep's Parquet (`user, coin, szi, entry_px, liq_px,
+  position_value, lev_type, lev_value, margin_used, account_value, poll_ts`),
+  produced by the study's `parse_state`; positions in coins other than
+  BTC/ETH/SOL and the rest of the `clearinghouseState` payload are not kept.
+  Capturing the raw payload would need an amendment to the study's collector
+  (a raw tee, ~250 MB/day gzipped) — an owner decision, not made.
+- **Coverage is the sweep's coverage**: ~19-20k of ~22k wallets per hour
+  (tier A, near-liquidation wallets, every sweep; tier B as the time budget
+  allows), i.e. 83-95 % of venue OI in BTC/ETH/SOL. A wallet's row carries its
+  own `poll_ts`; treat readings older than the sweep hour as stale per the
+  study's rule (8 h).
+- **Completion signal is the sweep manifest**
+  (`log/snapshot_manifest.jsonl`, sha256 per finished file). A sweep is
+  archived only once listed there and hashing to the listed value; an unlisted
+  file is left for the next run, a listed file with a different hash is
+  reported and NOT archived, and the job fails so the runner counters show it.
+- **Series lifetime is the study's.** The sweep runs until the ladder study's
+  single read (2027-03-31); continuing the series past that is a separate
+  decision (own poller or a study extension).
+
+Layout, same raw-only contract as §4.8:
+`raw/market/hyperliquid_universe_positions/<run_id>/raw/sweep=YYYYMMDDTHHMMZ.parquet`
+(byte-identical copy, verified by sha256 before and after copy) +
+`metrics/summary.json` (`sweep_id`, `sweep_started_at`, `sweep_ended_at`,
+`source_path`, `manifest_path`, `ingested_at`, `raw_bytes`, `sha256`,
+`manifest_sha256_match`, `row_count`, `manifest_rows`). `run_id` is the sweep
+timestamp (`sweep=20260919T1702Z` → `20260919_170200`), so re-runs are
+idempotent: an archived sweep with a matching sha256 is skipped, nothing is
+rewritten or deleted. The job FAILS (after archiving what is available) when
+the newest finished sweep is older than `stale_after_seconds` (default 3 h;
+a finished sweep appears ~1 h after its nominal hour, so this fires after two
+missed hours) — the freshness row lives in the health report's `poll_lanes`.
+No clean/quarantine split, no replay verdict, no promotion. Retention: keep
+indefinitely (~1.5 MB per sweep, ~35 MB/day); offloaded `age_only` to the
+cold tier like §4.9, and therefore mirrored. The source directory itself is
+separately preserved to the pair drives by the study's `hl-ladder-preserve`
+task; this lane adds the plant's contract, freshness monitoring and
+offload/mirror path, not a third copy of the bytes on the same disk.
+
 ## 5. Live quality gate (pre-replay)
 
 Applied per event during collection; failures go to `quarantine/events.jsonl`

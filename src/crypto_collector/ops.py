@@ -51,6 +51,9 @@ COLLECTOR_JOB_TYPES: frozenset[str] = frozenset(
         # Raw-only daily reference snapshot (STANDARDS 4.8) - tiny, but
         # pool-dispatched like every network job (the 2026-06-11 kalshi lesson).
         "hyperliquid-leaderboard-snapshot",
+        # Raw-only hourly ingest of the ladder study's universe positioning sweeps
+        # (STANDARDS 4.11) - local file I/O only, but pooled like every lane.
+        "hyperliquid-universe-positions-snapshot",
         # Options-IV raw-only snapshot lanes (STANDARDS 4.9) - collection
         # reassigned here from G:\Binance_IV_V1; same raw-only contract as the
         # leaderboard lane, pool-dispatched for the same reason.
@@ -238,6 +241,9 @@ POLL_LANE_JOB_TYPES = frozenset(
         # runbook's parallel-run check reads exactly this table.
         "binance-options-chain-snapshot",
         "deribit-options-snapshot",
+        # Universe positions ingest (STANDARDS 4.11): interval job, freshness only
+        # visible here; a stale row = hl-ladder-sweep or the ingest has stopped.
+        "hyperliquid-universe-positions-snapshot",
     }
 )
 

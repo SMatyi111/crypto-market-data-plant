@@ -1,9 +1,9 @@
-# Active lanes and research-grade status (snapshot 2026-09-18)
+# Active lanes and research-grade status (snapshot 2026-09-19)
 
 Owner directive 2026-09-09 was **stabilize this set; no new lanes**; the owner
 SUPERSEDED it on 2026-09-17 ("there is nothing to stabilize if nothing is
 complete") and approved the ETH/SOL completeness build in lanes 34-43 below.
-43 enabled lanes from `ops.live.local.json` (47 configured; `binance-perp-liquidations`
+44 enabled lanes from `ops.live.local.json` (48 configured; `binance-perp-liquidations`
 disabled because fstream delivers no frames from this host; Kalshi lanes off
 since the 2026-06-17 disk incident). "Grade" is what a research consumer can
 assume if the plant is left exactly as it is. The curated tier was repaired
@@ -27,6 +27,7 @@ curated data complete against raw. History lengths are as of 2026-09-10.
 | Options snapshots | Binance BTC/ETH chain 15 min; Deribit BTC/ETH 5 min | **R** reference | 2026-09-01 in the plant | 9 d here + V1 series since 2026-05 in `G:\Binance_IV_V1` | missed snapshots permanent; V1 Deribit gap 08-11..27 |
 | Hyperliquid wallet flow | 10 frozen wallets, BTC/ETH/SOL | **A** (prospective) | 2026-08-09 | 32 d | 60 s poll; frozen cohort. **Audited against the chain 2026-09-14:** 39,852 of 322,529 target fills (12.4 %) were missing (wallet-9 stall fixed in PR #82; wallets 1/3/4/6 lost fills by another path) and were backfilled from `node_fills_by_block` with `raw_type=node_fills_by_block`, `received_at` 2026-09-14T17:31Z - receipt-time evaluations must exclude those rows (STANDARDS 4.7). Completeness is now measurable: `backfill-wallet-flow-from-node` dry-run |
 | Hyperliquid leaderboard | daily | **R** | 2026-08-17 | 24 d | point-in-time reference |
+| Hyperliquid universe positions | hourly ingest of the ladder study's sweeps | **R** reference | 2026-09-15 (sweep series; lane live at the next redeploy after 2026-09-19) | 97 sweeps on 09-19 | the study's derived rows, not venue bytes; coverage 83-95 % of OI; series ends with the study (2027-03-31) unless extended |
 | Text | RSS, 5 feeds | **A** for what it is | 2026-07-16 | 56 d, ~74 items/day | thin; `ingestion_ts` is the clock |
 
 Pre-2026-06-08 coverage exists only as the read-only `D:\market_archive`, not
@@ -79,6 +80,7 @@ merged (ROADMAP open item 1).
 | 41 | okx-sol-perp-trades | OKX swap | SOL-USDT-SWAP | trades | WS | trades_replayable | **B** `none_native` |
 | 42 | okx-eth-perp-depth | OKX swap | ETH-USDT-SWAP | depth | WS | market_replayable | **A** sequence + checksum |
 | 43 | okx-sol-perp-depth | OKX swap | SOL-USDT-SWAP | depth | WS | market_replayable | **A** sequence + checksum |
+| 44 | hyperliquid-universe-positions-snapshot | Hyperliquid (via hl-liquidation-ladder sweep) | ~22k wallets, BTC/ETH/SOL positions | positioning (szi, entry, liq px, leverage, margin, account value) | hourly INGEST of the sweep Parquet, sha256-verified vs its manifest | raw only | **R** reference (STANDARDS 4.11); tier 5, owner 2026-09-19; configured, live at the next redeploy |
 
 ## 2026-09-17/18 — the ETH/SOL completeness build (lanes 34-43)
 
