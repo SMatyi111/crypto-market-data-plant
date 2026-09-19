@@ -8,7 +8,7 @@ changes scope or state. Companion docs:
 - [`STANDARDS.md`](STANDARDS.md) — the data contract (schemas, replayability, retention)
 - [`docs/HISTORY.md`](docs/HISTORY.md) — resolved-work narrative (what was fixed, and why)
 
-Last updated: **2026-09-14**.
+Last updated: **2026-09-19**.
 
 > **Operating mode — safe shaping (owner directive, 2026-07-04).** No extended
 > building on Claude's initiative: no new venues, lanes, or instruments, no big
@@ -61,6 +61,29 @@ decision is still owed.
    unrepeatable lane on the list: every hour not stored is gone.
 4. `binance_options_chain`, `deribit_options` and the disabled/legacy lanes still have
    no catch-up scorer - snapshot-reference contract, decide separately.
+5. **Curated Bybit BTC trades mix spot and perp.** `trades_replayable/source=bybit/
+   instrument=BTCUSDT` receives both `bybit_trades` (spot) and `bybit_perp_trades`
+   (linear perp): on 2026-09-18 2,583,145 perp + 762,498 spot rows in one partition,
+   distinguishable only via `source_run_path`. Found 2026-09-19 by the readiness check.
+   Fix = partition the Bybit perp lane under its own instrument (as `market_replayable`
+   already does with `BTC-USDT-PERP`, and OKX with `-SWAP`), which is a layout change
+   and therefore a STANDARDS_VERSION bump plus a one-off re-partition of the existing
+   Bybit BTCUSDT history. Until then readers split on `source_run_path`. ETH/SOL are
+   unaffected (no Bybit spot lane).
+
+Items 1 and 2 CLOSED 2026-09-19 by the readiness check (see `docs/lanes.md`): all ten
+lanes curated-complete at ratio 1.0000, zero quarantine, no `high_quarantine_ratio`
+finding on any of the 26 market lanes after the eight-lane redeploy.
+
+**Lesson from the same check - lane renames break downstream consumers silently.** The
+2026-09-08 v11 split of `bybit_perp_liquidations` into per-symbol lanes left the
+registered prospective study `mv-liquidation-prospective-2026` reading the retired shared
+directory: Bybit contributed 0 events to its pooled series from 09-08 until 09-19, and
+its hot-tier-only rebuild also dropped OKX rows once archive-offload moved a run to the
+cold tier. Both repaired on the study side (its amendment A1, all archive tiers read,
+non-regression guard). Plant-side rule going forward: **any lane rename, split or root
+move is a breaking change for readers** - grep the registered study repos under
+`G:/01-active/research/` for the old path in the same PR and say so in the PR body.
 
 ---
 
@@ -230,7 +253,7 @@ Levers, cheapest first:
 Verify with `moved_bytes` in `ops/offload_report_latest.json`, not by eyeballing
 free space - other things write to G: too.
 
-**Separately (not an offload matter):** `G:-reference-data\hyperliquid_node`
+**Separately (not an offload matter):** `G:/03-reference-data/hyperliquid_node`
 is ~147 GB of STATIC research corpus on the SSD. It is not a write buffer, is
 outside the plant tree, and is invisible to `archive-offload`. K: has ~4 TB free.
 Moving it is the single biggest one-off reclaim available and does not conflict
