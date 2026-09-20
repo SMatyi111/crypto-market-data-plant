@@ -98,6 +98,13 @@ Default runner log:
 G:\market_archive\ops\runner.log
 ```
 
+Since 2026-09-20 the runner appends UTF-8 through cmd.exe (see the incident
+section in ROADMAP); the boot path's marker gives a freshly created log a BOM, the
+redeploy path's does not, so read it with `Get-Content -Encoding UTF8`. Older
+`runner.log.utf16-until-*` files are the pre-fix mixed UTF-8/UTF-16LE logs. Each
+launch marker names the wrapper PowerShell pid, for attributing a
+Resource-Exhaustion-Detector (System log 2004) event.
+
 Operational state:
 
 ```text

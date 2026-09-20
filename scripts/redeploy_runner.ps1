@@ -37,6 +37,46 @@ $heartbeatPath = Join-Path $OpsRoot "heartbeat.json"
 
 if (-not (Test-Path $python)) { throw "venv python not found: $python" }
 if (-not (Test-Path $config)) { throw "ops config not found: $config" }
+# runner.log written by the pre-2026-09-20 `*>>` form is UTF-16LE (every ASCII char
+# followed by a NUL byte). Rotate such a file aside ONCE, before UTF-8 is appended to
+# it; a pure UTF-8 log has no NUL bytes and is left alone. Best effort, never fatal.
+function Test-LegacyRunnerLog([string]$Path) {
+    try {
+        $fs = [IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+        try {
+            $n = [int][Math]::Min(4096, $fs.Length)
+            if ($n -le 0) { return $false }
+            $buf = New-Object byte[] $n
+            [void]$fs.Seek(-$n, 'End')
+            [void]$fs.Read($buf, 0, $n)
+            return [bool]($buf -contains 0)
+        }
+        finally { $fs.Dispose() }
+    }
+    catch { return $false }
+}
+function Move-LegacyRunnerLogAside([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    if (-not (Test-LegacyRunnerLog $Path)) { return }
+    try {
+        $rotated = $Path + ".utf16-until-" + (Get-Date -Format "yyyyMMdd-HHmmss")
+        Move-Item -LiteralPath $Path -Destination $rotated -ErrorAction Stop
+        Write-Host "rotated the UTF-16LE-era runner.log to $rotated (new runner.log is UTF-8)"
+    }
+    catch {
+        Write-Warning "could not rotate the UTF-16LE-era runner.log (held open?): $_ -- appending to it instead"
+    }
+}
+# cmd re-expands %name% pairs in the command line it receives (PowerShell already
+# substituted %VAR% after --%, then cmd runs its own pass over the inlined text), so
+# a path containing a percent sign would be silently rewritten. Refuse it up front.
+function Assert-NoPercentInPath([string[]]$Paths) {
+    foreach ($p in $Paths) {
+        if ($p -like '*%*') { throw "path contains '%', which cmd.exe would re-expand: $p" }
+    }
+}
+# Fail here, BEFORE anything is stopped: the relaunch command below inlines these paths.
+Assert-NoPercentInPath @($python, $config, $OpsRoot, (Join-Path $OpsRoot "runner.log"))
 
 # Guard BEFORE stopping anything: more enabled collector lanes than pool slots means
 # the lanes sorting last are never dispatched (silent starvation -- shipped twice).
@@ -245,12 +285,17 @@ Remove-Item (Join-Path $OpsRoot "standalone_workers\*.lock.stale-*") -Force -Err
 #      log writes (relaunch marker, runner output, exit marker) happen INSIDE the
 #      child through cmd, so they share one encoding: UTF-8 (PYTHONIOENCODING /
 #      PYTHONUTF8 for python, ASCII echo for the markers). The old *>> wrote
-#      UTF-16LE, so the parent rotates a pre-existing runner.log aside once (best
-#      effort, never fatal) rather than appending UTF-8 after UTF-16LE.
+#      UTF-16LE, so the parent rotates a runner.log that still carries UTF-16LE
+#      content (NUL bytes in its tail) aside once, best effort, never fatal; a
+#      pure UTF-8 log is left alone. The redeploy-created log has no BOM, the boot
+#      path's Out-File marker gives its log one: read either with
+#      `Get-Content -Encoding UTF8` (runbook).
 #    - The command travels as -EncodedCommand (base64 UTF-16), so it is never
 #      re-tokenised by CommandLineToArgvW; the paths reach cmd as environment
-#      variables (%PLANT_*%), so neither PowerShell nor CommandLineToArgvW re-quotes
-#      them (proven with a path containing an apostrophe and spaces). Literals are
+#      variables (%PLANT_*%), so CommandLineToArgvW never re-quotes them (proven with
+#      a path containing an apostrophe and spaces). PowerShell substitutes %VAR%
+#      after --% and cmd then re-expands any %name% pair in the result, which is why
+#      Assert-NoPercentInPath refuses paths containing '%' up front. Literals are
 #      single-quoted with ' doubled. Each `cmd.exe --%` statement must END its line:
 #      after `--%` PowerShell stops parsing, so a `;` there would be handed to cmd.
 #    - The child intentionally runs at the default ErrorActionPreference=Continue.
@@ -260,16 +305,7 @@ Remove-Item (Join-Path $OpsRoot "standalone_workers\*.lock.stale-*") -Force -Err
 #      the relaunch marker so a future Resource-Exhaustion event can be attributed.
 $env:PYTHONPATH = Join-Path $repo "src"
 $logPath = Join-Path $OpsRoot "runner.log"
-if (Test-Path -LiteralPath $logPath) {
-    try {
-        $rotated = Join-Path $OpsRoot ("runner.log.pre-cmd-redirect-" + (Get-Date -Format "yyyyMMdd-HHmmss"))
-        Move-Item -LiteralPath $logPath -Destination $rotated -ErrorAction Stop
-        Write-Host "rotated the mixed-encoding runner.log to $rotated (new runner.log is UTF-8)"
-    }
-    catch {
-        Write-Warning "could not rotate runner.log (held open?): $_ -- appending to it instead"
-    }
-}
+Move-LegacyRunnerLogAside $logPath
 function Quote-PsLiteral([string]$s) { return "'" + $s.Replace("'", "''") + "'" }
 $qLog = Quote-PsLiteral $logPath
 $qConfig = Quote-PsLiteral $config

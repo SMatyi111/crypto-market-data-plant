@@ -216,6 +216,16 @@ def test_redeploy_runner_appends_runner_output_to_runner_log() -> None:
             "redeploy_runner.ps1 launch command no longer appends the runner's output to runner.log via cmd"
         )
     assert "$env:PLANT_LOG = {0}" in code, "runner.log must reach cmd as %PLANT_LOG%"
+    # Nothing may follow the cmd.exe --% statement on its line: after --% PowerShell
+    # stops parsing, so a trailing `; $x = $LASTEXITCODE` would be handed to cmd and run
+    # as a second command after python exits, and $LASTEXITCODE would be cmd's result
+    # for that garbage, not python's.
+    for line in command_lines:
+        assert line.rstrip().endswith("2>&1\"' + $nl +"), (
+            "redeploy template: the cmd.exe --% runner line must end the statement"
+        )
+    # The runner's UTF-8 contract lives in the launch wrappers; pin both env vars.
+    assert "$env:PYTHONUTF8 = ''1''" in code and "$env:PYTHONIOENCODING = ''utf-8''" in code
     assert "-EncodedCommand" in code, "launch must go through -EncodedCommand (no argv re-tokenisation)"
     run_body = (REPO_ROOT / "scripts" / "run_ops_runner.ps1").read_text(encoding="ascii")
     run_code = "\n".join(line for line in run_body.splitlines() if not line.lstrip().startswith("#"))
@@ -225,6 +235,9 @@ def test_redeploy_runner_appends_runner_output_to_runner_log() -> None:
         assert "*>>" not in line, "run_ops_runner.ps1 went back to a PowerShell redirect (2026-09-20 incident)"
         assert "cmd.exe --%" in line and '>> "%PLANT_LOG%" 2>&1' in line, "run_ops_runner.ps1 lost its runner.log redirect"
     assert "$env:PLANT_LOG = $LogPath" in run_code
+    for line in run_lines:
+        assert line.rstrip().endswith('2>&1"'), "run_ops_runner.ps1: the cmd.exe --% runner line must end the statement"
+    assert '$env:PYTHONUTF8 = "1"' in run_code and '$env:PYTHONIOENCODING = "utf-8"' in run_code
 _SCORED_CONFIGS = [
     name for name in ("ops.live.example.json", "ops.live.local.json") if (REPO_ROOT / name).exists()
 ]
