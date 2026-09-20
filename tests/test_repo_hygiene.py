@@ -204,12 +204,27 @@ def test_redeploy_runner_appends_runner_output_to_runner_log() -> None:
     assert 'Join-Path $OpsRoot "runner.log"' in code
     command_lines = [line for line in code.splitlines() if "crypto_collector.cli ops-runner" in line]
     assert command_lines, "redeploy_runner.ps1 no longer builds the ops-runner launch command"
-    assert all("*>> {0}" in line for line in command_lines), (
-        "redeploy_runner.ps1 launch command no longer appends the runner's output to runner.log"
-    )
+    # 2026-09-20: the append must be cmd.exe's, never PowerShell's. `& python ... *>>`
+    # routed every runner output line through the PowerShell 5.1 host for the life of
+    # the runner; Windows named a powershell.exe at 230 GB of virtual memory
+    # (Resource-Exhaustion-Detector 2004, pagefile peak 102 GB) while plant jobs failed
+    # with '[Errno 22] Invalid argument' and MemoryError, and the redeploy wrapper
+    # measurably grows under the same construct.
+    for line in command_lines:
+        assert "*>>" not in line, "the runner line went back to a PowerShell redirect (2026-09-20 incident)"
+        assert "cmd.exe --%" in line and '>> "%PLANT_LOG%" 2>&1' in line, (
+            "redeploy_runner.ps1 launch command no longer appends the runner's output to runner.log via cmd"
+        )
+    assert "$env:PLANT_LOG = {0}" in code, "runner.log must reach cmd as %PLANT_LOG%"
     assert "-EncodedCommand" in code, "launch must go through -EncodedCommand (no argv re-tokenisation)"
     run_body = (REPO_ROOT / "scripts" / "run_ops_runner.ps1").read_text(encoding="ascii")
-    assert "*>> $LogPath" in run_body, "run_ops_runner.ps1 lost its runner.log redirect"
+    run_code = "\n".join(line for line in run_body.splitlines() if not line.lstrip().startswith("#"))
+    run_lines = [line for line in run_code.splitlines() if "crypto_collector.cli ops-runner" in line]
+    assert run_lines, "run_ops_runner.ps1 no longer launches the ops runner"
+    for line in run_lines:
+        assert "*>>" not in line, "run_ops_runner.ps1 went back to a PowerShell redirect (2026-09-20 incident)"
+        assert "cmd.exe --%" in line and '>> "%PLANT_LOG%" 2>&1' in line, "run_ops_runner.ps1 lost its runner.log redirect"
+    assert "$env:PLANT_LOG = $LogPath" in run_code
 _SCORED_CONFIGS = [
     name for name in ("ops.live.example.json", "ops.live.local.json") if (REPO_ROOT / name).exists()
 ]

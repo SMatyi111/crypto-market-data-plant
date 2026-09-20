@@ -222,43 +222,77 @@ Remove-Item (Join-Path $OpsRoot "standalone_workers\*.lock") -Force -ErrorAction
 Remove-Item (Join-Path $OpsRoot "standalone_workers\*.lock.stale-*") -Force -ErrorAction SilentlyContinue
 
 # 3. Relaunch directly (no wrapper mutex), loading this repo's src via PYTHONPATH.
-#    Launch through a hidden PowerShell child that APPENDS the runner's stdout+stderr
-#    to runner.log, mirroring run_ops_runner.ps1's `*>> $LogPath`. A bare
-#    Start-Process discards both streams: after the 2026-09-01/02/08 manual
-#    redeploys runner.log had not grown since the 08-25 boot start, so a runner-
-#    process crash would have left no trace (2026-09-07 audit). Start-Process's own
-#    -RedirectStandard* switches are not used because they truncate instead of
-#    appending and cannot share one file between the two streams.
-#    Design notes (from the PR #60 review):
-#    - The parent never opens runner.log. We are past the lock deletions here and
-#      $ErrorActionPreference is Stop, so an Out-File that hit a held handle would
-#      abort the script with the plant down and no runner started. All three log
-#      writes (relaunch marker, runner output, exit marker) happen INSIDE the child
-#      under one `*>>` redirect, so they also share one encoding (PS 5.1 `*>>` is
-#      always UTF-16LE; mixing it with a UTF-8 Out-File marker renders the runner
-#      output as spaced mojibake in Get-Content).
+#    Launch through a hidden PowerShell child whose cmd.exe APPENDS the runner's
+#    stdout+stderr to runner.log, mirroring run_ops_runner.ps1. A bare Start-Process
+#    discards both streams: after the 2026-09-01/02/08 manual redeploys runner.log had
+#    not grown since the 08-25 boot start, so a runner-process crash would have left
+#    no trace (2026-09-07 audit). Start-Process's own -RedirectStandard* switches are
+#    not used because they truncate instead of appending and cannot share one file
+#    between the two streams.
+#    2026-09-20 incident: the child used to run `& python ... *>> runner.log`, which
+#    routes every output line through the PowerShell 5.1 host as a pipeline object
+#    for the life of the runner. Windows named a powershell.exe at 230 GB of virtual
+#    memory (System log 2004; pagefile peak 102 GB) while plant jobs failed with
+#    '[Errno 22] Invalid argument' and MemoryError; the boot-task host was the only
+#    long-lived PowerShell and died with the runner at the redeploy that freed the
+#    memory, and this child measurably grows under the same construct. cmd.exe now
+#    owns the redirect natively; the hidden PowerShell only waits and reads the exit
+#    code, which cmd /c propagates from python.
+#    Design notes (PR #60 review, updated for the cmd redirect):
+#    - The parent never opens runner.log for writing. We are past the lock deletions
+#      here and $ErrorActionPreference is Stop, so an Out-File that hit a held handle
+#      would abort the script with the plant down and no runner started. All three
+#      log writes (relaunch marker, runner output, exit marker) happen INSIDE the
+#      child through cmd, so they share one encoding: UTF-8 (PYTHONIOENCODING /
+#      PYTHONUTF8 for python, ASCII echo for the markers). The old *>> wrote
+#      UTF-16LE, so the parent rotates a pre-existing runner.log aside once (best
+#      effort, never fatal) rather than appending UTF-8 after UTF-16LE.
 #    - The command travels as -EncodedCommand (base64 UTF-16), so it is never
-#      re-tokenised by CommandLineToArgvW: apostrophes or doubled spaces in
-#      $repo / -OpsRoot cannot break the quoting. Literals are single-quoted with
-#      ' doubled, the only escape single quotes need.
-#    - The child intentionally runs at the default ErrorActionPreference=Continue:
-#      under Stop, PS 5.1 turns python's first stderr line (e.g. the config
-#      UserWarning) into a terminating NativeCommandError. Do not "harden" it.
-#    - The hidden powershell.exe is a plant process: it owns python's stdout/stderr
-#      pipes and exits by itself when python does. Killing it early leaves the
-#      runner alive but unlogged (the pre-fix state), nothing worse.
+#      re-tokenised by CommandLineToArgvW; the paths reach cmd as environment
+#      variables (%PLANT_*%), so neither PowerShell nor CommandLineToArgvW re-quotes
+#      them (proven with a path containing an apostrophe and spaces). Literals are
+#      single-quoted with ' doubled. Each `cmd.exe --%` statement must END its line:
+#      after `--%` PowerShell stops parsing, so a `;` there would be handed to cmd.
+#    - The child intentionally runs at the default ErrorActionPreference=Continue.
+#    - The hidden powershell.exe is a plant process: it waits on cmd, which waits on
+#      python, and exits by itself when python does. Killing it early leaves the
+#      runner alive but unlogged (the pre-fix state), nothing worse. Its pid is in
+#      the relaunch marker so a future Resource-Exhaustion event can be attributed.
 $env:PYTHONPATH = Join-Path $repo "src"
 $logPath = Join-Path $OpsRoot "runner.log"
+if (Test-Path -LiteralPath $logPath) {
+    try {
+        $rotated = Join-Path $OpsRoot ("runner.log.pre-cmd-redirect-" + (Get-Date -Format "yyyyMMdd-HHmmss"))
+        Move-Item -LiteralPath $logPath -Destination $rotated -ErrorAction Stop
+        Write-Host "rotated the mixed-encoding runner.log to $rotated (new runner.log is UTF-8)"
+    }
+    catch {
+        Write-Warning "could not rotate runner.log (held open?): $_ -- appending to it instead"
+    }
+}
 function Quote-PsLiteral([string]$s) { return "'" + $s.Replace("'", "''") + "'" }
 $qLog = Quote-PsLiteral $logPath
 $qConfig = Quote-PsLiteral $config
 $qPython = Quote-PsLiteral $python
 $qOps = Quote-PsLiteral $OpsRoot
-# Single-quoted templates: $(Get-Date ...) and $LASTEXITCODE must expand in the CHILD.
+$nl = [Environment]::NewLine
+# Single-quoted templates: $(Get-Date ...), $PID and $LASTEXITCODE must expand in the CHILD.
+# Lines, not `;`: everything after `--%` belongs to cmd (see the design notes).
 $runnerCommand = (
-    '"[$(Get-Date -Format o)] redeploy_runner.ps1 relaunching ops runner with {1}" *>> {0}; ' +
-    '& {2} -m crypto_collector.cli ops-runner --config {1} --ops-root {3} --collector-concurrency {4} *>> {0}; ' +
-    '"[$(Get-Date -Format o)] ops runner exited with code $LASTEXITCODE" *>> {0}'
+    '$env:PLANT_LOG = {0}' + $nl +
+    '$env:PLANT_CONFIG = {1}' + $nl +
+    '$env:PLANT_PYTHON = {2}' + $nl +
+    '$env:PLANT_OPS = {3}' + $nl +
+    '$env:PLANT_CAP = ''{4}''' + $nl +
+    '$env:PYTHONIOENCODING = ''utf-8''' + $nl +
+    '$env:PYTHONUTF8 = ''1''' + $nl +
+    '$env:PLANT_STAMP = Get-Date -Format o' + $nl +
+    '$env:PLANT_WRAPPER_PID = "$PID"' + $nl +
+    '& cmd.exe --% /d /s /c "echo [%PLANT_STAMP%] redeploy_runner.ps1 relaunching ops runner with "%PLANT_CONFIG%" (wrapper powershell pid %PLANT_WRAPPER_PID%) >> "%PLANT_LOG%"' + $nl +
+    '& cmd.exe --% /d /s /c ""%PLANT_PYTHON%" -m crypto_collector.cli ops-runner --config "%PLANT_CONFIG%" --ops-root "%PLANT_OPS%" --collector-concurrency %PLANT_CAP% >> "%PLANT_LOG%" 2>&1"' + $nl +
+    '$env:PLANT_EXIT = "$LASTEXITCODE"' + $nl +
+    '$env:PLANT_STAMP = Get-Date -Format o' + $nl +
+    '& cmd.exe --% /d /s /c "echo [%PLANT_STAMP%] ops runner exited with code %PLANT_EXIT% >> "%PLANT_LOG%"'
 ) -f $qLog, $qConfig, $qPython, $qOps, $CollectorConcurrency
 $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($runnerCommand))
 $launcher = Start-Process -PassThru -WindowStyle Hidden -WorkingDirectory $repo -FilePath "powershell.exe" `
