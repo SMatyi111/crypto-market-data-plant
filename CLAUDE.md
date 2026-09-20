@@ -11,6 +11,14 @@ Resolved-work narrative: [`docs/HISTORY.md`](docs/HISTORY.md). Runbook:
   which misdecodes UTF-8 em-dashes/typographic quotes into string-terminating curly
   quotes. After editing any `.ps1`, parse-check it:
   `powershell -NoProfile -Command "[void][scriptblock]::Create((Get-Content -Raw <file>))"`.
+- **Never route the long-lived runner's output through a PowerShell redirect**
+  (`& python ... *>> log`, `2>&1 | ...`). PowerShell 5.1 keeps a pipeline object per
+  line for the life of the native command; on 2026-09-20 Windows named a
+  powershell.exe at 230 GB of virtual memory (pagefile peak 102 GB) while plant jobs
+  failed with `[Errno 22] Invalid argument` and `MemoryError`, and the redeploy
+  wrapper measurably grows under that construct. Both runner scripts launch through
+  `cmd.exe --% /d /s /c "... >> "%PLANT_LOG%" 2>&1"` with the paths in `%PLANT_*%`
+  env vars and log their own pid; `tests/test_repo_hygiene.py` pins the form.
 - **Run tests with `PYTHONPATH=src`** (`python -m pytest`). Do not trust a bare
   editable install — it has historically resolved to a retired external tree.
 - **The ops runner reads its config once at startup.** Config or code changes do

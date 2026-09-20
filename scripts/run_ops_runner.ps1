@@ -35,6 +35,44 @@ $ErrorActionPreference = "Stop"
 
 $workspaceRoot = Split-Path -Parent $PSScriptRoot
 $pythonPath = Join-Path $workspaceRoot ".venv\Scripts\python.exe"
+# runner.log written by the pre-2026-09-20 `*>>` form is UTF-16LE (every ASCII char
+# followed by a NUL byte). Rotate such a file aside ONCE, before UTF-8 is appended to
+# it; a pure UTF-8 log has no NUL bytes and is left alone. Best effort, never fatal.
+function Test-LegacyRunnerLog([string]$Path) {
+    try {
+        $fs = [IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+        try {
+            $n = [int][Math]::Min(4096, $fs.Length)
+            if ($n -le 0) { return $false }
+            $buf = New-Object byte[] $n
+            [void]$fs.Seek(-$n, 'End')
+            [void]$fs.Read($buf, 0, $n)
+            return [bool]($buf -contains 0)
+        }
+        finally { $fs.Dispose() }
+    }
+    catch { return $false }
+}
+function Move-LegacyRunnerLogAside([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    if (-not (Test-LegacyRunnerLog $Path)) { return }
+    try {
+        $rotated = $Path + ".utf16-until-" + (Get-Date -Format "yyyyMMdd-HHmmss")
+        Move-Item -LiteralPath $Path -Destination $rotated -ErrorAction Stop
+        Write-Host "rotated the UTF-16LE-era runner.log to $rotated (new runner.log is UTF-8)"
+    }
+    catch {
+        Write-Warning "could not rotate the UTF-16LE-era runner.log (held open?): $_ -- appending to it instead"
+    }
+}
+# cmd re-expands %name% pairs in the command line it receives (PowerShell already
+# substituted %VAR% after --%, then cmd runs its own pass over the inlined text), so
+# a path containing a percent sign would be silently rewritten. Refuse it up front.
+function Assert-NoPercentInPath([string[]]$Paths) {
+    foreach ($p in $Paths) {
+        if ($p -like '*%*') { throw "path contains '%', which cmd.exe would re-expand: $p" }
+    }
+}
 
 if (-not (Test-Path -LiteralPath $pythonPath)) {
     throw "Python runtime not found at $pythonPath"
@@ -130,15 +168,39 @@ try {
     $env:PYTHONPATH = Join-Path $workspaceRoot "src"
     Push-Location $workspaceRoot
     try {
-        "[$(Get-Date -Format o)] starting ops runner with $resolvedConfig" | Out-File -FilePath $LogPath -Append -Encoding utf8
-        # PowerShell 5.1 quirk: with ErrorActionPreference=Stop, any line python writes to
-        # stderr (e.g. UserWarning from default_*_root fallbacks) gets wrapped as a
-        # NativeCommandError and terminates the script before python finishes. Temporarily
-        # downgrade so stderr lines are non-fatal; we still gate success on $LASTEXITCODE.
+        Assert-NoPercentInPath @($pythonPath, $resolvedConfig, $resolvedOpsRoot, $LogPath)
+        Move-LegacyRunnerLogAside $LogPath
+        "[$(Get-Date -Format o)] starting ops runner with $resolvedConfig (wrapper powershell pid $PID)" | Out-File -FilePath $LogPath -Append -Encoding utf8
+        # 2026-09-20 incident: the previous form (`& python ... *>> $LogPath`) routed the
+        # runner's stdout/stderr through THIS PowerShell 5.1 host, one pipeline object
+        # per line, for the life of the runner. Windows' Resource-Exhaustion-Detector
+        # named a powershell.exe at 230 GB of virtual memory (pagefile peak 102 GB) and
+        # plant jobs failed with '[Errno 22] Invalid argument' and MemoryError; the
+        # boot-task host, alive ~34 h, was the only long-lived PowerShell and died with
+        # the runner at the redeploy that freed the memory, and the identical redeploy
+        # wrapper measurably grows (~0.3 MB/min at ~60 log lines/min). cmd.exe now owns
+        # the append redirect natively (stdout+stderr into one file); PowerShell only
+        # waits and reads the exit code, which cmd /c propagates from python. `--%`
+        # hands the rest of the line to cmd verbatim (nothing may follow it on the line:
+        # a `;` there would be handed to cmd too). The paths travel as environment
+        # variables: PowerShell substitutes %VAR% after --%, then cmd re-expands any
+        # %name% pair in the result, so paths must not contain '%' (guarded above);
+        # apostrophes, spaces and parentheses are safe (proven). /s makes cmd strip
+        # exactly the outer quote pair. PYTHONIOENCODING/PYTHONUTF8 keep the appended
+        # bytes UTF-8, matching the utf8 marker lines (the old *>> wrote UTF-16LE into
+        # the same file). The wrapper pid in the marker lets a future 2004 event be
+        # attributed instead of inferred.
+        $env:PLANT_PYTHON = $pythonPath
+        $env:PLANT_CONFIG = $resolvedConfig
+        $env:PLANT_OPS = $resolvedOpsRoot
+        $env:PLANT_CAP = "$CollectorConcurrency"
+        $env:PLANT_LOG = $LogPath
+        $env:PYTHONIOENCODING = "utf-8"
+        $env:PYTHONUTF8 = "1"
         $savedErrorActionPreference = $ErrorActionPreference
         $ErrorActionPreference = "Continue"
         try {
-            & $pythonPath -m crypto_collector.cli ops-runner --config $resolvedConfig --ops-root $resolvedOpsRoot --collector-concurrency $CollectorConcurrency *>> $LogPath
+            & cmd.exe --% /d /s /c ""%PLANT_PYTHON%" -m crypto_collector.cli ops-runner --config "%PLANT_CONFIG%" --ops-root "%PLANT_OPS%" --collector-concurrency %PLANT_CAP% >> "%PLANT_LOG%" 2>&1"
             $exitCode = $LASTEXITCODE
         }
         finally {

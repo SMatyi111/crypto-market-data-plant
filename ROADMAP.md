@@ -8,7 +8,7 @@ changes scope or state. Companion docs:
 - [`STANDARDS.md`](STANDARDS.md) — the data contract (schemas, replayability, retention)
 - [`docs/HISTORY.md`](docs/HISTORY.md) — resolved-work narrative (what was fixed, and why)
 
-Last updated: **2026-09-19**.
+Last updated: **2026-09-20**.
 
 > **Operating mode — safe shaping (owner directive, 2026-07-04).** No extended
 > building on Claude's initiative: no new venues, lanes, or instruments, no big
@@ -18,6 +18,41 @@ Last updated: **2026-09-19**.
 > explicit owner ask to start.
 
 ---
+
+## Incident — a PowerShell process ate 230 GB; the runner's log wrapper is the suspect (2026-09-20)
+
+From ~07:48Z on 2026-09-20 random plant jobs failed one at a time with
+`[Errno 22] Invalid argument` opening `ops/job_runs.jsonl` (22 in 5.5 h), the runner
+logged `failed to append job run record`, a `disk 51` paging error hit the C: pagefile
+disk at 10:03 local, and the first runs after the 13:16Z redeploy died with
+`MemoryError`. Windows' Resource-Exhaustion-Detector (System log 2004, 09:56 / 10:01 /
+15:15 local) named the consumer: `powershell.exe` pid 16992 at 226-230 GB of virtual
+memory; pagefile peak 101.9 GB on a 128 GB box. Not a disk fault (every volume
+Healthy), not a collector defect.
+
+**Attribution, honestly stated.** pid 16992 could not be identified post-mortem (no
+process-creation auditing; the Task Scheduler operational log is empty from this
+shell). Circumstantial case for the SYSTEM boot task's `run_ops_runner.ps1` host: it
+was the only long-lived PowerShell on the box (alive since the 09-19 05:18 local boot,
+~34 h), it died with its python child at the 15:16 local redeploy, and RAM went from
+exhausted to 107 GB free at exactly that moment. Against: the identical redeploy
+wrapper measured afterwards grows at only ~0.3 MB/min at ~60 log lines/min, which does
+not extrapolate to 230 GB in 34 h, and the boot-era wrapper handled only ~2.8 MB of
+runner output in those 34 h, so the runaway mechanism is unconfirmed. The redirect fix
+removes the wrapper as a candidate and stops the measured leak; nothing more is
+claimed. Both hosts ran the same `& python ... *>> runner.log` construct, which keeps a
+PowerShell pipeline object per output line for the life of the runner.
+
+**Fix (this section's PR):** both launch paths hand the append redirect to cmd.exe
+(`cmd.exe --% /d /s /c "... >> "%PLANT_LOG%" 2>&1"`, paths as `%PLANT_*%` env vars,
+UTF-8 output via PYTHONIOENCODING/PYTHONUTF8); PowerShell only waits and reads the exit
+code (proven end to end, including a config path with an apostrophe and spaces). Each
+wrapper now logs its own pid in the launch marker so the next 2004 event is attributed,
+not inferred. The redeploy rotates the old mixed-encoding runner.log aside once. Pinned
+by `tests/test_repo_hygiene.py`; rule added to CLAUDE.md. **Verification owed after the
+redeploy:** the wrapper's private bytes flat over hours, no further `Errno 22` in
+job_runs.jsonl. **Weekly audit watch item:** any Resource-Exhaustion-Detector 2004
+event = incident; record the named pid against the wrapper pids in runner.log.
 
 ## Decision + build — ETH/SOL completeness build; the "no new lanes" directive superseded (PR #86, 2026-09-17/18)
 
