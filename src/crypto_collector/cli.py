@@ -819,6 +819,7 @@ def build_parser() -> argparse.ArgumentParser:
     bybit_depth_parser.add_argument("--output-root", type=Path, default=default_output_root())
     bybit_depth_parser.add_argument("--ops-root", type=Path, default=default_ops_root())
     bybit_depth_parser.add_argument("--worker-name", default="bybit-depth-worker")
+    bybit_depth_parser.add_argument("--session-evidence", action="store_true", default=False)
     bybit_depth_parser.add_argument("--heartbeat-interval-seconds", type=float, default=30.0)
     bybit_depth_parser.add_argument(
         "--source-suffix",
@@ -2516,9 +2517,16 @@ async def _collect_depth_stream_segment(
         idle_timeout_seconds=float(getattr(args, "idle_timeout_seconds", 0.0) or 0.0),
         message_decoder=message_decoder,
     )
+    evidence_enabled = bool(getattr(args, "session_evidence", False))
+    if evidence_enabled and (source != "bybit" or websocket_url != _bybit_ws_url("linear")
+                             or args.symbol != "BTCUSDT" or args.channel != "orderbook.50"):
+        raise ValueError("Session evidence is scoped to Bybit linear BTC depth 50")
     collector = GenericWebsocketCollector(config=config)
     source_name = _build_source_name(source_base, getattr(args, "source_suffix", ""))
     run_paths = prepare_run_paths(output_root=config.output_root, source=source_name)
+    if evidence_enabled:
+        from .session_evidence import SessionEvidence
+        collector.session_evidence = SessionEvidence(run_paths.base)
     fsync_events, fsync_ms = _fsync_intervals(args)
     pipeline = CollectorPipeline(
         collector=collector,
@@ -3639,6 +3647,7 @@ def _run_segmented_worker(
                     # lambda can silently drop it (the same enumeration trap that dropped
                     # `market`). fsync defaults on and BATCHED, so a hot lane gets
                     # crash-durable writes without per-event fsync capping its throughput.
+                    segment_args.session_evidence = bool(getattr(args, "session_evidence", False))
                     segment_args.jsonl_fsync = bool(getattr(args, "jsonl_fsync", True))
                     fsync_events, fsync_ms = _fsync_intervals(args)
                     segment_args.fsync_interval_events = fsync_events
@@ -3833,6 +3842,7 @@ def _execute_ops_job_inprocess(job: JobSpec) -> JobExecutionResult | str | None:
     # durable and `normalized_parquet: false` was dropped entirely — the per-job-type
     # enumeration trap, killed centrally like the cadence knobs above. Only override
     # when the config actually sets the key, so _job_args/parser defaults still win.
+    args.session_evidence = bool(job.args.get("session_evidence", False))
     if "jsonl_fsync" in job.args:
         args.jsonl_fsync = bool(job.args["jsonl_fsync"])
     if "normalized_parquet" in job.args:

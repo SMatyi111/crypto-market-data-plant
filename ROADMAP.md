@@ -19,6 +19,39 @@ Last updated: **2026-09-22**.
 
 ---
 
+## Bybit session evidence - offline implementation (2026-09-22)
+
+Owner authorized the first implementation slice of the plant-reuse specification:
+a disabled-by-default BTC linear depth session journal, explicit terminal evidence
+and offline validation. It reuses the existing socket, persists acknowledgements
+and connection boundaries, binds receipts to raw rows, and refuses incomplete
+runs. Writer failures preserve normal market collection. STANDARDS v14 adds the
+optional sidecar contract without changing existing replay/curation meaning.
+
+Synthetic validation covers pre-ack data, reconnect/reanchor, cancellation,
+missing/rejected ack, malformed frames, clock jumps, byte/queue caps, disk/close
+failures, slow publication, raw/journal mutations, dispatch and offload inclusion.
+Independent code/security review found error isolation, verifier trust and blocking
+finalization defects; those were fixed with regression tests. No live option,
+collector restart or new capture. Remaining slice: contemporaneous Bybit contract
+and funding references, separately reviewed before activation. Strategy gates and
+prior attempt budgets stay unchanged. Local full suite: 672 passed / 5 skipped;
+26 journal tests passed after adding the final missing-anchor regression. Full
+ruff and diff checks pass. Review also documented the OS rename deadline caveat
+in STANDARDS 4.12; no content-integrity exception is granted.
+
+Bounded pre-work operations check at 20:24-20:34 UTC: heartbeat running with 41
+active jobs, G: approximately 288 GiB free; the latest cold offload moved 92 runs,
+zero failures and zero stuck-unaccounted runs. Its warning status names legacy/
+unconfigured or missing lanes, not an offload failure. The 8 MiB job-log tail
+covers September 21 03:42 through September 22 20:34, contains no Errno 22, and
+contains historical failures including worker-lock contention. Cumulative runner
+counters show 21,951 successes and 240 errors; all tracked jobs last succeeded.
+These checks do not certify lane completeness, quarantine ratios or a full weekly
+health audit; the existing full-audit stamp below is deliberately unchanged.
+
+---
+
 ## Documentation correction - live OI polling cadence (2026-09-22)
 
 The live BTC/ETH/SOL OI lanes already have `poll_interval_seconds: 1`.
