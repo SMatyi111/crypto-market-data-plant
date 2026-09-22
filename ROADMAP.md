@@ -370,7 +370,36 @@ the same restart.
 | ~~2026-06-19~~ DONE 06-24 | The 06-17 `robocopy /MINAGE:3` move never finished (~88% of partitions still on G:), leaving G: at **3.9 GB free**. First retry (06-22) was killed by the Bash tool's 10-min timeout after freeing ~57 GB. Relaunched **detached via `Start-Process`** (pid 48444) so it survives session/tool teardown -> **COMPLETED 2026-06-24 16:19, FAILED: 0** (45.29 M files / 555 GB moved G:->`D:\market_archive_cold`). **G: now 489 GB free.** D: holds 113,407 normalized partitions (full set). 1 partition / 2 parquet files remain on G: -- robocopy *skipped* them (already byte-present on D: from the 06-17 partial), so redundant not stranded; immaterial (489 GB free). Lesson: long-running moves must be detached, never run inside a Bash call (10-min cap). |
 | ~~2026-07-26~~ DONE 08-01 | **Text raw offload wired for the next restart.** `archive-offload-text` is enabled in `ops.live.local.json` with the indexed promotion/quarantine gate, preserve-first aged-run backstop, byte-verified cold move, and `write_report:false` so it cannot replace the market health report. It remains inert until the guarded elevated runner restart. |
 
-**Last ops audit:** 2026-09-15 — **runner healthy; every configured lane
+**Last ops audit:** 2026-09-23 — **runner healthy on every lane; the 09-20 memory fix
+holds; one NEW data finding: a 4-day per-wallet stall on the wallet-flow lane.** Box
+rebooted twice 2026-09-21 ~16:20Z (Windows Update, `TrustedInstaller` planned restart, no
+bugcheck; last crash still 09-11). Runner came back from the SYSTEM task; wrapper
+powershell pid 3480 at 70 MB private after ~30 h (the 09-20 construct grew to 230 GB
+virtual), `runner.log` written again (item 17 closed), 0 Resource-Exhaustion 2004 events
+since the fix. `[Errno 22]` only on 09-20 (22 rows, pre-fix), 0 since; `MemoryError` 2,
+09-20 only. 24 h: 18,674 success / 3 error (99.98 %). Error bursts since 09-15 are both
+short: 09-19 03:18-03:25Z (3 lanes, `standalone worker already active` lock race) and
+09-21 15:49Z + 16:23-16:30Z (reboots, same lock race after boot) - about 7 min lost on
+those lanes per restart. Health `status=ok`, findings none; offload 22:48Z pass 87 moved /
+0 failed / `stuck_unaccounted=0`. Poll lanes: Deribit 2,195 and Binance chain 745 runs
+since 09-15, largest gaps 97 / 110 min both on 09-20 during the memory incident; tier 5
+universe-positions 23-24/day, first cold offload landed on I: (1 run). Cascade tasks
+`hl-forward-update` 06:00 and `mv-liq-daily-update` 06:30 both ran 09-22, result 0.
+Deribit trade tape: 106 hourly runs since 09-15, max gap 1.4 h. I/O ceiling re-test
+(open item 1): no `high_quarantine_ratio` with lanes 36-43 live. **Disk:** G: 290 GB
+free (410 on 09-15): the drop is the hot raw tier filling to its new steady state
+(206 GB, every lane's oldest run 09-18 = the 4-day fence) after the expansion lanes went
+live, plus curated ~2.4 GB/day and `limitless_books` (31.7 GB, <1 GB/day, not in any
+offload list). Steady-state G: burn ~3 GB/day, runway ~3 months. D: 287 GB free (361 on
+09-15) - plant cold tier left D: on 09-17, so this is mostly non-plant writes. I:/J:
+15.8 TB free. **Wallet-flow node audit** (dry-run, `--start 2026-09-15`, cold root I:,
+rechecked against D:): 8 of 10 wallets complete; wallet 4 `0x091159a8...` missing
+2,062 fills 09-15 22:19Z -> 09-19 20:00Z (2,055 writable), wallet 1 `0x939f9503...`
+missing 340 fills 09-15 13:42-15:42Z (276 writable, 64 inside the poller window).
+Wallet-flow runs exist ~48/day throughout, so this is a per-wallet stall, not an outage.
+Repair = the same command with `--apply` - **owner decision**, queued.
+
+**Previous ops audit:** 2026-09-15 — **runner healthy; every configured lane
 capturing and fresh; the PR #82 wallet-flow fix verified live; no new defect.**
 Runner `market-data-plant` up since the 09-10 15:06 local redeploy, heartbeat
 age 2 s, 112 jobs / 31 pooled, run_count 59,139. 24 h: 17,818 success / 27
@@ -1019,6 +1048,15 @@ owner ask (safe-shaping directive above).
 
 Decisions waiting on the owner; agents must not act on these without an explicit OK
 (see `CLAUDE.md` Governance):
+
+- **Wallet-flow node backfill for the 2026-09-15..09-19 stall (2026-09-23 audit).**
+  Dry-run found wallet 4 `0x091159a8...` missing 2,062 fills (09-15 22:19Z -> 09-19
+  20:00Z; 2,055 writable) and wallet 1 `0x939f9503...` missing 340 (09-15 13:42-15:42Z;
+  276 writable). Repair = the ROADMAP 2026-09-14 command with `--cold-root
+  I:\market_archive_coldaw\market`, `--start 2026-09-15T00:00:00Z`, both `--wallet`
+  flags, plus `--apply`. Writes raw rows the scorer then promotes; same path as the
+  39,852-fill 09-14 backfill. Open question for the fix side: why one wallet stalled 4
+  days while the lane kept running (the 09-14 stall was 20 days, also silent).
 
 - **Proposed next data-feasibility memo: official exchange rule changes
   (2026-09-10; owner requested this memo, not a new collector).** Assess whether
