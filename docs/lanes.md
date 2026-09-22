@@ -34,6 +34,17 @@ curated data complete against raw. History lengths are as of 2026-09-10.
 Pre-2026-06-08 coverage exists only as the read-only `D:\market_archive`, not
 merged (ROADMAP open item 1).
 
+## OI polling cadence correction (2026-09-22)
+
+The live BTC/ETH/SOL OI jobs specify `poll_interval_seconds: 1`; the previous
+60-second entries below were stale. At 10:39 UTC on September 22, the last 31
+raw receipt timestamps sampled per symbol had median spacings of 1.314 s (BTC),
+1.323 s (ETH) and 1.313 s (SOL), with sampled maxima of 4.314 s, 3.945 s and
+3.558 s respectively. The configured interval is not an exact delivery cadence
+or a guarantee that the venue's OI value updates every second. This bounded
+check does not establish when the setting changed, historical one-second
+coverage, or whole-day completeness. Other inventory dates above are unchanged.
+
 ## Per lane
 
 | # | Lane | Venue | Instrument | Data | Capture | Curated target | Grade |
@@ -59,9 +70,9 @@ merged (ROADMAP open item 1).
 | 19 | binance-futures-rest-trades | Binance USDT-M perp | BTCUSDT | aggTrades | REST 1 s poll | trades_replayable | **A** gap-proof ids, but `received_at` lags the venue by the poll (0.5–1.5 s) |
 | 20 | binance-futures-rest-depth | Binance USDT-M perp | BTCUSDT | depth | REST 2 s poll | market_replayable | **B** 2-second snapshots, not a stream |
 | 21 | binance-futures-rest-funding | Binance USDT-M perp | BTCUSDT | funding, mark, index | REST 5 s poll | funding | **A** inline summary, one orphan run per worker restart (accounted) |
-| 22 | binance-btc-open-interest | Binance USDT-M perp | BTCUSDT | open interest | REST 60 s poll | open_interest | **A since 2026-09-08** (v11 per-symbol dirs); 2026-08-25..09-08 legacy dir quarantined; daily 5-min history 2020→ lives outside the plant (Vision zips) |
-| 23 | binance-eth-open-interest | Binance USDT-M perp | ETHUSDT | open interest | REST 60 s poll | open_interest | **A since 2026-09-08** |
-| 24 | binance-sol-open-interest | Binance USDT-M perp | SOLUSDT | open interest | REST 60 s poll | open_interest | **A since 2026-09-08** |
+| 22 | binance-btc-open-interest | Binance USDT-M perp | BTCUSDT | open interest | REST 1 s configured poll | open_interest | **A since 2026-09-08** (v11 per-symbol dirs); 2026-08-25..09-08 legacy dir quarantined; daily 5-min history 2020→ lives outside the plant (Vision zips) |
+| 23 | binance-eth-open-interest | Binance USDT-M perp | ETHUSDT | open interest | REST 1 s configured poll | open_interest | **A since 2026-09-08** |
+| 24 | binance-sol-open-interest | Binance USDT-M perp | SOLUSDT | open interest | REST 1 s configured poll | open_interest | **A since 2026-09-08** |
 | 25 | bybit-btc-liquidations | Bybit linear perp | BTCUSDT | liquidations | WS, day segments | raw only | **B** structurally clean day runs since 2026-09-08; `none_native`; 2026-08-25..09-08 shared-dir runs mixed-symbol |
 | 26 | bybit-eth-liquidations | Bybit linear perp | ETHUSDT | liquidations | WS, day segments | raw only | **B** as above |
 | 27 | bybit-sol-liquidations | Bybit linear perp | SOLUSDT | liquidations | WS, day segments | raw only | **B** as above |
