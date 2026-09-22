@@ -1053,7 +1053,7 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   Dry-run found wallet 4 `0x091159a8...` missing 2,062 fills (09-15 22:19Z -> 09-19
   20:00Z; 2,055 writable) and wallet 1 `0x939f9503...` missing 340 (09-15 13:42-15:42Z;
   276 writable). Repair = the ROADMAP 2026-09-14 command with `--cold-root
-  I:\market_archive_coldaw\market`, `--start 2026-09-15T00:00:00Z`, both `--wallet`
+  I:\market_archive_cold\raw\market`, `--start 2026-09-15T00:00:00Z`, both `--wallet`
   flags, plus `--apply`. Writes raw rows the scorer then promotes; same path as the
   39,852-fill 09-14 backfill. Open question for the fix side: why one wallet stalled 4
   days while the lane kept running (the 09-14 stall was 20 days, also silent).
