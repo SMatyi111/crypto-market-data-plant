@@ -751,15 +751,18 @@ perp lanes poll REST (`binance-futures-rest-worker`), one lane per stream:
   (`none_native`: finite-positive marks, monotonic timestamps — there is no sequence
   to prove).
 - **`open_interest`** (`/fapi/v1/openInterest` → `binance_perp_open_interest_<symbol>/`,
-  one lane and one raw dir per symbol, 60 s poll — never share a raw dir between
+  one lane and one raw dir per symbol, 1 s configured poll as verified 2026-09-22 —
+  never share a raw dir between
   lanes: run dirs are named to the second, so lockstep segments merge): venue-computed
   contract count, `price` None by
   contract (see "Open-interest channel" above), value in `size` +
   `metadata.open_interest`. Normalized into the **`open_interest` dataset** and
   promoted to `curated/research/open_interest` (v11); scored by
   `replay_funding_run` on `size`. Venue history is ~30 days, so this lane is the
-  only sub-daily record — the Vision daily zips (reference-data) cover 5-minute
+  finer-than-five-minute record — the Vision daily zips (reference-data) cover 5-minute
   history losslessly but trail by a day.
+  Configured polling is not guaranteed receipt or venue-value refresh cadence;
+  see the dated bounded check in [docs/lanes.md](docs/lanes.md).
 
 ### 4.6 Text-capture lanes (`text-rss`, `text-reddit`) — the `text` dataset
 

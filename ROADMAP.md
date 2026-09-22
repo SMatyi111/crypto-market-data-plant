@@ -8,7 +8,7 @@ changes scope or state. Companion docs:
 - [`STANDARDS.md`](STANDARDS.md) — the data contract (schemas, replayability, retention)
 - [`docs/HISTORY.md`](docs/HISTORY.md) — resolved-work narrative (what was fixed, and why)
 
-Last updated: **2026-09-20**.
+Last updated: **2026-09-22**.
 
 > **Operating mode — safe shaping (owner directive, 2026-07-04).** No extended
 > building on Claude's initiative: no new venues, lanes, or instruments, no big
@@ -16,6 +16,23 @@ Last updated: **2026-09-20**.
 > observability, retention and hygiene, small low-risk fixes, and clean
 > documentation. Expansion items below are tagged **PARKED** and need an
 > explicit owner ask to start.
+
+---
+
+## Documentation correction - live OI polling cadence (2026-09-22)
+
+The live BTC/ETH/SOL OI lanes already have `poll_interval_seconds: 1`.
+`docs/lanes.md` and STANDARDS 4.5 incorrectly still described 60-second polling;
+corrected to the existing configuration, with receipt cadence distinguished
+from the requested interval and from venue-value refresh frequency. No schema,
+replay definition, configuration or collector change; no version bump or redeploy.
+
+Read-only verification at 10:39 UTC: last 31 raw receipts per symbol, from runs
+`20260922_102919` (BTC/SOL) and `20260922_103617` (ETH). Median spacing was
+1.314/1.323/1.313 s for BTC/ETH/SOL, sampled maxima 4.314/3.945/3.558 s.
+This small live sample is not a historical completeness or OI-value refresh audit.
+The change date was not reconstructed; the previous 60-second documentation
+must not be used to infer the actual historical polling configuration.
 
 ---
 
