@@ -1,7 +1,14 @@
 # Data Standards
 
-`STANDARDS_VERSION = 13`
+`STANDARDS_VERSION = 14`
 
+> **v14 (2026-09-22, offline implementation; not activated):** optional Bybit
+> BTC linear depth session-evidence sidecar (section 4.12). Default disabled;
+> existing raw/clean schemas, curation and replay verdicts unchanged. When opted
+> in, raw receipt UTC is taken before decoding, with a private monotonic binding
+> stored only in the sidecar. A session-admission result is not economic admission.
+> No live configuration or deployment is included in this change.
+>
 > **v13 (2026-09-10, owner decision):** the **hot-path normalized Parquet layer
 > (section 2.2) is retired.** `normalized_parquet: false` is set on every
 > collector lane in the live and example configs (20 enabled lanes were still
@@ -1265,3 +1272,62 @@ aspirations, listed so nobody mistakes them for the current contract — notably
   dense against live frames (the Bybit-depth path).
 - Continuous day-bounded rotation as the default run model (vs. wall-clock
   segment rotation).
+
+
+## 4.12 Optional Bybit session evidence (sidecar version 1)
+
+Implemented for the existing Bybit `linear` `BTCUSDT` `orderbook.50` depth lane
+only. `--session-evidence` / per-job `session_evidence: true` enables it; default
+false. The option passes through central ops and segmented-worker dispatch. No
+example/live config enables it, no socket or scheduler lane is added, and the
+public endpoint remains `wss://stream.bybit.com/v5/public/linear`.
+
+`session_evidence/events.jsonl` contains sequenced connection/open/end/boundary,
+subscription request, received-frame hash/size and UTC/monotonic clocks, decoded
+payload hash, acknowledgement payload, snapshot reset, decode failure, raw-write
+binding and terminal records. A raw-write binding names the global one-based
+ordinal, connection and receive sequence plus the canonical decoded-envelope
+SHA256. The terminal manifest lists raw shards in chronological order with row
+counts, byte sizes and SHA256, resolving each ordinal to its final shard/row.
+Wire-frame hashes identify receipts but cannot be reconstructed from reserialized
+legacy raw; this sidecar does not claim to preserve wire-exact payloads.
+
+The journal has a 64 MiB total byte ceiling and 1 MiB queued-byte ceiling. One
+process-wide daemon writer slot keeps a stuck disk from accumulating a writer per
+segment. Producers enqueue without waiting for disk; the writer flushes each line
+and batches fsync (64 records or 200 ms at the next write). Any journal failure,
+byte/queue exhaustion or missing receipt disables evidence, without stopping the
+existing raw/clean collector. No unbounded retries or provider calls are added.
+
+The enabled path explicitly closes the async stream and market sinks. Only then
+can the writer prepare `manifest.json`: file hashes, counts, termination reason,
+`capture_complete`, `session_admitted`, issues, and `economic_admission: false`.
+Hashing and manifest I/O run on that writer, not the collector's event-loop thread.
+The collector waits at most two seconds. Failed/timed-out preparation leaves no
+admissible manifest (a tmp file is not a manifest); the writer checks its deadline
+again after fsync and before publication. An atomic rename already started before
+that deadline can complete later if the OS stalls: the wait bound is not a hard
+publication-time bound. Such a late manifest still covers closed, hashed files,
+not an incomplete capture. Missing or torn evidence refuses.
+Legacy metrics `partial=false` alone NEVER establishes this completion state.
+
+`verify_session_evidence(run_path)` is an offline consumer for an explicitly named
+finalized run. It verifies the exact raw-file set, journal/raw byte hashes, positive
+counts, connection/run/process identities, requested topic, received/decoded/ack
+and snapshot bindings, UTC/monotonic consistency (0.5 s tolerance), and one-to-one
+persisted book-frame bindings. Altered hashes or internally inconsistent evidence
+refuse. These unsigned records prove internal integrity, not authenticity against
+wholesale replacement by someone with archive write access.
+
+Connection boundaries invalidate frame eligibility until a fresh snapshot.
+This first version conservatively refuses the WHOLE RUN when it contains a
+boundary, decode failure, unanchored row, unpersisted pre-ack frame or clock jump;
+it does not select a favorable subinterval. A new snapshot resets the anchor.
+Observed update-id density does not establish a venue publication guarantee.
+Existing replay scoring remains unchanged and is not substituted for this gate.
+
+Sidecars live inside the source run and are included by the existing recursive
+offload file manifest (which checks paths/sizes, not these content hashes). Readers
+must still verify the sidecar's own hashes after offload. Rules/funding references,
+ticker multiplexing, and economic admission are separate future work; session
+admission alone licenses no paper-return experiment or live trade.

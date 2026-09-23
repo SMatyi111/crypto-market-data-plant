@@ -37,7 +37,8 @@ DEFAULT_ARCHIVE_ROOT = Path(r"G:\market_archive")
 # v13 (2026-09-10): hot-path normalized Parquet layer retired (normalized_parquet
 # false on every lane; STANDARDS 2.2 optional per lane, default off); OKX
 # liquidation lane max_delay_ms 3600000. Datasets and verdicts unchanged.
-STANDARDS_VERSION = 13
+# v14: optional disabled Bybit BTC linear session-evidence sidecar (STANDARDS 4.12).
+STANDARDS_VERSION = 14
 
 _FALLBACK_WARNED: set[str] = set()
 

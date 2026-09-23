@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from collections.abc import AsyncIterator
 
 from ..config import CollectorConfig
@@ -28,6 +29,7 @@ _CLEAN_CLOSE_STORM_WINDOW_SECONDS = 30.0
 class GenericWebsocketCollector(BaseCollector):
     def __init__(self, config: CollectorConfig) -> None:
         self.config = config
+        self.session_evidence = None  # enabled only by the scoped Bybit depth pipeline
         # Number of times the data-arrival watchdog fired (no data frame within
         # `idle_timeout_seconds`). Read by the pipeline into metrics/summary.jsonl so
         # the health report can see a silent-but-connected feed. Stays 0 when the
@@ -58,6 +60,8 @@ class GenericWebsocketCollector(BaseCollector):
                 async with websockets.connect(
                     self.config.websocket_url, max_size=self.config.max_message_bytes
                 ) as websocket:
+                    if self.session_evidence is not None:
+                        self.session_evidence.opened(self.config.websocket_url)
                     pending = await self._subscribe(websocket)
                     attempt = 0
                     # Start the app-level keepalive (if configured) only after the
@@ -99,6 +103,8 @@ class GenericWebsocketCollector(BaseCollector):
                                 # stream cleanly so the consumer finalizes (writes
                                 # metrics + replay summary) and the worker opens a fresh
                                 # segment, instead of blocking forever in recv.
+                                if self.session_evidence is not None:
+                                    self.session_evidence.boundary("idle_timeout")
                                 self.idle_timeout_count += 1
                                 logger.warning(
                                     "websocket idle timeout source=%s channel=%s "
@@ -116,9 +122,11 @@ class GenericWebsocketCollector(BaseCollector):
                             # way — raw stores decoded payloads — so skipping loses
                             # no more than crashing did, and sequence-validated lanes
                             # surface any resulting gap at replay scoring.
+                            receipt = self._receipt(message)
                             try:
                                 payload = self._decode_frame(message)
                             except Exception as exc:  # noqa: BLE001
+                                self._evidence_decode_error(receipt)
                                 self.decode_error_count += 1
                                 consecutive_decode_errors += 1
                                 log = (
@@ -144,13 +152,15 @@ class GenericWebsocketCollector(BaseCollector):
                                     )
                                     return
                                 continue
+                            self._decoded(payload, receipt)
                             consecutive_decode_errors = 0
                             if not self._should_emit(payload):
                                 continue
                             yield RawMessage(
                                 source=self.config.source,
-                                received_at=utc_now(),
+                                received_at=(receipt[0] if receipt else utc_now()),
                                 payload=payload,
+                                _capture=receipt[1] if receipt else None,
                             )
                             message_count += 1
                             if limit is not None and message_count >= limit:
@@ -162,6 +172,8 @@ class GenericWebsocketCollector(BaseCollector):
                 # successful subscribe) never accrues backoff on this path. Guard the
                 # fast-close storm explicitly: closes spaced wider than the window
                 # are normal (24h policy closes) and reconnect immediately.
+                if self.session_evidence is not None:
+                    self.session_evidence.boundary("remote_close")
                 logger.warning("websocket closed cleanly; reconnecting source=%s", self.config.source)
                 now = asyncio.get_event_loop().time()
                 if (
@@ -185,6 +197,8 @@ class GenericWebsocketCollector(BaseCollector):
                     clean_close_streak = 0
                 last_clean_close_at = now
             except Exception as exc:  # noqa: BLE001
+                if self.session_evidence is not None:
+                    self.session_evidence.boundary(type(exc).__name__)
                 attempt += 1
                 if attempt >= max_attempts or not _is_retryable_connect_error(exc):
                     raise
@@ -201,6 +215,33 @@ class GenericWebsocketCollector(BaseCollector):
                     exc,
                 )
                 await asyncio.sleep(delay)
+            finally:
+                if self.session_evidence is not None:
+                    self.session_evidence.event("connection_end")
+
+    def _receipt(self, message):
+        if self.session_evidence is None:
+            return None
+        clock = (utc_now(), time.monotonic_ns())
+        try:
+            return clock[0], self.session_evidence.received(message, clock)
+        except Exception as exc:
+            self.session_evidence._fail(type(exc).__name__)
+            return None
+
+    def _decoded(self, payload, receipt):
+        if self.session_evidence is not None and receipt is not None:
+            try:
+                self.session_evidence.decoded(payload, receipt[1])
+            except Exception as exc:
+                self.session_evidence._fail(type(exc).__name__)
+
+    def _evidence_decode_error(self, receipt):
+        if self.session_evidence is not None:
+            self.session_evidence.issue("decode_error")
+            self.session_evidence.anchor = False
+            self.session_evidence.event("decode_error",
+                receive_seq=receipt[1]["receive_seq"] if receipt else None)
 
     def _start_keepalive(self, websocket: object) -> asyncio.Task | None:
         """Spawn the app-level ping task if configured; otherwise return None.
@@ -266,6 +307,8 @@ class GenericWebsocketCollector(BaseCollector):
         if not subscription:
             return []
         await websocket.send(json.dumps(subscription))
+        if self.session_evidence is not None:
+            self.session_evidence.event("subscribe_sent", payload=subscription)
         timeout = float(self.config.subscription_ack_timeout_seconds)
         if timeout <= 0:
             return []
@@ -279,13 +322,16 @@ class GenericWebsocketCollector(BaseCollector):
                     f"subscription ack timed out for {self.config.source}:{self.config.channel}"
                 )
             raw = await asyncio.wait_for(websocket.recv(), timeout=remaining)
+            receipt = self._receipt(raw)
             try:
                 payload = self._decode_frame(raw)
             except Exception:  # noqa: BLE001 - malformed frame during ack wait; skip it
                 # json.loads raises ValueError/TypeError; the optional binary decoder
                 # (MEXC protobuf) can raise its own DecodeError. Either way a single
                 # undecodable buffered frame is skipped, not fatal to the handshake.
+                self._evidence_decode_error(receipt)
                 continue
+            self._decoded(payload, receipt)
             if self._is_subscription_error(payload):
                 raise RuntimeError(f"subscription rejected: {payload}")
             if self._is_subscription_ack(payload):
@@ -294,8 +340,9 @@ class GenericWebsocketCollector(BaseCollector):
                 buffered.append(
                     RawMessage(
                         source=self.config.source,
-                        received_at=utc_now(),
+                        received_at=(receipt[0] if receipt else utc_now()),
                         payload=payload,
+                        _capture=receipt[1] if receipt else None,
                     )
                 )
 

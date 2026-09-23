@@ -14,9 +14,11 @@ class RawMessage:
     source: str
     received_at: datetime
     payload: dict[str, Any]
+    _capture: dict[str, Any] | None = field(default=None, repr=False, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
         row = asdict(self)
+        row.pop("_capture", None)
         row["received_at"] = self.received_at.isoformat()
         return row
 

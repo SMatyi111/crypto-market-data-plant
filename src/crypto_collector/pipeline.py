@@ -105,10 +105,18 @@ class CollectorPipeline:
         fans out to several events via `normalize_many`, so a frame-bounded segment can
         contain more clean events than `limit`."""
         summary = RunSummary()
+        evidence = getattr(self.collector, "session_evidence", None)
+        stream = self.collector.stream(limit=limit)
+        reason = "exception"
         try:
-            async for raw in self.collector.stream(limit=limit):
+            async for raw in stream:
                 summary.raw_messages += 1
                 self.raw_sink.write(raw.to_dict())
+                if evidence is not None:
+                    try:
+                        evidence.written(raw, summary.raw_messages)
+                    except Exception as exc:
+                        evidence._fail(type(exc).__name__)
 
                 for normalized in _normalize_events(self.normalizer, raw):
                     verdict = self.quality_gate.validate(normalized)
@@ -144,6 +152,9 @@ class CollectorPipeline:
                             "partial": True,
                         }
                     )
+            reason = ("deadline" if summary.deadline_reached else
+                      "limit" if limit is not None and summary.raw_messages >= limit else
+                      "unexpected_end")
         finally:
             # Always flush, even on cancellation / exception, so buffered Parquet rows
             # and the summary metrics are persisted instead of lost on shutdown. Each
@@ -153,6 +164,14 @@ class CollectorPipeline:
             # for. The first cleanup failure is re-raised only when no exception is
             # already propagating, so the original error is never masked.
             cleanup_error: BaseException | None = None
+            if evidence is not None:
+                if sys.exc_info()[0] is not None:
+                    reason = sys.exc_info()[0].__name__
+                try:
+                    await stream.aclose()
+                except BaseException as exc:
+                    cleanup_error = exc
+                    evidence.issue("stream_close_failed")
             try:
                 self.metrics_sink.write(
                     {
@@ -183,6 +202,8 @@ class CollectorPipeline:
                     except Exception as exc:  # noqa: BLE001
                         cleanup_error = cleanup_error or exc
                         logger.exception("pipeline shutdown: sink close failed")
+            if evidence is not None:
+                evidence.finish(reason=reason, sinks_closed=cleanup_error is None)
             if cleanup_error is not None and sys.exc_info()[0] is None:
                 raise cleanup_error
         return summary
