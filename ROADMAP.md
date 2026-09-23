@@ -1049,14 +1049,15 @@ owner ask (safe-shaping directive above).
 Decisions waiting on the owner; agents must not act on these without an explicit OK
 (see `CLAUDE.md` Governance):
 
-- **Wallet-flow node backfill for the 2026-09-15..09-19 stall (2026-09-23 audit).**
-  Dry-run found wallet 4 `0x091159a8...` missing 2,062 fills (09-15 22:19Z -> 09-19
-  20:00Z; 2,055 writable) and wallet 1 `0x939f9503...` missing 340 (09-15 13:42-15:42Z;
-  276 writable). Repair = the ROADMAP 2026-09-14 command with `--cold-root
-  I:\market_archive_cold\raw\market`, `--start 2026-09-15T00:00:00Z`, both `--wallet`
-  flags, plus `--apply`. Writes raw rows the scorer then promotes; same path as the
-  39,852-fill 09-14 backfill. Open question for the fix side: why one wallet stalled 4
-  days while the lane kept running (the 09-14 stall was 20 days, also silent).
+- ~~**Wallet-flow node backfill for the 2026-09-15..09-19 stall (2026-09-23 audit).**~~
+  **DONE 2026-09-23 (owner OK: "Do tha back fill").** `--apply` with cold root I: and
+  `--start 2026-09-15T00:00:00Z` wrote run `20260923_000338` (wallet 4 `0x091159a8...`,
+  2,055 fills) and `20260923_000339` (wallet 1 `0x939f9503...`, 276 fills), both
+  `replayable=True`, no findings. Re-run dry-run: wallet 4 missing 2,062 -> 7, wallet 1
+  340 -> 64, `writable=0`; the 71 left are `deferred_recent` at each wallet's poller
+  resume floor and would need `--no-poller-guard` (only sane with the poller stopped) -
+  left alone. Still open for the fix side: why one wallet stalled 4 days while the lane
+  kept running (the 09-14 stall was 20 days, also silent) - carried to the next audit.
 
 - **Proposed next data-feasibility memo: official exchange rule changes
   (2026-09-10; owner requested this memo, not a new collector).** Assess whether
