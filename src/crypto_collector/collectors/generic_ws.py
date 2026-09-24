@@ -29,6 +29,7 @@ _CLEAN_CLOSE_STORM_WINDOW_SECONDS = 30.0
 class GenericWebsocketCollector(BaseCollector):
     def __init__(self, config: CollectorConfig) -> None:
         self.config = config
+        self.reference_evidence = None
         self.session_evidence = None  # enabled only by the scoped Bybit depth pipeline
         # Number of times the data-arrival watchdog fired (no data frame within
         # `idle_timeout_seconds`). Read by the pipeline into metrics/summary.jsonl so
@@ -84,12 +85,20 @@ class GenericWebsocketCollector(BaseCollector):
                         # can't hang the loop forever. idle_timeout <= 0 (the default)
                         # is the exact `async for message in websocket` behavior.
                         idle_timeout = float(self.config.idle_timeout_seconds or 0.0)
+                        reference_mode = bool(self.session_evidence and self.session_evidence.reference_mode)
+                        if reference_mode and idle_timeout <= 0:
+                            idle_timeout = 30.0
+                        depth_deadline = time.monotonic() + idle_timeout
                         message_iter = websocket.__aiter__()
                         while True:
                             try:
+                                remaining = (depth_deadline - time.monotonic()
+                                             if reference_mode else idle_timeout)
+                                if reference_mode and remaining <= 0:
+                                    raise TimeoutError("Depth idle despite reference traffic")
                                 if idle_timeout > 0:
                                     message = await asyncio.wait_for(
-                                        message_iter.__anext__(), timeout=idle_timeout
+                                        message_iter.__anext__(), timeout=remaining
                                     )
                                 else:
                                     message = await message_iter.__anext__()
@@ -156,6 +165,7 @@ class GenericWebsocketCollector(BaseCollector):
                             consecutive_decode_errors = 0
                             if not self._should_emit(payload):
                                 continue
+                            depth_deadline = time.monotonic() + idle_timeout
                             yield RawMessage(
                                 source=self.config.source,
                                 received_at=(receipt[0] if receipt else utc_now()),
@@ -356,7 +366,9 @@ class GenericWebsocketCollector(BaseCollector):
         if self.config.subscription_style == "bybit":
             # {"success":true,"ret_msg":"subscribe","op":"subscribe",...}; the pong
             # reply uses op:"ping", so key off op:"subscribe" to avoid matching it.
-            return payload.get("op") == "subscribe" and payload.get("success") is True
+            return (payload.get("op") == "subscribe" and payload.get("success") is True
+                    and (not self.session_evidence or not self.session_evidence.reference_mode
+                         or payload.get("req_id") == self.session_evidence.process_session))
         if self.config.subscription_style == "kraken_v2":
             # {"method":"subscribe","success":true,...}; one ack per symbol.
             return payload.get("method") == "subscribe" and payload.get("success") is True
@@ -410,6 +422,10 @@ class GenericWebsocketCollector(BaseCollector):
                 "id": 1,
             }
         if self.config.subscription_style == "bybit":
+            if self.session_evidence and self.session_evidence.reference_mode:
+                from ..session_evidence import TOPIC, TICKER
+                return {"op": "subscribe", "args": [TOPIC, TICKER],
+                        "req_id": self.session_evidence.process_session}
             # Topic is "<channel>.<symbol>", e.g. "publicTrade.BTCUSDT" or
             # "orderbook.50.BTCUSDT" (the depth level is part of the channel).
             return {
@@ -456,6 +472,9 @@ class GenericWebsocketCollector(BaseCollector):
                 return False
         if self.config.subscription_style == "bybit":
             # Data frames carry a "topic"; acks/pongs carry "op" and no topic.
+            if self.session_evidence and self.session_evidence.reference_mode:
+                from ..session_evidence import TOPIC
+                return payload.get("topic") == TOPIC
             return "topic" in payload
         if self.config.subscription_style == "kraken_v2":
             # Data frames are channel trade/book; drop heartbeat/status/pong + acks.

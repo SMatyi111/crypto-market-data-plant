@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 ENDPOINT = "wss://stream.bybit.com/v5/public/linear"
 TOPIC = "orderbook.50.BTCUSDT"
 VERSION = 1
+TICKER = "tickers.BTCUSDT"
 _WRITER_SLOT = threading.BoundedSemaphore(1)
 
 
@@ -57,7 +58,8 @@ class SessionEvidence:
     sink or timeout refuses evidence instead of interrupting legacy market writes.
     """
 
-    def __init__(self, root: Path, *, max_bytes=64 * 1024**2, queue_bytes=1024**2):
+    def __init__(self, root: Path, *, max_bytes=64 * 1024**2, queue_bytes=1024**2, reference_mode=False):
+        self.reference_mode = reference_mode
         self.root = root
         self.directory = root / "session_evidence"
         self.max_bytes, self.queue_bytes = max_bytes, queue_bytes
@@ -180,12 +182,17 @@ class SessionEvidence:
         self.event("decoded", receive_seq=receipt["receive_seq"],
                    payload_sha256=digest(canonical(payload)), topic=payload.get("topic"),
                    book_type=payload.get("type"),
-                   symbol=payload.get("data", {}).get("s") if isinstance(payload.get("data"), dict) else None)
+                   symbol=payload.get("data", {}).get("symbol" if payload.get("topic") == TICKER else "s")
+                   if isinstance(payload.get("data"), dict) else None)
         if payload.get("op") == "subscribe":
-            self.ack = payload.get("success") is True
+            self.ack = (payload.get("success") is True and
+                        (not self.reference_mode or payload.get("req_id") == self.process_session))
             self.event("ack", receive_seq=receipt["receive_seq"], payload=payload)
             if not self.ack:
                 self.issue("rejected_ack")
+        if self.reference_mode and payload.get("topic") == TICKER:
+            self.event("ticker", receipt=receipt.copy(), payload=payload)
+            return
         if "topic" in payload:
             self.book_received += 1
             if (payload.get("topic") != TOPIC or not isinstance(payload.get("data"), dict)
@@ -238,7 +245,8 @@ class SessionEvidence:
         if sum(f["rows"] for f in files) != self.raw_count:
             self.issue("raw_count_mismatch")
         complete = self._sinks_closed and self._reason in {"limit", "deadline"}
-        manifest = {"version": VERSION, "process_session": self.process_session,
+        manifest = {"version": 2 if self.reference_mode else VERSION,
+                    "reference_mode": self.reference_mode, "process_session": self.process_session,
                     "run_id": self.root.name, "reason": self._reason,
                     "capture_complete": complete, "issues": sorted(self.issues),
                     "session_admitted": complete and not self.issues and self.raw_count > 0,
@@ -264,7 +272,8 @@ def verify_session_evidence(root: Path) -> dict:
     independently reconciled with legacy raw, which is not a wire-exact archive.
     """
     manifest = json.loads((root / "session_evidence/manifest.json").read_text())
-    if (manifest["version"] != VERSION or not manifest["session_admitted"]
+    references = manifest.get("reference_mode", False)
+    if (manifest["version"] != (2 if references else VERSION) or not manifest["session_admitted"]
             or not manifest["capture_complete"] or manifest["economic_admission"]
             or manifest["issues"] or manifest["run_id"] != root.name
             or type(manifest["raw_count"]) is not int or manifest["raw_count"] <= 0):
@@ -280,6 +289,7 @@ def verify_session_evidence(root: Path) -> dict:
     connection = 0
     terminal = previous = None
     used = set()
+    tickers = set()
     with journal_path.open() as stream:
         for seq, line in enumerate(stream, 1):
             row = json.loads(line)
@@ -309,7 +319,10 @@ def verify_session_evidence(root: Path) -> dict:
             elif not connection or row["connection"] != connection:
                 raise ValueError("Missing connection")
             elif kind == "subscribe_sent":
-                if row["payload"] != {"op": "subscribe", "args": [TOPIC]} or subscribed:
+                expected_subscription = {"op": "subscribe", "args": [TOPIC]}
+                if references:
+                    expected_subscription.update(args=[TOPIC, TICKER], req_id=manifest["process_session"])
+                if row["payload"] != expected_subscription or subscribed:
                     raise ValueError("Wrong subscription")
                 subscribed = True
             elif kind in {"connection_boundary", "decode_error"}:
@@ -321,16 +334,17 @@ def verify_session_evidence(root: Path) -> dict:
                 if rid not in receipts or rid in decoded:
                     raise ValueError("Unbound decoded payload")
                 if row["topic"] is not None:
-                    if (row["topic"] != TOPIC or row["symbol"] != "BTCUSDT"
+                    if (row["topic"] not in ({TOPIC, TICKER} if references else {TOPIC}) or row["symbol"] != "BTCUSDT"
                             or row["book_type"] not in {"snapshot", "delta"}):
                         raise ValueError("Wrong book identity/type")
-                    if row["book_type"] == "snapshot":
+                    if row["book_type"] == "snapshot" and row["topic"] == TOPIC:
                         anchored = True
                 decoded[rid] = dict(row, anchored=anchored)
             elif kind == "ack":
                 item = decoded.get(row["receive_seq"])
                 if (not subscribed or item is None or row["payload"].get("op") != "subscribe"
                         or row["payload"].get("success") is not True
+                        or (references and row["payload"].get("req_id") != manifest["process_session"])
                         or item["payload_sha256"] != digest(canonical(row["payload"]))):
                     raise ValueError("Unbound acknowledgement")
                 acknowledged = True
@@ -350,10 +364,25 @@ def verify_session_evidence(root: Path) -> dict:
                     raise ValueError("Unanchored or unbound row")
                 used.add(rid)
                 bindings.append(row)
+            elif kind == "ticker" and references:
+                receipt = row["receipt"]
+                rid = receipt["receive_seq"]
+                original, item = receipts.get(rid), decoded.get(rid)
+                if (original is None or item is None or rid in tickers
+                        or item["topic"] != TICKER or receipt["connection"] != connection
+                        or original["utc"] != receipt["utc"]
+                        or original["monotonic_ns"] != receipt["monotonic_ns"]
+                        or item["payload_sha256"] != digest(canonical(row["payload"]))):
+                    raise ValueError("Unbound ticker")
+                tickers.add(rid)
+            elif kind == "http_reference" and references:
+                pass  # Separate reference validator checks HTTP semantics and timing.
             elif kind == "terminal":
                 terminal = row
             elif kind != "connection_end":
                 raise ValueError("Unknown session record")
+    if {rid for rid, item in decoded.items() if item["topic"] == TICKER} != tickers:
+        raise ValueError("Unpersisted ticker")
     if {rid for rid, item in decoded.items() if item["topic"] == TOPIC} != used:
         raise ValueError("Unpersisted book frames or snapshot anchor")
     if (terminal is None or not terminal["sinks_closed"]

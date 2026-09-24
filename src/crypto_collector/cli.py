@@ -820,6 +820,7 @@ def build_parser() -> argparse.ArgumentParser:
     bybit_depth_parser.add_argument("--ops-root", type=Path, default=default_ops_root())
     bybit_depth_parser.add_argument("--worker-name", default="bybit-depth-worker")
     bybit_depth_parser.add_argument("--session-evidence", action="store_true", default=False)
+    bybit_depth_parser.add_argument("--reference-evidence", action="store_true", default=False)
     bybit_depth_parser.add_argument("--heartbeat-interval-seconds", type=float, default=30.0)
     bybit_depth_parser.add_argument(
         "--source-suffix",
@@ -2518,6 +2519,9 @@ async def _collect_depth_stream_segment(
         message_decoder=message_decoder,
     )
     evidence_enabled = bool(getattr(args, "session_evidence", False))
+    references_enabled = bool(getattr(args, "reference_evidence", False))
+    if references_enabled and not evidence_enabled:
+        raise ValueError("Reference evidence requires session evidence")
     if evidence_enabled and (source != "bybit" or websocket_url != _bybit_ws_url("linear")
                              or args.symbol != "BTCUSDT" or args.channel != "orderbook.50"):
         raise ValueError("Session evidence is scoped to Bybit linear BTC depth 50")
@@ -2526,7 +2530,10 @@ async def _collect_depth_stream_segment(
     run_paths = prepare_run_paths(output_root=config.output_root, source=source_name)
     if evidence_enabled:
         from .session_evidence import SessionEvidence
-        collector.session_evidence = SessionEvidence(run_paths.base)
+        collector.session_evidence = SessionEvidence(run_paths.base, reference_mode=references_enabled)
+        if references_enabled:
+            from .bybit_references import BybitReferences
+            collector.reference_evidence = BybitReferences(collector.session_evidence)
     fsync_events, fsync_ms = _fsync_intervals(args)
     pipeline = CollectorPipeline(
         collector=collector,
@@ -3648,6 +3655,7 @@ def _run_segmented_worker(
                     # `market`). fsync defaults on and BATCHED, so a hot lane gets
                     # crash-durable writes without per-event fsync capping its throughput.
                     segment_args.session_evidence = bool(getattr(args, "session_evidence", False))
+                    segment_args.reference_evidence = bool(getattr(args, "reference_evidence", False))
                     segment_args.jsonl_fsync = bool(getattr(args, "jsonl_fsync", True))
                     fsync_events, fsync_ms = _fsync_intervals(args)
                     segment_args.fsync_interval_events = fsync_events
@@ -3722,6 +3730,10 @@ def _run_segmented_worker(
         else:
             runtime.record_event("worker_stopped", details={"reason": "completed", "completed_segments": completed_segments})
             runtime.write_heartbeat(status="stopped", last_segment_index=completed_segments, last_run_path=last_run_path)
+        finally:
+            if getattr(args, "reference_evidence", False):
+                from .bybit_references import drain_reference_finalizers
+                drain_reference_finalizers()
 
 
 def run_ops_runner(args: argparse.Namespace) -> None:
@@ -3843,6 +3855,7 @@ def _execute_ops_job_inprocess(job: JobSpec) -> JobExecutionResult | str | None:
     # enumeration trap, killed centrally like the cadence knobs above. Only override
     # when the config actually sets the key, so _job_args/parser defaults still win.
     args.session_evidence = bool(job.args.get("session_evidence", False))
+    args.reference_evidence = bool(job.args.get("reference_evidence", False))
     if "jsonl_fsync" in job.args:
         args.jsonl_fsync = bool(job.args["jsonl_fsync"])
     if "normalized_parquet" in job.args:

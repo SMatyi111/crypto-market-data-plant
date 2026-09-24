@@ -8,7 +8,7 @@ changes scope or state. Companion docs:
 - [`STANDARDS.md`](STANDARDS.md) — the data contract (schemas, replayability, retention)
 - [`docs/HISTORY.md`](docs/HISTORY.md) — resolved-work narrative (what was fixed, and why)
 
-Last updated: **2026-09-22**.
+Last updated: **2026-09-24**.
 
 > **Operating mode — safe shaping (owner directive, 2026-07-04).** No extended
 > building on Claude's initiative: no new venues, lanes, or instruments, no big
@@ -16,6 +16,35 @@ Last updated: **2026-09-22**.
 > observability, retention and hygiene, small low-risk fixes, and clean
 > documentation. Expansion items below are tagged **PARKED** and need an
 > explicit owner ask to start.
+
+---
+
+## Bybit reference evidence - second offline slice (2026-09-24)
+
+Owner authorized the next plant-reuse slice: public contract/funding references
+and ticker messages on the existing BTC linear depth socket. Implemented behind
+`reference_evidence: false` by default, requiring the optional session journal.
+STANDARDS v15 / sidecar v2 preserves depth-only raw output, correlates the combined
+subscription acknowledgement, and gives depth its own idle deadline. Bounded
+HTTP helpers run off the market loop; finalization follows market sink closure.
+Offline validation refuses incomplete reference coverage. Crossed funding still
+lacks an exact settlement mark and cannot be called funding-complete.
+
+Synthetic tests cover routing, depth silence despite ticker traffic, malformed
+and missing references, funding boundaries, worker finalization and owned-helper
+timeouts. Review identified premature worker exit and unbounded Decimal-to-int
+expansion; both were fixed. Worker exit now drains only terminal finalizers, with
+a bounded gap that must be considered before activation. No live
+option, runner restart, standalone capture, outcome scan, holdout release or paid
+dispatch is part of this change. After merge, the next step is a separately scoped
+activation/capacity check on the existing lane; do not silently start a new trial.
+The pre-existing incomplete standalone capture remains unadmitted.
+
+Test-development deviation: after the HTTP helper changed from `run` to `Popen`,
+one stale mock allowed a single fixed public funding-history request for epoch
+0..1000 ms. Its output was not persisted or used as evidence. The reference test
+module now denies real child processes by default; individual synthetic-process
+fixtures must opt in explicitly.
 
 ---
 

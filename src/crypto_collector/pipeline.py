@@ -106,9 +106,12 @@ class CollectorPipeline:
         contain more clean events than `limit`."""
         summary = RunSummary()
         evidence = getattr(self.collector, "session_evidence", None)
+        references = getattr(self.collector, "reference_evidence", None)
         stream = self.collector.stream(limit=limit)
         reason = "exception"
         try:
+            if references is not None:
+                references.start()
             async for raw in stream:
                 summary.raw_messages += 1
                 self.raw_sink.write(raw.to_dict())
@@ -203,7 +206,10 @@ class CollectorPipeline:
                         cleanup_error = cleanup_error or exc
                         logger.exception("pipeline shutdown: sink close failed")
             if evidence is not None:
-                evidence.finish(reason=reason, sinks_closed=cleanup_error is None)
+                if references is not None:
+                    references.close(reason=reason, sinks_closed=cleanup_error is None)
+                else:
+                    evidence.finish(reason=reason, sinks_closed=cleanup_error is None)
             if cleanup_error is not None and sys.exc_info()[0] is None:
                 raise cleanup_error
         return summary
