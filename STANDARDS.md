@@ -1,7 +1,12 @@
 # Data Standards
 
-`STANDARDS_VERSION = 14`
+`STANDARDS_VERSION = 15`
 
+> **v15 (2026-09-24, offline implementation; not activated):** optional Bybit
+> BTC linear ticker, contract and funding reference evidence (section 4.13).
+> Adds sidecar version 2 only when explicitly enabled; raw/clean and curation
+> contracts stay unchanged. No new scheduler lane, socket or live option.
+>
 > **v14 (2026-09-22, offline implementation; not activated):** optional Bybit
 > BTC linear depth session-evidence sidecar (section 4.12). Default disabled;
 > existing raw/clean schemas, curation and replay verdicts unchanged. When opted
@@ -1328,6 +1333,88 @@ Existing replay scoring remains unchanged and is not substituted for this gate.
 
 Sidecars live inside the source run and are included by the existing recursive
 offload file manifest (which checks paths/sizes, not these content hashes). Readers
-must still verify the sidecar's own hashes after offload. Rules/funding references,
-ticker multiplexing, and economic admission are separate future work; session
+must still verify the sidecar's own hashes after offload. Rules/funding references and
+ticker multiplexing are the optional v2 extension below; session
 admission alone licenses no paper-return experiment or live trade.
+
+
+## 4.13 Optional Bybit public reference evidence (sidecar version 2)
+
+`--reference-evidence` / per-job `reference_evidence: true` is disabled by default
+and requires `session_evidence: true` on the existing BTCUSDT linear depth-50
+collector. Central ops/segment dispatch carries both options. No example or live
+configuration enables them. Scope and prerequisites are checked before creating
+run files. Version 1 journals remain readable.
+
+The existing socket requests `[orderbook.50.BTCUSDT, tickers.BTCUSDT]` in ONE
+subscription with a process-session request ID. A successful acknowledgement
+must echo that ID. Each ticker payload and its UTC/monotonic receipt is journaled
+and bound to the decoded-frame hash; tickers never enter raw/clean depth output
+or its counters. Snapshots reset ticker state; deltas carry omitted fields from
+the preceding snapshot. Wrong symbols, missing anchors or unbound receipts refuse
+reference validation. Only depth frames reset the enabled path's idle deadline;
+ticker/pong traffic cannot hide a stalled depth stream. A nonpositive configured
+idle timeout resolves to 30 seconds on this optional path only.
+
+One daemon lifecycle starts a bounded public rules GET concurrently with market
+collection. When the market stream and sinks close normally, the collector returns
+from the pipeline: the lifecycle performs the post-rules GET, then funding-history GET,
+then enqueues all HTTP evidence and finalizes the journal. It never waits for HTTP
+on the book-writing event loop. A crash before finalization is incomplete, even
+if some HTTP requests succeeded. The existing process-wide journal-writer slot
+remains occupied through this work; a segment starting before it is released
+collects books but refuses its optional evidence. Thus this is not a guarantee of
+reference coverage in every adjacent segment.
+
+The segmented worker drains outstanding reference finalizers only at its terminal
+exit, with a 33-second shared wait ceiling and cancellation of the exact owned
+HTTP child on expiry. It does not drain between segments. A single-segment worker
+can therefore add up to that bound before the next ops job starts; activation must
+account for this source-coverage gap. Direct library users of `CollectorPipeline`
+with references must call `drain_reference_finalizers()` before process exit.
+The HTTP helper also has its own ten-second exit watchdog so a killed parent does
+not leave an indefinitely trickling child. These time limits do not bound a kernel
+operation that Windows itself cannot complete.
+
+Public GETs are fixed to `https://api.bybit.com`, category `linear`, symbol
+`BTCUSDT`: `/v5/market/instruments-info` before/after and
+`/v5/market/funding/history?category=linear&symbol=BTCUSDT&startTime=...&endTime=...&limit=200`.
+No keys, signed endpoints, inherited HTTP proxies, redirects or retries. Each
+owned helper subprocess has a 10-second wall timeout (including DNS/TLS/body), an
+8-second socket timeout and a 1 MiB response-body cap. Maximum three attempts per
+normal segment, sequential, with a capture lifetime of 1,860 seconds. Timeout
+terminates only that owned helper; capture expiry disables evidence, not books.
+Bodies are preserved as base64 plus SHA256, HTTP status, fixed URL and UTC/monotonic
+request/receipt clocks. The producer holds at most three capped responses until
+market closure, keeping journal sequencing single-producer. The existing 64 MiB
+total / 1 MiB queue limits also apply; base64 expansion or busy depth traffic may
+exhaust them and refuse evidence. Caps are not a capacity guarantee for 30 minutes.
+
+`verify_bybit_references(run_path)` first validates session/raw integrity, then
+checks all three reference attempts, byte hashes, fixed endpoints, bounded and
+journal-consistent clocks, unchanged contract-rule projections, ticker snapshot/
+delta continuity and settlement-history coverage. It uses finite Decimal rule
+values, bounded integral funding intervals and bounded ASCII timestamps before
+integer conversion, requires Trading / LinearPerpetual / USDT and BTCUSDT, and rejects full
+200-row funding pages, duplicate times, unexpected symbols and missing expected
+settlements. No historical rules are applied to earlier book receipts.
+
+The eligible interval starts only after the initial rules receipt, ticker anchor
+and first persisted book; it ends at the last persisted book. Ticker coverage must
+have no observed gap exceeding five seconds, including the last ticker to book
+end. Empty funding history supports a no-settlement interval only when every
+observed next-funding time lies more than five seconds after that end. This is
+conditional on the observed venue schedule; it is not an exchange guarantee.
+If any settlement is crossed, the settled rate is retained but
+`funding_cashflow_complete` stays false: the public funding history has no exact
+settlement mark, and nearby tickers/OHLC are not substituted. Unchanged before/after
+rules are an interval assumption, not proof against unobserved temporary changes.
+
+Reference integrity is distinct from `session_admitted` and always returns
+`economic_admission: false`. Account-specific fees, fills, research admission,
+sealed holdout and prior attempt budgets remain separate. No paper round-trip
+or live trade is invoked. Official protocol references:
+[WS connect](https://bybit-exchange.github.io/docs/v5/ws/connect),
+[ticker](https://bybit-exchange.github.io/docs/v5/websocket/public/ticker),
+[instruments](https://bybit-exchange.github.io/docs/v5/market/instrument),
+[funding history](https://bybit-exchange.github.io/docs/v5/market/history-fund-rate).
