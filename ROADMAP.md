@@ -8,7 +8,7 @@ changes scope or state. Companion docs:
 - [`STANDARDS.md`](STANDARDS.md) — the data contract (schemas, replayability, retention)
 - [`docs/HISTORY.md`](docs/HISTORY.md) — resolved-work narrative (what was fixed, and why)
 
-Last updated: **2026-09-24**.
+Last updated: **2026-09-27**.
 
 > **Operating mode — safe shaping (owner directive, 2026-07-04).** No extended
 > building on Claude's initiative: no new venues, lanes, or instruments, no big
@@ -16,6 +16,26 @@ Last updated: **2026-09-24**.
 > observability, retention and hygiene, small low-risk fixes, and clean
 > documentation. Expansion items below are tagged **PARKED** and need an
 > explicit owner ask to start.
+
+---
+
+## Bybit reference capacity preflight - activation remains off (2026-09-27)
+
+The September 25 synthetic preflight rejects enabling PR95 with the current
+30-minute / 64 MiB settings. Conservative projections including HTTP/control
+reserves: 121.12 MiB nominal (50 depth / 10 ticker messages per second), 379.59 MiB
+stress (double rates and 4 KiB extra ticker payload). Short synthetic runs passed
+both integrity validators; these are projections, not measured venue traffic or
+a sustained G: I/O benchmark. Method, limits and lifecycle findings are recorded
+in [the preflight note](docs/bybit_reference_preflight.md).
+
+Keep the existing collector cadence and both evidence flags disabled. Next code
+slice: bounded opt-in per-lane journal sizing and a disk-headroom preflight;
+retain 64 MiB by default and test 512 MiB offline before any activation decision.
+The 512 MiB cap envelope is 24 GiB/day at 48 runs, so raising a cap alone is not
+permission to consume that storage. Terminal drain, writer-slot handoff and the
+single-record queue limit remain explicit coverage constraints. No runner,
+config, transfer, archive, holdout or economic-read changes were made.
 
 ---
 
