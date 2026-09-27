@@ -1,7 +1,12 @@
 # Data Standards
 
-`STANDARDS_VERSION = 15`
+`STANDARDS_VERSION = 16`
 
+> **v16 (2026-09-27, offline implementation; not activated):** bounded optional
+> journal budgets and disk-headroom checks (section 4.14). Default 64 MiB cap,
+> unchanged 1 MiB queue and evidence-off live configuration. Additive resource
+> metadata; earlier v1/v2 manifests remain readable.
+>
 > **v15 (2026-09-24, offline implementation; not activated):** optional Bybit
 > BTC linear ticker, contract and funding reference evidence (section 4.13).
 > Adds sidecar version 2 only when explicitly enabled; raw/clean and curation
@@ -1418,3 +1423,53 @@ or live trade is invoked. Official protocol references:
 [ticker](https://bybit-exchange.github.io/docs/v5/websocket/public/ticker),
 [instruments](https://bybit-exchange.github.io/docs/v5/market/instrument),
 [funding history](https://bybit-exchange.github.io/docs/v5/market/history-fund-rate).
+
+
+## 4.14 Optional journal byte budget and disk headroom
+
+For the scoped Bybit BTC linear depth journal, `--session-evidence-max-mib` /
+`session_evidence_max_mib` selects an integer cap in 1..512 MiB; default **64**.
+`--session-evidence-min-free-gib` / `session_evidence_min_free_gib` selects an
+integer free-space floor in 100..4096 GiB; default **100**. Booleans, fractions,
+numeric strings in ops JSON, and out-of-range settings are invalid. CLI text is
+converted by argparse. Enabled-path validation occurs before creating run files.
+Both settings pass through central ops and segmented-worker dispatch. Disabled
+session evidence does not instantiate a writer or query free space.
+
+The existing daemon journal writer queries available space on the run directory's
+filesystem before opening the journal, before writing a record that crosses a
+1 MiB check interval, and again after journal close before manifest preparation.
+A query failure refuses evidence with `disk_headroom_unavailable`; insufficient
+space refuses with `insufficient_disk_headroom`. The test at each checkpoint is:
+
+`available bytes >= configured floor + max(0, total cap - journal bytes written)`.
+
+A 512 MiB cap and 100 GiB floor thus require at least 100.5 GiB available initially.
+This is a sampled free-space check, **not a reservation**, allocation, retention
+policy, forecast, or guarantee against concurrent filesystem writers. Checkpoints
+may permit up to about 1 MiB of journal writes between observations. Raw/clean and
+other processes can consume space meanwhile; manifest metadata also needs space.
+No free-space guard can make an already-full disk safe for the underlying market
+collector. The optional guard simply avoids continuing journal writes once its
+own next check fails; legacy market collection remains independent.
+
+Disk queries stay on the writer, outside the market loop. A stuck query consumes
+the existing one-writer slot; producer queue/total caps and the two-second terminal
+wait still refuse evidence. It cannot create a disk-query thread per frame or
+per segment. The optional Bybit HTTP lifecycle keeps its existing bounds.
+
+Published v1/v2 manifests add `resource_budget`: total and queue byte caps,
+free-space floor, check interval, successful probe count, and initial/last observed
+free bytes. The offline verifier validates the recorded total-cap/floor ranges
+and that hashed journal bytes fit that cap. Probe values are diagnostics, not
+independent proof of historical disk availability. Earlier manifests without this
+additive field retain the prior verification contract. Resource checks do not
+change raw/clean schemas, replay verdicts or economic admission.
+
+The **512 MiB setting is an offline-tested candidate**, not the new default and
+not enabled in any live/example configuration. The September 25 projections fit
+this cap with 20% headroom, but throughput, observed payloads, retention and source
+continuity still require separate checks. Worst cap consumption is 24 GiB/day at
+48 full segments; this change does not reserve or authorize that ongoing budget.
+The 1 MiB queue, oversized-HTTP refusal, writer-slot handoff and terminal-job gaps
+remain unchanged. Do not treat a successful disk probe as permission to activate.

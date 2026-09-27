@@ -24,6 +24,12 @@ def no_real_http_children(monkeypatch):
     monkeypatch.setattr(subprocess, "Popen", forbidden)
 
 
+@pytest.fixture(autouse=True)
+def ample_journal_disk(monkeypatch):
+    import crypto_collector.session_evidence as module
+    monkeypatch.setattr(module, "disk_usage", lambda path: SimpleNamespace(free=1024**4))
+
+
 def instrument():
     return {"retCode": 0, "result": {"category": "linear", "list": [{
         "symbol": "BTCUSDT", "status": "Trading", "contractType": "LinearPerpetual",

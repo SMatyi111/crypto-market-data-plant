@@ -19,6 +19,26 @@ Last updated: **2026-09-27**.
 
 ---
 
+## Optional evidence budget and headroom guard (2026-09-27)
+
+Owner-authorized follow-up to the capacity no-go: explicit per-lane 1..512 MiB
+journal cap (64 MiB default) and 100..4096 GiB free-space floor (100 GiB default).
+The writer checks the remaining full journal budget plus the floor at startup,
+every approximately 1 MiB, and before finalization. Low/unknown space disables
+optional evidence while market writes continue. Probes remain on the bounded
+journal writer; no new lane, network endpoint, retention action or live flag.
+STANDARDS v16 documents the additive resource telemetry and its limits.
+
+Synthetic tests cover exact thresholds, dropping space, probe exceptions/stalls,
+512 MiB accounting without large writes, CLI/central dispatch, invalid values,
+legacy manifest compatibility and disabled-path isolation. Local full suite:
+737 passed / 5 skipped; 90 focused tests and full ruff pass. Required independent
+code/security review found no blocking issues; Windows CI is the final merge gate. Activation remains off; 512 MiB is an
+offline candidate, not an approved daily allocation. Source/economic gates and
+prior attempt budgets are unchanged.
+
+---
+
 ## Bybit reference capacity preflight - activation remains off (2026-09-27)
 
 The September 25 synthetic preflight rejects enabling PR95 with the current
@@ -452,7 +472,20 @@ the same restart.
 | ~~2026-06-19~~ DONE 06-24 | The 06-17 `robocopy /MINAGE:3` move never finished (~88% of partitions still on G:), leaving G: at **3.9 GB free**. First retry (06-22) was killed by the Bash tool's 10-min timeout after freeing ~57 GB. Relaunched **detached via `Start-Process`** (pid 48444) so it survives session/tool teardown -> **COMPLETED 2026-06-24 16:19, FAILED: 0** (45.29 M files / 555 GB moved G:->`D:\market_archive_cold`). **G: now 489 GB free.** D: holds 113,407 normalized partitions (full set). 1 partition / 2 parquet files remain on G: -- robocopy *skipped* them (already byte-present on D: from the 06-17 partial), so redundant not stranded; immaterial (489 GB free). Lesson: long-running moves must be detached, never run inside a Bash call (10-min cap). |
 | ~~2026-07-26~~ DONE 08-01 | **Text raw offload wired for the next restart.** `archive-offload-text` is enabled in `ops.live.local.json` with the indexed promotion/quarantine gate, preserve-first aged-run backstop, byte-verified cold move, and `write_report:false` so it cannot replace the market health report. It remains inert until the guarded elevated runner restart. |
 
-**Last ops audit:** 2026-09-23 — **runner healthy on every lane; the 09-20 memory fix
+**Last ops audit:** 2026-09-27 — operational baseline refreshed read-only before
+budget work. Health at 21:15 UTC: `ok`, no findings, heartbeat age 2.7 s; 154 jobs
+all latest-success and none stale. Runner-since-start counters: 74,979 success /
+83 error (99.89% success). Forty managed worker rows: 27 have quarantine metrics,
+maximum 0.061%; 13 do not supply that metric, so their ratios remain unknown.
+No current maintenance/worker health findings. G: 291.4 GiB free, D: 287.5 GiB,
+I: 15,567.9 GiB. Latest offload: 87 moved, zero failed/unaccounted; warnings concern
+unconfigured or missing legacy lanes. Its 64 KiB index tail parses to 223 unique
+cold paths; the latest three cold directories exist and hot sources are absent.
+No recursive size walk, archive-content read, restart, reconfiguration or transfer
+change. The known per-wallet silent-stall and restart lock-race questions remain;
+node-archive wallet completeness was not re-audited by this operational baseline.
+
+**Previous ops audit:** 2026-09-23 — **runner healthy on every lane; the 09-20 memory fix
 holds; one NEW data finding: a 4-day per-wallet stall on the wallet-flow lane.** Box
 rebooted twice 2026-09-21 ~16:20Z (Windows Update, `TrustedInstaller` planned restart, no
 bugcheck; last crash still 09-11). Runner came back from the SYSTEM task; wrapper

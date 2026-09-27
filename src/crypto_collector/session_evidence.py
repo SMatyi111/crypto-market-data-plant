@@ -10,9 +10,12 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from shutil import disk_usage
 from uuid import uuid4
 
 from .models import utc_now
+from .evidence_budget import (DEFAULT_MAX_BYTES, MAX_BYTES, DEFAULT_MIN_FREE_BYTES,
+                              DISK_CHECK_BYTES, GIB, required_free_bytes)
 
 logger = logging.getLogger(__name__)
 ENDPOINT = "wss://stream.bybit.com/v5/public/linear"
@@ -58,7 +61,15 @@ class SessionEvidence:
     sink or timeout refuses evidence instead of interrupting legacy market writes.
     """
 
-    def __init__(self, root: Path, *, max_bytes=64 * 1024**2, queue_bytes=1024**2, reference_mode=False):
+    def __init__(self, root: Path, *, max_bytes=DEFAULT_MAX_BYTES, queue_bytes=1024**2,
+                 reference_mode=False, min_free_bytes=DEFAULT_MIN_FREE_BYTES):
+        if type(max_bytes) is not int or not 1 <= max_bytes <= MAX_BYTES:
+            raise ValueError("Invalid journal byte budget")
+        if type(min_free_bytes) is not int or not DEFAULT_MIN_FREE_BYTES <= min_free_bytes <= 4096 * GIB:
+            raise ValueError("Invalid journal free-space floor")
+        self.min_free_bytes = min_free_bytes
+        self._disk_checks = 0
+        self._initial_free = self._last_free = None
         self.reference_mode = reference_mode
         self.root = root
         self.directory = root / "session_evidence"
@@ -132,15 +143,44 @@ class SessionEvidence:
             self._fail(type(exc).__name__)
             return 0
 
+    def _check_headroom(self, written_bytes: int) -> bool:
+        # Writer thread only: a stalled OS disk query must never block the book
+        # producer. The bounded queue and writer slot still fail closed.
+        try:
+            free = disk_usage(self.root).free
+            if type(free) is not int or free < 0:
+                raise ValueError("Invalid free-space result")
+            self._disk_checks += 1
+            self._last_free = free
+            if self._initial_free is None:
+                self._initial_free = free
+            if free < required_free_bytes(self.max_bytes, written_bytes, self.min_free_bytes):
+                self._fail("insufficient_disk_headroom")
+                return False
+            return True
+        except Exception:
+            self._fail("disk_headroom_unavailable")
+            return False
+
     def _write(self) -> None:
         try:
+            if not self._check_headroom(0):
+                return
             with (self.directory / "events.jsonl").open("xb") as stream:
                 count, synced = 0, time.monotonic()
+                written_bytes = checked_bytes = 0
                 while True:
                     line = self._queue.get()
                     if line is None:
                         break
+                    if self.error:
+                        return
+                    if written_bytes - checked_bytes + len(line) >= DISK_CHECK_BYTES:
+                        if not self._check_headroom(written_bytes):
+                            return
+                        checked_bytes = written_bytes
                     stream.write(line)
+                    written_bytes += len(line)
                     stream.flush()
                     count += 1
                     if count % 64 == 0 or time.monotonic() - synced >= 0.2:
@@ -150,7 +190,8 @@ class SessionEvidence:
                         self._queued -= len(line)
                 stream.flush()
                 os.fsync(stream.fileno())
-            self._publish()
+            if self._check_headroom(written_bytes):
+                self._publish()
         except Exception as exc:
             self._fail(type(exc).__name__)
         finally:
@@ -251,7 +292,13 @@ class SessionEvidence:
                     "capture_complete": complete, "issues": sorted(self.issues),
                     "session_admitted": complete and not self.issues and self.raw_count > 0,
                     "economic_admission": False, "raw_count": self.raw_count,
-                    "journal": journal, "raw_files": files}
+                    "journal": journal, "raw_files": files,
+                    "resource_budget": {"max_bytes": self.max_bytes, "queue_bytes": self.queue_bytes,
+                                        "min_free_bytes": self.min_free_bytes,
+                                        "disk_check_bytes": DISK_CHECK_BYTES,
+                                        "disk_check_count": self._disk_checks,
+                                        "initial_free_bytes": self._initial_free,
+                                        "last_free_bytes": self._last_free}}
         # Check again AFTER potentially blocking file I/O/fsync. Never rename a
         # timed-out preparation into a terminal manifest. A leftover tmp is refused.
         tmp = self.directory / "manifest.tmp"
@@ -281,6 +328,13 @@ def verify_session_evidence(root: Path) -> dict:
     journal_path = root / "session_evidence/events.jsonl"
     if file_info(journal_path, root) != manifest["journal"]:
         raise ValueError("Journal hash/count mismatch")
+    budget = manifest.get("resource_budget")
+    if budget is not None:
+        if (type(budget.get("max_bytes")) is not int or not 1 <= budget["max_bytes"] <= MAX_BYTES
+                or type(budget.get("min_free_bytes")) is not int
+                or not DEFAULT_MIN_FREE_BYTES <= budget["min_free_bytes"] <= 4096 * GIB
+                or manifest["journal"]["bytes"] > budget["max_bytes"]):
+            raise ValueError("Invalid evidence resource budget")
     files = raw_files(root)
     if [file_info(p, root) for p in files] != manifest["raw_files"]:
         raise ValueError("Raw file set/hash/count mismatch")
