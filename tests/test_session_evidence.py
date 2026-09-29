@@ -21,6 +21,12 @@ from crypto_collector.storage import prepare_run_paths
 ACK = {"op": "subscribe", "success": True, "conn_id": "fake-local-socket"}
 
 
+@pytest.fixture(autouse=True)
+def ample_journal_disk(monkeypatch):
+    import crypto_collector.session_evidence as module
+    monkeypatch.setattr(module, "disk_usage", lambda path: SimpleNamespace(free=1024**4))
+
+
 def book(kind="snapshot", update=1):
     return {"topic": TOPIC, "type": kind, "ts": 1000,
             "data": {"s": "BTCUSDT", "u": update, "seq": update,
