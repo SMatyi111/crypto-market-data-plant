@@ -8,7 +8,7 @@ changes scope or state. Companion docs:
 - [`STANDARDS.md`](STANDARDS.md) — the data contract (schemas, replayability, retention)
 - [`docs/HISTORY.md`](docs/HISTORY.md) — resolved-work narrative (what was fixed, and why)
 
-Last updated: **2026-09-27**.
+Last updated: **2026-10-04**.
 
 > **Operating mode — safe shaping (owner directive, 2026-07-04).** No extended
 > building on Claude's initiative: no new venues, lanes, or instruments, no big
@@ -18,6 +18,26 @@ Last updated: **2026-09-27**.
 > explicit owner ask to start.
 
 ---
+
+## Bounded optional evidence lease - offline implementation (2026-10-04)
+
+The factory's independent reviewer accepted the NO-GO activation specification.
+This slice implements its default-off stopping mechanism: a separately prepared
+durable trial ID/control ledger, two nonrefundable segment reservations, 1040 MiB
+total additional logical evidence allowance, and an immutable one-hour deadline.
+Clock reversal, missing/corrupt state, exhausted slots, insufficient headroom and
+metadata overflow refuse optional evidence while ordinary market rows continue.
+See STANDARDS 4.15 for crash, cross-process writer, metadata and clock semantics.
+Two slots within one hour do not promise two full 1800-second segments. Failures
+before a durable grant, including prior-writer refusal, remain coverage gaps;
+committed slots cannot be retried or recovered by offloading run artifacts.
+
+Implementation is tested only with synthetic data. Activation remains NO-GO:
+retention disposition, separately scoped activation, fresh readiness checks and
+observed source completeness are still required. No live flag, restart, transfer,
+paid agent/API dispatch, outcome scan, holdout release or economic admission.
+The frozen PR95 capacity preflight and prior research attempt budgets stay intact.
+Required independent code/security review and Windows CI are merge gates.
 
 ## Optional evidence budget and headroom guard (2026-09-27)
 
@@ -472,7 +492,19 @@ the same restart.
 | ~~2026-06-19~~ DONE 06-24 | The 06-17 `robocopy /MINAGE:3` move never finished (~88% of partitions still on G:), leaving G: at **3.9 GB free**. First retry (06-22) was killed by the Bash tool's 10-min timeout after freeing ~57 GB. Relaunched **detached via `Start-Process`** (pid 48444) so it survives session/tool teardown -> **COMPLETED 2026-06-24 16:19, FAILED: 0** (45.29 M files / 555 GB moved G:->`D:\market_archive_cold`). **G: now 489 GB free.** D: holds 113,407 normalized partitions (full set). 1 partition / 2 parquet files remain on G: -- robocopy *skipped* them (already byte-present on D: from the 06-17 partial), so redundant not stranded; immaterial (489 GB free). Lesson: long-running moves must be detached, never run inside a Bash call (10-min cap). |
 | ~~2026-07-26~~ DONE 08-01 | **Text raw offload wired for the next restart.** `archive-offload-text` is enabled in `ops.live.local.json` with the indexed promotion/quarantine gate, preserve-first aged-run backstop, byte-verified cold move, and `write_report:false` so it cannot replace the market health report. It remains inert until the guarded elevated runner restart. |
 
-**Last ops audit:** 2026-09-27 — operational baseline refreshed read-only before
+**Last ops audit:** 2026-10-04 - read-only health at 18:23 UTC: status ok,
+heartbeat 2.9 seconds old, 154 jobs, 205,863 cumulative successes / 989 errors
+(99.52% success). No job or normalized partition flagged stale. One job's last
+completed status is error (Bybit BTC liquidations, 01:12 UTC), while its current
+long-running worker is fresh; this is not a claim that every last run succeeded.
+Forty managed worker rows, 27 with quarantine metrics, maximum 0.0262 percent.
+G: 261.46 GiB free. Latest offload (18:10 UTC): 88 moved, zero failures and zero
+stuck-unaccounted; warning findings name legacy/unconfigured or missing lanes.
+Both optional evidence flags remain absent/disabled in live config. This is an
+operational freshness audit, not node-archive wallet completeness, a cold-index
+filesystem census or research admission. No restart/config/Robocopy intervention.
+
+**Previous ops audit:** 2026-09-27 — operational baseline refreshed read-only before
 budget work. Health at 21:15 UTC: `ok`, no findings, heartbeat age 2.7 s; 154 jobs
 all latest-success and none stale. Runner-since-start counters: 74,979 success /
 83 error (99.89% success). Forty managed worker rows: 27 have quarantine metrics,

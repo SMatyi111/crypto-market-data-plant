@@ -163,7 +163,7 @@ class BybitReferences:
         row = {"stage": stage, "started_at": started.isoformat(),
                "start_monotonic_ns": mono, "url": request_url(stage, start_ms, end_ms)}
         try:
-            if self.evidence.error:
+            if not self.evidence.capture_available():
                 raise RuntimeError("Reference evidence already unavailable")
             response = self.fetch(stage, start_ms, end_ms)
             body = base64.b64decode(response["body_base64"], validate=True)
@@ -179,7 +179,10 @@ class BybitReferences:
     def _run(self) -> None:
         try:
             self._fetch("rules_before")
-            if not self.closed.wait(max(0, MAX_CAPTURE_SECONDS - (time.monotonic() - self.start_monotonic))):
+            remaining = max(0, MAX_CAPTURE_SECONDS - (time.monotonic() - self.start_monotonic))
+            if self.evidence.lease:
+                remaining = min(remaining, self.evidence.lease.remaining())
+            if not self.closed.wait(remaining):
                 self.evidence._fail("reference_capture_timeout")
                 return
             if self.reason in {"limit", "deadline"} and self.sinks_closed:

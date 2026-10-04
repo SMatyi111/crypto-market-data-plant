@@ -62,12 +62,22 @@ class SessionEvidence:
     """
 
     def __init__(self, root: Path, *, max_bytes=DEFAULT_MAX_BYTES, queue_bytes=1024**2,
-                 reference_mode=False, min_free_bytes=DEFAULT_MIN_FREE_BYTES):
+                 reference_mode=False, min_free_bytes=DEFAULT_MIN_FREE_BYTES,
+                 lease_directory=None, trial_id=None):
         if type(max_bytes) is not int or not 1 <= max_bytes <= MAX_BYTES:
             raise ValueError("Invalid journal byte budget")
         if type(min_free_bytes) is not int or not DEFAULT_MIN_FREE_BYTES <= min_free_bytes <= 4096 * GIB:
             raise ValueError("Invalid journal free-space floor")
         self.min_free_bytes = min_free_bytes
+        if bool(lease_directory) != bool(trial_id):
+            raise ValueError("Evidence lease directory and trial ID are required together")
+        self.lease = None
+        if lease_directory:
+            from .evidence_lease import EvidenceLease
+            if max_bytes != MAX_BYTES:
+                raise ValueError("Leased evidence requires the fixed 512 MiB reservation")
+            self.lease = EvidenceLease(Path(lease_directory), trial_id, root.name)
+        self.ready = threading.Event()
         self._disk_checks = 0
         self._initial_free = self._last_free = None
         self.reference_mode = reference_mode
@@ -90,7 +100,8 @@ class SessionEvidence:
         self._thread = None
         self._finished = False
         try:
-            self.directory.mkdir(exist_ok=False)
+            if not self.lease:
+                self.directory.mkdir(exist_ok=False)
             if not _WRITER_SLOT.acquire(blocking=False):
                 self._fail("previous_writer_pending")
                 return
@@ -114,6 +125,8 @@ class SessionEvidence:
 
     def event(self, kind: str, *, clock=None, **fields) -> int:
         if self.error or self._finished:
+            return 0
+        if self.lease and self.ready.is_set() and not self.capture_available():
             return 0
         try:
             utc, mono = clock or (utc_now(), time.monotonic_ns())
@@ -164,13 +177,32 @@ class SessionEvidence:
 
     def _write(self) -> None:
         try:
+            if self.lease:
+                from .evidence_lease import TOTAL_BYTES
+                self.lease.claim()
+                # Full initial allocation, not just this segment. Sample only.
+                if disk_usage(self.root).free < self.min_free_bytes + TOTAL_BYTES:
+                    self._fail("insufficient_trial_headroom")
+                    return
+                self.lease.check(checkpoint=True)
+                if self.error:
+                    return
+                self.directory.mkdir(exist_ok=False)
+            self.ready.set()
+            if self.error:
+                return
             if not self._check_headroom(0):
                 return
             with (self.directory / "events.jsonl").open("xb") as stream:
                 count, synced = 0, time.monotonic()
                 written_bytes = checked_bytes = 0
                 while True:
-                    line = self._queue.get()
+                    if self.lease:
+                        self.lease.check()
+                    try:
+                        line = self._queue.get(timeout=0.25)
+                    except queue.Empty:
+                        continue
                     if line is None:
                         break
                     if self.error:
@@ -179,6 +211,8 @@ class SessionEvidence:
                         if not self._check_headroom(written_bytes):
                             return
                         checked_bytes = written_bytes
+                    if self.lease:
+                        self.lease.check()
                     stream.write(line)
                     written_bytes += len(line)
                     stream.flush()
@@ -195,7 +229,19 @@ class SessionEvidence:
         except Exception as exc:
             self._fail(type(exc).__name__)
         finally:
+            self.ready.set()
+            if self.lease:
+                self.lease.close()
             _WRITER_SLOT.release()
+
+    def capture_available(self) -> bool:
+        """No I/O on the market/reference producer. Durable checks use writer."""
+        if self.error:
+            return False
+        if self.lease and self.ready.is_set() and self.lease.remaining() <= 0:
+            self._fail("lease_expired")
+            return False
+        return True
 
     def opened(self, endpoint: str) -> None:
         self.connection += 1
@@ -279,6 +325,8 @@ class SessionEvidence:
         # close. A process-wide slot prevents stuck writers accumulating per run.
         if self.error:
             return
+        if self.lease:
+            self.lease.check(checkpoint=True)
         files = [file_info(p, self.root) for p in raw_files(self.root)]
         journal = file_info(self.directory / "events.jsonl", self.root)
         if self.book_received != self.raw_count:
@@ -301,14 +349,25 @@ class SessionEvidence:
                                         "last_free_bytes": self._last_free}}
         # Check again AFTER potentially blocking file I/O/fsync. Never rename a
         # timed-out preparation into a terminal manifest. A leftover tmp is refused.
+        if self.lease:
+            manifest["evidence_lease"] = self.lease.receipt()
+        payload = (json.dumps(manifest, indent=2) + "\n").encode("utf-8")
+        if self.lease:
+            from .evidence_lease import MANIFEST_BYTES
+            if len(payload) > MANIFEST_BYTES:
+                self._fail("metadata_cap")
+                return
+            self.lease.check(checkpoint=True)
         tmp = self.directory / "manifest.tmp"
-        with tmp.open("x", encoding="utf-8") as stream:
-            stream.write(json.dumps(manifest, indent=2) + "\n")
+        with tmp.open("xb") as stream:
+            stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
         if self.error or time.monotonic() > self._publish_deadline:
             self._fail("writer_close_timeout")
             return
+        if self.lease:
+            self.lease.check(checkpoint=True)
         tmp.replace(self.directory / "manifest.json")
 
 
@@ -335,6 +394,19 @@ def verify_session_evidence(root: Path) -> dict:
                 or not DEFAULT_MIN_FREE_BYTES <= budget["min_free_bytes"] <= 4096 * GIB
                 or manifest["journal"]["bytes"] > budget["max_bytes"]):
             raise ValueError("Invalid evidence resource budget")
+    lease = manifest.get("evidence_lease")
+    if lease is not None:
+        from .evidence_lease import ID, MANIFEST_BYTES, METADATA_BYTES, RESERVATION_BYTES, TOTAL_BYTES
+        import math
+        if (lease.get("version") != 1 or type(lease.get("slot")) is not int or lease["slot"] not in (1, 2)
+                or not isinstance(lease.get("trial_id"), str) or not ID.fullmatch(lease["trial_id"])
+                or not isinstance(lease.get("deadline_utc"), (int, float))
+                or not math.isfinite(lease["deadline_utc"]) or lease["deadline_utc"] <= 0
+                or lease.get("reservation_bytes") != RESERVATION_BYTES
+                or lease.get("total_bytes") != TOTAL_BYTES or lease.get("metadata_bytes") != METADATA_BYTES
+                or budget is None or budget["max_bytes"] != MAX_BYTES
+                or (root / "session_evidence/manifest.json").stat().st_size > MANIFEST_BYTES):
+            raise ValueError("Invalid evidence lease receipt")
     files = raw_files(root)
     if [file_info(p, root) for p in files] != manifest["raw_files"]:
         raise ValueError("Raw file set/hash/count mismatch")
@@ -352,6 +424,8 @@ def verify_session_evidence(root: Path) -> dict:
             utc = datetime.fromisoformat(row["utc"])
             if utc.utcoffset() is None:
                 raise ValueError("Naive receipt clock")
+            if lease is not None and utc.timestamp() >= lease["deadline_utc"]:
+                raise ValueError("Journal extends past evidence lease")
             if type(row["monotonic_ns"]) is not int or row["monotonic_ns"] < 0:
                 raise ValueError("Invalid monotonic clock")
             current = utc.timestamp(), row["monotonic_ns"]

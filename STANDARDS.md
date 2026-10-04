@@ -1,6 +1,6 @@
 # Data Standards
 
-`STANDARDS_VERSION = 16`
+`STANDARDS_VERSION = 17`
 
 > **v16 (2026-09-27, offline implementation; not activated):** bounded optional
 > journal budgets and disk-headroom checks (section 4.14). Default 64 MiB cap,
@@ -1473,3 +1473,80 @@ continuity still require separate checks. Worst cap consumption is 24 GiB/day at
 48 full segments; this change does not reserve or authorize that ongoing budget.
 The 1 MiB queue, oversized-HTTP refusal, writer-slot handoff and terminal-job gaps
 remain unchanged. Do not treat a successful disk probe as permission to activate.
+
+## 4.15 Optional nonrenewable evidence lease
+
+This is default-off source-qualification infrastructure, not capture authorization.
+The existing Bybit BTCUSDT linear depth-50 lane can additionally specify
+`session_evidence_lease` (a prepared control directory) and
+`session_evidence_trial_id` (1..64 ASCII letters/digits/underscore/hyphen, starting
+alphanumeric). CLI names use hyphens. Both require session evidence, a 512 MiB
+journal cap and an existing segment deadline no more than 1800 seconds away.
+They pass through central ops/segmented dispatch. No example or live config enables
+them. Legacy unleased evidence retains its prior contract; a lease is mandatory
+in the proposed two-segment activation packet, not retroactively in old captures.
+
+An explicit operator preparation command, `python -m crypto_collector.evidence_lease
+<new-control-directory> <trial-id>`, creates only unused control state. It does not
+activate a lane. Preparation refuses every existing directory, including partial
+initialization; capture never initializes, repairs or resets state. Place control
+state outside run/offload trees, retain it permanently as spent-budget evidence,
+and never clone, replace, delete or repoint it to renew an allocation. Trial ID
+plus this single control location is an operator-bound identity, not protection
+against an administrator deliberately replacing valid state or creating new trials.
+
+SQLite `BEGIN IMMEDIATE` plus `synchronous=FULL` commits each segment reservation
+before optional capture can begin. Exactly two slots each reserve 512 MiB journal
+plus 8 MiB metadata: 1040 MiB (1.015625 GiB) total logical file bytes. Every committed
+slot remains spent after failure, crash, offload or missing run files; duplicate
+run IDs cannot claim again. There are no refunds, retries or automatic renewals.
+Failures before a transaction commits never receive a grant. A process-local
+previous-writer refusal happens before a new claim; it still belongs in the trial's
+coverage-gap denominator. Competing processes may spend a slot and then fail the
+cross-process writer lock. Every committed claim remains inventoried, including
+such failures. The OS byte lock (Windows) / flock (POSIX) is held through journal
+and manifest closure, released on process exit, and never uses PID termination.
+
+The first claim fixes UTC and monotonic deadlines one hour later; subsequent
+claims retain both. Clock high-water marks are persisted approximately each
+second and at publication. Backward observed clocks, a restart with a lower
+monotonic clock, wall/monotonic disagreement over 0.5 seconds, missing/corrupt
+state, expired time or spent slots refuse evidence. Detected clock/expiry refusal
+is durably terminal when the state database is writable. This is sampling, not
+proof that a sub-checkpoint clock excursion never occurred. Two slots within one
+hour do not promise two complete 30-minute segments: preparation, gaps and terminal
+reference work consume that hour. Raw market collection continues at its existing
+cadence even when optional evidence expires; an incomplete segment is unadmitted.
+
+The existing journal daemon performs lease I/O. The leased CLI waits at most two
+seconds before opening this segment's market socket; timeout/refusal falls back
+to ordinary collection without references. No new journal/DB thread is created
+per frame. A stuck setup still occupies the existing writer slot. Producer byte
+and queue caps remain enforced. The writer checks time before every write and
+publication, and wakes at most every 0.25 seconds when idle. Reference helpers
+start no new request after observed expiry, but an already-started public helper
+may finish within its existing timeout; its late evidence is refused. An OS I/O
+or rename already entered cannot be cancelled at an exact deadline. No plant or
+transfer process is stopped. Control-state writes recording refusal are allowed
+after the capture deadline; they contain no market payload.
+
+At each admitted start the writer samples at least the configured free-space
+floor plus the full 1040 MiB allocation on the run filesystem (conservative for
+the second slot). Existing per-journal ongoing probes remain. This does not
+reserve space against other writers. Each slot allows one <=7 MiB manifest,
+including a partial `manifest.tmp`; exclusive creation plus rename prevents two
+copies. A further 1 MiB per slot covers the shared control DB, rollback journal
+and one-byte lock. DB page size is 4096, capped at 64 pages; DELETE journaling
+keeps DB plus rollback journal below 1 MiB. No WAL or growing event table exists.
+This bounds logical file sizes, not cumulative write traffic, filesystem allocation
+overhead, underlying market files or artifacts written by other tools. It grants
+no retention deletion and does not include unrelated operation logs.
+
+Leased v1/v2 manifests add `evidence_lease`: trial ID, slot, fixed UTC deadline and
+reservation/total/metadata byte limits. Offline verification checks this shape,
+the 512 MiB journal cap, manifest size and journal timestamps before expiry.
+It does not certify the independent control DB's authenticity or reconstruct
+missing failed runs from a successful manifest. Admission requires the separately
+retained two-slot ledger and inventory of all failures/gaps. Existing manifests
+without this optional field remain valid under their prior rules. Source,
+economic, account, funding-completeness and holdout gates are unchanged.

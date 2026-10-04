@@ -40,7 +40,7 @@ DEFAULT_ARCHIVE_ROOT = Path(r"G:\market_archive")
 # v14: optional disabled Bybit BTC linear session-evidence sidecar (STANDARDS 4.12).
 # v15: optional Bybit public ticker/rules/funding references (STANDARDS 4.13).
 # v16: bounded optional journal budgets and writer-side headroom guard (STANDARDS 4.14).
-STANDARDS_VERSION = 16
+STANDARDS_VERSION = 17
 
 _FALLBACK_WARNED: set[str] = set()
 
