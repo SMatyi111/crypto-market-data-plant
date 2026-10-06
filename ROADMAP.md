@@ -19,6 +19,30 @@ Last updated: **2026-10-06**.
 
 ---
 
+## Bounded optional evidence lease - offline implementation (2026-10-04)
+
+The factory's independent reviewer accepted the NO-GO activation specification.
+This slice implements its default-off stopping mechanism: a separately prepared
+durable trial ID/control ledger, two nonrefundable segment reservations, 1040 MiB
+total additional logical evidence allowance, and an immutable one-hour deadline.
+Clock reversal, missing/corrupt state, exhausted slots, insufficient headroom and
+metadata overflow refuse optional evidence while ordinary market rows continue.
+See STANDARDS 4.16 for crash, cross-process writer, metadata and clock semantics.
+Two slots within one hour do not promise two full 1800-second segments. Failures
+before a durable grant, including prior-writer refusal, remain coverage gaps;
+committed slots cannot be retried or recovered by offloading run artifacts.
+
+Implementation is tested only with synthetic data. Activation remains NO-GO:
+retention disposition, separately scoped activation, fresh readiness checks and
+observed source completeness are still required. No live flag, restart, transfer,
+paid agent/API dispatch, outcome scan, holdout release or economic admission.
+The frozen PR95 capacity preflight and prior research attempt budgets stay intact.
+Independent code/security review found a deadline race after blocking control
+checkpoint I/O; post-I/O clock and publication checks fix it, with synthetic
+regressions. Reviewer approved the fix and integration with the newer Hyperliquid
+lanes. Combined local suite on October 6: 776 passed / 5 skipped; ruff and diff
+checks pass. Windows Python 3.11/3.12 CI remains the final merge gate.
+
 ## Owner decision + build — Hyperliquid public WS trades lanes with wallet pair (2026-10-06)
 
 **Owner approved 2026-10-06** (explicit ask, so the safe-shaping "no new lanes" mode
@@ -511,6 +535,18 @@ Binance fapi REST lanes (exceptions raised from the REST poll in `rest_poll`), p
 G: 268.2 GiB free (291.4 on 09-27, ~2.4 GiB/day), D: 487.9, I: 15,100.6. The 10-05
 fapi burst is worth a look if it recurs (an undetected fapi outage minted orphans on
 09-13); not investigated further here.
+
+**Previous ops audit:** 2026-10-04 - read-only health at 18:23 UTC: status ok,
+heartbeat 2.9 seconds old, 154 jobs, 205,863 cumulative successes / 989 errors
+(99.52% success). No job or normalized partition flagged stale. One job's last
+completed status is error (Bybit BTC liquidations, 01:12 UTC), while its current
+long-running worker is fresh; this is not a claim that every last run succeeded.
+Forty managed worker rows, 27 with quarantine metrics, maximum 0.0262 percent.
+G: 261.46 GiB free. Latest offload (18:10 UTC): 88 moved, zero failures and zero
+stuck-unaccounted; warning findings name legacy/unconfigured or missing lanes.
+Both optional evidence flags remain absent/disabled in live config. This is an
+operational freshness audit, not node-archive wallet completeness, a cold-index
+filesystem census or research admission. No restart/config/Robocopy intervention.
 
 **Previous ops audit:** 2026-09-27 — operational baseline refreshed read-only before
 budget work. Health at 21:15 UTC: `ok`, no findings, heartbeat age 2.7 s; 154 jobs

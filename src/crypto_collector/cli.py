@@ -823,6 +823,8 @@ def build_parser() -> argparse.ArgumentParser:
     bybit_depth_parser.add_argument("--session-evidence", action="store_true", default=False)
     bybit_depth_parser.add_argument("--session-evidence-max-mib", type=int, default=64)
     bybit_depth_parser.add_argument("--session-evidence-min-free-gib", type=int, default=100)
+    bybit_depth_parser.add_argument("--session-evidence-lease", type=Path, default=None)
+    bybit_depth_parser.add_argument("--session-evidence-trial-id", default=None)
     bybit_depth_parser.add_argument("--reference-evidence", action="store_true", default=False)
     bybit_depth_parser.add_argument("--heartbeat-interval-seconds", type=float, default=30.0)
     bybit_depth_parser.add_argument(
@@ -2587,6 +2589,12 @@ async def _collect_depth_stream_segment(
     )
     evidence_enabled = bool(getattr(args, "session_evidence", False))
     references_enabled = bool(getattr(args, "reference_evidence", False))
+    lease_directory = getattr(args, "session_evidence_lease", None)
+    trial_id = getattr(args, "session_evidence_trial_id", None)
+    if (lease_directory or trial_id) and not evidence_enabled:
+        raise ValueError("Evidence lease requires session evidence")
+    if bool(lease_directory) != bool(trial_id):
+        raise ValueError("Evidence lease directory and trial ID are required together")
     if references_enabled and not evidence_enabled:
         raise ValueError("Reference evidence requires session evidence")
     if evidence_enabled and (source != "bybit" or websocket_url != _bybit_ws_url("linear")
@@ -2597,14 +2605,32 @@ async def _collect_depth_stream_segment(
         max_bytes, min_free_bytes = configured_budget(
             getattr(args, "session_evidence_max_mib", 64),
             getattr(args, "session_evidence_min_free_gib", 100))
+        if lease_directory:
+            from .evidence_lease import ID
+            if max_bytes != 512 * 1024**2 or not isinstance(trial_id, str) or not ID.fullmatch(trial_id):
+                raise ValueError("Evidence lease requires a valid trial ID and fixed 512 MiB cap")
+            segment_deadline = getattr(args, "deadline_utc", None)
+            if (not isinstance(segment_deadline, datetime) or segment_deadline.utcoffset() is None
+                    or not 0 < (segment_deadline - utc_now()).total_seconds() <= 1800):
+                raise ValueError("Leased evidence requires an existing segment deadline within 1800 seconds")
     collector = GenericWebsocketCollector(config=config)
     source_name = _build_source_name(source_base, getattr(args, "source_suffix", ""))
     run_paths = prepare_run_paths(output_root=config.output_root, source=source_name)
     if evidence_enabled:
         from .session_evidence import SessionEvidence
+        lease_options = {"lease_directory": lease_directory, "trial_id": trial_id} if lease_directory else {}
         collector.session_evidence = SessionEvidence(run_paths.base, reference_mode=references_enabled,
-                                                    max_bytes=max_bytes, min_free_bytes=min_free_bytes)
-        if references_enabled:
+                                                    max_bytes=max_bytes, min_free_bytes=min_free_bytes,
+                                                    **lease_options)
+        if lease_directory:
+            # Bounded setup wait before opening this segment's socket. Filesystem
+            # work stays on the existing writer, never on the market event loop.
+            ready = await asyncio.to_thread(collector.session_evidence.ready.wait, 2)
+            if not ready:
+                collector.session_evidence._fail("lease_prepare_timeout")
+            if collector.session_evidence.error:
+                collector.session_evidence = None
+        if references_enabled and collector.session_evidence is not None:
             from .bybit_references import BybitReferences
             collector.reference_evidence = BybitReferences(collector.session_evidence)
     fsync_events, fsync_ms = _fsync_intervals(args)
@@ -3756,6 +3782,8 @@ def _run_segmented_worker(
                     segment_args.session_evidence = bool(getattr(args, "session_evidence", False))
                     segment_args.session_evidence_max_mib = getattr(args, "session_evidence_max_mib", 64)
                     segment_args.session_evidence_min_free_gib = getattr(args, "session_evidence_min_free_gib", 100)
+                    segment_args.session_evidence_lease = getattr(args, "session_evidence_lease", None)
+                    segment_args.session_evidence_trial_id = getattr(args, "session_evidence_trial_id", None)
                     segment_args.reference_evidence = bool(getattr(args, "reference_evidence", False))
                     segment_args.jsonl_fsync = bool(getattr(args, "jsonl_fsync", True))
                     fsync_events, fsync_ms = _fsync_intervals(args)
@@ -3958,6 +3986,8 @@ def _execute_ops_job_inprocess(job: JobSpec) -> JobExecutionResult | str | None:
     args.session_evidence = bool(job.args.get("session_evidence", False))
     args.session_evidence_max_mib = job.args.get("session_evidence_max_mib", 64)
     args.session_evidence_min_free_gib = job.args.get("session_evidence_min_free_gib", 100)
+    args.session_evidence_lease = job.args.get("session_evidence_lease")
+    args.session_evidence_trial_id = job.args.get("session_evidence_trial_id")
     args.reference_evidence = bool(job.args.get("reference_evidence", False))
     if "jsonl_fsync" in job.args:
         args.jsonl_fsync = bool(job.args["jsonl_fsync"])
