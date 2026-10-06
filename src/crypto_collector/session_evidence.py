@@ -368,6 +368,9 @@ class SessionEvidence:
             return
         if self.lease:
             self.lease.check(checkpoint=True)
+        if self.error or time.monotonic() > self._publish_deadline:
+            self._fail("writer_close_timeout")
+            return
         tmp.replace(self.directory / "manifest.json")
 
 

@@ -165,6 +165,26 @@ def test_active_clock_reversal_is_durable(directory, monkeypatch):
         claim(directory, "run-2")
 
 
+def test_checkpoint_stall_cannot_authorize_payload_after_expiry(directory, monkeypatch):
+    clock = [10_000.0, 100.0]
+    monkeypatch.setattr(lease.time, "time", lambda: clock[0])
+    monkeypatch.setattr(lease.time, "monotonic", lambda: clock[1])
+    obj = claim(directory)
+    real_connect = lease._connect
+    def delayed_connect(path):
+        conn = real_connect(path)
+        clock[:] = [13_601.0, 3701.0]
+        return conn
+    monkeypatch.setattr(lease, "_connect", delayed_connect)
+    try:
+        with pytest.raises(lease.LeaseRefused, match="expired"):
+            obj.check(checkpoint=True)
+    finally:
+        obj.close()
+    with sqlite3.connect(directory / "lease.sqlite3") as conn:
+        assert conn.execute("SELECT stopped FROM trial").fetchone()[0] == "lease_expired"
+
+
 def test_leased_pipeline_can_publish_and_verify(directory, tmp_path, monkeypatch):
     paths, pipeline, evidence, _ = setup(tmp_path / "data", monkeypatch, [[ACK, book()]],
         max_bytes=MAX_BYTES, lease_directory=directory, trial_id="offline-test")
@@ -201,6 +221,26 @@ def test_optional_failures_preserve_market_rows(directory, tmp_path, monkeypatch
         assert not (paths.base / "session_evidence").exists()
     if fault != "missing_state":
         assert len(rows(directory)) == 1
+
+
+def test_final_checkpoint_expiry_leaves_only_bounded_partial_manifest(directory, tmp_path, monkeypatch):
+    paths, pipeline, evidence, _ = setup(tmp_path / "data", monkeypatch, [[ACK, book()]],
+        max_bytes=MAX_BYTES, lease_directory=directory, trial_id="offline-test")
+    assert evidence.ready.wait(2)
+    temporary = paths.base / "session_evidence/manifest.tmp"
+    original = lease._connect
+    def delayed_final_checkpoint(path):
+        conn = original(path)
+        if temporary.exists():
+            # Equivalent to the clock passing the deadline during control I/O.
+            evidence.lease.deadline = 0
+        return conn
+    monkeypatch.setattr(lease, "_connect", delayed_final_checkpoint)
+    assert asyncio.run(pipeline.run(limit=1)).raw_messages == 1
+    assert evidence.error
+    assert temporary.is_file()
+    assert temporary.stat().st_size <= lease.MANIFEST_BYTES
+    assert not (temporary.parent / "manifest.json").exists()
 
 
 def test_cli_missing_lease_continues_with_original_market_collector(directory, tmp_path, monkeypatch):

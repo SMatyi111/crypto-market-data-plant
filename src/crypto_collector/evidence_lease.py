@@ -168,10 +168,7 @@ class EvidenceLease:
             return 0.0
         return max(0.0, min(self.deadline - time.time(), self.monotonic_deadline - time.monotonic()))
 
-    def check(self, *, checkpoint=False):
-        if self.writer is None:
-            raise LeaseRefused("lease_not_claimed")
-        now, mono = time.time(), time.monotonic()
+    def _check_clock(self, now, mono):
         old_wall, old_mono = self.last_clock
         reason = None
         if (not math.isfinite(now) or now < old_wall or mono < old_mono
@@ -185,6 +182,12 @@ class EvidenceLease:
                 _stop(conn, reason)
             finally:
                 conn.close()
+
+    def check(self, *, checkpoint=False):
+        if self.writer is None:
+            raise LeaseRefused("lease_not_claimed")
+        now, mono = time.time(), time.monotonic()
+        self._check_clock(now, mono)
         # Used on writer thread only. Producer consults remaining() without I/O.
         self.last_clock = now, mono
         if checkpoint or mono - self.last_checkpoint >= 1:
@@ -199,6 +202,11 @@ class EvidenceLease:
                 self.last_checkpoint = mono
             finally:
                 conn.close()
+            # Opening/checkpointing/closing control state can block past expiry.
+            # That must not authorize a NEW payload write or manifest rename.
+            now, mono = time.time(), time.monotonic()
+            self._check_clock(now, mono)
+            self.last_clock = now, mono
 
     def close(self):
         if self.writer is not None:
