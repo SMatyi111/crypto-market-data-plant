@@ -33,8 +33,9 @@ from crypto_collector.models import RawMessage
 from crypto_collector.ops import COLLECTOR_JOB_TYPES, JobSpec
 from crypto_collector.quality import QualityGate
 
-BUYER = "0x2cffce91b4e0c81df18726ff66b31b2b1545e1ad"
-SELLER = "0x6BB971430554E3AF58FBD469BCE46AB2359A2D23"
+# Synthetic addresses (not real wallets); the seller is mixed-case on purpose.
+BUYER = "0x" + "1a" * 20
+SELLER = "0x" + "B2" * 20
 RECEIVED = dt.datetime(2026, 10, 6, 13, 0, 1, tzinfo=dt.timezone.utc)
 TRADE_MS = 1791291600500  # 2026-10-06T13:00:00.500Z
 
@@ -46,7 +47,7 @@ def _print(**overrides):
         "px": "86093.0",
         "sz": "0.00347",
         "time": TRADE_MS,
-        "hash": "0xa114c41c6b550ddba28e0445f7dbac0201f9000206582cad44dd6f6f2a58e7c6",
+        "hash": "0xa114" + "0" * 60,
         "tid": 1021093340028777,
         "users": [BUYER, SELLER],
     }
@@ -136,6 +137,22 @@ def test_bad_side_and_missing_time_are_parse_errors():
     item.pop("time")
     ev = HyperliquidTradeNormalizer().normalize_many(_frame(item))[0]
     assert ev.exchange_time is None and "invalid_event_time" in ev.metadata["parse_errors"]
+
+
+def test_missing_tid_or_coin_is_quarantined_and_coin_case_is_kept():
+    """tid is the dedupe key for reconnect-gap recovery; a print without it, or
+    without a coin (bogus instrument=UNKNOWNUSDC partition), must not reach clean.
+    Venue coin names are case-sensitive (kPEPE), so they are not upper-cased."""
+    normalizer = HyperliquidTradeNormalizer()
+    gate = _gate()
+    for key, reason in (("tid", "missing_trade_id"), ("coin", "missing_coin")):
+        item = _print()
+        item.pop(key)
+        ev = normalizer.normalize_many(_frame(item))[0]
+        assert reason in ev.metadata["parse_errors"]
+        assert not gate.validate(ev).accepted
+    ev = normalizer.normalize_many(_frame(_print(coin="kPEPE")))[0]
+    assert ev.metadata["hyperliquid_coin"] == "kPEPE" and ev.product == "kPEPEUSDC"
 
 
 def test_clean_print_passes_gate_and_snapshot_print_is_quarantined():
@@ -329,7 +346,7 @@ def test_segment_writes_lane_dir_and_stream_verdict(monkeypatch, tmp_path):
         lambda: dt.datetime.fromtimestamp((t0 + 5000) / 1000, tz=dt.timezone.utc),
     )
     args = SimpleNamespace(
-        symbol="btc",
+        symbol="BTC",
         channel="trades",
         count=4,
         output_root=tmp_path,

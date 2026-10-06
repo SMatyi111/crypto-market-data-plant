@@ -2182,7 +2182,8 @@ async def collect_hyperliquid_trades_segment(args: argparse.Namespace) -> dict[s
     # Every print carries `users` = [buyer, seller] public wallets (STANDARDS 4.15).
     # `tid` is unique but not dense, so curate as a non-sequence ("none_native") feed
     # - structurally clean, NOT gap-proof (4.3), same class as Bybit/OKX trades.
-    args.symbol = str(getattr(args, "symbol", "BTC") or "BTC").upper()
+    # Coin names are case-sensitive on the venue (kPEPE): subscribe exactly as configured.
+    args.symbol = str(getattr(args, "symbol", "BTC") or "BTC")
     return await _collect_trades_segment(
         args,
         source="hyperliquid",

@@ -1508,7 +1508,9 @@ on some prints; kept as sent), `hyperliquid_coin`, `hyperliquid_side_raw`,
 
 - **Every clean row is wallet-attributed.** A print whose `users` is not exactly two
   `0x` + 40-hex addresses gets the parse error `invalid_users` and is quarantined
-  by the live gate (section 5).
+  by the live gate (section 5). Likewise `missing_trade_id` (no `tid`, the dedupe
+  key) and `missing_coin`. Coin names are kept as the venue sends them
+  (case-sensitive, e.g. `kPEPE`).
 - **`product` is the venue symbol `<COIN>USDC`**, so the curated partition is
   `trades_replayable/.../source=hyperliquid/instrument=BTCUSDC` (ETHUSDC,
   SOLUSDC). The frozen-cohort wallet-fill lane (4.7) partitions as `instrument=BTC`

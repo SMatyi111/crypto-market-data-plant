@@ -1122,7 +1122,10 @@ class HyperliquidTradeNormalizer:
     ) -> NormalizedL3Event:
         item = item if isinstance(item, dict) else {}
         parse_errors: list[str] = []
-        coin = str(item.get("coin") or "UNKNOWN").upper()
+        # Coin names are case-sensitive on the venue (kPEPE), so keep them as sent.
+        coin = str(item.get("coin") or "UNKNOWN")
+        if coin == "UNKNOWN":
+            parse_errors.append("missing_coin")
         trade_time = _parse_timestamp_ms(item.get("time"), parse_errors)
         if trade_time is None and "invalid_event_time" not in parse_errors:
             parse_errors.append("invalid_event_time")
@@ -1133,6 +1136,9 @@ class HyperliquidTradeNormalizer:
         price = _optional_float(item.get("px"), "price", parse_errors)
         size = _optional_float(item.get("sz"), "size", parse_errors)
         trade_id = _optional_int(item.get("tid"), "trade_id", parse_errors)
+        if trade_id is None and "invalid_trade_id" not in parse_errors:
+            # tid is the only dedupe key for recovering reconnect-gap prints.
+            parse_errors.append("missing_trade_id")
         buyer, seller = _hyperliquid_users(item.get("users"), parse_errors)
         instrument = resolve_perp_instrument(f"{coin}USDC", venue="hyperliquid")
         product = instrument.venue_symbol if instrument is not None else f"{coin}USDC"
