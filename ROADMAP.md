@@ -37,7 +37,11 @@ retention disposition, separately scoped activation, fresh readiness checks and
 observed source completeness are still required. No live flag, restart, transfer,
 paid agent/API dispatch, outcome scan, holdout release or economic admission.
 The frozen PR95 capacity preflight and prior research attempt budgets stay intact.
-Required independent code/security review and Windows CI are merge gates.
+Independent code/security review found a deadline race after blocking control
+checkpoint I/O; post-I/O clock and publication checks fix it, with synthetic
+regressions. Reviewer approved the fix and integration with the newer Hyperliquid
+lanes. Combined local suite on October 6: 776 passed / 5 skipped; ruff and diff
+checks pass. Windows Python 3.11/3.12 CI remains the final merge gate.
 
 ## Owner decision + build — Hyperliquid public WS trades lanes with wallet pair (2026-10-06)
 
