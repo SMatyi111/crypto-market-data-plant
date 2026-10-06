@@ -2971,6 +2971,7 @@ async def collect_hyperliquid_wallet_flow_segment(
             "twap_request_count": poller.twap_request_count,
             "twap_error_count": poller.twap_error_count,
             "twap_emitted_count": poller.twap_emitted_count,
+            "twap_duplicate_count": poller.twap_duplicate_count,
             "twap_deferred_count": poller.twap_deferred_count,
             "twap_window_gap_count": poller.twap_window_gap_count,
             "replayable": replayable,

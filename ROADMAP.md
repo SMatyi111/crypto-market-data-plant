@@ -33,11 +33,15 @@ its current range. So `userFillsByTime` simply never serves TWAP slices.
 
 Fix (this PR, collector-side, reaches the lane at its next segment): every 5th
 poll the poller also reads `userTwapSliceFills` per wallet; new slices are emitted
-with `raw_type="userTwapSliceFills"`; they never move the fills cursor; a slice
-older than what the run already emitted is deferred to the next run so per-wallet
-ordering holds; a full window that no longer overlaps the last one is flagged
-`window_gap`. STANDARDS 4.7 documents it; no version bump (additive `raw_type`
-value, same row contract).
+with `raw_type="userTwapSliceFills"`; they never move the fills cursor; the
+replay gate orders per (wallet, endpoint stream), so slices only need to be
+monotonic among themselves; a late slice older than the run's newest emitted slice
+is deferred to the next run; a full window that no longer overlaps the last seen
+slice (also across restarts) is flagged `window_gap`. Both keep the poll
+incomplete. **STANDARDS v18** (replay ordering semantics changed for this lane;
+row schema and partitions unchanged). Measured 2026-10-06: wallet 1 has 1,610
+target TWAP slices in its current window (newest 8 h old), none of them captured
+before this fix.
 
 Consequence: the node archive (`node_fills_by_block`) that measured these gaps
 stopped on 2026-09-26 (AWS account closed), so TWAP fills between 2026-09-26 and

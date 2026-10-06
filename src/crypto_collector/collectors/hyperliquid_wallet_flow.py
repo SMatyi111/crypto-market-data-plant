@@ -127,8 +127,12 @@ def scan_durable_wallet_fills(
     source_root: Path | str,
     *,
     prospective_start_at: datetime,
+    twap_newest: dict[str, int] | None = None,
 ) -> tuple[set[str], dict[str, int]]:
     """Recover dedup/high-water state from every durable clean row.
+
+    TWAP slice rows (`raw_type="userTwapSliceFills"`) feed dedup only; their
+    newest timestamp per wallet goes to `twap_newest` when a dict is passed.
 
     This includes unfinished runs. If a worker dies after writing part of a poll but
     before finalizing its replay summary, the next worker suppresses those rows rather
@@ -171,6 +175,10 @@ def scan_durable_wallet_fills(
                     # TWAP slice rows come from a second endpoint with no time
                     # window; they must not move the userFillsByTime cursor (a
                     # restart would otherwise skip an unfinished capped region).
+                    if twap_newest is not None:
+                        twap_newest[wallet] = max(
+                            timestamp_ms, twap_newest.get(wallet, timestamp_ms)
+                        )
                     continue
                 highwater[wallet] = max(timestamp_ms, highwater.get(wallet, timestamp_ms))
     return seen, highwater
@@ -208,9 +216,11 @@ class HyperliquidWalletFlowPoller:
         )
         self.poll_history_error_count = 0
         self.last_poll_history_error: str | None = None
+        durable_twap_newest: dict[str, int] = {}
         self.seen, self.highwater = scan_durable_wallet_fills(
             self.source_root,
             prospective_start_at=cohort.prospective_start_at,
+            twap_newest=durable_twap_newest,
         )
         self.poll_count = 0
         self.poll_error_count = 0
@@ -235,13 +245,20 @@ class HyperliquidWalletFlowPoller:
         self.twap_request_count = 0
         self.twap_error_count = 0
         self.twap_emitted_count = 0
-        self.twap_deferred_count = 0
+        self.twap_duplicate_count = 0
         self.twap_window_gap_count = 0
-        # Newest exchange time emitted per wallet by THIS poller (one poller per
-        # run). A TWAP fill older than it would break the run's per-wallet
-        # ordering gate, so it is deferred to the next run instead of emitted.
-        self.last_emitted_ms: dict[str, int] = {}
-        self.twap_newest_seen_ms: dict[str, int] = {}
+        # TWAP slices are their own ordered stream per wallet (the replay gate
+        # orders per (wallet, endpoint)). Newest slice emitted by THIS poller (one
+        # poller per run): a newly visible slice older than it is deferred to the
+        # next run instead of breaking the stream order.
+        self.twap_last_emitted_ms: dict[str, int] = {}
+        self.twap_deferred_keys: set[str] = set()
+        # Newest slice seen per wallet, seeded from durable TWAP rows so the first
+        # read after a restart can still prove a window gap.
+        self.twap_newest_seen_ms: dict[str, int] = durable_twap_newest
+        # Wallets whose last TWAP read failed, showed a gap or left slices
+        # deferred; keeps later non-TWAP polls honest about completeness.
+        self.twap_incomplete_wallets: set[str] = set()
         self.last_poll_complete: bool | None = None
         self.per_wallet: dict[str, dict[str, Any]] = {
             wallet.address: {"candidate_rank": wallet.candidate_rank, "cohort_rank": wallet.cohort_rank}
@@ -347,14 +364,7 @@ class HyperliquidWalletFlowPoller:
                     if trade_key in self.seen:
                         self.duplicate_count += 1
                         continue
-                    payload = dict(fill)
-                    payload["_wallet"] = wallet.address
-                    payload["_candidate_rank"] = wallet.candidate_rank
-                    payload["_cohort_rank"] = wallet.cohort_rank
-                    payload["_trade_key"] = trade_key
-                    payload["_prospective_start_at"] = self.cohort.prospective_start_at.isoformat()
-                    payload["_cohort_sha256"] = self.cohort.sha256
-                    emitted.append(payload)
+                    emitted.append(self._build_payload(wallet, fill, trade_key))
                     self.seen.add(trade_key)
                     self.highwater[wallet.address] = max(
                         timestamp_ms,
@@ -379,8 +389,7 @@ class HyperliquidWalletFlowPoller:
             if self.twap_every_polls and self.poll_count % self.twap_every_polls == 0:
                 if self.request_pause_seconds:
                     await asyncio.sleep(self.request_pause_seconds)
-                if not await self._poll_twap(wallet, start_floor_ms, state, emitted):
-                    complete = False
+                await self._poll_twap(wallet, start_floor_ms, state, emitted)
             state["page_start_timestamp_ms"] = self.page_starts.get(wallet.address)
             state["resume_floor_timestamp_ms"] = self.resume_floors.get(wallet.address)
             if index + 1 < len(self.cohort.wallets) and self.request_pause_seconds:
@@ -392,13 +401,8 @@ class HyperliquidWalletFlowPoller:
                 str(row.get("_trade_key") or ""),
             )
         )
-        for row in emitted:
-            stamp = _optional_int(row.get("time"))
-            wallet_address = str(row.get("_wallet") or "")
-            if stamp is not None and wallet_address:
-                self.last_emitted_ms[wallet_address] = max(
-                    stamp, self.last_emitted_ms.get(wallet_address, stamp)
-                )
+        if self.twap_incomplete_wallets:
+            complete = False
         self.poll_count += 1
         self.emitted_count += len(emitted)
         self.last_poll_complete = complete
@@ -421,8 +425,10 @@ class HyperliquidWalletFlowPoller:
             "twap_request_count": self.twap_request_count,
             "twap_error_count": self.twap_error_count,
             "twap_emitted_count": self.twap_emitted_count,
+            "twap_duplicate_count": self.twap_duplicate_count,
             "twap_deferred_count": self.twap_deferred_count,
             "twap_window_gap_count": self.twap_window_gap_count,
+            "twap_incomplete_wallets": sorted(self.twap_incomplete_wallets),
             "per_wallet": self.per_wallet,
         }
         if self.poll_history_sink is not None:
@@ -444,28 +450,53 @@ class HyperliquidWalletFlowPoller:
         write_wallet_flow_state(self.state_path, snapshot)
         return emitted, False
 
+    @property
+    def twap_deferred_count(self) -> int:
+        """Distinct slices currently held back for the next run."""
+        return len(self.twap_deferred_keys)
+
+    def _build_payload(
+        self,
+        wallet: CohortWallet,
+        fill: dict[str, Any],
+        trade_key: str,
+        endpoint: str | None = None,
+    ) -> dict[str, Any]:
+        payload = dict(fill)
+        payload["_wallet"] = wallet.address
+        payload["_candidate_rank"] = wallet.candidate_rank
+        payload["_cohort_rank"] = wallet.cohort_rank
+        payload["_trade_key"] = trade_key
+        payload["_prospective_start_at"] = self.cohort.prospective_start_at.isoformat()
+        payload["_cohort_sha256"] = self.cohort.sha256
+        if endpoint is not None:
+            payload["_fill_endpoint"] = endpoint
+        return payload
+
     async def _poll_twap(
         self,
         wallet: CohortWallet,
         start_floor_ms: int,
         state: dict[str, Any],
         emitted: list[dict[str, Any]],
-    ) -> bool:
-        """Read the wallet's recent TWAP slice fills; return False if incomplete."""
+    ) -> None:
+        """Read the wallet's most recent TWAP slices into the TWAP stream."""
+        address = wallet.address
         self.twap_request_count += 1
         state["last_twap_attempt_at"] = self.clock().astimezone(UTC).isoformat()
-        state.update(last_twap_rows=None, last_twap_new_rows=0, last_twap_deferred=0)
+        state.update(last_twap_rows=None, last_twap_new_rows=0)
         try:
             response = await asyncio.to_thread(
-                self.fetch, {"type": TWAP_ENDPOINT, "user": wallet.address}
+                self.fetch, {"type": TWAP_ENDPOINT, "user": address}
             )
             if not isinstance(response, list):
                 raise ValueError("userTwapSliceFills response is not a list")
         except Exception as exc:  # noqa: BLE001 - isolate one public wallet failure
             self.twap_error_count += 1
+            self.twap_incomplete_wallets.add(address)
             state["last_twap_status"] = "failed"
             state["last_twap_error"] = f"{type(exc).__name__}: {exc}"
-            return False
+            return
         fills: list[dict[str, Any]] = []
         for item in response:
             if not isinstance(item, dict) or not isinstance(item.get("fill"), dict):
@@ -473,35 +504,33 @@ class HyperliquidWalletFlowPoller:
             fill = dict(item["fill"])
             if fill.get("twapId") in (None, "") and item.get("twapId") not in (None, ""):
                 fill["twapId"] = item["twapId"]
-            fills.append(fill)
-        stamps = [
-            stamp
-            for stamp in (_optional_int(fill.get("time")) for fill in fills)
-            if stamp is not None
-        ]
+            if _optional_int(fill.get("time")) is not None:
+                fills.append(fill)
+        fills.sort(key=lambda fill: (_optional_int(fill.get("time")), str(fill.get("tid"))))
         state["last_twap_rows"] = len(response)
         state.pop("last_twap_error", None)
-        complete = True
         status = "ok"
-        previous_newest = self.twap_newest_seen_ms.get(wallet.address)
-        if (
-            len(response) >= TWAP_RESPONSE_CAP
-            and stamps
-            and previous_newest is not None
-            and min(stamps) > previous_newest
-        ):
-            # The most-recent window no longer reaches back to what this poller
-            # last saw: slices in between are unreachable here (node backfill).
-            self.twap_window_gap_count += 1
-            status = "window_gap"
-            complete = False
-        if stamps:
-            newest = max(stamps)
-            if previous_newest is not None:
-                newest = max(newest, previous_newest)
-            self.twap_newest_seen_ms[wallet.address] = newest
-        floor = self.last_emitted_ms.get(wallet.address)
-        new_rows = deferred = 0
+        previous_newest = self.twap_newest_seen_ms.get(address)
+        if fills:
+            oldest = _optional_int(fills[0].get("time"))
+            newest = _optional_int(fills[-1].get("time"))
+            if (
+                len(response) >= TWAP_RESPONSE_CAP
+                and previous_newest is not None
+                and oldest is not None
+                and oldest > previous_newest
+            ):
+                # The most-recent window no longer reaches back to the newest slice
+                # seen before (this run, or durable rows at start-up): slices in
+                # between are unreachable from this endpoint.
+                self.twap_window_gap_count += 1
+                status = "window_gap"
+            if newest is not None:
+                self.twap_newest_seen_ms[address] = max(
+                    newest, previous_newest if previous_newest is not None else newest
+                )
+        floor = self.twap_last_emitted_ms.get(address)
+        new_rows = 0
         for fill in fills:
             timestamp_ms = _optional_int(fill.get("time"))
             coin = str(fill.get("coin") or "").upper()
@@ -511,31 +540,31 @@ class HyperliquidWalletFlowPoller:
                 or coin not in self.cohort.target_coins
             ):
                 continue
-            trade_key = wallet_trade_key(wallet.address, fill)
+            trade_key = wallet_trade_key(address, fill)
             if trade_key in self.seen:
-                self.duplicate_count += 1
+                self.twap_duplicate_count += 1
                 continue
             if floor is not None and timestamp_ms < floor:
-                deferred += 1
+                self.twap_deferred_keys.add(trade_key)
                 continue
-            payload = dict(fill)
-            payload["_wallet"] = wallet.address
-            payload["_candidate_rank"] = wallet.candidate_rank
-            payload["_cohort_rank"] = wallet.cohort_rank
-            payload["_trade_key"] = trade_key
-            payload["_prospective_start_at"] = self.cohort.prospective_start_at.isoformat()
-            payload["_cohort_sha256"] = self.cohort.sha256
-            payload["_fill_endpoint"] = TWAP_ENDPOINT
-            emitted.append(payload)
+            emitted.append(self._build_payload(wallet, fill, trade_key, TWAP_ENDPOINT))
             self.seen.add(trade_key)
+            self.twap_deferred_keys.discard(trade_key)
+            self.twap_last_emitted_ms[address] = timestamp_ms
             new_rows += 1
         self.twap_emitted_count += new_rows
-        self.twap_deferred_count += deferred
+        prefix = f"{address}:"
+        deferred = sum(1 for key in self.twap_deferred_keys if key.startswith(prefix))
+        if status == "ok" and deferred:
+            status = "deferred_to_next_run"
+        if status == "ok":
+            self.twap_incomplete_wallets.discard(address)
+        else:
+            self.twap_incomplete_wallets.add(address)
         state["last_twap_status"] = status
         state["last_twap_new_rows"] = new_rows
         state["last_twap_deferred"] = deferred
         state["last_twap_success_at"] = self.clock().astimezone(UTC).isoformat()
-        return complete
 
 
 class HyperliquidWalletFillNormalizer:
