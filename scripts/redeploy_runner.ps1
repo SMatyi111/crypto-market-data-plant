@@ -22,11 +22,11 @@
 param(
     [string]$OpsRoot = "G:\market_archive\ops",
     # Match run_ops_runner.ps1's live default (one slot per pooled lane; see the
-    # full 46-slot enumeration there, including the 2 options-IV snapshot lanes
-    # and the universe-positions ingest lane).
+    # full 49-slot enumeration there, including the 2 options-IV snapshot lanes,
+    # the universe-positions ingest lane and the 3 Hyperliquid WS trades lanes).
     # Keep these in sync -- a
     # redeploy with a lower value silently throttles coverage until reboot.
-    [int]$CollectorConcurrency = 46
+    [int]$CollectorConcurrency = 49
 )
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot

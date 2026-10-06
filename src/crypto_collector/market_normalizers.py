@@ -1072,6 +1072,128 @@ class OkxTradeNormalizer:
         )
 
 
+# Plant-added provenance key on the FIRST `trades` frame after each subscribe ack
+# (see GenericWebsocketCollector, subscription_style "hyperliquid"). Hyperliquid
+# answers every subscribe with its ~30 most recent prints in an UNFLAGGED frame of
+# the ordinary shape, so only the collector, which knows the frame order, can mark it.
+HYPERLIQUID_SUBSCRIBE_SNAPSHOT_KEY = "_plant_subscribe_snapshot"
+
+
+class HyperliquidTradeNormalizer:
+    """Normalize Hyperliquid public WebSocket `trades` frames (STANDARDS 4.15).
+
+    Frame: `{"channel":"trades","data":[{coin, side, px, sz, time, hash, tid,
+    users:[buyer, seller]}, ...]}` - batched, fanned out via `normalize_many`.
+
+    * `side` is the **taker (aggressor) side**: `"B"` = taker bought (lifted the
+      ask), `"A"` = taker sold (hit the bid) - checked against live prints
+      2026-10-06 (A prints at the bid, B at the ask). No flip needed.
+    * `users` is `[buyer, seller]` - the two PUBLIC wallet addresses on the print,
+      independent of `side`. The taker is the buyer when side is B, the seller
+      when side is A. Kept (lower-cased) in `metadata.users` plus the
+      `buyer`/`seller` scalars. A print without a well-formed `users` pair fails
+      the live gate (`invalid_users`), so every clean row is wallet-attributed.
+    * `tid` is unique but NOT a dense or monotonic counter, so `sequence` stays
+      `None` and the run is curated by `replay_trades_stream_run` (`none_native`:
+      structurally clean, not gap-proof - STANDARDS 4.3).
+    * `product` is the plant's venue symbol `<COIN>USDC` (curated partition
+      `instrument=BTCUSDC`), NOT the bare coin: the frozen-cohort wallet-fill lane
+      (4.7) already partitions as `instrument=BTC`, and the public tape must never
+      share a partition with a subset of itself. The bare coin is in
+      `metadata.hyperliquid_coin`.
+    * The subscribe snapshot (frame tagged `HYPERLIQUID_SUBSCRIBE_SNAPSHOT_KEY`)
+      re-delivers prints the previous segment already holds; they are tagged
+      `subscribe_replay` and, with no sequence to prove novelty, quarantined by
+      the live gate. Raw and quarantine keep them (dedupe by `tid` to recover the
+      few that fall inside a reconnect gap).
+    """
+
+    def normalize_many(self, raw: RawMessage) -> list[NormalizedL3Event]:
+        data = raw.payload.get("data")
+        if not isinstance(data, list):
+            return []
+        subscribe_replay = raw.payload.get(HYPERLIQUID_SUBSCRIBE_SNAPSHOT_KEY) is True
+        return [
+            self._normalize_one(item, raw, subscribe_replay=subscribe_replay) for item in data
+        ]
+
+    def _normalize_one(
+        self, item: Any, raw: RawMessage, *, subscribe_replay: bool = False
+    ) -> NormalizedL3Event:
+        item = item if isinstance(item, dict) else {}
+        parse_errors: list[str] = []
+        # Coin names are case-sensitive on the venue (kPEPE), so keep them as sent.
+        coin = str(item.get("coin") or "UNKNOWN")
+        if coin == "UNKNOWN":
+            parse_errors.append("missing_coin")
+        trade_time = _parse_timestamp_ms(item.get("time"), parse_errors)
+        if trade_time is None and "invalid_event_time" not in parse_errors:
+            parse_errors.append("invalid_event_time")
+        raw_side = item.get("side")
+        taker_side = {"B": "buy", "A": "sell"}.get(str(raw_side))
+        if taker_side is None:
+            parse_errors.append("invalid_side")
+        price = _optional_float(item.get("px"), "price", parse_errors)
+        size = _optional_float(item.get("sz"), "size", parse_errors)
+        trade_id = _optional_int(item.get("tid"), "trade_id", parse_errors)
+        if trade_id is None and "invalid_trade_id" not in parse_errors:
+            # tid is the only dedupe key for recovering reconnect-gap prints.
+            parse_errors.append("missing_trade_id")
+        buyer, seller = _hyperliquid_users(item.get("users"), parse_errors)
+        instrument = resolve_perp_instrument(f"{coin}USDC", venue="hyperliquid")
+        product = instrument.venue_symbol if instrument is not None else f"{coin}USDC"
+
+        metadata: dict[str, Any] = {
+            "instrument_id": instrument.instrument_id if instrument is not None else None,
+            "canonical_symbol": instrument.canonical_symbol if instrument is not None else None,
+            "buyer_is_maker": (taker_side == "sell") if taker_side is not None else None,
+            "hyperliquid_coin": coin,
+            "hyperliquid_side_raw": str(raw_side) if raw_side is not None else None,
+            "users": [buyer, seller] if buyer and seller else None,
+            "buyer": buyer,
+            "seller": seller,
+            "transaction_hash": _optional_str(item.get("hash")),
+            "subscribe_replay": True if subscribe_replay else None,
+        }
+        if parse_errors:
+            metadata["parse_errors"] = parse_errors
+
+        return NormalizedL3Event(
+            source=raw.source,
+            product=product,
+            channel="trades",
+            event_type="trade",
+            exchange_time=trade_time,
+            received_at=raw.received_at,
+            side=taker_side,
+            price=price,
+            size=size,
+            trade_id=str(trade_id) if trade_id is not None else None,
+            # tid is unique but neither dense nor monotonic -> no sequence proof.
+            sequence=None,
+            raw_type="ws_trades",
+            metadata={key: value for key, value in metadata.items() if value is not None},
+        )
+
+
+def _hyperliquid_users(value: Any, errors: list[str]) -> tuple[str | None, str | None]:
+    """`users` must be exactly [buyer, seller], two 0x-prefixed 40-hex addresses."""
+    if (
+        isinstance(value, list)
+        and len(value) == 2
+        and all(_is_evm_address(entry) for entry in value)
+    ):
+        return str(value[0]).lower(), str(value[1]).lower()
+    errors.append("invalid_users")
+    return None, None
+
+
+def _is_evm_address(value: Any) -> bool:
+    if not isinstance(value, str) or len(value) != 42 or value[:2].lower() != "0x":
+        return False
+    return all(ch in "0123456789abcdefABCDEF" for ch in value[2:])
+
+
 class OkxDepthNormalizer:
     """Normalize OKX v5 `books` channel frames.
 

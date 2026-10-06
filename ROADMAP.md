@@ -8,7 +8,7 @@ changes scope or state. Companion docs:
 - [`STANDARDS.md`](STANDARDS.md) — the data contract (schemas, replayability, retention)
 - [`docs/HISTORY.md`](docs/HISTORY.md) — resolved-work narrative (what was fixed, and why)
 
-Last updated: **2026-10-04**.
+Last updated: **2026-10-06**.
 
 > **Operating mode — safe shaping (owner directive, 2026-07-04).** No extended
 > building on Claude's initiative: no new venues, lanes, or instruments, no big
@@ -27,7 +27,7 @@ durable trial ID/control ledger, two nonrefundable segment reservations, 1040 Mi
 total additional logical evidence allowance, and an immutable one-hour deadline.
 Clock reversal, missing/corrupt state, exhausted slots, insufficient headroom and
 metadata overflow refuse optional evidence while ordinary market rows continue.
-See STANDARDS 4.15 for crash, cross-process writer, metadata and clock semantics.
+See STANDARDS 4.16 for crash, cross-process writer, metadata and clock semantics.
 Two slots within one hour do not promise two full 1800-second segments. Failures
 before a durable grant, including prior-writer refusal, remain coverage gaps;
 committed slots cannot be retried or recovered by offloading run artifacts.
@@ -38,6 +38,34 @@ observed source completeness are still required. No live flag, restart, transfer
 paid agent/API dispatch, outcome scan, holdout release or economic admission.
 The frozen PR95 capacity preflight and prior research attempt budgets stay intact.
 Required independent code/security review and Windows CI are merge gates.
+
+## Owner decision + build — Hyperliquid public WS trades lanes with wallet pair (2026-10-06)
+
+**Owner approved 2026-10-06** (explicit ask, so the safe-shaping "no new lanes" mode
+does not apply). Lanes 45-47 `hyperliquid-{btc,eth,sol}-trades` (job type
+`hyperliquid-trades-worker`, STANDARDS 4.15): keyless public WS `trades` subscription
+per coin, keeping the `users` = `[buyer, seller]` wallet pair on every print. Why: the
+Hyperliquid S3 fill archive stopped at 2026-09-26 when the AWS account was closed, and
+a BSc thesis (HL wallet-level positioning -> BTC realized-minus-implied vol) needs
+wallet-attributed trades through a Nov-2026 holdout; the hourly universe position
+sweeps (lane 44) re-anchor positions and this tape carries the flow in between.
+
+Contract choices: reuses the v2 `trades` row and the `none_native` stream verdict (no
+STANDARDS_VERSION bump, compatible lane addition); prints without a valid wallet pair
+are quarantined (`invalid_users`); `product` = `<COIN>USDC` so the curated partition
+(`instrument=BTCUSDC`) never mixes with the wallet-flow lane's `instrument=BTC`;
+the unflagged subscribe snapshot (~30 recent prints per connect) is tagged by the
+collector and quarantined as `subscribe_replay`. Each lane has its quarantine,
+promote, score and `archive-offload-cold` entry in the live config. Concurrency
+46 -> 49 in both runner scripts. **Forward-only**: the WS has no history, so the
+2026-09-26 -> 2026-10-06 window stays a hole on this source.
+
+Open: (1) curated completeness check for lanes 45-47 after the first day (grade B is
+inherited from the other `none_native` WS trades lanes until then); (2) whether a
+node-archive (`node_fills_by_block`) backfill of the 09-26 -> 10-06 hole is wanted is a
+separate owner decision.
+
+---
 
 ## Optional evidence budget and headroom guard (2026-09-27)
 
@@ -492,7 +520,19 @@ the same restart.
 | ~~2026-06-19~~ DONE 06-24 | The 06-17 `robocopy /MINAGE:3` move never finished (~88% of partitions still on G:), leaving G: at **3.9 GB free**. First retry (06-22) was killed by the Bash tool's 10-min timeout after freeing ~57 GB. Relaunched **detached via `Start-Process`** (pid 48444) so it survives session/tool teardown -> **COMPLETED 2026-06-24 16:19, FAILED: 0** (45.29 M files / 555 GB moved G:->`D:\market_archive_cold`). **G: now 489 GB free.** D: holds 113,407 normalized partitions (full set). 1 partition / 2 parquet files remain on G: -- robocopy *skipped* them (already byte-present on D: from the 06-17 partial), so redundant not stranded; immaterial (489 GB free). Lesson: long-running moves must be detached, never run inside a Bash call (10-min cap). |
 | ~~2026-07-26~~ DONE 08-01 | **Text raw offload wired for the next restart.** `archive-offload-text` is enabled in `ops.live.local.json` with the indexed promotion/quarantine gate, preserve-first aged-run backstop, byte-verified cold move, and `write_report:false` so it cannot replace the market health report. It remains inert until the guarded elevated runner restart. |
 
-**Last ops audit:** 2026-10-04 - read-only health at 18:23 UTC: status ok,
+**Last ops audit:** 2026-10-06 — read-only, before adding the Hyperliquid WS trades
+lanes. Health 13:13 UTC: `status=ok`, findings none, heartbeat age 4.9 s; poll lanes
+(universe positions, options chain, Deribit) all fresh. 24 h: 15,561 success / 212
+error (98.7 %); 208 of the errors are one burst at 2026-10-05 20:xx UTC on the eight
+Binance fapi REST lanes (exceptions raised from the REST poll in `rest_poll`), plus
+4 scattered single errors; no lane is stale now. Offload: 89 moved, 0 failed,
+`stuck_unaccounted=0`; warnings only `unconfigured_lane` (leaderboard, limitless,
+`hyperliquid_retro_fills`) and `missing_lane_dir` (legacy kalshi/coinbase-usdc). Disk:
+G: 268.2 GiB free (291.4 on 09-27, ~2.4 GiB/day), D: 487.9, I: 15,100.6. The 10-05
+fapi burst is worth a look if it recurs (an undetected fapi outage minted orphans on
+09-13); not investigated further here.
+
+**Previous ops audit:** 2026-10-04 - read-only health at 18:23 UTC: status ok,
 heartbeat 2.9 seconds old, 154 jobs, 205,863 cumulative successes / 989 errors
 (99.52% success). No job or normalized partition flagged stale. One job's last
 completed status is error (Bybit BTC liquidations, 01:12 UTC), while its current

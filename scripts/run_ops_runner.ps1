@@ -26,9 +26,11 @@ param(
     # 4 that are disabled or off (the 2 kalshi REST jobs, text-reddit, and the
     # binance all-market liquidations lane that fstream never delivers from this
     # host). The preflight counts ENABLED lanes, so 44 is the number that must fit;
-    # 46 leaves 2 slots of headroom. Raise it by one per lane added, in BOTH this
-    # script and redeploy_runner.ps1.
-    [int]$CollectorConcurrency = 46
+    # 46 leaves 2 slots of headroom. 2026-10-06: + 3 Hyperliquid public WS trades
+    # lanes (BTC/ETH/SOL, wallet-attributed prints, STANDARDS 4.15) = 47 enabled,
+    # 49 keeps the same 2 slots of headroom. Raise it by one per lane added, in
+    # BOTH this script and redeploy_runner.ps1.
+    [int]$CollectorConcurrency = 49
 )
 
 $ErrorActionPreference = "Stop"

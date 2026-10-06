@@ -7,6 +7,7 @@ import time
 from collections.abc import AsyncIterator
 
 from ..config import CollectorConfig
+from ..market_normalizers import HYPERLIQUID_SUBSCRIBE_SNAPSHOT_KEY
 from ..models import RawMessage, utc_now
 from .base import BaseCollector
 
@@ -65,6 +66,10 @@ class GenericWebsocketCollector(BaseCollector):
                         self.session_evidence.opened(self.config.websocket_url)
                     pending = await self._subscribe(websocket)
                     attempt = 0
+                    # Hyperliquid answers every subscribe with an unflagged frame of
+                    # its most recent prints; mark the first data frame of each
+                    # connection so the normalizer can tag it as a replay.
+                    snapshot_pending = self.config.subscription_style == "hyperliquid"
                     # Start the app-level keepalive (if configured) only after the
                     # subscription handshake, so a pong reply can never be mistaken
                     # for the subscribe ack. Always torn down in `finally` — on a
@@ -76,6 +81,9 @@ class GenericWebsocketCollector(BaseCollector):
                             payload = raw.payload
                             if not self._should_emit(payload):
                                 continue
+                            if snapshot_pending:
+                                payload[HYPERLIQUID_SUBSCRIBE_SNAPSHOT_KEY] = True
+                                snapshot_pending = False
                             yield raw
                             message_count += 1
                             if limit is not None and message_count >= limit:
@@ -165,6 +173,9 @@ class GenericWebsocketCollector(BaseCollector):
                             consecutive_decode_errors = 0
                             if not self._should_emit(payload):
                                 continue
+                            if snapshot_pending:
+                                payload[HYPERLIQUID_SUBSCRIBE_SNAPSHOT_KEY] = True
+                                snapshot_pending = False
                             depth_deadline = time.monotonic() + idle_timeout
                             yield RawMessage(
                                 source=self.config.source,
@@ -380,6 +391,9 @@ class GenericWebsocketCollector(BaseCollector):
         if self.config.subscription_style == "okx":
             # {"event":"subscribe","arg":{"channel":..,"instId":..},"connId":..}.
             return payload.get("event") == "subscribe"
+        if self.config.subscription_style == "hyperliquid":
+            # {"channel":"subscriptionResponse","data":{"method":"subscribe",...}}.
+            return payload.get("channel") == "subscriptionResponse"
         return False
 
     def _is_subscription_error(self, payload: object) -> bool:
@@ -404,6 +418,9 @@ class GenericWebsocketCollector(BaseCollector):
         if self.config.subscription_style == "okx":
             # {"event":"error","code":"60012","msg":..,"connId":..}.
             return payload.get("event") == "error"
+        if self.config.subscription_style == "hyperliquid":
+            # {"channel":"error","data":"Invalid subscription ..."}.
+            return payload.get("channel") == "error"
         return False
 
     def _subscription_message(self) -> dict[str, object]:
@@ -457,6 +474,12 @@ class GenericWebsocketCollector(BaseCollector):
                     }
                 ],
             }
+        if self.config.subscription_style == "hyperliquid":
+            # One subscription per (type, coin), e.g. {"type":"trades","coin":"BTC"}.
+            return {
+                "method": "subscribe",
+                "subscription": {"type": self.config.channel, "coin": self.config.product},
+            }
         raise ValueError(f"Unsupported subscription_style: {self.config.subscription_style}")
 
     def _should_emit(self, payload: object) -> bool:
@@ -489,6 +512,12 @@ class GenericWebsocketCollector(BaseCollector):
             # Data frames carry both "arg" (channel+instId) and "data"; the subscribe
             # ack / error carry "event" and no "data", and the "pong" maps to {} above.
             return "data" in payload and "arg" in payload
+        if self.config.subscription_style == "hyperliquid":
+            # Data frames are {"channel":<subscribed type>,"data":[...]}; the ack
+            # (subscriptionResponse), error and {"channel":"pong"} are dropped.
+            return payload.get("channel") == self.config.channel and isinstance(
+                payload.get("data"), list
+            )
         return True
 
 
