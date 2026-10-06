@@ -959,6 +959,25 @@ it is a no-op. Backfilled rows are admissible for completeness-oriented work
 on receipt-time availability. The run's `metrics/summary.jsonl` row records
 `capture_source`, the source window and the dedup counts.
 
+TWAP slice fills (2026-10-06). `userFillsByTime` never returns a wallet's TWAP
+slice fills (zero transaction hash); only `userTwapSliceFills` does, and that
+endpoint has no time window - it serves the most recent 2,000 slices. Every
+`twap_every_polls` polls (default 5, `0` disables) the poller also reads that
+endpoint per wallet, applies the same target-coin filter and `(wallet, trade_id)`
+dedup, and emits new slices with `raw_type="userTwapSliceFills"` and `twap_id`
+lifted from the response wrapper. The rest of the row contract is unchanged. TWAP
+rows never move the `userFillsByTime` high-water, including on restart (the
+durable scan keeps them for dedup only). A slice older than a fill the current run
+already emitted for that wallet is deferred to the next run, so the per-wallet
+ordering gate holds. A 2,000-row TWAP response whose oldest slice is newer than
+the newest slice this poller saw before is a proven gap
+(`last_twap_status="window_gap"`, poll incomplete). TWAP counters are in
+`_collector_state.json` and the segment summary. Before this, every TWAP-executed
+target fill was missing from the lane: the 2026-09-14 and 2026-09-15..19 "silent
+per-wallet stalls" were exactly that. The node archive that measured those gaps
+stopped on 2026-09-26 (AWS account closed), so slices that leave the 2,000-row
+window are now unrecoverable.
+
 Consumers performing the registered causal evaluation MUST filter on the frozen
 cohort's `prospective_start_at` and join using event time plus an explicit
 receipt/availability delay. Rows from earlier scratch or snapshot work are

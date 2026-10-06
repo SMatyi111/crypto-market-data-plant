@@ -19,6 +19,32 @@ Last updated: **2026-10-06**.
 
 ---
 
+## Finding + fix - wallet-flow "silent stalls" were TWAP slice fills (2026-10-06)
+
+The open audit question (why one cohort wallet stopped receiving fills for days
+while the lane kept running, 2026-09-14 and 2026-09-15..19) is answered. Every
+fill the node backfill recovered for wallets 1 and 4 (2,331 rows) has a zero
+transaction hash, i.e. it is a TWAP slice. Wallet 4's poll history shows the
+poller healthy throughout: uncapped responses of up to 1,977 rows, zero new
+target rows, because those rows were its alt-coin fills. Querying the public API
+today for 2026-09-15 22:02 -> 09-16 09:01 returns 0 of the 563 missing fills in
+that window, while `userTwapSliceFills` returns all 108 missing fills that fall in
+its current range. So `userFillsByTime` simply never serves TWAP slices.
+
+Fix (this PR, collector-side, reaches the lane at its next segment): every 5th
+poll the poller also reads `userTwapSliceFills` per wallet; new slices are emitted
+with `raw_type="userTwapSliceFills"`; they never move the fills cursor; a slice
+older than what the run already emitted is deferred to the next run so per-wallet
+ordering holds; a full window that no longer overlaps the last one is flagged
+`window_gap`. STANDARDS 4.7 documents it; no version bump (additive `raw_type`
+value, same row contract).
+
+Consequence: the node archive (`node_fills_by_block`) that measured these gaps
+stopped on 2026-09-26 (AWS account closed), so TWAP fills between 2026-09-26 and
+this deploy that have left the 2,000-slice window are unrecoverable, and the
+lane has no completeness oracle any more. The 2026-09-14 loss "while its
+high-water advanced" on wallet 4 is the same mechanism.
+
 ## Bounded optional evidence lease - offline implementation (2026-10-04)
 
 The factory's independent reviewer accepted the NO-GO activation specification.
@@ -1249,6 +1275,9 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   resume floor and would need `--no-poller-guard` (only sane with the poller stopped) -
   left alone. Still open for the fix side: why one wallet stalled 4 days while the lane
   kept running (the 09-14 stall was 20 days, also silent) - carried to the next audit.
+  **ROOT-CAUSED 2026-10-06:** not a stall - the missing fills are TWAP slice fills,
+  which `userFillsByTime` never returns (fix: poll `userTwapSliceFills`, see the
+  2026-10-06 finding at the top).
 
 - **Proposed next data-feasibility memo: official exchange rule changes
   (2026-09-10; owner requested this memo, not a new collector).** Assess whether

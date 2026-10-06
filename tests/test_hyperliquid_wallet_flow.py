@@ -238,6 +238,7 @@ def test_cli_and_ops_thread_every_wallet_flow_field(tmp_path: Path, monkeypatch)
                 "request_pause_seconds": 0.25,
                 "overlap_seconds": 600.0,
                 "response_cap": 1234,
+                "twap_every_polls": 3,
                 "segment_count": 777,
                 "max_segments": 1,
                 "cooldown_seconds": 0.0,
@@ -261,6 +262,7 @@ def test_cli_and_ops_thread_every_wallet_flow_field(tmp_path: Path, monkeypatch)
             "request_pause_seconds",
             "overlap_seconds",
             "response_cap",
+            "twap_every_polls",
             "max_delay_ms",
             "max_future_skew_ms",
             "max_clock_skew_ms",
@@ -278,6 +280,7 @@ def test_cli_and_ops_thread_every_wallet_flow_field(tmp_path: Path, monkeypatch)
         "request_pause_seconds": 0.25,
         "overlap_seconds": 600.0,
         "response_cap": 1234,
+        "twap_every_polls": 3,
         "max_delay_ms": 456000,
         "max_future_skew_ms": 4000,
         "max_clock_skew_ms": 456000.0,
@@ -654,3 +657,160 @@ def test_segment_persists_poll_diagnostics_without_claiming_batch_delivery(tmp_p
     assert result['raw_messages'] == 1 and result['clean_events'] == 1
     assert summary[-1]['last_poll_complete'] is True
     assert summary[-1]['capped_response_count'] == 0
+
+
+# --- TWAP slice fills (2026-10-06) -------------------------------------------
+# userFillsByTime never returns TWAP slice fills; only userTwapSliceFills does
+# (most recent 2000, no time window). The 09-14 and 09-15..09-19 "silent
+# per-wallet stalls" were TWAP-executed BTC/ETH fills.
+
+
+def _twap_item(fill: dict, twap_id: int = 77) -> dict:
+    inner = dict(fill)
+    inner["hash"] = "0x" + "0" * 64
+    inner["twapId"] = None
+    return {"fill": inner, "twapId": twap_id}
+
+
+def _twap_poller(tmp_path, ledger, twap_ledger, *, every=1, now_ms=None):
+    cohort_path = tmp_path / "cohort.json"
+    if not cohort_path.exists():
+        _write_cohort(cohort_path)
+    requests = []
+
+    def fetch(request):
+        requests.append(dict(request))
+        if request["user"] != ADDRESS_A:
+            return []
+        if request["type"] == "userTwapSliceFills":
+            return [_twap_item(f) for f in twap_ledger][-2000:]
+        return [dict(f) for f in ledger
+                if request["startTime"] <= f["time"] <= request["endTime"]]
+
+    clock_ms = now_ms if now_ms is not None else int(START.timestamp() * 1000) + 600_000
+    poller = HyperliquidWalletFlowPoller(
+        cohort=load_wallet_flow_cohort(cohort_path),
+        source_root=tmp_path / "source", state_path=tmp_path / "state.json",
+        fetch=fetch, request_pause_seconds=0, response_cap=2000,
+        twap_every_polls=every,
+        clock=lambda: datetime.fromtimestamp(clock_ms / 1000, tz=UTC),
+    )
+    return poller, requests
+
+
+def test_twap_slice_fills_are_collected_and_marked(tmp_path):
+    base = int(START.timestamp() * 1000)
+    ledger = [_fill(trade_id=1, timestamp_ms=base + 1_000)]
+    twap = [
+        _fill(trade_id=10, timestamp_ms=base + 2_000),
+        _fill(trade_id=11, timestamp_ms=base + 3_000, coin="DOGE"),  # non-target
+    ]
+    poller, requests = _twap_poller(tmp_path, ledger, twap)
+    first, _ = asyncio.run(poller.poll())
+    assert [x["tid"] for x in first] == [1, 10]
+    twap_row = first[1]
+    assert twap_row["_fill_endpoint"] == "userTwapSliceFills"
+    assert twap_row["twapId"] == 77  # lifted from the wrapper
+    event = HyperliquidWalletFillNormalizer().normalize(
+        RawMessage(source="hyperliquid", received_at=START, payload=twap_row)
+    )
+    assert event.raw_type == "userTwapSliceFills"
+    assert event.metadata["twap_id"] == 77
+    regular = HyperliquidWalletFillNormalizer().normalize(
+        RawMessage(source="hyperliquid", received_at=START, payload=first[0])
+    )
+    assert regular.raw_type == "userFillsByTime"
+    # The TWAP fill never moves the userFillsByTime cursor.
+    assert poller.highwater[ADDRESS_A] == base + 1_000
+    second, _ = asyncio.run(poller.poll())
+    assert second == []  # deduplicated on the next sweep
+    state = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    assert state["twap_emitted_count"] == 1
+    assert state["per_wallet"][ADDRESS_A]["last_twap_status"] == "ok"
+    assert {r["type"] for r in requests} == {"userFillsByTime", "userTwapSliceFills"}
+
+
+def test_twap_cadence_and_disabled_by_default(tmp_path):
+    poller, requests = _twap_poller(tmp_path, [], [], every=3)
+    for _ in range(6):
+        asyncio.run(poller.poll())
+    twap_requests = [r for r in requests if r["type"] == "userTwapSliceFills"]
+    assert len(twap_requests) == 2 * 2  # polls 0 and 3, both wallets
+    off_dir = tmp_path / "off"
+    off_dir.mkdir()
+    off, off_requests = _twap_poller(off_dir, [], [], every=0)
+    asyncio.run(off.poll())
+    assert all(r["type"] == "userFillsByTime" for r in off_requests)
+
+
+def test_twap_failure_is_isolated_and_marks_poll_incomplete(tmp_path):
+    base = int(START.timestamp() * 1000)
+    poller, _ = _twap_poller(tmp_path, [_fill(trade_id=1, timestamp_ms=base + 1_000)], [])
+    real = poller.fetch
+
+    def broken(request):
+        if request["type"] == "userTwapSliceFills":
+            raise RuntimeError("twap outage")
+        return real(request)
+
+    poller.fetch = broken
+    emitted, _ = asyncio.run(poller.poll())
+    assert [x["tid"] for x in emitted] == [1]
+    assert poller.last_poll_complete is False
+    assert poller.twap_error_count == 2
+    assert poller.poll_error_count == 0
+    wallet_state = poller.per_wallet[ADDRESS_A]
+    assert wallet_state["last_twap_status"] == "failed"
+    assert wallet_state["last_poll_status"] == "response_uncapped"
+
+
+def test_restart_scan_ignores_twap_rows_for_highwater(tmp_path):
+    base = int(START.timestamp() * 1000)
+    rows = [
+        {"trade_id": f"{ADDRESS_A}:1", "raw_type": "userFillsByTime",
+         "metadata": {"wallet": ADDRESS_A, "hyperliquid_timestamp_ms": base + 1_000}},
+        {"trade_id": f"{ADDRESS_A}:2", "raw_type": "userTwapSliceFills",
+         "metadata": {"wallet": ADDRESS_A, "hyperliquid_timestamp_ms": base + 9_000}},
+    ]
+    _write_clean_run(tmp_path / "source" / "20260809_000001", rows)
+    seen, highwater = scan_durable_wallet_fills(tmp_path / "source", prospective_start_at=START)
+    assert seen == {f"{ADDRESS_A}:1", f"{ADDRESS_A}:2"}
+    assert highwater[ADDRESS_A] == base + 1_000
+
+
+def test_late_twap_fill_is_deferred_to_next_run_not_misordered(tmp_path):
+    base = int(START.timestamp() * 1000)
+    ledger = [_fill(trade_id=1, timestamp_ms=base + 5_000)]
+    twap: list[dict] = []
+    poller, _ = _twap_poller(tmp_path, ledger, twap)
+    first, _ = asyncio.run(poller.poll())
+    assert [x["tid"] for x in first] == [1]
+    # A slice older than what this run already emitted shows up late.
+    twap.append(_fill(trade_id=20, timestamp_ms=base + 4_000))
+    second, _ = asyncio.run(poller.poll())
+    assert second == []
+    assert poller.twap_deferred_count == 1
+    assert poller.per_wallet[ADDRESS_A]["last_twap_deferred"] == 1
+    # The next run (a fresh poller after the segment rotates) emits it.
+    normalizer = HyperliquidWalletFillNormalizer()
+    clean = [normalizer.normalize(RawMessage(source="hyperliquid", received_at=START, payload=x))
+             for x in first]
+    _write_clean_run(tmp_path / "source" / "20260809_000001", [
+        {"trade_id": e.trade_id, "raw_type": e.raw_type, "metadata": e.metadata} for e in clean])
+    next_run, _ = _twap_poller(tmp_path, ledger, twap)
+    third, _ = asyncio.run(next_run.poll())
+    assert [x["tid"] for x in third] == [20]
+
+
+def test_twap_window_gap_is_flagged(tmp_path):
+    base = int(START.timestamp() * 1000)
+    twap = [_fill(trade_id=i, timestamp_ms=base + i * 10, coin="DOGE") for i in range(2000)]
+    poller, _ = _twap_poller(tmp_path, [], twap)
+    asyncio.run(poller.poll())
+    assert poller.twap_window_gap_count == 0  # first look cannot prove a gap
+    twap[:] = [_fill(trade_id=5000 + i, timestamp_ms=base + 100_000 + i, coin="DOGE")
+               for i in range(2000)]
+    asyncio.run(poller.poll())
+    assert poller.twap_window_gap_count == 1
+    assert poller.last_poll_complete is False
+    assert poller.per_wallet[ADDRESS_A]["last_twap_status"] == "window_gap"

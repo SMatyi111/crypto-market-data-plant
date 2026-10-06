@@ -442,6 +442,13 @@ def build_parser() -> argparse.ArgumentParser:
     hl_parser.add_argument("--request-pause-seconds", type=float, default=0.1)
     hl_parser.add_argument("--overlap-seconds", type=float, default=300.0)
     hl_parser.add_argument("--response-cap", type=int, default=2000)
+    hl_parser.add_argument(
+        "--twap-every-polls",
+        type=int,
+        default=5,
+        help="Also read userTwapSliceFills every N polls (0 disables). TWAP slice "
+        "fills are absent from userFillsByTime.",
+    )
     hl_parser.add_argument("--segment-count", type=int, default=100000)
     hl_parser.add_argument("--max-segments", type=int)
     hl_parser.add_argument("--cooldown-seconds", type=float, default=1.0)
@@ -2909,6 +2916,7 @@ async def collect_hyperliquid_wallet_flow_segment(
         request_pause_seconds=float(getattr(args, "request_pause_seconds", 0.1)),
         overlap_seconds=float(getattr(args, "overlap_seconds", 300.0)),
         response_cap=int(getattr(args, "response_cap", 2000)),
+        twap_every_polls=int(getattr(args, "twap_every_polls", 5)),
     )
     collector = RestPollingCollector(
         source="hyperliquid",
@@ -2960,6 +2968,11 @@ async def collect_hyperliquid_wallet_flow_segment(
             "last_poll_complete": poller.last_poll_complete,
             "emitted_count": poller.emitted_count,
             "duplicate_count": poller.duplicate_count,
+            "twap_request_count": poller.twap_request_count,
+            "twap_error_count": poller.twap_error_count,
+            "twap_emitted_count": poller.twap_emitted_count,
+            "twap_deferred_count": poller.twap_deferred_count,
+            "twap_window_gap_count": poller.twap_window_gap_count,
             "replayable": replayable,
             "replay_findings": replay_findings,
             "replay_summary_path": replay_summary_path,
@@ -3820,6 +3833,7 @@ def _run_segmented_worker(
                         ("request_pause_seconds", float),
                         ("overlap_seconds", float),
                         ("response_cap", int),
+                        ("twap_every_polls", int),
                         ("max_delay_ms", int),
                         ("max_future_skew_ms", int),
                         ("max_clock_skew_ms", float),
@@ -4226,6 +4240,7 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             request_pause_seconds=raw_args.get("request_pause_seconds", 0.1),
             overlap_seconds=raw_args.get("overlap_seconds", 300.0),
             response_cap=raw_args.get("response_cap", 2000),
+            twap_every_polls=raw_args.get("twap_every_polls", 5),
             segment_count=raw_args.get("segment_count", 100000),
             max_segments=raw_args.get("max_segments"),
             cooldown_seconds=raw_args.get("cooldown_seconds", 1.0),
