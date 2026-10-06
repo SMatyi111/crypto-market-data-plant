@@ -641,7 +641,7 @@ def test_segment_persists_poll_diagnostics_without_claiming_batch_delivery(tmp_p
         return HyperliquidWalletFlowPoller(**kwargs, fetch=lambda request: [
             _fill(trade_id=1, timestamp_ms=base),
             _fill(trade_id=2, timestamp_ms=base + 1000),
-        ] if request['user'] == ADDRESS_A else [])
+        ] if request['user'] == ADDRESS_A and request['type'] == 'userFillsByTime' else [])
 
     monkeypatch.setattr(cli, 'HyperliquidWalletFlowPoller', fake_poller)
     result = asyncio.run(cli.collect_hyperliquid_wallet_flow_segment(SimpleNamespace(
@@ -689,6 +689,8 @@ def _twap_poller(tmp_path, ledger, twap_ledger, *, every=1, now_ms=None):
                 if request["startTime"] <= f["time"] <= request["endTime"]]
 
     clock_ms = now_ms if now_ms is not None else int(START.timestamp() * 1000) + 600_000
+    # An old hot run puts the TWAP dedup horizon well before START.
+    (tmp_path / "source" / "20260801_000000").mkdir(parents=True, exist_ok=True)
     poller = HyperliquidWalletFlowPoller(
         cohort=load_wallet_flow_cohort(cohort_path),
         source_root=tmp_path / "source", state_path=tmp_path / "state.json",
@@ -731,7 +733,7 @@ def test_twap_slice_fills_are_collected_and_marked(tmp_path):
     assert {r["type"] for r in requests} == {"userFillsByTime", "userTwapSliceFills"}
 
 
-def test_twap_cadence_and_disabled_by_default(tmp_path):
+def test_twap_cadence_and_off_when_zero(tmp_path):
     poller, requests = _twap_poller(tmp_path, [], [], every=3)
     for _ in range(6):
         asyncio.run(poller.poll())
@@ -893,13 +895,48 @@ def test_twap_window_gap_is_flagged_in_run_and_after_restart(tmp_path):
     assert poller.twap_window_gap_count == 1
     assert poller.last_poll_complete is False
     assert poller.per_wallet[ADDRESS_A]["last_twap_status"] == "window_gap"
-    # Restart: a durable target slice seeds the newest-seen mark.
-    restart_dir = tmp_path / "restart"
-    restart_dir.mkdir()
-    seed, _ = _twap_poller(restart_dir, [], [])
-    stored = seed._build_payload(seed.cohort.wallets[0], _fill(trade_id=1, timestamp_ms=base + 50),
-                                 f"{ADDRESS_A}:1", "userTwapSliceFills")
-    _durable(restart_dir, "20260809_000001", [stored])
-    restarted, _ = _twap_poller(restart_dir, [], twap)
+    # Restart: the previous run's state file carries the newest-seen mark
+    # (all coins), so a window that moved on while down is still a gap...
+    twap[:] = [_fill(trade_id=9000 + i, timestamp_ms=base + 200_000 + i, coin="DOGE")
+               for i in range(2000)]
+    restarted, _ = _twap_poller(tmp_path, [], twap)
     asyncio.run(restarted.poll())
     assert restarted.twap_window_gap_count == 1
+    # ...while an alt-coin window that still overlaps after a restart is not.
+    again, _ = _twap_poller(tmp_path, [], twap)
+    asyncio.run(again.poll())
+    assert again.twap_window_gap_count == 0
+    assert again.last_poll_complete is True
+
+
+def test_twap_dedup_horizon_follows_oldest_hot_run(tmp_path):
+    from crypto_collector.collectors.hyperliquid_wallet_flow import _twap_dedup_horizon_ms
+
+    now = datetime(2026, 8, 20, tzinfo=UTC)
+    empty = tmp_path / "empty"
+    assert _twap_dedup_horizon_ms(empty, lambda: now) == int(now.timestamp() * 1000)
+    hot = tmp_path / "hot"
+    for name in ("20260810_120000", "20260809_000500", "not-a-run"):
+        (hot / name).mkdir(parents=True)
+    oldest = int(datetime(2026, 8, 9, 0, 5, tzinfo=UTC).timestamp() * 1000)
+    assert _twap_dedup_horizon_ms(hot, lambda: now) == oldest + 6 * 3_600_000
+
+
+def test_twap_slice_beyond_dedup_horizon_is_never_emitted(tmp_path):
+    base = int(START.timestamp() * 1000)
+    twap = [_fill(trade_id=1, timestamp_ms=base + 60_000),
+            _fill(trade_id=2, timestamp_ms=base + 7 * 3_600_000)]
+    poller, _ = _twap_poller(tmp_path, [], twap, now_ms=base + 8 * 3_600_000)
+    poller.twap_dedup_horizon_ms = base + 6 * 3_600_000
+    emitted, _ = asyncio.run(poller.poll())
+    assert [x["tid"] for x in emitted] == [2]
+    assert poller.twap_beyond_horizon_count == 1
+
+
+def test_twap_unparseable_response_is_not_silent(tmp_path):
+    poller, _ = _twap_poller(tmp_path, [], [])
+    poller.fetch = lambda request: ([{"coin": "BTC", "time": 1}]
+                                    if request["type"] == "userTwapSliceFills" else [])
+    asyncio.run(poller.poll())
+    assert poller.per_wallet[ADDRESS_A]["last_twap_status"] == "unparseable_response"
+    assert poller.last_poll_complete is False

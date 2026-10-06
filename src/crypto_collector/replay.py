@@ -8,6 +8,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
+from .collectors.hyperliquid_wallet_flow import TWAP_ENDPOINT
+
 
 @dataclass(slots=True)
 class ReplaySummary:
@@ -1546,7 +1548,7 @@ def replay_wallet_flow_run(
             missing_wallet_count += 1
         else:
             event_dt = _parse_iso_dt(exchange_time_str)
-            stream = "twap" if row.get("raw_type") == "userTwapSliceFills" else "fills"
+            stream = "twap" if row.get("raw_type") == TWAP_ENDPOINT else "fills"
             if event_dt is not None:
                 previous_event_dt = previous_event_dt_by_wallet.get((wallet, stream))
                 if previous_event_dt is not None and event_dt < previous_event_dt:

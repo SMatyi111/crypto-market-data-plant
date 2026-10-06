@@ -41,7 +41,15 @@ slice (also across restarts) is flagged `window_gap`. Both keep the poll
 incomplete. **STANDARDS v18** (replay ordering semantics changed for this lane;
 row schema and partitions unchanged). Measured 2026-10-06: wallet 1 has 1,610
 target TWAP slices in its current window (newest 8 h old), none of them captured
-before this fix.
+before this fix. Slices older than the oldest hot run plus 6 h are never emitted,
+because the start-up dedup scan cannot see offloaded runs.
+
+**Deployment: merged is not fully deployed.** Collectors pick the change up at their
+next segment after the live checkout is pulled. The runner's in-process scorer keeps
+the pre-v18 per-wallet gate until the next guarded runner restart (owner at the PC,
+UAC). Until then a crashed segment holding TWAP rows may be quarantined and
+re-fetched (STANDARDS 4.7). **Owner action: one guarded restart at a convenient
+time.**
 
 Consequence: the node archive (`node_fills_by_block`) that measured these gaps
 stopped on 2026-09-26 (AWS account closed), so TWAP fills between 2026-09-26 and

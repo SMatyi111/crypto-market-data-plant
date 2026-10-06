@@ -24,6 +24,12 @@ DEFAULT_RESPONSE_CAP = 2_000
 DEFAULT_OVERLAP_SECONDS = 300.0
 # userTwapSliceFills has no time window: it returns the most recent fills only.
 TWAP_RESPONSE_CAP = 2_000
+# Lane default cadence (argparse, ops job args and the segment builder all use
+# it). The poller class itself defaults to 0 = off for library/test callers.
+DEFAULT_TWAP_EVERY_POLLS = 5
+# Slices older than the oldest hot run (+ margin) may already be stored in a run
+# that was offloaded to cold storage, which the start-up dedup scan cannot see.
+TWAP_DEDUP_HORIZON_MARGIN_MS = 6 * 3_600_000
 FILLS_ENDPOINT = "userFillsByTime"
 TWAP_ENDPOINT = "userTwapSliceFills"
 
@@ -127,12 +133,10 @@ def scan_durable_wallet_fills(
     source_root: Path | str,
     *,
     prospective_start_at: datetime,
-    twap_newest: dict[str, int] | None = None,
 ) -> tuple[set[str], dict[str, int]]:
     """Recover dedup/high-water state from every durable clean row.
 
-    TWAP slice rows (`raw_type="userTwapSliceFills"`) feed dedup only; their
-    newest timestamp per wallet goes to `twap_newest` when a dict is passed.
+    TWAP slice rows (`raw_type="userTwapSliceFills"`) feed dedup only.
 
     This includes unfinished runs. If a worker dies after writing part of a poll but
     before finalizing its replay summary, the next worker suppresses those rows rather
@@ -175,10 +179,6 @@ def scan_durable_wallet_fills(
                     # TWAP slice rows come from a second endpoint with no time
                     # window; they must not move the userFillsByTime cursor (a
                     # restart would otherwise skip an unfinished capped region).
-                    if twap_newest is not None:
-                        twap_newest[wallet] = max(
-                            timestamp_ms, twap_newest.get(wallet, timestamp_ms)
-                        )
                     continue
                 highwater[wallet] = max(timestamp_ms, highwater.get(wallet, timestamp_ms))
     return seen, highwater
@@ -216,11 +216,9 @@ class HyperliquidWalletFlowPoller:
         )
         self.poll_history_error_count = 0
         self.last_poll_history_error: str | None = None
-        durable_twap_newest: dict[str, int] = {}
         self.seen, self.highwater = scan_durable_wallet_fills(
             self.source_root,
             prospective_start_at=cohort.prospective_start_at,
-            twap_newest=durable_twap_newest,
         )
         self.poll_count = 0
         self.poll_error_count = 0
@@ -253,9 +251,12 @@ class HyperliquidWalletFlowPoller:
         # next run instead of breaking the stream order.
         self.twap_last_emitted_ms: dict[str, int] = {}
         self.twap_deferred_keys: set[str] = set()
-        # Newest slice seen per wallet, seeded from durable TWAP rows so the first
-        # read after a restart can still prove a window gap.
-        self.twap_newest_seen_ms: dict[str, int] = durable_twap_newest
+        # Newest slice seen per wallet (all coins), restored from the previous
+        # run's state file so the first read after a restart can prove a gap.
+        # Diagnostic only - never a cursor - so restoring it is safe.
+        self.twap_newest_seen_ms: dict[str, int] = _restore_twap_newest(self.state_path)
+        self.twap_dedup_horizon_ms = _twap_dedup_horizon_ms(self.source_root, clock)
+        self.twap_beyond_horizon_count = 0
         # Wallets whose last TWAP read failed, showed a gap or left slices
         # deferred; keeps later non-TWAP polls honest about completeness.
         self.twap_incomplete_wallets: set[str] = set()
@@ -428,6 +429,8 @@ class HyperliquidWalletFlowPoller:
             "twap_duplicate_count": self.twap_duplicate_count,
             "twap_deferred_count": self.twap_deferred_count,
             "twap_window_gap_count": self.twap_window_gap_count,
+            "twap_beyond_horizon_count": self.twap_beyond_horizon_count,
+            "twap_dedup_horizon_ms": self.twap_dedup_horizon_ms,
             "twap_incomplete_wallets": sorted(self.twap_incomplete_wallets),
             "per_wallet": self.per_wallet,
         }
@@ -484,7 +487,7 @@ class HyperliquidWalletFlowPoller:
         address = wallet.address
         self.twap_request_count += 1
         state["last_twap_attempt_at"] = self.clock().astimezone(UTC).isoformat()
-        state.update(last_twap_rows=None, last_twap_new_rows=0)
+        state.update(last_twap_rows=None, last_twap_new_rows=0, last_twap_deferred=None)
         try:
             response = await asyncio.to_thread(
                 self.fetch, {"type": TWAP_ENDPOINT, "user": address}
@@ -510,6 +513,9 @@ class HyperliquidWalletFlowPoller:
         state["last_twap_rows"] = len(response)
         state.pop("last_twap_error", None)
         status = "ok"
+        if response and not fills:
+            # A non-empty answer we cannot read is a silent stall in the making.
+            status = "unparseable_response"
         previous_newest = self.twap_newest_seen_ms.get(address)
         if fills:
             oldest = _optional_int(fills[0].get("time"))
@@ -518,11 +524,11 @@ class HyperliquidWalletFlowPoller:
                 len(response) >= TWAP_RESPONSE_CAP
                 and previous_newest is not None
                 and oldest is not None
-                and oldest > previous_newest
+                and oldest >= previous_newest
             ):
-                # The most-recent window no longer reaches back to the newest slice
-                # seen before (this run, or durable rows at start-up): slices in
-                # between are unreachable from this endpoint.
+                # The most-recent window no longer reaches back past the newest
+                # slice seen before (this run, or the previous run's state file):
+                # slices in between - or tied at that millisecond - may be lost.
                 self.twap_window_gap_count += 1
                 status = "window_gap"
             if newest is not None:
@@ -543,6 +549,10 @@ class HyperliquidWalletFlowPoller:
             trade_key = wallet_trade_key(address, fill)
             if trade_key in self.seen:
                 self.twap_duplicate_count += 1
+                continue
+            if timestamp_ms < self.twap_dedup_horizon_ms:
+                # Cannot be deduplicated against offloaded runs; never re-emit.
+                self.twap_beyond_horizon_count += 1
                 continue
             if floor is not None and timestamp_ms < floor:
                 self.twap_deferred_keys.add(trade_key)
@@ -565,6 +575,7 @@ class HyperliquidWalletFlowPoller:
         state["last_twap_new_rows"] = new_rows
         state["last_twap_deferred"] = deferred
         state["last_twap_success_at"] = self.clock().astimezone(UTC).isoformat()
+        state["twap_newest_seen_ms"] = self.twap_newest_seen_ms.get(address)
 
 
 class HyperliquidWalletFillNormalizer:
@@ -654,6 +665,47 @@ def write_wallet_flow_state(path: Path | str, payload: dict[str, Any]) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     temporary.replace(target)
+
+
+def _restore_twap_newest(state_path: Path) -> dict[str, int]:
+    try:
+        payload = json.loads(Path(state_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    restored: dict[str, int] = {}
+    per_wallet = payload.get("per_wallet") if isinstance(payload, dict) else None
+    if isinstance(per_wallet, dict):
+        for address, wallet_state in per_wallet.items():
+            if isinstance(wallet_state, dict):
+                stamp = _optional_int(wallet_state.get("twap_newest_seen_ms"))
+                if stamp is not None:
+                    restored[str(address).lower()] = stamp
+    return restored
+
+
+def _twap_dedup_horizon_ms(source_root: Path, clock: Callable[[], datetime]) -> int:
+    """Oldest exchange time a TWAP slice may have and still be deduplicated.
+
+    Run directories are named by creation time (YYYYMMDD_HHMMSS) and offloaded
+    oldest first, so a fill in an offloaded run is older than the oldest hot run
+    plus one segment. With no hot run there is nothing to dedup against: only
+    slices from now on are safe.
+    """
+    oldest: datetime | None = None
+    root = Path(source_root)
+    if root.exists():
+        for path in root.iterdir():
+            if not path.is_dir():
+                continue
+            try:
+                created = datetime.strptime(path.name[:15], "%Y%m%d_%H%M%S").replace(tzinfo=UTC)
+            except ValueError:
+                continue
+            if oldest is None or created < oldest:
+                oldest = created
+    if oldest is None:
+        return int(clock().astimezone(UTC).timestamp() * 1000)
+    return int(oldest.timestamp() * 1000) + TWAP_DEDUP_HORIZON_MARGIN_MS
 
 
 def _parse_datetime(value: Any) -> datetime | None:

@@ -68,6 +68,7 @@ from .collectors.hyperliquid_universe_positions import (
     ingest_universe_positions,
 )
 from .collectors.hyperliquid_wallet_flow import (
+    DEFAULT_TWAP_EVERY_POLLS,
     SOURCE_NAME as HYPERLIQUID_WALLET_FLOW_SOURCE,
     HyperliquidWalletFillNormalizer,
     HyperliquidWalletFlowPoller,
@@ -445,7 +446,7 @@ def build_parser() -> argparse.ArgumentParser:
     hl_parser.add_argument(
         "--twap-every-polls",
         type=int,
-        default=5,
+        default=DEFAULT_TWAP_EVERY_POLLS,
         help="Also read userTwapSliceFills every N polls (0 disables). TWAP slice "
         "fills are absent from userFillsByTime.",
     )
@@ -2916,7 +2917,7 @@ async def collect_hyperliquid_wallet_flow_segment(
         request_pause_seconds=float(getattr(args, "request_pause_seconds", 0.1)),
         overlap_seconds=float(getattr(args, "overlap_seconds", 300.0)),
         response_cap=int(getattr(args, "response_cap", 2000)),
-        twap_every_polls=int(getattr(args, "twap_every_polls", 5)),
+        twap_every_polls=int(getattr(args, "twap_every_polls", DEFAULT_TWAP_EVERY_POLLS)),
     )
     collector = RestPollingCollector(
         source="hyperliquid",
@@ -2974,6 +2975,7 @@ async def collect_hyperliquid_wallet_flow_segment(
             "twap_duplicate_count": poller.twap_duplicate_count,
             "twap_deferred_count": poller.twap_deferred_count,
             "twap_window_gap_count": poller.twap_window_gap_count,
+            "twap_beyond_horizon_count": poller.twap_beyond_horizon_count,
             "replayable": replayable,
             "replay_findings": replay_findings,
             "replay_summary_path": replay_summary_path,
@@ -4241,7 +4243,7 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             request_pause_seconds=raw_args.get("request_pause_seconds", 0.1),
             overlap_seconds=raw_args.get("overlap_seconds", 300.0),
             response_cap=raw_args.get("response_cap", 2000),
-            twap_every_polls=raw_args.get("twap_every_polls", 5),
+            twap_every_polls=raw_args.get("twap_every_polls", DEFAULT_TWAP_EVERY_POLLS),
             segment_count=raw_args.get("segment_count", 100000),
             max_segments=raw_args.get("max_segments"),
             cooldown_seconds=raw_args.get("cooldown_seconds", 1.0),

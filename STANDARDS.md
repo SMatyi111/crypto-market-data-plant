@@ -975,15 +975,27 @@ lifted from the response wrapper. The rest of the row contract is unchanged. Sin
 v18 the replay ordering gate is per (wallet, endpoint stream): TWAP slices are
 monotonic among themselves per wallet, and may follow a newer `userFillsByTime`
 fill of the same wallet. TWAP rows never move the `userFillsByTime` high-water,
-including on restart (the durable scan keeps them for dedup and for the newest
-seen slice). A newly visible slice older than a slice the current run already
-emitted for that wallet is deferred to the next run
+including on restart (the durable scan keeps them for dedup only). Because the
+endpoint can re-serve slices whose rows were already offloaded to cold storage,
+which the start-up dedup scan does not read, a slice older than the oldest hot
+run's creation time plus 6 h is never emitted (`twap_beyond_horizon_count`); with
+no hot run the horizon is the poller's start. A newly visible slice older than a
+slice the current run already emitted for that wallet is deferred to the next run
 (`last_twap_status="deferred_to_next_run"`). A 2,000-row TWAP response whose
-oldest slice is newer than the newest slice seen before (this run, or durable rows
-at start-up) is a proven gap (`window_gap`). Both keep the poll incomplete until a
-clean TWAP read, as does a failed read. TWAP counters (requests, errors, emitted,
-duplicates, distinct deferred, gaps) are in `_collector_state.json` and the
-segment summary, separate from the `userFillsByTime` counters. Before this, every TWAP-executed
+oldest slice is at or after the newest slice seen before (all coins; this run, or
+the previous run's `_collector_state.json`, which is diagnostic-only and safe to
+restore) may have lost slices (`window_gap`). A failed read and a non-empty
+response with no readable slice (`unparseable_response`) also count. All of these
+keep the poll incomplete until a clean TWAP read. TWAP counters (requests, errors,
+emitted, duplicates, distinct deferred, gaps, beyond-horizon) are in
+`_collector_state.json` and the segment summary, separate from the
+`userFillsByTime` counters. Two operating rules follow. The node backfill
+(`--apply`) must run with the lane stopped, because a running poller does not see
+rows written after its start and its TWAP read is not limited to the high-water
+window. And the runner's in-process scorer keeps the pre-v18 per-wallet gate until
+the next guarded runner restart: until then a crashed segment holding TWAP rows
+that follow newer fills can be quarantined by it, and its rows are re-fetched by the
+next run while they remain in the endpoint windows. Before this, every TWAP-executed
 target fill was missing from the lane: the 2026-09-14 and 2026-09-15..19 "silent
 per-wallet stalls" were exactly that. The node archive that measured those gaps
 stopped on 2026-09-26 (AWS account closed), so slices that leave the 2,000-row
