@@ -44,6 +44,8 @@ COLLECTOR_JOB_TYPES: frozenset[str] = frozenset(
         "binance-liquidations-worker",
         "okx-trades-worker",
         "okx-depth-worker",
+        # Hyperliquid public WS trade tape with [buyer, seller] wallets (STANDARDS 4.15).
+        "hyperliquid-trades-worker",
         "mexc-trades-worker",
         "mexc-depth-worker",
         "binance-futures-rest-worker",

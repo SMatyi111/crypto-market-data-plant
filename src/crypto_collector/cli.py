@@ -108,6 +108,7 @@ from .market_normalizers import (
     BybitTradeNormalizer,
     CoinbaseDepthNormalizer,
     CoinbaseTradeNormalizer,
+    HyperliquidTradeNormalizer,
     KrakenDepthNormalizer,
     KrakenTradeNormalizer,
     MexcDepthNormalizer,
@@ -872,6 +873,41 @@ def build_parser() -> argparse.ArgumentParser:
         "<output_root>/okx_trades_<suffix>/<timestamp>/ instead of okx_trades/.",
     )
     okx_trades_parser.add_argument(
+        "--rotate-at-midnight",
+        action="store_true",
+        help="Rotate the run directory at midnight UTC instead of at --segment-count messages.",
+    )
+
+    hl_trades_parser = subparsers.add_parser(
+        "hyperliquid-trades-worker",
+        help="Run segmented Hyperliquid public WebSocket `trades` collection (perp prints "
+        "with the [buyer, seller] wallet pair; non-sequence feed, STANDARDS 4.15)",
+    )
+    hl_trades_parser.add_argument(
+        "--symbol",
+        default="BTC",
+        help="Hyperliquid perp coin as the venue names it, e.g. BTC / ETH / SOL.",
+    )
+    hl_trades_parser.add_argument(
+        "--channel", default="trades", help="Hyperliquid WS subscription type."
+    )
+    hl_trades_parser.add_argument("--segment-count", type=int, default=5000)
+    hl_trades_parser.add_argument("--max-segments", type=int)
+    hl_trades_parser.add_argument("--cooldown-seconds", type=float, default=1.0)
+    hl_trades_parser.add_argument("--output-root", type=Path, default=default_output_root())
+    hl_trades_parser.add_argument("--ops-root", type=Path, default=default_ops_root())
+    hl_trades_parser.add_argument("--worker-name", default="hyperliquid-trades-worker")
+    hl_trades_parser.add_argument("--heartbeat-interval-seconds", type=float, default=30.0)
+    hl_trades_parser.add_argument("--max-delay-ms", type=int, default=60_000)
+    hl_trades_parser.add_argument("--max-future-skew-ms", type=int, default=5_000)
+    hl_trades_parser.add_argument("--max-clock-skew-ms", type=float, default=60_000.0)
+    hl_trades_parser.add_argument(
+        "--source-suffix",
+        default="",
+        help="Per-coin lane suffix. When non-empty, runs go to "
+        "<output_root>/hyperliquid_perp_trades_<suffix>/<timestamp>/.",
+    )
+    hl_trades_parser.add_argument(
         "--rotate-at-midnight",
         action="store_true",
         help="Rotate the run directory at midnight UTC instead of at --segment-count messages.",
@@ -2132,6 +2168,34 @@ async def collect_okx_trades_segment(args: argparse.Namespace) -> dict[str, obje
     )
 
 
+# Hyperliquid public WebSocket (keyless, read-only). The server drops a connection
+# it has not heard from for 60 s, so the lane opts into the app-level keepalive with
+# the documented {"method":"ping"} (reply {"channel":"pong"}, dropped by
+# _should_emit). WS subscriptions do not draw on the per-IP REST weight budget the
+# universe-positions sweep uses (STANDARDS 4.11).
+_HYPERLIQUID_WS_URL = "wss://api.hyperliquid.xyz/ws"
+_HYPERLIQUID_PING_MESSAGE = {"method": "ping"}
+_HYPERLIQUID_PING_INTERVAL_SECONDS = 30.0
+
+
+async def collect_hyperliquid_trades_segment(args: argparse.Namespace) -> dict[str, object]:
+    # Every print carries `users` = [buyer, seller] public wallets (STANDARDS 4.15).
+    # `tid` is unique but not dense, so curate as a non-sequence ("none_native") feed
+    # - structurally clean, NOT gap-proof (4.3), same class as Bybit/OKX trades.
+    args.symbol = str(getattr(args, "symbol", "BTC") or "BTC").upper()
+    return await _collect_trades_segment(
+        args,
+        source="hyperliquid",
+        websocket_url=_HYPERLIQUID_WS_URL,
+        subscription_style="hyperliquid",
+        normalizer=HyperliquidTradeNormalizer(),
+        source_base="hyperliquid_perp_trades",
+        replay_fn=replay_trades_stream_run,
+        ping_message=_HYPERLIQUID_PING_MESSAGE,
+        ping_interval_seconds=_HYPERLIQUID_PING_INTERVAL_SECONDS,
+    )
+
+
 async def collect_okx_depth_segment(args: argparse.Namespace) -> dict[str, object]:
     # OKX `books` delivers a 400-level in-stream snapshot + incremental updates carrying
     # seqId/prevSeqId, where prevSeqId(N) == seqId(N-1). Passing chain_sequence promotes
@@ -3161,6 +3225,32 @@ def run_okx_trades_worker(args: argparse.Namespace) -> None:
     )
 
 
+def run_hyperliquid_trades_worker(args: argparse.Namespace) -> None:
+    _run_segmented_worker(
+        args=args,
+        default_worker_name="hyperliquid-trades-worker",
+        worker_type="hyperliquid-trades-worker",
+        venue="hyperliquid",
+        build_segment_args=lambda source_args: SimpleNamespace(
+            symbol=source_args.symbol,
+            channel=source_args.channel,
+            count=source_args.segment_count,
+            output_root=source_args.output_root,
+            max_delay_ms=source_args.max_delay_ms,
+            max_future_skew_ms=getattr(source_args, "max_future_skew_ms", 5_000),
+            max_clock_skew_ms=getattr(source_args, "max_clock_skew_ms", 60_000.0),
+            source_suffix=getattr(source_args, "source_suffix", ""),
+            deadline_utc=None,  # _run_segmented_worker overrides this when a deadline applies
+        ),
+        collect_segment=collect_hyperliquid_trades_segment,
+        progress_message=lambda segment_index, summary: (
+            "hyperliquid trades segment finished: "
+            f"segment={segment_index} clean_events={summary['clean_events']} "
+            f"replayable={summary.get('replayable')} run_path={summary['run_path']}"
+        ),
+    )
+
+
 def run_okx_depth_worker(args: argparse.Namespace) -> None:
     _run_segmented_worker(
         args=args,
@@ -3926,6 +4016,9 @@ def _execute_ops_job_inprocess(job: JobSpec) -> JobExecutionResult | str | None:
     if job.job_type == "okx-trades-worker":
         run_okx_trades_worker(args)
         return "okx trades worker completed"
+    if job.job_type == "hyperliquid-trades-worker":
+        run_hyperliquid_trades_worker(args)
+        return "hyperliquid trades worker completed"
     if job.job_type == "okx-depth-worker":
         run_okx_depth_worker(args)
         return "okx depth worker completed"
@@ -4379,6 +4472,26 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             normalized_root=raw_args.get("normalized_root"),
             worker_name=raw_args.get("worker_name", "okx-trades-worker"),
             # Durable batched JSONL by default — see coinbase-trades-worker.
+            jsonl_fsync=raw_args.get("jsonl_fsync", True),
+            heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
+            max_delay_ms=raw_args.get("max_delay_ms", _TRADES_STALE_WINDOW_MS),
+            max_future_skew_ms=raw_args.get("max_future_skew_ms", 5_000),
+            max_clock_skew_ms=raw_args.get("max_clock_skew_ms", 60_000.0),
+            source_suffix=raw_args.get("source_suffix", ""),
+            rotate_at_midnight=raw_args.get("rotate_at_midnight", False),
+            idle_timeout_seconds=raw_args.get("idle_timeout_seconds", 0.0),
+        )
+    if job.job_type == "hyperliquid-trades-worker":
+        return SimpleNamespace(
+            symbol=raw_args.get("symbol", "BTC"),
+            channel=raw_args.get("channel", "trades"),
+            segment_count=raw_args.get("segment_count", 5000),
+            max_segments=raw_args.get("max_segments"),
+            cooldown_seconds=raw_args.get("cooldown_seconds", 1.0),
+            output_root=raw_args.get("output_root", default_output_root()),
+            ops_root=Path(raw_args.get("ops_root", default_ops_root())),
+            normalized_root=raw_args.get("normalized_root"),
+            worker_name=raw_args.get("worker_name", "hyperliquid-trades-worker"),
             jsonl_fsync=raw_args.get("jsonl_fsync", True),
             heartbeat_interval_seconds=raw_args.get("heartbeat_interval_seconds", 30.0),
             max_delay_ms=raw_args.get("max_delay_ms", _TRADES_STALE_WINDOW_MS),
@@ -5791,6 +5904,8 @@ def main() -> None:
         run_bybit_depth_worker(args)
     elif args.command == "okx-trades-worker":
         run_okx_trades_worker(args)
+    elif args.command == "hyperliquid-trades-worker":
+        run_hyperliquid_trades_worker(args)
     elif args.command == "okx-depth-worker":
         run_okx_depth_worker(args)
     elif args.command == "kraken-depth-worker":

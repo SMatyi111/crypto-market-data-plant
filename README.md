@@ -46,6 +46,7 @@ lanes on per lane when you want them.
 | MEXC    | spot `BTCUSDT` | ✅ | ✅ | both = `none_native` (protobuf transport) |
 | OKX     | spot + linear perp `BTC-USDT` | ✅ | ✅ | trades = `none_native`; depth = `sequence` (`prevSeqId`/`seqId` linked chain) |
 | Hyperliquid | public frozen-wallet perp fills (`BTC`/`ETH`/`SOL`) | ✅ REST polling | — | `none_native`; composite `(wallet, trade_id)` dedup, explicit event/receipt time |
+| Hyperliquid | public perp trade tape with `[buyer, seller]` wallets (`BTC`/`ETH`/`SOL`, since 2026-10-06) | ✅ WS `trades` | — | `none_native`; every clean print wallet-attributed (STANDARDS 4.15) |
 
 Perp lanes are tagged `perp:<venue>:<symbol>` and write to their own
 `<venue>_perp_<dataset>` lanes, so perp never mixes with spot. Two venue notes

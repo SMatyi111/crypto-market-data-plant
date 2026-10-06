@@ -1149,6 +1149,64 @@
       }
     },
     {
+      "name": "hyperliquid-btc-trades",
+      "job_type": "hyperliquid-trades-worker",
+      "interval_seconds": 5,
+      "enabled": false,
+      "args": {
+        "normalized_parquet": false,
+        "symbol": "BTC",
+        "channel": "trades",
+        "segment_count": 100000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "worker_name": "hyperliquid-trades-worker-btc",
+        "idle_timeout_seconds": 120,
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\trades",
+        "max_segment_seconds": 1800,
+        "source_suffix": "btc"
+      }
+    },
+    {
+      "name": "quarantine-hyperliquid-trades-btc",
+      "job_type": "quarantine-runs",
+      "interval_seconds": 300,
+      "enabled": false,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\hyperliquid_perp_trades_btc",
+        "quarantine_root": "G:\\market_archive\\quarantine\\market\\hyperliquid_perp_trades_btc",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "promote-hyperliquid-trades-btc",
+      "job_type": "promote-replayable",
+      "interval_seconds": 300,
+      "enabled": false,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\hyperliquid_perp_trades_btc",
+        "target_root": "G:\\market_archive\\curated\\research\\trades_replayable",
+        "quarantine_index": "G:\\market_archive\\quarantine\\market\\hyperliquid_perp_trades_btc\\_quarantine_index.jsonl",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "score-hyperliquid-trades-btc",
+      "job_type": "backfill-trades-replay",
+      "interval_seconds": 3600,
+      "enabled": false,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\hyperliquid_perp_trades_btc",
+        "stream": true,
+        "limit": 1000,
+        "max_age_hours": 6
+      }
+    },
+    {
       "name": "okx-perp-depth",
       "job_type": "okx-depth-worker",
       "interval_seconds": 5,

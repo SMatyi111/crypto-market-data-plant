@@ -2,6 +2,12 @@
 
 `STANDARDS_VERSION = 16`
 
+> **Compatible lane addition (2026-10-06; within v16, no version bump):**
+> owner-approved Hyperliquid public WebSocket `trades` lanes (BTC/ETH/SOL perps)
+> keeping the `users` [buyer, seller] wallet pair on every print. They reuse the
+> v2 `trades` row, partition contract and the existing `none_native` stream
+> verdict (4.3); wallet identity lives in `metadata`. See section 4.15.
+>
 > **v16 (2026-09-27, offline implementation; not activated):** bounded optional
 > journal budgets and disk-headroom checks (section 4.14). Default 64 MiB cap,
 > unchanged 1 MiB queue and evidence-off live configuration. Additive resource
@@ -171,7 +177,7 @@ instrument) lane (a fourth, non-market `text` dataset is specified in §4.6):
 | Dataset  | Channel  | Normalizer(s)                                  | Curated target            |
 | -------- | -------- | ---------------------------------------------- | ------------------------- |
 | `depth`  | order book diffs / snapshots | `BinanceDepthNormalizer`, `CoinbaseDepthNormalizer`, `BybitDepthNormalizer`, `KrakenDepthNormalizer`, `MexcDepthNormalizer`, `OkxDepthNormalizer` (+ Binance USDT-M REST snapshot polling) | `market_replayable`  |
-| `trades` | trade prints     | `BinanceTradeNormalizer`, `CoinbaseTradeNormalizer`, `KrakenTradeNormalizer`, `BybitTradeNormalizer`, `MexcTradeNormalizer`, `OkxTradeNormalizer`, `HyperliquidWalletFillNormalizer` (+ REST polling lanes) | `trades_replayable` |
+| `trades` | trade prints     | `BinanceTradeNormalizer`, `CoinbaseTradeNormalizer`, `KrakenTradeNormalizer`, `BybitTradeNormalizer`, `MexcTradeNormalizer`, `OkxTradeNormalizer`, `HyperliquidWalletFillNormalizer`, `HyperliquidTradeNormalizer` (+ REST polling lanes) | `trades_replayable` |
 | `funding` | perp funding / mark-price metric | Binance USDT-M `premiumIndex` REST poll (native dict passthrough) | `funding` |
 | `open_interest` | perp open-interest metric (contract count in `size`, `price` None) | `BinanceOpenInterestNormalizer` (Binance USDT-M `/fapi/v1/openInterest` REST poll) | `open_interest` |
 
@@ -180,7 +186,8 @@ depth + funding via REST polling — §4.5), **Coinbase** (trades + depth), **Kr
 (trades + depth), **Bybit** (spot + linear perp, trades + depth), **MEXC** (trades +
 depth; the only **protobuf-transport** venue, verified against live frames 2026-06-09 —
 see §4.3), **OKX** (spot + linear perp, trades + depth — §4.4), and
-**Hyperliquid** (frozen public-wallet BTC/ETH/SOL perp fills — §4.7). Perp lanes are tagged
+**Hyperliquid** (frozen public-wallet BTC/ETH/SOL perp fills — §4.7; public WS
+BTC/ETH/SOL perp trade tape with buyer/seller wallets — §4.15). Perp lanes are tagged
 `perp:<venue>:<symbol>` and write to their own `<venue>_perp_<dataset>` lane
 directories, so perp never mixes with spot.
 
@@ -1473,3 +1480,54 @@ continuity still require separate checks. Worst cap consumption is 24 GiB/day at
 48 full segments; this change does not reserve or authorize that ongoing budget.
 The 1 MiB queue, oversized-HTTP refusal, writer-slot handoff and terminal-job gaps
 remain unchanged. Do not treat a successful disk probe as permission to activate.
+
+
+## 4.15 Hyperliquid public trade tape with wallet pair — WS `trades` (2026-10-06)
+
+Owner-approved 2026-10-06. Three lanes (`hyperliquid-{btc,eth,sol}-trades`, job type
+`hyperliquid-trades-worker`) subscribe to the keyless public WebSocket
+`wss://api.hyperliquid.xyz/ws` with `{"method":"subscribe","subscription":
+{"type":"trades","coin":<COIN>}}`, one connection per coin, app-level
+`{"method":"ping"}` every 30 s. Read-only: no key, signature or account endpoint.
+WS subscriptions do not draw on the per-IP REST weight budget the universe-positions
+sweep (4.11) depends on. Purpose: the Hyperliquid S3 fill archive stopped at
+2026-09-26 (the AWS account was closed); these lanes are the forward record of
+wallet-attributed prints between the hourly position sweeps.
+
+Rows reuse the v2 `trades` contract: `source="hyperliquid"`, `channel="trades"`,
+`event_type="trade"`, `raw_type="ws_trades"` (the wallet-flow lane's fills say
+`user_fill` / `userFillsByTime`), `exchange_time` = venue `time`, `received_at` =
+plant receipt, `price`/`size` from `px`/`sz`, `trade_id` = `tid`. `side` is the
+**taker side** (`B` = taker bought, `A` = taker sold; checked against live prints:
+A prints at the bid, B at the ask). Metadata: `users` = `[buyer, seller]` exactly
+as the venue lists them (lower-cased), plus `buyer` and `seller` scalars - the
+order does NOT depend on `side`; the taker is the buyer when side is B and the
+seller when side is A. Also `transaction_hash` (the venue sends an all-zero hash
+on some prints; kept as sent), `hyperliquid_coin`, `hyperliquid_side_raw`,
+`instrument_id` `perp:hyperliquid:<COIN>USDC`, `canonical_symbol`, `buyer_is_maker`.
+
+- **Every clean row is wallet-attributed.** A print whose `users` is not exactly two
+  `0x` + 40-hex addresses gets the parse error `invalid_users` and is quarantined
+  by the live gate (section 5).
+- **`product` is the venue symbol `<COIN>USDC`**, so the curated partition is
+  `trades_replayable/.../source=hyperliquid/instrument=BTCUSDC` (ETHUSDC,
+  SOLUSDC). The frozen-cohort wallet-fill lane (4.7) partitions as `instrument=BTC`
+  (bare coin); the two never share a partition, and a reader must not add them
+  (the cohort's fills are a subset of this tape).
+- **Subscribe snapshot.** On every subscribe (segment start and any mid-run
+  reconnect) the venue first sends its ~30 most recent prints in an ordinary,
+  unflagged `trades` frame. The collector marks the first data frame of each
+  connection with the plant key `_plant_subscribe_snapshot: true` (visible in raw);
+  its prints carry `metadata.subscribe_replay` and, with no sequence to prove
+  novelty, are quarantined (`subscribe_replay`), as for Kraken/Coinbase. They stay
+  in raw and quarantine: prints inside a reconnect or segment-rotation gap are
+  recoverable from there by deduplicating on `tid`.
+- **Verdict.** `tid` is unique but neither dense nor monotonic, so the lane is
+  `none_native` and scored by `replay_trades_stream_run` (4.3): structurally clean,
+  NOT gap-proof. Same rotation loss as every WS lane (~5-8 s per 30-min segment,
+  partly recoverable from the snapshot prints above).
+- **Forward-only.** The public WS has no history; coverage starts at the lane's
+  first deploy (2026-10-06) and every uncaptured interval is permanent.
+- Raw dirs `hyperliquid_perp_trades_{btc,eth,sol}/`; quarantine/promote/score/offload
+  chain identical to the other WS trades lanes.
+
