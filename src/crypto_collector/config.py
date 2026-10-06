@@ -40,7 +40,10 @@ DEFAULT_ARCHIVE_ROOT = Path(r"G:\market_archive")
 # v14: optional disabled Bybit BTC linear session-evidence sidecar (STANDARDS 4.12).
 # v15: optional Bybit public ticker/rules/funding references (STANDARDS 4.13).
 # v16: bounded optional journal budgets and writer-side headroom guard (STANDARDS 4.14).
-STANDARDS_VERSION = 17
+# v18 (2026-10-06): wallet-flow lane also collects TWAP slice fills
+# (raw_type userTwapSliceFills) and replay_wallet_flow_run orders per
+# (wallet, endpoint stream) instead of per wallet (STANDARDS 4.7).
+STANDARDS_VERSION = 18
 
 _FALLBACK_WARNED: set[str] = set()
 

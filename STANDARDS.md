@@ -1,7 +1,13 @@
 # Data Standards
 
-`STANDARDS_VERSION = 17`
+`STANDARDS_VERSION = 18`
 
+> **v18 (2026-10-06):** the Hyperliquid wallet-flow lane also collects TWAP slice
+> fills from `userTwapSliceFills` (`raw_type="userTwapSliceFills"`), which
+> `userFillsByTime` never returns. `replay_wallet_flow_run` now orders per
+> (wallet, endpoint stream) instead of per wallet. Row schema and partitions are
+> unchanged. See section 4.7, "TWAP slice fills".
+>
 > **Compatible lane addition (2026-10-06; within v16, no version bump):**
 > owner-approved Hyperliquid public WebSocket `trades` lanes (BTC/ETH/SOL perps)
 > keeping the `users` [buyer, seller] wallet pair on every print. They reuse the
@@ -958,6 +964,42 @@ it is a no-op. Backfilled rows are admissible for completeness-oriented work
 (positions, PnL, flow totals) and MUST be excluded from any evaluation that relies
 on receipt-time availability. The run's `metrics/summary.jsonl` row records
 `capture_source`, the source window and the dedup counts.
+
+TWAP slice fills (2026-10-06). `userFillsByTime` never returns a wallet's TWAP
+slice fills (zero transaction hash); only `userTwapSliceFills` does, and that
+endpoint has no time window - it serves the most recent 2,000 slices. Every
+`twap_every_polls` polls (default 5, `0` disables) the poller also reads that
+endpoint per wallet, applies the same target-coin filter and `(wallet, trade_id)`
+dedup, and emits new slices with `raw_type="userTwapSliceFills"` and `twap_id`
+lifted from the response wrapper. The rest of the row contract is unchanged. Since
+v18 the replay ordering gate is per (wallet, endpoint stream): TWAP slices are
+monotonic among themselves per wallet, and may follow a newer `userFillsByTime`
+fill of the same wallet. TWAP rows never move the `userFillsByTime` high-water,
+including on restart (the durable scan keeps them for dedup only). Because the
+endpoint can re-serve slices whose rows were already offloaded to cold storage,
+which the start-up dedup scan does not read, a slice older than the oldest hot
+run's creation time plus 6 h is never emitted (`twap_beyond_horizon_count`); with
+no hot run the horizon is the poller's start. A newly visible slice older than a
+slice the current run already emitted for that wallet is deferred to the next run
+(`last_twap_status="deferred_to_next_run"`). A 2,000-row TWAP response whose
+oldest slice is at or after the newest slice seen before (all coins; this run, or
+the previous run's `_collector_state.json`, which is diagnostic-only and safe to
+restore) may have lost slices (`window_gap`). A failed read and a non-empty
+response with no readable slice (`unparseable_response`) also count. All of these
+keep the poll incomplete until a clean TWAP read. TWAP counters (requests, errors,
+emitted, duplicates, distinct deferred, gaps, beyond-horizon) are in
+`_collector_state.json` and the segment summary, separate from the
+`userFillsByTime` counters. Two operating rules follow. The node backfill
+(`--apply`) must run with the lane stopped, because a running poller does not see
+rows written after its start and its TWAP read is not limited to the high-water
+window. And the runner's in-process scorer keeps the pre-v18 per-wallet gate until
+the next guarded runner restart: until then a crashed segment holding TWAP rows
+that follow newer fills can be quarantined by it, and its rows are re-fetched by the
+next run while they remain in the endpoint windows. Before this, every TWAP-executed
+target fill was missing from the lane: the 2026-09-14 and 2026-09-15..19 "silent
+per-wallet stalls" were exactly that. The node archive that measured those gaps
+stopped on 2026-09-26 (AWS account closed), so slices that leave the 2,000-row
+window are now unrecoverable.
 
 Consumers performing the registered causal evaluation MUST filter on the frozen
 cohort's `prospective_start_at` and join using event time plus an explicit

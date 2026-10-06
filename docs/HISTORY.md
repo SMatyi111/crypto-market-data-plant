@@ -7,6 +7,24 @@ git log + the merged PR descriptions; this file keeps the *why*.
 
 ---
 
+## 2026-10-06 - the wallet-flow "silent stalls" were TWAP slices on a second endpoint
+
+**Why it looked like a stall.** A wallet that executes BTC/ETH through TWAP while
+trading alts by hand shows healthy uncapped polls with zero new target rows. The
+high-water freezes because no target fill arrives, not because the poller is stuck.
+The node archive saw the fills; the API endpoint the lane used never serves them.
+
+**How it was proven.** Every backfilled row for the 09-15..19 window has a zero
+transaction hash. The public API returns none of them for that window today, and
+`userTwapSliceFills` returns every missing fill still inside its 2,000-slice range.
+
+**Design choice.** The second endpoint has no time window, so it is polled on a
+slower cadence (every 5th poll) and deduplicated by the existing trade key. It must
+not touch the `userFillsByTime` cursor, and late slices go to the next run rather
+than breaking the per-wallet ordering gate.
+
+---
+
 ## 2026-09-14 - the wallet-flow lane audited against the chain: a 20-day stall, 12.4 % missing, backfilled
 
 **What happened.** The PR #42 (2026-08-17) capped-page paging fixed the "raise

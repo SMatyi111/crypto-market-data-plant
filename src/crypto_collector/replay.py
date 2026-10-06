@@ -8,6 +8,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
+from .collectors.hyperliquid_wallet_flow import TWAP_ENDPOINT
+
 
 @dataclass(slots=True)
 class ReplaySummary:
@@ -1505,6 +1507,10 @@ def replay_wallet_flow_run(
       catch-up run, the quarantine job would move it aside, and the durable-scan
       dedup would then refetch the same window into another failing run — a loop.
       A row with no wallet metadata cannot be ordered and fails the run.
+      Since v18 the key is (wallet, endpoint stream): TWAP slice rows
+      (`raw_type="userTwapSliceFills"`) come from a second endpoint with no time
+      window and form their own per-wallet stream, so a slice may legitimately
+      follow a newer `userFillsByTime` fill of the same wallet.
     - **The clock-skew default is resume-window-sized** (90 days, matching the
       lane's capture gates): received_at - exchange_time equals the outage length
       on refetched fills, and both timestamps are recorded per row for auditing.
@@ -1522,7 +1528,7 @@ def replay_wallet_flow_run(
     source: str | None = None
     product: str | None = None
     instrument_id: str | None = None
-    previous_event_dt_by_wallet: dict[str, datetime] = {}
+    previous_event_dt_by_wallet: dict[tuple[str, str], datetime] = {}
 
     for row in _read_jsonl(events_path):
         event_count += 1
@@ -1542,12 +1548,13 @@ def replay_wallet_flow_run(
             missing_wallet_count += 1
         else:
             event_dt = _parse_iso_dt(exchange_time_str)
+            stream = "twap" if row.get("raw_type") == TWAP_ENDPOINT else "fills"
             if event_dt is not None:
-                previous_event_dt = previous_event_dt_by_wallet.get(wallet)
+                previous_event_dt = previous_event_dt_by_wallet.get((wallet, stream))
                 if previous_event_dt is not None and event_dt < previous_event_dt:
                     non_monotonic_time_count += 1
                 if previous_event_dt is None or event_dt >= previous_event_dt:
-                    previous_event_dt_by_wallet[wallet] = event_dt
+                    previous_event_dt_by_wallet[(wallet, stream)] = event_dt
 
         price = _optional_float(row.get("price"))
         if price is None or not _is_finite_positive(price):
