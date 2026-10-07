@@ -99,6 +99,7 @@ class SessionEvidence:
         self._queue: queue.Queue = queue.Queue()
         self._thread = None
         self._finished = False
+        self._journal_info = None
         try:
             if not self.lease:
                 self.directory.mkdir(exist_ok=False)
@@ -196,6 +197,7 @@ class SessionEvidence:
             with (self.directory / "events.jsonl").open("xb") as stream:
                 count, synced = 0, time.monotonic()
                 written_bytes = checked_bytes = 0
+                journal_hash = hashlib.sha256()
                 while True:
                     if self.lease:
                         self.lease.check()
@@ -214,6 +216,7 @@ class SessionEvidence:
                     if self.lease:
                         self.lease.check()
                     stream.write(line)
+                    journal_hash.update(line)
                     written_bytes += len(line)
                     stream.flush()
                     count += 1
@@ -224,6 +227,12 @@ class SessionEvidence:
                         self._queued -= len(line)
                 stream.flush()
                 os.fsync(stream.fileno())
+            # Only publish this accounting after the journal has closed. Avoid
+            # rereading up to 512 MiB inside the two-second terminal window.
+            # The offline verifier still independently hashes the stored bytes.
+            self._journal_info = {"path": "session_evidence/events.jsonl",
+                                  "bytes": written_bytes, "rows": count,
+                                  "sha256": journal_hash.hexdigest()}
             if self._check_headroom(written_bytes):
                 self._publish()
         except Exception as exc:
@@ -328,7 +337,9 @@ class SessionEvidence:
         if self.lease:
             self.lease.check(checkpoint=True)
         files = [file_info(p, self.root) for p in raw_files(self.root)]
-        journal = file_info(self.directory / "events.jsonl", self.root)
+        journal = self._journal_info
+        if journal is None:
+            raise ValueError("Journal not closed")
         if self.book_received != self.raw_count:
             self.issue("unpersisted_book_frames")
         if sum(f["rows"] for f in files) != self.raw_count:

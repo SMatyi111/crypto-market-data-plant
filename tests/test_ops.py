@@ -197,22 +197,13 @@ def test_startup_task_installer_disables_execution_time_limit() -> None:
     assert "-ExecutionTimeLimit (New-TimeSpan -Seconds 0)" in script
 
 
-def test_redeploy_alive_check_is_scoped_to_plant_pythons() -> None:
-    """2026-06-10 outage: the redeploy script's step-2 alive-check matched ANY
-    python.exe, so unrelated (crypto-modelling backtest) pythons aborted the redeploy
-    AFTER step 1 had already killed the runner — leaving collection down with a stale
-    lock. The check must only consider this plant's runner/workers, identifiable by
-    `crypto_collector` in the command line (every worker is spawned as
-    `sys.executable -m crypto_collector.cli run-job ...`) or the repo root in the
-    process paths."""
-    script = Path("scripts/redeploy_runner.ps1").read_text(encoding="utf-8")
-
-    assert "crypto_collector" in script
-    # The old unscoped check's abort message must not come back.
-    assert "python.exe still running" not in script
-    # Unreadable (other-principal, e.g. SYSTEM boot runner) pythons must still abort:
-    # they may BE the live runner, and step 1's taskkill failed against them too.
-    assert "Select-UnreadablePython" in script
+def test_redeploy_does_not_use_shared_python_environment_as_identity() -> None:
+    """Shared venv backfills must neither be killed nor block task restart."""
+    script = Path("scripts/redeploy_runner.ps1").read_text(encoding="ascii")
+    assert "Get-CimInstance" not in script
+    assert "Stop-Process" not in script
+    assert "ExecutablePath" not in script
+    assert "Start-ScheduledTask" in script
 
 
 def test_run_ops_runner_rejects_duplicate_lock(tmp_path: Path) -> None:
@@ -3177,3 +3168,20 @@ def test_cleanup_zero_byte_scan_tolerates_files_vanishing_mid_walk(tmp_path, mon
     zero = sorted(c.path for c in candidates if c.reason == "zero_byte_parquet")
     assert zero == [str(part / "empty.parquet")]
 
+
+def test_successful_collector_retains_only_bounded_evidence_reasons(monkeypatch):
+    from types import SimpleNamespace
+    import crypto_collector.cli as cli_mod
+    stderr = ('session evidence unavailable: writer_close_timeout\n' * 2
+              + 'session evidence unavailable: LeaseRefused\r\n'
+              + 'secret=https://private.example/token\n'
+              + 'session evidence unavailable: secret=https://private.example/token\n'
+              + 'session evidence unavailable: ' + 'x' * 65 + '\n')
+    proc = SimpleNamespace(returncode=0, stdout='private stdout', stderr=stderr)
+    monkeypatch.setattr(cli_mod.subprocess, 'run', lambda *a, **k: proc)
+    job = JobSpec(name='test', job_type='bybit-depth-worker', interval_seconds=60)
+    result = _execute_ops_job(job)
+    assert result.endswith('optional_evidence_unavailable=LeaseRefused,writer_close_timeout')
+    assert 'private' not in result and 'secret' not in result
+    proc.stderr = ''.join(f'session evidence unavailable: reason{i:02d}\n' for i in range(20))
+    assert _execute_ops_job(job).count(',') == 7

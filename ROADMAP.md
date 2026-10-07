@@ -8,7 +8,7 @@ changes scope or state. Companion docs:
 - [`STANDARDS.md`](STANDARDS.md) — the data contract (schemas, replayability, retention)
 - [`docs/HISTORY.md`](docs/HISTORY.md) — resolved-work narrative (what was fixed, and why)
 
-Last updated: **2026-10-06**.
+Last updated: **2026-10-07**.
 
 > **Operating mode — safe shaping (owner directive, 2026-07-04).** No extended
 > building on Claude's initiative: no new venues, lanes, or instruments, no big
@@ -18,6 +18,41 @@ Last updated: **2026-10-06**.
 > explicit owner ask to start.
 
 ---
+
+## Bybit terminal evidence and restart recovery (2026-10-07)
+
+The owner-approved bounded source trial spent both slots and expired on time;
+ordinary collection continued. Both runs lacked terminal evidence manifests.
+The first journal contained its terminal and reference events; its publication
+failure reason was lost because successful child stderr was discarded. The
+second hit the immutable deadline before terminal completion. Neither run is
+admitted; no retrospective manifest, renewed lease or new capture is part of
+this repair. Raw/clean replay contracts and economic gates remain unchanged.
+
+Offline fixes: stream the journal hash/counts instead of rereading the complete
+journal during the two-second terminal window; retain bounded optional-evidence
+failure tokens in successful ops results. The first run's historical cause
+remains unconfirmed; present-day file-hash timing cannot establish past latency.
+Raw hashing and slow OS I/O can still cause terminal refusal. Tests retain the
+fail-closed slow-I/O and lease-expiry behavior and independent hash validation.
+
+Restart recovery: replace the old PID-sweep/ad-hoc launcher with preflight plus
+one existing SYSTEM-task transaction, default dry-run (`-Apply` to restart).
+A shared venv is never treated as process ownership. Once Stop is attempted,
+Start is attempted in finally even if the bounded stop-state observation fails;
+verify new runner identity plus advancing heartbeat afterward. If IgnoreNew
+discarded Start during a delayed Stop, reconcile Start once on Ready before any
+new runner identity is observed. No fallback
+process, repeated Stop, PID kill or lock removal. This addresses the October 7
+outage caused by an unrelated backfill holding a post-stop guard. Lost intervals
+remain gaps even after health recovers; see the updated Windows runbook.
+
+Validation: 802 tests passed, 5 skipped locally; ruff and diff checks pass.
+Independent code/security review found a delayed-stop/IgnoreNew race; a bounded
+Start-only reconciliation and synthetic regression resolved it. Reviewer approved
+the corrected delta. Windows Python 3.11/3.12 CI remains the merge gate.
+Deployment: no live pull, restart, configuration change, new lease, paid dispatch
+or outcome read in this work. A merge does not deploy these fixes.
 
 ## Finding + fix - wallet-flow "silent stalls" were TWAP slice fills (2026-10-06)
 

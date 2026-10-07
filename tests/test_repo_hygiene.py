@@ -198,35 +198,9 @@ def test_redeploy_runner_appends_runner_output_to_runner_log() -> None:
     would have left no trace (2026-09-07 audit, ROADMAP item 17). Pin the append
     redirect so a refactor cannot quietly drop it again."""
     body = (REPO_ROOT / "scripts" / "redeploy_runner.ps1").read_text(encoding="ascii")
-    # Comments must not satisfy the pin (a reverted launch line with the explanatory
-    # comment block left in place would otherwise pass).
-    code = "\n".join(line for line in body.splitlines() if not line.lstrip().startswith("#"))
-    assert 'Join-Path $OpsRoot "runner.log"' in code
-    command_lines = [line for line in code.splitlines() if "crypto_collector.cli ops-runner" in line]
-    assert command_lines, "redeploy_runner.ps1 no longer builds the ops-runner launch command"
-    # 2026-09-20: the append must be cmd.exe's, never PowerShell's. `& python ... *>>`
-    # routed every runner output line through the PowerShell 5.1 host for the life of
-    # the runner; Windows named a powershell.exe at 230 GB of virtual memory
-    # (Resource-Exhaustion-Detector 2004, pagefile peak 102 GB) while plant jobs failed
-    # with '[Errno 22] Invalid argument' and MemoryError, and the redeploy wrapper
-    # measurably grows under the same construct.
-    for line in command_lines:
-        assert "*>>" not in line, "the runner line went back to a PowerShell redirect (2026-09-20 incident)"
-        assert "cmd.exe --%" in line and '>> "%PLANT_LOG%" 2>&1' in line, (
-            "redeploy_runner.ps1 launch command no longer appends the runner's output to runner.log via cmd"
-        )
-    assert "$env:PLANT_LOG = {0}" in code, "runner.log must reach cmd as %PLANT_LOG%"
-    # Nothing may follow the cmd.exe --% statement on its line: after --% PowerShell
-    # stops parsing, so a trailing `; $x = $LASTEXITCODE` would be handed to cmd and run
-    # as a second command after python exits, and $LASTEXITCODE would be cmd's result
-    # for that garbage, not python's.
-    for line in command_lines:
-        assert line.rstrip().endswith("2>&1\"' + $nl +"), (
-            "redeploy template: the cmd.exe --% runner line must end the statement"
-        )
-    # The runner's UTF-8 contract lives in the launch wrappers; pin both env vars.
-    assert "$env:PYTHONUTF8 = ''1''" in code and "$env:PYTHONIOENCODING = ''utf-8''" in code
-    assert "-EncodedCommand" in code, "launch must go through -EncodedCommand (no argv re-tokenisation)"
+    assert "Start-ScheduledTask" in body
+    assert "run_ops_runner.ps1" in body
+    assert "Start-Process" not in body
     run_body = (REPO_ROOT / "scripts" / "run_ops_runner.ps1").read_text(encoding="ascii")
     run_code = "\n".join(line for line in run_body.splitlines() if not line.lstrip().startswith("#"))
     run_lines = [line for line in run_code.splitlines() if "crypto_collector.cli ops-runner" in line]
@@ -272,41 +246,10 @@ def test_score_job_min_age_floor_exceeds_longest_live_segment(config_name: str) 
         )
 
 
-def test_redeploy_runner_verifies_pid_identity_before_killing() -> None:
-    """2026-09-10: the lock named pid 1668, which Windows had reused for a critical
-    svchost.exe; the unconditional Stop-Process -Force blue-screened the machine
-    (CRITICAL_PROCESS_DIED). The kill-tree must prove the pid is a plant python
-    (same matcher as the straggler sweep) and must re-verify every child before any
-    kill primitive runs. Pin the GATING form, not just the presence of the words."""
+def test_redeploy_uses_task_lifecycle_without_pid_kills_or_lock_deletion() -> None:
+    """A shared venv or recycled PID must never be a target for termination."""
     body = (REPO_ROOT / "scripts" / "redeploy_runner.ps1").read_text(encoding="ascii")
-    # Drop the <# .SYNOPSIS #> header block and every # comment line: the pins below
-    # must be satisfied by code, not by the prose that explains the code.
-    if "#>" in body:
-        body = body[body.index("#>") + 2 :]
     code = "\n".join(line for line in body.splitlines() if not line.lstrip().startswith("#"))
-    assert "function Test-PlantProcess" in code
-    assert "$Proc.Name -ne 'python.exe'" in code, "only python.exe may ever be killed by the redeploy"
-    start = code.index("function Stop-PlantProcessTree")
-    end = code.index("\n}\n", start)
-    tree = code[start:end]
-    kill = tree.index("Stop-Process -Id $RootPid -Force")
-    # The gate must be an early-return `if (-not (Test-PlantProcess $proc)) { ... return }`
-    # placed before the kill - evaluating the predicate without acting on it must fail.
-    gate = re.search(r"if \(-not \(Test-PlantProcess \$proc\)\) \{[^}]*?\breturn\b", tree, re.S)
-    assert gate is not None, "Stop-PlantProcessTree must early-return when the pid is not a plant python"
-    assert gate.start() < kill, "the plant-python gate must precede Stop-Process"
-    unreadable = re.search(r"if \(Test-UnreadablePython \$proc\) \{[^}]*?\breturn\b", tree, re.S)
-    assert unreadable is not None and unreadable.start() < kill, (
-        "an unreadable (other-principal) python must be refused, not killed or called stale"
-    )
-    assert "Get-Process -Id $RootPid" in tree[:kill], "a CIM miss must be cross-checked before treating the pid as dead"
-    # Every kill primitive in the script must be that one guarded line.
-    kills = [
-        line for line in code.splitlines()
-        if re.search(r"taskkill|\.Kill\(|Stop-Process|TerminateProcess", line, re.I)
-        and "Stop-Process -Id $RootPid -Force" not in line
-    ]
-    assert kills == [], f"unguarded kill primitive in redeploy_runner.ps1: {kills}"
-    assert code.count("Stop-Process -Id $RootPid -Force") == 1, "exactly one guarded kill site"
-    # The lock path must go through the guarded tree kill.
-    assert "Stop-PlantProcessTree ([int]$lock.pid)" in code
+    assert not re.search(r"Stop-Process|taskkill|Remove-Item|Get-CimInstance|Start-Process", code, re.I)
+    assert "Stop-ScheduledTask" in code and "Start-ScheduledTask" in code
+    assert "[switch]$Apply" in code
