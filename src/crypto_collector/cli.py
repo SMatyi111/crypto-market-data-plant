@@ -3965,7 +3965,16 @@ def _run_collector_in_subprocess(job: JobSpec) -> str:
             f"collector subprocess for {job.name} ({job.job_type}) exited "
             f"{proc.returncode}: {tail}"
         )
-    return f"{job.job_type} completed (process-isolated)"
+    message = f"{job.job_type} completed (process-isolated)"
+    # Optional evidence can fail while ordinary collection succeeds. Retain only
+    # bounded reason tokens, never arbitrary child logs, payloads or URLs.
+    import re
+    reasons = sorted(set(re.findall(
+        r"(?m)^session evidence unavailable: ([A-Za-z][A-Za-z0-9_]{0,63})\r?$",
+        proc.stderr or "")))[:8]
+    if reasons:
+        message += "; optional_evidence_unavailable=" + ",".join(reasons)
+    return message
 
 
 def run_single_job(args: argparse.Namespace) -> None:

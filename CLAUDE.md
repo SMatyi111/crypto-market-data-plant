@@ -16,15 +16,16 @@ Resolved-work narrative: [`docs/HISTORY.md`](docs/HISTORY.md). Runbook:
   line for the life of the native command; on 2026-09-20 Windows named a
   powershell.exe at 230 GB of virtual memory (pagefile peak 102 GB) while plant jobs
   failed with `[Errno 22] Invalid argument` and `MemoryError`, and the redeploy
-  wrapper measurably grows under that construct. Both runner scripts launch through
+  wrapper measurably grows under that construct. The SYSTEM wrapper `run_ops_runner.ps1` launches through
   `cmd.exe --% /d /s /c "... >> "%PLANT_LOG%" 2>&1"` with the paths in `%PLANT_*%`
-  env vars and log their own pid; `tests/test_repo_hygiene.py` pins the form.
+  env vars and logs its own pid; `redeploy_runner.ps1` controls that existing task; `tests/test_repo_hygiene.py` pins the form.
 - **Run tests with `PYTHONPATH=src`** (`python -m pytest`). Do not trust a bare
   editable install — it has historically resolved to a retired external tree.
-- **The ops runner reads its config once at startup.** Config or code changes do
-  NOT take effect until the runner restarts (`scripts/redeploy_runner.ps1`, or
-  reboot — the SYSTEM task `CryptoMarketDataPlant` starts it at boot). Say so when
-  delivering a change: merged ≠ deployed.
+- **The ops runner reads its config once at startup.** Config and in-process code
+  changes need a restart; collector subprocesses can pick up pulled code at their
+  next segment. `scripts/redeploy_runner.ps1` defaults to preflight only; `-Apply`
+  performs a bounded SYSTEM-task restart. Never use PID sweeps or an ad-hoc
+  launcher. Say so when delivering a change: merged is not fully deployed.
 - **When adding collector lanes, bump `-CollectorConcurrency`** in
   `scripts/run_ops_runner.ps1` AND `scripts/redeploy_runner.ps1` (one slot per
   worker lane — currently 49, covering 47 enabled lanes with the three Hyperliquid WS trades lanes). This has silently

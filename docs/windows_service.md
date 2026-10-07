@@ -138,19 +138,45 @@ custom config points there.
 
 ## Deploying code changes (restart the runner)
 
-The runner reads the ops config **and loads the Python code once at process
-start**. Pulling new code or editing `ops.live.local.json` therefore has **no
-effect until the runner is restarted**. To deploy:
+The runner reads its config and in-process Python code at startup. Collector
+subprocesses can pick up pulled code at their next segment. **Merged is not
+fully deployed.** Pull only reviewed current main into the live checkout; do not
+run an older restart script.
+
+From elevated PowerShell in that checkout:
 
 ```powershell
-Stop-ScheduledTask  -TaskName CryptoMarketDataPlant   # stops the running runner
-Start-ScheduledTask -TaskName CryptoMarketDataPlant   # relaunches with new code/config
+.\scripts\redeploy_runner.ps1           # preflight only; no restart
+.\scripts\redeploy_runner.ps1 -Apply    # one SYSTEM-task stop/start
 market-data-plant health --ops-root G:\market_archive\ops --format text
 ```
 
-> ⚠️ The restart briefly interrupts **every** lane, including the live Binance
-> BTCUSDT collector — its current segment ends and a fresh one starts (a clean
-> segment boundary, not data loss). Only restart when you intend to deploy.
+The script validates the existing root `CryptoMarketDataPlant` task, SYSTEM
+principal, IgnoreNew setting, exact wrapper/config/root, capacity and fresh
+heartbeat before stopping anything. It never matches processes by venv path,
+kills a PID, deletes a lock, edits a config or starts an ad-hoc runner. A shared
+Python environment is not proof of plant ownership.
+
+After Stop is attempted, a `finally` path waits at most 15 seconds for the task
+to settle and attempts Start even if Stop or that observation fails. There is no
+post-stop process inventory or logging prerequisite. It then checks for a new
+runner identity and two advancing fresh heartbeats for at most 60 seconds. This
+bounds observation, not uptime: OS failure, host termination or a failed task
+start can still prevent recovery. If IgnoreNew discarded Start during a delayed
+Stop, the verification loop issues at most one Start-only reconciliation after
+the task becomes Ready, provided no new runner identity has been observed. It
+never repeats Stop or restarts an observed new failed runner. A timeout is not
+success and must not trigger
+another Stop. Inspect the task and runner log; if the task is stopped, complete
+the pending Start only. Do not reset any evidence lease.
+
+Every restart interrupts collection. A clean segment boundary and no data loss
+are **not guaranteed**. Preserve the interval as a coverage gap; poll/backfill
+capability differs by lane. Health returning OK does not fill the historical gap.
+The October 7 interruption exposed this: an unrelated research process sharing
+the venv held the old helper's post-stop guard, followed by interrupted recovery.
+Tests now cover preflight failure, failed Stop, failed stop observation, failed
+Start, failed verification and dry-run, with task operations mocked.
 
 ## Backfilling stream-depth replay
 

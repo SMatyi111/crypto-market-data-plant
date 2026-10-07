@@ -341,3 +341,28 @@ def test_rehashed_manifest_cannot_admit_a_missing_raw_snapshot(tmp_path, monkeyp
     manifest_path.write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match="Unpersisted book frames or snapshot anchor"):
         verify_session_evidence(paths.base)
+
+
+def test_journal_accounting_is_streamed_but_verifier_rereads(tmp_path, monkeypatch):
+    import crypto_collector.session_evidence as module
+    original = module.file_info
+    def raw_only(path, root):
+        if path.name == 'events.jsonl':
+            raise AssertionError('terminal publication must not reread the journal')
+        return original(path, root)
+    monkeypatch.setattr(module, 'file_info', raw_only)
+    paths, pipeline, evidence, _ = setup(tmp_path, monkeypatch,
+        [[ACK, book(), *[book('delta', n) for n in range(2, 30)]]])
+    assert asyncio.run(pipeline.run(limit=29)).raw_messages == 29
+    assert evidence.error is None
+    manifest_path = paths.base / 'session_evidence/manifest.json'
+    manifest = json.loads(manifest_path.read_text())
+    journal_path = paths.base / 'session_evidence/events.jsonl'
+    assert manifest['journal'] == original(journal_path, paths.base)
+    monkeypatch.setattr(module, 'file_info', original)
+    verify_session_evidence(paths.base)
+    # A disk edit after writing cannot pass merely because capture used streaming hashes.
+    with journal_path.open('ab') as stream:
+        stream.write(b'{}\n')
+    with pytest.raises(ValueError):
+        verify_session_evidence(paths.base)

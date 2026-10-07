@@ -1584,8 +1584,9 @@ The existing Bybit BTCUSDT linear depth-50 lane can additionally specify
 `session_evidence_trial_id` (1..64 ASCII letters/digits/underscore/hyphen, starting
 alphanumeric). CLI names use hyphens. Both require session evidence, a 512 MiB
 journal cap and an existing segment deadline no more than 1800 seconds away.
-They pass through central ops/segmented dispatch. No example or live config enables
-them. Legacy unleased evidence retains its prior contract; a lease is mandatory
+They pass through central ops/segmented dispatch. Example configuration stays
+disabled. The separately authorized October 7 live trial spent both slots and
+expired with no admitted manifests; its existing lease must never be reset. Legacy unleased evidence retains its prior contract; a lease is mandatory
 in the proposed two-segment activation packet, not retroactively in old captures.
 
 An explicit operator preparation command, `python -m crypto_collector.evidence_lease
@@ -1652,3 +1653,23 @@ missing failed runs from a successful manifest. Admission requires the separatel
 retained two-slot ledger and inventory of all failures/gaps. Existing manifests
 without this optional field remain valid under their prior rules. Source,
 economic, account, funding-completeness and holdout gates are unchanged.
+
+
+### Evidence terminal accounting and operational diagnostics (2026-10-07)
+
+The writer accumulates journal SHA256, byte and row counts as bytes are written,
+and makes that accounting available only after flush/fsync/close. Terminal
+publication no longer rereads the journal (up to 512 MiB) inside its unchanged
+two-second window. Raw files still need terminal hashing; slow I/O can still
+refuse publication. Offline verification independently rereads and hashes both
+journal and raw files. Manifest shape, admission rules and STANDARDS_VERSION
+remain unchanged. Missing manifests from past runs are never retroactively built.
+
+A successful collector subprocess may still have failed optional evidence.
+Its ordinary success message now retains up to eight distinct bounded evidence
+failure tokens from stderr, without forwarding arbitrary child logs. The failure
+appears in the existing ops job result; it does not change ordinary collection
+success into an error or grant source admission. Immutable trial expiry is not
+extended to finish a second segment: 2 x 1800 seconds plus gaps/HTTP work cannot
+fit inside a 3600-second lease. Future capture sizing needs an explicit scope;
+these fixes do not renew any allowance or enable another capture.
