@@ -597,7 +597,30 @@ the same restart.
 | ~~2026-06-19~~ DONE 06-24 | The 06-17 `robocopy /MINAGE:3` move never finished (~88% of partitions still on G:), leaving G: at **3.9 GB free**. First retry (06-22) was killed by the Bash tool's 10-min timeout after freeing ~57 GB. Relaunched **detached via `Start-Process`** (pid 48444) so it survives session/tool teardown -> **COMPLETED 2026-06-24 16:19, FAILED: 0** (45.29 M files / 555 GB moved G:->`D:\market_archive_cold`). **G: now 489 GB free.** D: holds 113,407 normalized partitions (full set). 1 partition / 2 parquet files remain on G: -- robocopy *skipped* them (already byte-present on D: from the 06-17 partial), so redundant not stranded; immaterial (489 GB free). Lesson: long-running moves must be detached, never run inside a Bash call (10-min cap). |
 | ~~2026-07-26~~ DONE 08-01 | **Text raw offload wired for the next restart.** `archive-offload-text` is enabled in `ops.live.local.json` with the indexed promotion/quarantine gate, preserve-first aged-run backstop, byte-verified cold move, and `write_report:false` so it cannot replace the market health report. It remains inert until the guarded elevated runner restart. |
 
-**Last ops audit:** 2026-10-06 — read-only, before adding the Hyperliquid WS trades
+**Last ops audit:** 2026-10-08 - read-only, 10:35-11:00 UTC. Health: `status=ok`, findings
+none, heartbeat 4 s; 166 jobs, none stale, no partition stale, none long-running; poll lanes
+(universe positions, options chain, Deribit) fresh. Runner pid 9664 up since 2026-10-07
+13:38 UTC (after the 13 h 36 m outage); since then 17,017 success / 24 error (99.86 %).
+43 managed workers, 42 running + text-rss between batches, no findings, no pid missing;
+28 report quarantine, max 0.016 % (coinbase trades). G: 264.0 GiB free (268.2 on 10-06).
+Offload: 87 moved, 0 failed, `stuck_unaccounted=0`, warnings only the usual
+unconfigured/missing legacy lanes. Cold mirror I:->J: hourly, last run 09:52 UTC
+canonical=mirror=194,600 files, delta 0. `deribit-options-tape` task last result 0.
+**Binance fapi REST errors recurred (10-05 finding):** all 24 errors since restart are the
+eight fapi REST lanes, `URLError SSL UNEXPECTED_EOF_WHILE_READING` (upstream TLS drop),
+self-recovering. Outage windows (first error to next success) from job_runs: 10-05
+20:15 ~9 min on all 8 lanes; 10-07 20:05 ~1 min (sol OI 11 min from 19:55); 10-08
+02:00/04:18/07:31 single runs, 5-16 s. Loss: the aggTrades lane resumes from the
+durable fromId high-water, so no trades lost; depth/funding/OI are snapshots and lose
+only those minutes. Not a plant bug; watch for a longer burst. **Wallet-flow TWAP
+(PR #100) since 10-06:** 58 segments, twap_error 0, twap_deferred 0,
+twap_window_gap 1 (10-07, the first segment after the outage restart - expected),
+6,461 TWAP fills emitted; capped_response 12 / incomplete_poll 11 over 3 days (9/8 on
+10-07) - small, but a capped response can hide fills, keep counting. Wallet-flow
+segment gaps match the known outages (10-06 14:21-16:00 and 10-06 23:32-10-07
+13:38 UTC). No restart, config, transfer or deletion.
+
+**Previous ops audit:** 2026-10-06 - read-only, before adding the Hyperliquid WS trades
 lanes. Health 13:13 UTC: `status=ok`, findings none, heartbeat age 4.9 s; poll lanes
 (universe positions, options chain, Deribit) all fresh. 24 h: 15,561 success / 212
 error (98.7 %); 208 of the errors are one burst at 2026-10-05 20:xx UTC on the eight
