@@ -272,30 +272,182 @@ def test_self_consistent_hashes_do_not_replace_structural_checks(tmp_path, monke
         verify_session_evidence(paths.base)
 
 
-def test_slow_finalization_does_not_hold_market_or_accumulate_writers(tmp_path, monkeypatch):
-    import crypto_collector.session_evidence as module
+def stall_at(evidence, stage):
+    """Deterministic stall of the writer at exactly one terminal stage: the test
+    learns when the writer arrived (`entered`) and decides when it may continue."""
     release, entered = threading.Event(), threading.Event()
+    def hook(name):
+        if name == stage:
+            entered.set()
+            release.wait(10)
+    evidence._terminal_stage_hook = hook
+    gate_join_on(evidence, entered)
+    return release, entered
+
+
+def gate_join_on(evidence, entered):
+    """The caller's bounded join starts only once the writer has arrived at the
+    stalled stage, so a slow CI disk cannot expire the wait in an earlier stage."""
+    real_join = evidence._thread.join
+    def join(timeout=None):
+        entered.wait(10)
+        return real_join(timeout)
+    evidence._thread.join = join
+
+
+def test_raw_reread_is_outside_terminal_window(tmp_path, monkeypatch):
+    """Before this repair every raw file was reread and hashed inside the two-second
+    terminal wait (this test then fails with error == 'AssertionError' and no
+    manifest). Now the sink's streamed account is published and must equal an
+    independent reread, including across rotated parts."""
+    import crypto_collector.session_evidence as module
     original = module.file_info
-    def slow(path, root):
-        entered.set()
-        release.wait(5)
-        return original(path, root)
-    monkeypatch.setattr(module, "file_info", slow)
+    def forbidden(path, root):
+        raise AssertionError("terminal publication must not reread raw files")
+    monkeypatch.setattr(module, "file_info", forbidden)
+    paths, pipeline, evidence, _ = setup(tmp_path, monkeypatch,
+        [[ACK, book(), book("delta", 2), book("snapshot", 3), book("delta", 4)]])
+    assert asyncio.run(pipeline.run(limit=4)).raw_messages == 4
+    assert evidence.error is None
+    manifest = json.loads((paths.base / "session_evidence/manifest.json").read_text())
+    assert len(manifest["raw_files"]) > 1
+    assert manifest["raw_files"] == [original(paths.base / f["path"], paths.base) for f in manifest["raw_files"]]
+    assert manifest["raw_accounting"] == {"mode": "streamed", "files_closed": True, "durable_close": True}
+    assert manifest["terminal_wait_seconds"] == 2
+    assert set(manifest["terminal_timing_ms"]) == {"drain", "journal_fsync", "headroom",
+                                                   "lease_checkpoint", "raw_accounting"}
+    assert evidence._stage == "published"
+    assert all(type(v) is int and v >= 0 for v in manifest["terminal_timing_ms"].values())
+    monkeypatch.setattr(module, "file_info", original)
+    assert verify_session_evidence(paths.base)["session_admitted"]
+
+
+@pytest.mark.parametrize("stage", ["queue_wait", "journal_fsync", "headroom", "raw_accounting",
+                                   "manifest_write", "manifest_rename", "published"])
+def test_stalled_terminal_stage_is_named_and_never_publishes(tmp_path, monkeypatch, caplog, stage):
+    """Any stalled stage: bounded wait, bounded stage token, no manifest ever (a
+    stall released later meets the deadline check), writer slot released, market
+    rows intact and the next segment's evidence usable again."""
+    import logging
+    import crypto_collector.session_evidence as module
+    monkeypatch.setattr(module, "TERMINAL_WAIT_SECONDS", 0.3)  # the stall is event-gated, not timed
     paths, pipeline, evidence, _ = setup(tmp_path, monkeypatch, [[ACK, book()]])
+    if stage == "queue_wait":
+        # Stall the writer while it is still inside the record loop (after taking
+        # the sentinel, before the fsync stage): the loop's own marker is reported.
+        release, entered = threading.Event(), threading.Event()
+        real_get = evidence._queue.get
+        def blocking_get(*args, **kwargs):
+            item = real_get(*args, **kwargs)
+            if item is None:
+                entered.set()
+                release.wait(10)
+            return item
+        monkeypatch.setattr(evidence._queue, "get", blocking_get)
+        gate_join_on(evidence, entered)
+    else:
+        release, entered = stall_at(evidence, stage)
     started = time.monotonic()
     try:
-        assert asyncio.run(pipeline.run(limit=1)).raw_messages == 1
+        with caplog.at_level(logging.WARNING, logger="crypto_collector.session_evidence"):
+            assert asyncio.run(pipeline.run(limit=1)).raw_messages == 1
         assert entered.is_set()
         assert time.monotonic() - started < 4
-        assert evidence.error == "writer_close_timeout"
         (tmp_path / "another").mkdir()
-        another = SessionEvidence(tmp_path / "another")
-        assert another.error == "previous_writer_pending"
-        assert not (paths.base / "session_evidence/manifest.json").exists()
+        assert SessionEvidence(tmp_path / "another").error == "previous_writer_pending"
+        if stage == "published":
+            # The rename completed inside the wait: that is a manifest, not a failure.
+            assert evidence.error is None
+            assert not [m for m in caplog.messages if "writer_close_timeout" in m or "terminal_stage" in m]
+            assert (paths.base / "session_evidence/manifest.json").exists()
+        else:
+            assert evidence.error == "writer_close_timeout"
+            assert f"session evidence unavailable: terminal_stage_{stage}" in caplog.messages
+            assert "session evidence unavailable: writer_close_timeout" in caplog.messages
+            assert not (paths.base / "session_evidence/manifest.json").exists()
     finally:
         release.set()
         evidence._thread.join(5)
+    assert not evidence._thread.is_alive()
+    if stage != "published":
+        # Both reporters (the caller's timeout and the writer's own deadline
+        # refusal) ran; exactly one stage token was retained.
+        assert sum(m.startswith("session evidence unavailable: terminal_stage_") for m in caplog.messages) == 1
+    if stage == "published":
+        verify_session_evidence(paths.base)
+        return
     assert not (paths.base / "session_evidence/manifest.json").exists()
+    assert (paths.base / "raw/messages.jsonl").read_text().count("\n") == 1
+    (tmp_path / "next").mkdir()
+    following = SessionEvidence(tmp_path / "next")
+    assert following.error is None
+    following.finish(reason="limit", sinks_closed=True)
+    following._thread.join(5)
+
+
+@pytest.mark.parametrize("damage", ["truncate", "append", "delete", "extra_part"])
+def test_streamed_account_is_checked_against_closed_files(tmp_path, monkeypatch, damage):
+    """The account describes bytes handed to the sink; the manifest is only admitted
+    when the closed files on disk still have exactly those sizes and names, and the
+    offline verifier rehashes regardless."""
+    paths, pipeline, evidence, _ = setup(tmp_path, monkeypatch, [[ACK, book(), book("delta", 2)]])
+    raw = paths.base / "raw/messages.jsonl"
+    def hook(stage):
+        if stage != "raw_accounting":
+            return
+        if damage == "truncate":
+            raw.write_bytes(raw.read_bytes()[:-3])
+        elif damage == "append":
+            with raw.open("ab") as stream:
+                stream.write(b"{}\n")
+        elif damage == "delete":
+            raw.unlink()
+        else:
+            (paths.base / "raw/messages.7.jsonl").write_bytes(b"{}\n")
+    evidence._terminal_stage_hook = hook
+    assert asyncio.run(pipeline.run(limit=2)).raw_messages == 2
+    assert evidence.error is None
+    manifest = json.loads((paths.base / "session_evidence/manifest.json").read_text())
+    assert not manifest["session_admitted"]
+    expected = {"extra_part": "raw_file_set_mismatch", "delete": "raw_size_mismatch"}.get(damage, "raw_size_mismatch")
+    assert expected in manifest["issues"]
+    if damage == "delete":
+        assert "raw_file_set_mismatch" in manifest["issues"]
+    with pytest.raises(ValueError):
+        verify_session_evidence(paths.base)
+
+
+def test_unclosed_or_unavailable_account_falls_back_safely(tmp_path, monkeypatch):
+    import crypto_collector.session_evidence as module
+    reread = []
+    original = module.file_info
+    def counting(path, root):
+        reread.append(path.name)
+        return original(path, root)
+    monkeypatch.setattr(module, "file_info", counting)
+    # No account at all (plain sink / library caller): the legacy reread publishes.
+    paths, pipeline, evidence, _ = setup(tmp_path, monkeypatch, [[ACK, book()]])
+    monkeypatch.setattr(pipeline.raw_sink, "ledger", lambda: None)
+    assert asyncio.run(pipeline.run(limit=1)).raw_messages == 1
+    assert reread == ["messages.jsonl"]  # the terminal reread, before the verifier's own
+    manifest = verify_session_evidence(paths.base)
+    assert manifest["raw_accounting"] == {"mode": "reread"}
+    # An account whose file the sink never closed is published but not admitted.
+    paths2, pipeline2, evidence2, _ = setup(tmp_path / "second", monkeypatch, [[ACK, book()]])
+    real = pipeline2.raw_sink.ledger
+    monkeypatch.setattr(pipeline2.raw_sink, "ledger",
+                        lambda: [dict(e, closed=False, fsynced=False) for e in real()])
+    assert asyncio.run(pipeline2.run(limit=1)).raw_messages == 1
+    manifest2 = json.loads((paths2.base / "session_evidence/manifest.json").read_text())
+    assert "raw_sink_not_closed" in manifest2["issues"] and not manifest2["session_admitted"]
+    assert manifest2["raw_accounting"]["files_closed"] is False
+    # A malformed account disables evidence, never market rows.
+    paths3, pipeline3, evidence3, _ = setup(tmp_path / "third", monkeypatch, [[ACK, book()]])
+    monkeypatch.setattr(pipeline3.raw_sink, "ledger", lambda: [{"path": "not-a-path"}])
+    assert asyncio.run(pipeline3.run(limit=1)).raw_messages == 1
+    assert evidence3.error == "raw_ledger_invalid"
+    assert not (paths3.base / "session_evidence/manifest.json").exists()
+    assert (paths3.base / "raw/messages.jsonl").read_text().count("\n") == 1
 
 
 def test_sidecar_included_in_offload_file_manifest(tmp_path, monkeypatch):

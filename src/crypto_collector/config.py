@@ -43,7 +43,10 @@ DEFAULT_ARCHIVE_ROOT = Path(r"G:\market_archive")
 # v18 (2026-10-06): wallet-flow lane also collects TWAP slice fills
 # (raw_type userTwapSliceFills) and replay_wallet_flow_run orders per
 # (wallet, endpoint stream) instead of per wallet (STANDARDS 4.7).
-STANDARDS_VERSION = 18
+# v19 (2026-10-08): optional Bybit evidence manifest adds raw_accounting,
+# terminal_wait_seconds and terminal_timing_ms; raw_files hashes come from the
+# sink's streamed account (STANDARDS 4.16). Market schemas unchanged.
+STANDARDS_VERSION = 19
 
 _FALLBACK_WARNED: set[str] = set()
 

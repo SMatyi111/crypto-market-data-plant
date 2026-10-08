@@ -223,24 +223,81 @@ def test_optional_failures_preserve_market_rows(directory, tmp_path, monkeypatch
         assert len(rows(directory)) == 1
 
 
-def test_final_checkpoint_expiry_leaves_only_bounded_partial_manifest(directory, tmp_path, monkeypatch):
+def test_expiry_during_manifest_write_leaves_only_bounded_partial_manifest(directory, tmp_path, monkeypatch, caplog):
+    import logging
     paths, pipeline, evidence, _ = setup(tmp_path / "data", monkeypatch, [[ACK, book()]],
         max_bytes=MAX_BYTES, lease_directory=directory, trial_id="offline-test")
     assert evidence.ready.wait(2)
     temporary = paths.base / "session_evidence/manifest.tmp"
-    original = lease._connect
-    def delayed_final_checkpoint(path):
-        conn = original(path)
-        if temporary.exists():
-            # Equivalent to the clock passing the deadline during control I/O.
+    def hook(stage):
+        if stage == "manifest_rename":
+            # Equivalent to the clock passing the deadline during the tmp write/fsync.
+            assert temporary.is_file()
             evidence.lease.deadline = 0
-        return conn
-    monkeypatch.setattr(lease, "_connect", delayed_final_checkpoint)
-    assert asyncio.run(pipeline.run(limit=1)).raw_messages == 1
-    assert evidence.error
+    evidence._terminal_stage_hook = hook
+    with caplog.at_level(logging.WARNING, logger="crypto_collector.session_evidence"):
+        assert asyncio.run(pipeline.run(limit=1)).raw_messages == 1
+    assert evidence.error == "LeaseRefused"
+    assert "session evidence unavailable: terminal_stage_manifest_rename" in caplog.messages
     assert temporary.is_file()
     assert temporary.stat().st_size <= lease.MANIFEST_BYTES
     assert not (temporary.parent / "manifest.json").exists()
+    with sqlite3.connect(directory / "lease.sqlite3") as conn:
+        assert conn.execute("SELECT stopped FROM trial").fetchone()[0] == "lease_expired"
+
+
+@pytest.mark.parametrize("stage", ["lease_checkpoint", "raw_accounting", "manifest_write"])
+def test_expiry_before_manifest_write_creates_no_manifest_file(directory, tmp_path, monkeypatch, stage):
+    """Expiry observed during blocking terminal I/O before the tmp write: no tmp,
+    no manifest, durable refusal, slot stays spent, market row intact."""
+    paths, pipeline, evidence, _ = setup(tmp_path / "data", monkeypatch, [[ACK, book()]],
+        max_bytes=MAX_BYTES, lease_directory=directory, trial_id="offline-test")
+    assert evidence.ready.wait(2)
+    def hook(name):
+        if name == stage:
+            evidence.lease.monotonic_deadline = 0
+    evidence._terminal_stage_hook = hook
+    assert asyncio.run(pipeline.run(limit=1)).raw_messages == 1
+    assert evidence.error == "LeaseRefused"
+    assert not list((paths.base / "session_evidence").glob("manifest*"))
+    assert (paths.base / "raw/messages.jsonl").read_text().count("\n") == 1
+    assert len(rows(directory)) == 1
+    with sqlite3.connect(directory / "lease.sqlite3") as conn:
+        assert conn.execute("SELECT stopped FROM trial").fetchone()[0] == "lease_expired"
+
+
+def test_terminal_window_has_one_durable_checkpoint(directory, tmp_path, monkeypatch):
+    """After the drain, publication commits control state exactly once (the
+    checkpoint 'at publication'); the only other control access is the read-only
+    stopped check before the rename, which never commits."""
+    paths, pipeline, evidence, _ = setup(tmp_path / "data", monkeypatch, [[ACK, book()]],
+        max_bytes=MAX_BYTES, lease_directory=directory, trial_id="offline-test")
+    assert evidence.ready.wait(2)
+    connects, writes = [], []
+    real = lease._connect
+    class Recording:
+        def __init__(self, conn):
+            self._conn = conn
+        def execute(self, sql, *args):
+            if sql.lstrip().upper().startswith("UPDATE"):
+                writes.append(evidence._stage)
+            return self._conn.execute(sql, *args)
+        def __enter__(self):
+            self._conn.__enter__()
+            return self
+        def __exit__(self, *args):
+            return self._conn.__exit__(*args)
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+    def counting(path):
+        connects.append(evidence._stage)
+        return Recording(real(path))
+    monkeypatch.setattr(lease, "_connect", counting)
+    assert asyncio.run(pipeline.run(limit=1)).raw_messages == 1
+    assert journal.verify_session_evidence(paths.base)["session_admitted"]
+    loop_stages = {"capture", "lease_check", "queue_wait", "headroom", "journal_write"}
+    assert [s for s in connects if s not in loop_stages] == ["lease_checkpoint", "manifest_rename"]
+    assert [s for s in writes if s not in loop_stages] == ["lease_checkpoint"]
 
 
 def test_cli_missing_lease_continues_with_original_market_collector(directory, tmp_path, monkeypatch):
@@ -300,3 +357,76 @@ def test_disabled_path_never_opens_lease(tmp_path, monkeypatch):
     paths, pipeline, _, _ = setup(tmp_path, monkeypatch, [[ACK, book()]], enabled=False)
     assert asyncio.run(pipeline.run(limit=1)).raw_messages == 1
     assert not (paths.base / "session_evidence").exists()
+
+
+def test_stall_inside_record_loop_is_named_by_its_call(directory, tmp_path, monkeypatch, caplog):
+    """finish() must not relabel a writer already blocked in its per-line lease
+    check: the token names that call, not the drain."""
+    import logging
+    import threading
+    monkeypatch.setattr(journal, "TERMINAL_WAIT_SECONDS", 0.3)
+    paths, pipeline, evidence, _ = setup(tmp_path / "data", monkeypatch, [[ACK, book()]],
+        max_bytes=MAX_BYTES, lease_directory=directory, trial_id="offline-test")
+    assert evidence.ready.wait(2)
+    release, entered, terminal_seen = threading.Event(), threading.Event(), threading.Event()
+    real_get = evidence._queue.get
+    def watching_get(*args, **kwargs):
+        line = real_get(*args, **kwargs)
+        if line is not None and b'"kind":"terminal"' in line:
+            terminal_seen.set()  # the next per-line lease check is inside the drain
+        return line
+    monkeypatch.setattr(evidence._queue, "get", watching_get)
+    real_check = evidence.lease.check
+    def blocking_check(*args, **kwargs):
+        if terminal_seen.is_set() and not entered.is_set():
+            entered.set()
+            release.wait(10)
+        return real_check(*args, **kwargs)
+    monkeypatch.setattr(evidence.lease, "check", blocking_check)
+    real_join = evidence._thread.join
+    monkeypatch.setattr(evidence._thread, "join", lambda timeout=None: (entered.wait(10), real_join(timeout))[1])
+    try:
+        with caplog.at_level(logging.WARNING, logger="crypto_collector.session_evidence"):
+            assert asyncio.run(pipeline.run(limit=1)).raw_messages == 1
+        assert entered.is_set() and evidence.error == "writer_close_timeout"
+        assert "session evidence unavailable: terminal_stage_lease_check" in caplog.messages
+        assert not any("terminal_stage_drain" in m for m in caplog.messages)
+    finally:
+        release.set()
+        evidence._thread.join(5)
+    assert not (paths.base / "session_evidence/manifest.json").exists()
+
+
+def test_trial_stopped_by_another_process_cannot_be_published(directory, tmp_path, monkeypatch):
+    """Between the durable checkpoint and the rename another process (a later
+    claim) durably stops the trial: the read-only control check before the rename
+    refuses, leaving the bounded tmp and no manifest."""
+    paths, pipeline, evidence, _ = setup(tmp_path / "data", monkeypatch, [[ACK, book()]],
+        max_bytes=MAX_BYTES, lease_directory=directory, trial_id="offline-test")
+    assert evidence.ready.wait(2)
+    def hook(stage):
+        if stage == "manifest_rename":
+            with sqlite3.connect(directory / "lease.sqlite3") as conn:
+                conn.execute("UPDATE trial SET stopped='lease_clock_or_corrupt'")
+    evidence._terminal_stage_hook = hook
+    assert asyncio.run(pipeline.run(limit=1)).raw_messages == 1
+    assert evidence.error == "LeaseRefused"
+    assert (paths.base / "session_evidence/manifest.tmp").is_file()
+    assert not (paths.base / "session_evidence/manifest.json").exists()
+
+
+def test_clock_behind_another_process_high_water_cannot_be_published(directory, tmp_path, monkeypatch):
+    """The read-only control read before the rename keeps the former checkpoint's
+    cross-process reversal refusal: a persisted last_utc ahead of this writer's
+    clock refuses the manifest."""
+    paths, pipeline, evidence, _ = setup(tmp_path / "data", monkeypatch, [[ACK, book()]],
+        max_bytes=MAX_BYTES, lease_directory=directory, trial_id="offline-test")
+    assert evidence.ready.wait(2)
+    def hook(stage):
+        if stage == "manifest_rename":
+            with sqlite3.connect(directory / "lease.sqlite3") as conn:
+                conn.execute("UPDATE trial SET last_utc=last_utc+3600")
+    evidence._terminal_stage_hook = hook
+    assert asyncio.run(pipeline.run(limit=1)).raw_messages == 1
+    assert evidence.error == "LeaseRefused"
+    assert not (paths.base / "session_evidence/manifest.json").exists()

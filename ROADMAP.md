@@ -8,7 +8,7 @@ changes scope or state. Companion docs:
 - [`STANDARDS.md`](STANDARDS.md) — the data contract (schemas, replayability, retention)
 - [`docs/HISTORY.md`](docs/HISTORY.md) — resolved-work narrative (what was fixed, and why)
 
-Last updated: **2026-10-07**.
+Last updated: **2026-10-08**.
 
 > **Operating mode — safe shaping (owner directive, 2026-07-04).** No extended
 > building on Claude's initiative: no new venues, lanes, or instruments, no big
@@ -18,6 +18,46 @@ Last updated: **2026-10-07**.
 > explicit owner ask to start.
 
 ---
+
+## Bybit terminal publication repair: streamed raw accounting + stage diagnostics (2026-10-08)
+
+The owner-authorized v2 source trial (two slots, immutable hour) ended 0/2
+admitted on 2026-10-08. Run 1 wrote its terminal and three reference records,
+then failed `writer_close_timeout`; run 2 expired before its terminal record
+(2 x 1800 s plus the ~15 s inter-segment gap and terminal reference work do not
+fit 3600 s). Neither run is admitted; no manifest was rebuilt, no lease reset,
+no new capture. Ordinary collection and post-trial health were unaffected.
+
+Mechanism, demonstrated offline: the two-second terminal wait covered ten
+sequential blocking stages, among them a full reread + SHA256 of every raw file
+(34 MB for run 1) and three durable SQLite checkpoints. Which stage stalled on
+October 8 is unknown and not provable from today's timings (a warm reread of
+run 1's raw file takes about 0.1 s now; a cold cache, a busy disk or a scan of a
+freshly written file are plausible, unproven contributors). A hermetic test that
+forbids any raw reread at terminal fails on the pre-repair tree and passes now.
+
+Repair (STANDARDS v19, default-off lane; cadence, lease length, admission and
+economic gates unchanged): the raw sink keeps a streamed per-file account of the
+bytes it wrote; terminal publication checks it against the closed files' names
+and sizes instead of rereading; after the drain exactly one durable control
+checkpoint remains (clock-only and read-only checks after file I/O, which still
+refuse an expired or externally stopped trial); the writer names its stage,
+so a failure retains `terminal_stage_<stage>` next to the reason in the ops job
+result, and a published manifest records per-stage timings. The offline
+verifier is unchanged and still rereads and rehashes everything; synthetic
+end-to-end sessions (lease + references + admission) pass, and tamper negatives
+(raw byte, rehashed manifest, missing file, journal append, dropped reference,
+tmp-only manifest) refuse. Stage stalls, expiry during terminal I/O, writer-slot
+release and second-segment continuation are tested with events, not sleeps.
+
+**Merged is not deployed.** The live config still carries both evidence flags
+pointed at the spent v2 lease, so every Bybit depth segment claims, is refused
+(`LeaseRefused`) and collects ordinarily; this change does not alter that. Once
+the live checkout is pulled, collector subprocesses pick the new code up at
+their next segment without a runner restart (the in-runner ops harvesting is
+unchanged). Trial sizing is a reviewable proposal only
+(`docs/evidence_trial_sizing.md`, decision queue); no lease, flag or trial is
+created by this work.
 
 ## Bybit terminal evidence and restart recovery (2026-10-07)
 
@@ -1335,6 +1375,18 @@ owner ask (safe-shaping directive above).
 
 Decisions waiting on the owner; agents must not act on these without an explicit OK
 (see `CLAUDE.md` Governance):
+
+- **Bybit source-trial sizing (2026-10-08, proposal only; see
+  `docs/evidence_trial_sizing.md`).** The immutable 3600 s lease cannot hold two
+  1800 s segments plus the observed ~15 s gap, the 2 s prepare wait and two
+  terminal reference/publication phases. Options: (A) a trial-scoped shorter
+  segment for the Bybit depth lane (1740 s keeps ~70 s worst-case margin; 1500 s
+  is comfortable), at the cost of that lane's ordinary run length during the
+  trial; (B) one admitted segment per trial, slot 2 held as the spare for a
+  rejected first claim; (C) a STANDARDS 4.16 contract change making the lease
+  length slots x segment plus a fixed overhead allowance (not implemented).
+  Any option still needs a fresh readiness check and an explicit activation
+  scope. This entry creates no lease, flag or trial.
 
 - ~~**Wallet-flow node backfill for the 2026-09-15..09-19 stall (2026-09-23 audit).**~~
   **DONE 2026-09-23 (owner OK: "Do tha back fill").** `--apply` with cold root I: and

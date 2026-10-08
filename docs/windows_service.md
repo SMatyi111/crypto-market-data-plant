@@ -242,3 +242,31 @@ partition at that moment may see the run vanish and reappear within seconds.
 ```powershell
 Unregister-ScheduledTask -TaskName CryptoMarketDataPlant -Confirm:$false
 ```
+
+## Reading optional-evidence diagnostics in ops results
+
+A `bybit-depth-worker` job can succeed while its optional session evidence
+fails. Its ops job result message then ends with
+`optional_evidence_unavailable=<tokens>` (up to eight distinct tokens, sorted).
+Since 2026-10-08 a failure inside the terminal publication window also names
+the call the writer was in. Before the record loop (claim, headroom probe,
+journal open): `terminal_stage_capture`. Record loop: `terminal_stage_queue_wait`,
+`terminal_stage_lease_check`, `terminal_stage_headroom`,
+`terminal_stage_journal_write`. After the sentinel: `terminal_stage_journal_fsync`,
+`terminal_stage_headroom`, `terminal_stage_lease_checkpoint`,
+`terminal_stage_raw_accounting`, `terminal_stage_manifest_encode`,
+`terminal_stage_manifest_write`, `terminal_stage_manifest_rename`.
+`writer_close_timeout` plus a stage token means the writer was still inside
+that stage when the two-second wait ended; `LeaseRefused` plus a stage token
+means the lease expired or refused during that stage; `OperationalError` plus a
+stage token is control-state contention with a concurrent claim (the slot is
+spent, the clock is not at fault). `writer_close_timeout` with
+`terminal_stage_manifest_rename` and an existing `manifest.json` means the
+rename syscall outlasted the wait: the manifest is valid if it verifies offline. A published
+`session_evidence/manifest.json` carries `terminal_timing_ms` per completed
+stage and `raw_accounting` (`streamed` or `reread`).
+
+Do not reset a lease, rebuild a manifest or restart the runner in response to
+these tokens. Inventory the run and verify it offline with
+`verify_session_evidence` / `verify_bybit_references`; a `manifest.tmp` without
+`manifest.json` is not a manifest.

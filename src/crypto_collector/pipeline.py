@@ -70,12 +70,15 @@ class CollectorPipeline:
             "fsync_interval_ms": fsync_interval_ms,
         }
         # Raw traffic is the fastest-growing file; rotate it so a long-running
-        # collector doesn't produce a single multi-GB messages.jsonl.
+        # collector doesn't produce a single multi-GB messages.jsonl. The streamed
+        # per-file account is opt-in and only the optional Bybit session-evidence
+        # lane pays for it (one SHA256 update per raw line).
         self.raw_sink = RotatingJsonlSink(
             run_paths.raw,
             "messages.jsonl",
             max_bytes=raw_rotate_bytes,
             fsync=jsonl_fsync,
+            ledger=getattr(collector, "session_evidence", None) is not None,
             **fsync_kwargs,
         )
         self.clean_sink = JsonlSink(run_paths.clean, "events.jsonl", fsync=jsonl_fsync, **fsync_kwargs)
@@ -206,6 +209,14 @@ class CollectorPipeline:
                         cleanup_error = cleanup_error or exc
                         logger.exception("pipeline shutdown: sink close failed")
             if evidence is not None:
+                # Hand over the raw sink's streamed account only now, after the sinks
+                # closed: terminal publication must not reread every raw file inside
+                # its bounded wait, and the account must describe closed files.
+                try:
+                    ledger = getattr(self.raw_sink, "ledger", None)
+                    evidence.attach_raw_ledger(ledger() if callable(ledger) else None)
+                except Exception:  # noqa: BLE001
+                    evidence._fail("raw_ledger_invalid")
                 if references is not None:
                     references.close(reason=reason, sinks_closed=cleanup_error is None)
                 else:
