@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
 
 import pyarrow.dataset as ds
+import pytest
 
 from crypto_collector.pipeline import CollectorPipeline
 from crypto_collector.quality import QualityGate
@@ -322,3 +324,54 @@ def test_parquet_dataset_sink_handles_optional_fields_across_batches(tmp_path: P
     rows = dataset.to_table().to_pylist()
     assert len(rows) == 2
     assert sorted(row["metadata"]["trade_id"] for row in rows) == ["1", "2"]
+
+
+@pytest.mark.parametrize("posture", ["per_event", "batched"])
+def test_rotating_jsonl_sink_ledger_matches_independent_reread(tmp_path: Path, posture: str) -> None:
+    kwargs = {} if posture == "per_event" else {"fsync_interval_events": 64, "fsync_interval_ms": 200.0}
+    sink = RotatingJsonlSink(tmp_path, "messages.jsonl", max_bytes=50, ledger=True, **kwargs)
+    for i in range(6):
+        sink.write({"i": i, "payload": "abcdef"})
+    before_close = sink.ledger()
+    assert before_close[-1]["closed"] is False and all(e["closed"] for e in before_close[:-1])
+    sink.close()
+    entries = sink.ledger()
+    assert len(entries) >= 2 and entries[-1]["path"].name == "messages.jsonl"
+    assert all(e["closed"] and e["fsynced"] for e in entries)
+    for entry in entries:
+        data = entry["path"].read_bytes()
+        assert entry["bytes"] == len(data) and entry["rows"] == data.count(b"\n")
+        assert entry["sha256"] == hashlib.sha256(data).hexdigest()
+    assert sorted(p.name for p in tmp_path.glob("messages*.jsonl")) == sorted(e["path"].name for e in entries)
+    assert sum(e["rows"] for e in entries) == 6
+
+
+def test_rotating_jsonl_sink_ledger_off_by_default_and_unavailable_for_preexisting_bytes(tmp_path: Path) -> None:
+    assert RotatingJsonlSink(tmp_path, "messages.jsonl").ledger() is None
+    (tmp_path / "messages.jsonl").write_text("{}\n", encoding="utf-8")
+    sink = RotatingJsonlSink(tmp_path, "messages.jsonl", ledger=True)
+    sink.write({"a": 1})
+    assert sink.ledger() is None  # the pre-existing prefix was never observed
+
+
+def test_rotating_jsonl_sink_ledger_buffered_close_is_not_durable(tmp_path: Path) -> None:
+    sink = RotatingJsonlSink(tmp_path, "messages.jsonl", fsync=False, ledger=True)
+    sink.write({"a": 1})
+    sink.close()
+    [entry] = sink.ledger()
+    assert entry["closed"] is True and entry["fsynced"] is False
+
+
+def test_rotating_jsonl_sink_ledger_follows_deferred_rotation(tmp_path: Path, monkeypatch) -> None:
+    sink = RotatingJsonlSink(tmp_path, "messages.jsonl", max_bytes=30, ledger=True,
+                             on_rotate_error="warn", rotate_retry_seconds=600.0)
+    def refuse(src, dst):
+        raise OSError("held open by another process")
+    monkeypatch.setattr(os, "replace", refuse)
+    for i in range(3):
+        sink.write({"i": i})
+    sink.close()
+    [entry] = sink.ledger()
+    data = (tmp_path / "messages.jsonl").read_bytes()
+    assert entry["path"].name == "messages.jsonl" and entry["rows"] == 3
+    assert entry["bytes"] == len(data) and entry["sha256"] == hashlib.sha256(data).hexdigest()

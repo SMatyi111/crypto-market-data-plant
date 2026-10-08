@@ -1,7 +1,17 @@
 # Data Standards
 
-`STANDARDS_VERSION = 18`
+`STANDARDS_VERSION = 19`
 
+> **v19 (2026-10-08, offline implementation; lane still disabled live):** the
+> optional Bybit evidence manifest adds `raw_accounting`, `terminal_wait_seconds`
+> and `terminal_timing_ms` (section 4.16, "Streamed raw accounting and terminal
+> stage diagnostics"). The `raw_files` hashes now come from the raw sink's
+> streamed account of the bytes it wrote, checked against the closed files'
+> sizes at terminal instead of rereading every raw file inside the two-second
+> publication wait; the offline verifier still rereads and rehashes every file.
+> `raw_files` shape, admission rules, raw/clean schemas, curation and replay
+> verdicts are unchanged. Earlier v1/v2 manifests remain readable.
+>
 > **v18 (2026-10-06):** the Hyperliquid wallet-flow lane also collects TWAP slice
 > fills from `userTwapSliceFills` (`raw_type="userTwapSliceFills"`), which
 > `userFillsByTime` never returns. `replay_wallet_flow_run` now orders per
@@ -1673,3 +1683,62 @@ success into an error or grant source admission. Immutable trial expiry is not
 extended to finish a second segment: 2 x 1800 seconds plus gaps/HTTP work cannot
 fit inside a 3600-second lease. Future capture sizing needs an explicit scope;
 these fixes do not renew any allowance or enable another capture.
+
+
+### Streamed raw accounting and terminal stage diagnostics (2026-10-08, v19)
+
+The October 8 v2 trial spent both slots with no manifest. Run 1 wrote its
+terminal record and three reference records, then failed `writer_close_timeout`;
+run 2 reached the immutable lease expiry before its terminal record. The
+retained token proved only that the shared two-second deadline failed. That
+window still held, in order: draining the queued records with per-line lease
+checks, the final journal fsync, a free-space probe, a durable control
+checkpoint (SQLite, `synchronous=FULL`), a full reread and SHA256 of every raw
+file (34 MB for run 1), manifest encoding, a second durable checkpoint, the tmp
+write and fsync, a third durable checkpoint and the rename. Which stage consumed
+the time on October 8 is not known and cannot be established from a present-day
+measurement (a warm reread of that raw file takes about 0.1 s today).
+
+Repair, limited to the default-off evidence lane; cadence, lease length,
+admission rules and economic gates unchanged:
+
+- **Streamed raw accounting.** With session evidence enabled, the raw
+  `RotatingJsonlSink` keeps a per-file account (path, bytes, rows, SHA256) of
+  the exact encoded bytes it hands to each file, marked closed at every roll
+  and at shutdown together with whether that close fsynced. The pipeline hands
+  the account to the evidence writer only after its sinks closed. Terminal
+  publication lists it as `raw_files` after checking that the files on disk
+  are exactly the account's files with exactly its sizes; a missing, truncated,
+  appended, extra or unclosed file becomes an issue (`raw_file_set_mismatch`,
+  `raw_size_mismatch`, `raw_sink_not_closed`), so the manifest is published but
+  not admitted. No raw file is reread inside the terminal window. The manifest
+  records `raw_accounting` (`mode` streamed or reread, `files_closed`,
+  `durable_close`). Library callers with a plain sink keep the legacy reread
+  (`mode: reread`). The account binds the manifest to what the producer wrote;
+  `verify_session_evidence` is unchanged and still independently rereads and
+  rehashes every raw file and the journal, so a disk edit after close is
+  refused either way. `durable_close` is false for a buffered
+  (`jsonl_fsync: false`) lane; it is recorded, not an admission gate.
+- **One durable checkpoint in the window.** Publication persists the control
+  high-water mark once ("at publication"), before manifest encoding. The
+  checks before the tmp write and before the rename are clock-only (no control
+  I/O) and still refuse an expired lease; a refusal is written durably. An
+  expiry observed before the tmp write creates no tmp file; one observed after
+  it leaves the bounded tmp and no manifest, as before.
+- **Stage diagnostics.** The writer names its terminal stage: `drain`,
+  `journal_fsync`, `headroom`, `lease_checkpoint`, `raw_accounting`,
+  `manifest_encode`, `manifest_write`, `manifest_rename`. On the two-second
+  timeout or a terminal-stage exception it logs one extra bounded token,
+  `terminal_stage_<stage>`, which the existing ops harvesting retains next to
+  the failure reason (for example
+  `optional_evidence_unavailable=terminal_stage_raw_accounting,writer_close_timeout`).
+  A published manifest records `terminal_wait_seconds` (2) and
+  `terminal_timing_ms` for the stages completed before encoding. No payload,
+  path or arbitrary log line is forwarded, and the only per-frame cost is one
+  SHA256 update per raw line on this lane.
+
+The remaining terminal work is the queue drain, one journal fsync, one
+free-space probe, one control checkpoint, a glob plus one `stat` per raw file,
+the manifest write/fsync and the rename. A kernel-level stall in any of these
+still refuses evidence, now with its stage named. Missing manifests from past
+runs are never rebuilt; the two spent trials stay 0/2 admitted.

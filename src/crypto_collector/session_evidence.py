@@ -22,6 +22,11 @@ ENDPOINT = "wss://stream.bybit.com/v5/public/linear"
 TOPIC = "orderbook.50.BTCUSDT"
 VERSION = 1
 TICKER = "tickers.BTCUSDT"
+# Bounded terminal wait for the writer; the manifest records it. Stages of that
+# window (`terminal_stage_*` tokens, `terminal_timing_ms`), in order: drain,
+# journal_fsync, headroom, lease_checkpoint, raw_accounting, manifest_encode,
+# manifest_write, manifest_rename.
+TERMINAL_WAIT_SECONDS = 2
 _WRITER_SLOT = threading.BoundedSemaphore(1)
 
 
@@ -59,6 +64,9 @@ class SessionEvidence:
 
     Terminal publication waits at most two seconds for that writer. An unavailable
     sink or timeout refuses evidence instead of interrupting legacy market writes.
+    Raw file hashes come from the sink's streamed account of the bytes it wrote
+    (checked against the closed files' sizes), never from rereading raw files
+    inside that window; the offline verifier still rehashes everything.
     """
 
     def __init__(self, root: Path, *, max_bytes=DEFAULT_MAX_BYTES, queue_bytes=1024**2,
@@ -100,6 +108,15 @@ class SessionEvidence:
         self._thread = None
         self._finished = False
         self._journal_info = None
+        self._raw_ledger = None
+        # Terminal-window stage bookkeeping (writer thread; `finish` only reads the
+        # current stage name). `_terminal_stage_hook` is a test seam for
+        # deterministic stalls/faults at an exact stage; production leaves it None.
+        self._stage = "capture"
+        self._stage_started = None
+        self._stage_ms: dict[str, int] = {}
+        self._stage_reported = False
+        self._terminal_stage_hook = None
         try:
             if not self.lease:
                 self.directory.mkdir(exist_ok=False)
@@ -121,8 +138,39 @@ class SessionEvidence:
             self.error = reason
             logger.warning("session evidence unavailable: %s", reason)
 
+    def _report_stage(self) -> None:
+        # One bounded token naming the terminal stage that stalled or raised. The ops
+        # runner retains it next to the failure reason; no payload, path or timing.
+        if not self._stage_reported:
+            self._stage_reported = True
+            logger.warning("session evidence unavailable: terminal_stage_%s", self._stage)
+
+    def _enter_stage(self, stage: str) -> None:
+        now = time.monotonic()
+        if self._stage_started is not None:
+            self._stage_ms[self._stage] = int((now - self._stage_started) * 1000)
+        self._stage, self._stage_started = stage, now
+        if self._terminal_stage_hook is not None:
+            self._terminal_stage_hook(stage)
+
     def issue(self, reason: str) -> None:
         self.issues.add(reason)
+
+    def attach_raw_ledger(self, entries) -> None:
+        """Streamed raw-file account from the closed raw sink, or None for the
+        legacy reread. Called by the pipeline after its sinks closed, before finish."""
+        if entries is None:
+            self._raw_ledger = None
+            return
+        ledger = []
+        for entry in entries:
+            if (not isinstance(entry.get("path"), Path) or type(entry.get("bytes")) is not int
+                    or type(entry.get("rows")) is not int or entry["bytes"] < 0 or entry["rows"] < 0
+                    or not isinstance(entry.get("sha256"), str) or len(entry["sha256"]) != 64
+                    or type(entry.get("closed")) is not bool or type(entry.get("fsynced")) is not bool):
+                raise ValueError("Invalid raw ledger entry")
+            ledger.append(dict(entry))
+        self._raw_ledger = ledger
 
     def event(self, kind: str, *, clock=None, **fields) -> int:
         if self.error or self._finished:
@@ -225,6 +273,7 @@ class SessionEvidence:
                         synced = time.monotonic()
                     with self._lock:
                         self._queued -= len(line)
+                self._enter_stage("journal_fsync")
                 stream.flush()
                 os.fsync(stream.fileno())
             # Only publish this accounting after the journal has closed. Avoid
@@ -233,10 +282,13 @@ class SessionEvidence:
             self._journal_info = {"path": "session_evidence/events.jsonl",
                                   "bytes": written_bytes, "rows": count,
                                   "sha256": journal_hash.hexdigest()}
+            self._enter_stage("headroom")
             if self._check_headroom(written_bytes):
                 self._publish()
         except Exception as exc:
             self._fail(type(exc).__name__)
+            if self._finished:
+                self._report_stage()
         finally:
             self.ready.set()
             if self.lease:
@@ -322,24 +374,65 @@ class SessionEvidence:
         self.event("terminal", reason=reason, sinks_closed=sinks_closed)
         self._finished = True
         self._reason, self._sinks_closed = reason, sinks_closed
-        self._publish_deadline = time.monotonic() + 2
+        # The writer only advances the stage from here on; `drain` covers queued
+        # records, their per-line lease checks, flushes and batched fsyncs.
+        self._stage, self._stage_started = "drain", time.monotonic()
+        self._publish_deadline = self._stage_started + TERMINAL_WAIT_SECONDS
         if self._thread is not None and self._thread.ident is not None:
             self._queue.put_nowait(None)
-            self._thread.join(timeout=2)
+            self._thread.join(timeout=TERMINAL_WAIT_SECONDS)
             if self._thread.is_alive():
                 self._fail("writer_close_timeout")
+                self._report_stage()
+
+    def _raw_accounting(self) -> tuple[list[dict], dict]:
+        """Per-file {path, bytes, rows, sha256} plus how it was obtained.
+
+        Streamed: the sink's account of the exact bytes it wrote, each file checked
+        against its size on disk after the sink closed it. Mismatches (a missing,
+        truncated, appended or unclosed file) are issues, so the manifest is not
+        admitted, and the offline verifier rereads and rehashes every file anyway.
+        Without an account (library callers with a plain sink) the legacy reread runs.
+        """
+        files = raw_files(self.root)
+        ledger = self._raw_ledger
+        if ledger is None:
+            return [file_info(p, self.root) for p in files], {"mode": "reread"}
+        accounting = {"mode": "streamed",
+                      "files_closed": all(e["closed"] for e in ledger),
+                      "durable_close": bool(ledger) and all(e["fsynced"] for e in ledger)}
+        if [os.path.normcase(str(e["path"])) for e in ledger] != [os.path.normcase(str(p)) for p in files]:
+            self.issue("raw_file_set_mismatch")
+        if not accounting["files_closed"]:
+            self.issue("raw_sink_not_closed")
+        infos = []
+        for entry in ledger:
+            try:
+                size = entry["path"].stat().st_size
+            except OSError:
+                size = None
+            if size != entry["bytes"]:
+                self.issue("raw_size_mismatch")
+            infos.append({"path": entry["path"].relative_to(self.root).as_posix(),
+                          "bytes": entry["bytes"], "rows": entry["rows"], "sha256": entry["sha256"]})
+        return infos, accounting
 
     def _publish(self) -> None:
         # Runs only on the daemon writer, after journal close and all market sinks
         # close. A process-wide slot prevents stuck writers accumulating per run.
         if self.error:
             return
-        if self.lease:
-            self.lease.check(checkpoint=True)
-        files = [file_info(p, self.root) for p in raw_files(self.root)]
         journal = self._journal_info
         if journal is None:
             raise ValueError("Journal not closed")
+        # The single durable control checkpoint of the terminal window ("at
+        # publication"); later checks are clock-only until the rename.
+        self._enter_stage("lease_checkpoint")
+        if self.lease:
+            self.lease.check(checkpoint=True)
+        self._enter_stage("raw_accounting")
+        files, accounting = self._raw_accounting()
+        self._enter_stage("manifest_encode")
         if self.book_received != self.raw_count:
             self.issue("unpersisted_book_frames")
         if sum(f["rows"] for f in files) != self.raw_count:
@@ -357,9 +450,10 @@ class SessionEvidence:
                                         "disk_check_bytes": DISK_CHECK_BYTES,
                                         "disk_check_count": self._disk_checks,
                                         "initial_free_bytes": self._initial_free,
-                                        "last_free_bytes": self._last_free}}
-        # Check again AFTER potentially blocking file I/O/fsync. Never rename a
-        # timed-out preparation into a terminal manifest. A leftover tmp is refused.
+                                        "last_free_bytes": self._last_free},
+                    "raw_accounting": accounting,
+                    "terminal_wait_seconds": TERMINAL_WAIT_SECONDS,
+                    "terminal_timing_ms": dict(self._stage_ms)}
         if self.lease:
             manifest["evidence_lease"] = self.lease.receipt()
         payload = (json.dumps(manifest, indent=2) + "\n").encode("utf-8")
@@ -368,21 +462,25 @@ class SessionEvidence:
             if len(payload) > MANIFEST_BYTES:
                 self._fail("metadata_cap")
                 return
-            self.lease.check(checkpoint=True)
+        self._enter_stage("manifest_write")
+        if self.lease:
+            self.lease.verify_clock()  # expiry seen during accounting creates no tmp
         tmp = self.directory / "manifest.tmp"
         with tmp.open("xb") as stream:
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
-        if self.error or time.monotonic() > self._publish_deadline:
-            self._fail("writer_close_timeout")
-            return
+        # Check again AFTER potentially blocking file I/O/fsync. Never rename a
+        # timed-out preparation into a terminal manifest. A leftover tmp is refused.
+        self._enter_stage("manifest_rename")
         if self.lease:
-            self.lease.check(checkpoint=True)
+            self.lease.verify_clock()
         if self.error or time.monotonic() > self._publish_deadline:
             self._fail("writer_close_timeout")
+            self._report_stage()
             return
         tmp.replace(self.directory / "manifest.json")
+        self._enter_stage("published")
 
 
 def verify_session_evidence(root: Path) -> dict:

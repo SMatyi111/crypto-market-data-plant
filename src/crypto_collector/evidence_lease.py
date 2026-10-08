@@ -183,6 +183,19 @@ class EvidenceLease:
             finally:
                 conn.close()
 
+    def verify_clock(self):
+        """Expiry/reversal check with no control-state I/O unless it refuses.
+
+        Terminal publication calls this after each blocking file operation so a
+        stall cannot authorize a manifest past the deadline, without adding another
+        durable checkpoint (and its fsyncs) to the bounded terminal window.
+        """
+        if self.writer is None:
+            raise LeaseRefused("lease_not_claimed")
+        now, mono = time.time(), time.monotonic()
+        self._check_clock(now, mono)
+        self.last_clock = now, mono
+
     def check(self, *, checkpoint=False):
         if self.writer is None:
             raise LeaseRefused("lease_not_claimed")

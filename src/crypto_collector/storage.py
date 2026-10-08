@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -185,6 +186,7 @@ class RotatingJsonlSink:
         max_files: int | None = None,
         on_rotate_error: str = "raise",
         rotate_retry_seconds: float = 600.0,
+        ledger: bool = False,
     ) -> None:
         """`max_files` (retention): after each roll, prune the oldest numbered parts
         so at most that many remain. None (default) keeps everything - the raw
@@ -192,7 +194,14 @@ class RotatingJsonlSink:
         failed roll (Windows: another process holding the active file blocks the
         rename) non-fatal: the sink keeps appending to the active file, logs one
         warning, and retries after `rotate_retry_seconds`. The default "raise"
-        preserves the collectors' fail-loud posture."""
+        preserves the collectors' fail-loud posture.
+
+        `ledger=True` (opt-in, used only by the Bybit session-evidence lane) keeps a
+        per-file SHA256/byte/row account of the exact encoded bytes handed to each
+        file as they are written, so a terminal manifest does not have to reread
+        every raw file. See `ledger()`. It is unavailable (None) when the active
+        file already held bytes at construction, because that prefix was never
+        observed by this sink."""
         self.root = root
         self.filename = filename
         self.max_bytes = max(1, int(max_bytes))
@@ -222,10 +231,36 @@ class RotatingJsonlSink:
         self._current_bytes = (
             self._active_path.stat().st_size if self._active_path.exists() else 0
         )
+        # Streamed per-file accounting (see the docstring). Entries are appended in
+        # write order; the last entry is the active file until a roll renames it.
+        self._ledger: list[dict[str, Any]] | None = (
+            [] if ledger and self._current_bytes == 0 else None
+        )
 
     @property
     def path(self) -> Path:
         return self._active_path
+
+    def _ledger_entry(self) -> dict[str, Any] | None:
+        if self._ledger is None:
+            return None
+        if not self._ledger or self._ledger[-1]["closed"]:
+            self._ledger.append({"path": self._active_path, "bytes": 0, "rows": 0,
+                                 "sha256": hashlib.sha256(), "closed": False,
+                                 "fsynced": False})
+        return self._ledger[-1]
+
+    def ledger(self) -> list[dict[str, Any]] | None:
+        """Snapshot of the streamed per-file account, chronological, or None when
+        the account is unavailable. `bytes`/`rows`/`sha256` describe exactly the
+        encoded bytes this sink handed to each file; `closed` means this sink has
+        closed that handle (a roll or `close()`), `fsynced` that the close fsynced.
+        It is an account of what was written, not a reread of the disk."""
+        if self._ledger is None:
+            return None
+        return [{"path": e["path"], "bytes": e["bytes"], "rows": e["rows"],
+                 "sha256": e["sha256"].hexdigest(), "closed": e["closed"],
+                 "fsynced": e["fsynced"]} for e in self._ledger]
 
     def write(self, row: dict[str, Any]) -> None:
         encoded = (json.dumps(row, sort_keys=True) + "\n").encode("utf-8")
@@ -259,6 +294,11 @@ class RotatingJsonlSink:
                     handle.flush()
                     self._pending_writes = 0
         self._current_bytes += len(encoded)
+        entry = self._ledger_entry()
+        if entry is not None:
+            entry["sha256"].update(encoded)
+            entry["bytes"] += len(encoded)
+            entry["rows"] += 1
 
     def _should_fsync(self) -> bool:
         if self._fsync_pending >= self._fsync_interval_events:
@@ -290,7 +330,13 @@ class RotatingJsonlSink:
             logger.warning(
                 "rotation of %s deferred %.0f s: %s", self._active_path, self._rotate_retry_seconds, exc
             )
+            if self._ledger:
+                # The closed handle reopens on the same (oversized) active file, so the
+                # account keeps extending that file rather than starting a new part.
+                self._ledger[-1]["closed"] = self._ledger[-1]["fsynced"] = False
             return
+        if self._ledger:
+            self._ledger[-1]["path"] = rotated_path
         self._part_index += 1
         self._current_bytes = 0
         self._prune_rotated()
@@ -338,6 +384,10 @@ class RotatingJsonlSink:
             self._handle = None
             self._pending_writes = 0
             self._fsync_pending = 0
+        if self._ledger:
+            # Per-event fsync mode never holds a handle, yet every line was fsynced.
+            self._ledger[-1]["closed"] = True
+            self._ledger[-1]["fsynced"] = bool(self._fsync)
 
     def _discover_next_part_index(self) -> int:
         parts = self._rotated_parts()
