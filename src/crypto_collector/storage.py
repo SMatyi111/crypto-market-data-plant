@@ -206,6 +206,9 @@ class RotatingJsonlSink:
         self.filename = filename
         self.max_bytes = max(1, int(max_bytes))
         self.max_files = None if max_files is None else max(1, int(max_files))
+        if ledger and self.max_files is not None:
+            # Pruned parts would leave account entries no file can reconcile with.
+            raise ValueError("A streamed ledger cannot be combined with max_files retention")
         if on_rotate_error not in {"raise", "warn"}:
             raise ValueError(f"on_rotate_error must be 'raise' or 'warn', got {on_rotate_error!r}")
         self._on_rotate_error = on_rotate_error

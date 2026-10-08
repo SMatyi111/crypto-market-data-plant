@@ -183,26 +183,37 @@ class EvidenceLease:
             finally:
                 conn.close()
 
-    def verify_clock(self):
-        """Expiry/reversal check with no control-state I/O unless it refuses.
-
-        Terminal publication calls this after each blocking file operation so a
-        stall cannot authorize a manifest past the deadline, without adding another
-        durable checkpoint (and its fsyncs) to the bounded terminal window.
-        """
+    def _observe_clock(self):
+        # Writer thread only. Producer consults remaining() without I/O.
         if self.writer is None:
             raise LeaseRefused("lease_not_claimed")
         now, mono = time.time(), time.monotonic()
         self._check_clock(now, mono)
         self.last_clock = now, mono
+        return now, mono
+
+    def verify_clock(self, *, control=False):
+        """Expiry/reversal check without a durable checkpoint (no fsync).
+
+        Terminal publication calls this after blocking file I/O so a stall cannot
+        authorize a manifest past the deadline. `control=True` additionally reads
+        the trial row (read-only, no commit) and refuses a trial that another
+        process has durably stopped meanwhile, which the former checkpoint did.
+        """
+        self._observe_clock()
+        if control:
+            conn = _connect(self.directory)
+            try:
+                row = conn.execute("SELECT stopped FROM trial WHERE id=?", (self.trial_id,)).fetchone()
+            finally:
+                conn.close()
+            if row is None:
+                raise LeaseRefused("lease_clock_or_missing")
+            if row[0] is not None:
+                raise LeaseRefused("lease_stopped")
 
     def check(self, *, checkpoint=False):
-        if self.writer is None:
-            raise LeaseRefused("lease_not_claimed")
-        now, mono = time.time(), time.monotonic()
-        self._check_clock(now, mono)
-        # Used on writer thread only. Producer consults remaining() without I/O.
-        self.last_clock = now, mono
+        now, mono = self._observe_clock()
         if checkpoint or mono - self.last_checkpoint >= 1:
             conn = _connect(self.directory)
             try:

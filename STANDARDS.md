@@ -2,7 +2,7 @@
 
 `STANDARDS_VERSION = 19`
 
-> **v19 (2026-10-08, offline implementation; lane still disabled live):** the
+> **v19 (2026-10-08, offline implementation; live flags still point at a spent lease):** the
 > optional Bybit evidence manifest adds `raw_accounting`, `terminal_wait_seconds`
 > and `terminal_timing_ms` (section 4.16, "Streamed raw accounting and terminal
 > stage diagnostics"). The `raw_files` hashes now come from the raw sink's
@@ -1719,26 +1719,35 @@ admission rules and economic gates unchanged:
   rehashes every raw file and the journal, so a disk edit after close is
   refused either way. `durable_close` is false for a buffered
   (`jsonl_fsync: false`) lane; it is recorded, not an admission gate.
-- **One durable checkpoint in the window.** Publication persists the control
-  high-water mark once ("at publication"), before manifest encoding. The
-  checks before the tmp write and before the rename are clock-only (no control
-  I/O) and still refuse an expired lease; a refusal is written durably. An
-  expiry observed before the tmp write creates no tmp file; one observed after
-  it leaves the bounded tmp and no manifest, as before.
-- **Stage diagnostics.** The writer names its terminal stage: `drain`,
+- **One durable checkpoint after the drain.** Publication persists the control
+  high-water mark once ("at publication"), before manifest encoding. The drain
+  keeps the per-line lease check, which itself checkpoints at most once more if
+  a second has passed since the last one. The check before the tmp write is
+  clock-only (no control I/O); the check before the rename is clock plus a
+  read-only control read (no commit, no fsync) that also refuses a trial another
+  process has durably stopped meanwhile. Both still refuse an expired lease, and
+  a refusal is written durably. An expiry observed before the tmp write creates
+  no tmp file; one observed after it leaves the bounded tmp and no manifest.
+- **Stage diagnostics.** The writer names where it is. Inside the record loop:
+  `queue_wait`, `lease_check`, `headroom`, `journal_write`; after the sentinel:
   `journal_fsync`, `headroom`, `lease_checkpoint`, `raw_accounting`,
   `manifest_encode`, `manifest_write`, `manifest_rename`. On the two-second
   timeout or a terminal-stage exception it logs one extra bounded token,
   `terminal_stage_<stage>`, which the existing ops harvesting retains next to
   the failure reason (for example
   `optional_evidence_unavailable=terminal_stage_raw_accounting,writer_close_timeout`).
-  A published manifest records `terminal_wait_seconds` (2) and
-  `terminal_timing_ms` for the stages completed before encoding. No payload,
-  path or arbitrary log line is forwarded, and the only per-frame cost is one
-  SHA256 update per raw line on this lane.
+  A writer already blocked before `finish()` (for example in a per-line lease
+  checkpoint) is named by that call, not as a drain. A rename that completes
+  inside the wait is a manifest, not a timeout (`published` marks it and is never
+  a failure token). A published manifest records `terminal_wait_seconds` (2) and
+  `terminal_timing_ms`: `drain` (from `finish()` to the sentinel) and the stages
+  completed before encoding. No payload, path or arbitrary log line is
+  forwarded, and the only per-frame cost is one SHA256 update per raw line on
+  this lane.
 
-The remaining terminal work is the queue drain, one journal fsync, one
-free-space probe, one control checkpoint, a glob plus one `stat` per raw file,
-the manifest write/fsync and the rename. A kernel-level stall in any of these
+The remaining terminal work is the queue drain (with at most one more per-line
+checkpoint), one journal fsync, one free-space probe, one control checkpoint, a
+glob plus one `stat` per raw file, the manifest write/fsync, one read-only
+control read and the rename. A kernel-level stall in any of these
 still refuses evidence, now with its stage named. Missing manifests from past
 runs are never rebuilt; the two spent trials stay 0/2 admitted.

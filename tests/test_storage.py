@@ -375,3 +375,8 @@ def test_rotating_jsonl_sink_ledger_follows_deferred_rotation(tmp_path: Path, mo
     data = (tmp_path / "messages.jsonl").read_bytes()
     assert entry["path"].name == "messages.jsonl" and entry["rows"] == 3
     assert entry["bytes"] == len(data) and entry["sha256"] == hashlib.sha256(data).hexdigest()
+
+
+def test_rotating_jsonl_sink_ledger_refuses_retention_pruning(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="max_files"):
+        RotatingJsonlSink(tmp_path, "messages.jsonl", ledger=True, max_files=3)

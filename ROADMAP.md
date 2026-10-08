@@ -39,8 +39,9 @@ forbids any raw reread at terminal fails on the pre-repair tree and passes now.
 Repair (STANDARDS v19, default-off lane; cadence, lease length, admission and
 economic gates unchanged): the raw sink keeps a streamed per-file account of the
 bytes it wrote; terminal publication checks it against the closed files' names
-and sizes instead of rereading; exactly one durable control checkpoint remains
-in the window (clock-only checks after file I/O); the writer names its stage,
+and sizes instead of rereading; after the drain exactly one durable control
+checkpoint remains (clock-only and read-only checks after file I/O, which still
+refuse an expired or externally stopped trial); the writer names its stage,
 so a failure retains `terminal_stage_<stage>` next to the reason in the ops job
 result, and a published manifest records per-stage timings. The offline
 verifier is unchanged and still rereads and rehashes everything; synthetic
@@ -49,10 +50,14 @@ end-to-end sessions (lease + references + admission) pass, and tamper negatives
 tmp-only manifest) refuse. Stage stalls, expiry during terminal I/O, writer-slot
 release and second-segment continuation are tested with events, not sleeps.
 
-**Merged is not deployed**, and nothing needs a restart for this change: the
-evidence flags stay disabled in the live config. Trial sizing is a reviewable
-proposal only (`docs/evidence_trial_sizing.md`, decision queue); no lease, flag
-or trial is created by this work.
+**Merged is not deployed.** The live config still carries both evidence flags
+pointed at the spent v2 lease, so every Bybit depth segment claims, is refused
+(`LeaseRefused`) and collects ordinarily; this change does not alter that. Once
+the live checkout is pulled, collector subprocesses pick the new code up at
+their next segment without a runner restart (the in-runner ops harvesting is
+unchanged). Trial sizing is a reviewable proposal only
+(`docs/evidence_trial_sizing.md`, decision queue); no lease, flag or trial is
+created by this work.
 
 ## Bybit terminal evidence and restart recovery (2026-10-07)
 

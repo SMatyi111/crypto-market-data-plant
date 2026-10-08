@@ -249,10 +249,12 @@ A `bybit-depth-worker` job can succeed while its optional session evidence
 fails. Its ops job result message then ends with
 `optional_evidence_unavailable=<tokens>` (up to eight distinct tokens, sorted).
 Since 2026-10-08 a failure inside the terminal publication window also names
-the stage the writer was in: `terminal_stage_drain`, `terminal_stage_journal_fsync`,
+the call the writer was in. Record loop: `terminal_stage_queue_wait`,
+`terminal_stage_lease_check`, `terminal_stage_headroom`,
+`terminal_stage_journal_write`. After the sentinel: `terminal_stage_journal_fsync`,
 `terminal_stage_headroom`, `terminal_stage_lease_checkpoint`,
 `terminal_stage_raw_accounting`, `terminal_stage_manifest_encode`,
-`terminal_stage_manifest_write` or `terminal_stage_manifest_rename`.
+`terminal_stage_manifest_write`, `terminal_stage_manifest_rename`.
 `writer_close_timeout` plus a stage token means the writer was still inside
 that stage when the two-second wait ended; `LeaseRefused` plus a stage token
 means the lease expired or refused during that stage. A published

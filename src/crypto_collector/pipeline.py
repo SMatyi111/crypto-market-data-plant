@@ -215,8 +215,8 @@ class CollectorPipeline:
                 try:
                     ledger = getattr(self.raw_sink, "ledger", None)
                     evidence.attach_raw_ledger(ledger() if callable(ledger) else None)
-                except Exception as exc:  # noqa: BLE001
-                    evidence._fail(type(exc).__name__)
+                except Exception:  # noqa: BLE001
+                    evidence._fail("raw_ledger_invalid")
                 if references is not None:
                     references.close(reason=reason, sinks_closed=cleanup_error is None)
                 else:

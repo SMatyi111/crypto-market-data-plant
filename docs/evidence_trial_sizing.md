@@ -112,8 +112,10 @@ Inventory every claim, including rejected ones, as the trial's denominator.
 
 ## Readiness checklist before any activation scope
 
-1. v19 merged and the live checkout on it (the lane stays disabled; no restart
-   is needed for the code alone, but option A's config change needs one).
+1. v19 merged and the live checkout pulled (collector subprocesses pick the
+   code up at their next segment; the live flags currently point at the spent
+   v2 lease and are refused each segment; option A's config change and any new
+   lease path need the reviewed config path and a runner restart).
 2. Fresh plant health OK, free space above floor + 1040 MiB.
 3. A new control directory with a new trial ID, prepared by the operator
    command; the October 7 and 8 directories untouched.

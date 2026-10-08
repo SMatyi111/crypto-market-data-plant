@@ -22,10 +22,13 @@ ENDPOINT = "wss://stream.bybit.com/v5/public/linear"
 TOPIC = "orderbook.50.BTCUSDT"
 VERSION = 1
 TICKER = "tickers.BTCUSDT"
-# Bounded terminal wait for the writer; the manifest records it. Stages of that
-# window (`terminal_stage_*` tokens, `terminal_timing_ms`), in order: drain,
+# Bounded terminal wait for the writer; the manifest records it. The writer
+# names where it is (`terminal_stage_*` token on failure): inside the record
+# loop queue_wait, lease_check, headroom, journal_write; after the sentinel
 # journal_fsync, headroom, lease_checkpoint, raw_accounting, manifest_encode,
-# manifest_write, manifest_rename.
+# manifest_write, manifest_rename; `published` marks a completed rename and is
+# never reported as a failure. `terminal_timing_ms` adds `drain` (finish() to
+# the sentinel) and the completed stages before manifest encoding.
 TERMINAL_WAIT_SECONDS = 2
 _WRITER_SLOT = threading.BoundedSemaphore(1)
 
@@ -114,6 +117,7 @@ class SessionEvidence:
         # deterministic stalls/faults at an exact stage; production leaves it None.
         self._stage = "capture"
         self._stage_started = None
+        self._finish_started = None
         self._stage_ms: dict[str, int] = {}
         self._stage_reported = False
         self._terminal_stage_hook = None
@@ -141,9 +145,12 @@ class SessionEvidence:
     def _report_stage(self) -> None:
         # One bounded token naming the terminal stage that stalled or raised. The ops
         # runner retains it next to the failure reason; no payload, path or timing.
-        if not self._stage_reported:
+        with self._lock:
+            if self._stage_reported or self._stage == "published":
+                return
             self._stage_reported = True
-            logger.warning("session evidence unavailable: terminal_stage_%s", self._stage)
+            stage = self._stage
+        logger.warning("session evidence unavailable: terminal_stage_%s", stage)
 
     def _enter_stage(self, stage: str) -> None:
         now = time.monotonic()
@@ -247,22 +254,32 @@ class SessionEvidence:
                 written_bytes = checked_bytes = 0
                 journal_hash = hashlib.sha256()
                 while True:
+                    # Plain stage markers (no hook, no timing) so a stall inside
+                    # this loop is named by the call it is in, even when finish()
+                    # arrives while the writer is already blocked here.
                     if self.lease:
+                        self._stage = "lease_check"
                         self.lease.check()
+                    self._stage = "queue_wait"
                     try:
                         line = self._queue.get(timeout=0.25)
                     except queue.Empty:
                         continue
                     if line is None:
+                        if self._finish_started is not None:
+                            self._stage_ms["drain"] = int((time.monotonic() - self._finish_started) * 1000)
                         break
                     if self.error:
                         return
                     if written_bytes - checked_bytes + len(line) >= DISK_CHECK_BYTES:
+                        self._stage = "headroom"
                         if not self._check_headroom(written_bytes):
                             return
                         checked_bytes = written_bytes
                     if self.lease:
+                        self._stage = "lease_check"
                         self.lease.check()
+                    self._stage = "journal_write"
                     stream.write(line)
                     journal_hash.update(line)
                     written_bytes += len(line)
@@ -374,14 +391,16 @@ class SessionEvidence:
         self.event("terminal", reason=reason, sinks_closed=sinks_closed)
         self._finished = True
         self._reason, self._sinks_closed = reason, sinks_closed
-        # The writer only advances the stage from here on; `drain` covers queued
-        # records, their per-line lease checks, flushes and batched fsyncs.
-        self._stage, self._stage_started = "drain", time.monotonic()
-        self._publish_deadline = self._stage_started + TERMINAL_WAIT_SECONDS
+        # The writer alone names its stage; this thread only records when the
+        # terminal wait began so the writer can report the drain duration.
+        self._finish_started = time.monotonic()
+        self._publish_deadline = self._finish_started + TERMINAL_WAIT_SECONDS
         if self._thread is not None and self._thread.ident is not None:
             self._queue.put_nowait(None)
             self._thread.join(timeout=TERMINAL_WAIT_SECONDS)
-            if self._thread.is_alive():
+            if self._thread.is_alive() and self._stage != "published":
+                # A rename completed inside the wait is a manifest; only the
+                # writer's slot/lease release is still pending in that case.
                 self._fail("writer_close_timeout")
                 self._report_stage()
 
@@ -425,8 +444,9 @@ class SessionEvidence:
         journal = self._journal_info
         if journal is None:
             raise ValueError("Journal not closed")
-        # The single durable control checkpoint of the terminal window ("at
-        # publication"); later checks are clock-only until the rename.
+        # The single durable checkpoint after the drain ("at publication"); the
+        # drain's per-line check may itself have checkpointed once if a second
+        # had passed. Later checks are clock-only or read-only until the rename.
         self._enter_stage("lease_checkpoint")
         if self.lease:
             self.lease.check(checkpoint=True)
@@ -474,7 +494,7 @@ class SessionEvidence:
         # timed-out preparation into a terminal manifest. A leftover tmp is refused.
         self._enter_stage("manifest_rename")
         if self.lease:
-            self.lease.verify_clock()
+            self.lease.verify_clock(control=True)
         if self.error or time.monotonic() > self._publish_deadline:
             self._fail("writer_close_timeout")
             self._report_stage()
