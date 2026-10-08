@@ -368,14 +368,23 @@ def test_stall_inside_record_loop_is_named_by_its_call(directory, tmp_path, monk
     paths, pipeline, evidence, _ = setup(tmp_path / "data", monkeypatch, [[ACK, book()]],
         max_bytes=MAX_BYTES, lease_directory=directory, trial_id="offline-test")
     assert evidence.ready.wait(2)
-    release, entered = threading.Event(), threading.Event()
+    release, entered, terminal_seen = threading.Event(), threading.Event(), threading.Event()
+    real_get = evidence._queue.get
+    def watching_get(*args, **kwargs):
+        line = real_get(*args, **kwargs)
+        if line is not None and b'"kind":"terminal"' in line:
+            terminal_seen.set()  # the next per-line lease check is inside the drain
+        return line
+    monkeypatch.setattr(evidence._queue, "get", watching_get)
     real_check = evidence.lease.check
     def blocking_check(*args, **kwargs):
-        if evidence._finished and not entered.is_set():
+        if terminal_seen.is_set() and not entered.is_set():
             entered.set()
             release.wait(10)
         return real_check(*args, **kwargs)
     monkeypatch.setattr(evidence.lease, "check", blocking_check)
+    real_join = evidence._thread.join
+    monkeypatch.setattr(evidence._thread, "join", lambda timeout=None: (entered.wait(10), real_join(timeout))[1])
     try:
         with caplog.at_level(logging.WARNING, logger="crypto_collector.session_evidence"):
             assert asyncio.run(pipeline.run(limit=1)).raw_messages == 1
@@ -403,4 +412,21 @@ def test_trial_stopped_by_another_process_cannot_be_published(directory, tmp_pat
     assert asyncio.run(pipeline.run(limit=1)).raw_messages == 1
     assert evidence.error == "LeaseRefused"
     assert (paths.base / "session_evidence/manifest.tmp").is_file()
+    assert not (paths.base / "session_evidence/manifest.json").exists()
+
+
+def test_clock_behind_another_process_high_water_cannot_be_published(directory, tmp_path, monkeypatch):
+    """The read-only control read before the rename keeps the former checkpoint's
+    cross-process reversal refusal: a persisted last_utc ahead of this writer's
+    clock refuses the manifest."""
+    paths, pipeline, evidence, _ = setup(tmp_path / "data", monkeypatch, [[ACK, book()]],
+        max_bytes=MAX_BYTES, lease_directory=directory, trial_id="offline-test")
+    assert evidence.ready.wait(2)
+    def hook(stage):
+        if stage == "manifest_rename":
+            with sqlite3.connect(directory / "lease.sqlite3") as conn:
+                conn.execute("UPDATE trial SET last_utc=last_utc+3600")
+    evidence._terminal_stage_hook = hook
+    assert asyncio.run(pipeline.run(limit=1)).raw_messages == 1
+    assert evidence.error == "LeaseRefused"
     assert not (paths.base / "session_evidence/manifest.json").exists()

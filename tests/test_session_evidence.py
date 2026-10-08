@@ -281,7 +281,18 @@ def stall_at(evidence, stage):
             entered.set()
             release.wait(10)
     evidence._terminal_stage_hook = hook
+    gate_join_on(evidence, entered)
     return release, entered
+
+
+def gate_join_on(evidence, entered):
+    """The caller's bounded join starts only once the writer has arrived at the
+    stalled stage, so a slow CI disk cannot expire the wait in an earlier stage."""
+    real_join = evidence._thread.join
+    def join(timeout=None):
+        entered.wait(10)
+        return real_join(timeout)
+    evidence._thread.join = join
 
 
 def test_raw_reread_is_outside_terminal_window(tmp_path, monkeypatch):
@@ -333,6 +344,7 @@ def test_stalled_terminal_stage_is_named_and_never_publishes(tmp_path, monkeypat
                 release.wait(10)
             return item
         monkeypatch.setattr(evidence._queue, "get", blocking_get)
+        gate_join_on(evidence, entered)
     else:
         release, entered = stall_at(evidence, stage)
     started = time.monotonic()
@@ -357,6 +369,10 @@ def test_stalled_terminal_stage_is_named_and_never_publishes(tmp_path, monkeypat
         release.set()
         evidence._thread.join(5)
     assert not evidence._thread.is_alive()
+    if stage != "published":
+        # Both reporters (the caller's timeout and the writer's own deadline
+        # refusal) ran; exactly one stage token was retained.
+        assert sum(m.startswith("session evidence unavailable: terminal_stage_") for m in caplog.messages) == 1
     if stage == "published":
         verify_session_evidence(paths.base)
         return

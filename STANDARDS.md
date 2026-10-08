@@ -1728,7 +1728,8 @@ admission rules and economic gates unchanged:
   process has durably stopped meanwhile. Both still refuse an expired lease, and
   a refusal is written durably. An expiry observed before the tmp write creates
   no tmp file; one observed after it leaves the bounded tmp and no manifest.
-- **Stage diagnostics.** The writer names where it is. Inside the record loop:
+- **Stage diagnostics.** The writer names where it is. Before the record loop
+  (claim, headroom probe, journal open): `capture`. Inside the record loop:
   `queue_wait`, `lease_check`, `headroom`, `journal_write`; after the sentinel:
   `journal_fsync`, `headroom`, `lease_checkpoint`, `raw_accounting`,
   `manifest_encode`, `manifest_write`, `manifest_rename`. On the two-second
@@ -1737,9 +1738,13 @@ admission rules and economic gates unchanged:
   the failure reason (for example
   `optional_evidence_unavailable=terminal_stage_raw_accounting,writer_close_timeout`).
   A writer already blocked before `finish()` (for example in a per-line lease
-  checkpoint) is named by that call, not as a drain. A rename that completes
-  inside the wait is a manifest, not a timeout (`published` marks it and is never
-  a failure token). A published manifest records `terminal_wait_seconds` (2) and
+  checkpoint) is named by that call, not as a drain. The writer's own cut-off
+  for starting the rename is 0.1 s before the caller's wait expires, so a rename
+  that completes inside the wait is a manifest, not a timeout (`published` marks
+  it and is never a failure token). A rename syscall that itself stalls past the
+  wait is still reported as `writer_close_timeout` with
+  `terminal_stage_manifest_rename`; the manifest it leaves is valid and the
+  offline verifier decides. A published manifest records `terminal_wait_seconds` (2) and
   `terminal_timing_ms`: `drain` (from `finish()` to the sentinel) and the stages
   completed before encoding. No payload, path or arbitrary log line is
   forwarded, and the only per-frame cost is one SHA256 update per raw line on
@@ -1748,6 +1753,6 @@ admission rules and economic gates unchanged:
 The remaining terminal work is the queue drain (with at most one more per-line
 checkpoint), one journal fsync, one free-space probe, one control checkpoint, a
 glob plus one `stat` per raw file, the manifest write/fsync, one read-only
-control read and the rename. A kernel-level stall in any of these
+control read and the rename. A kernel-level stall in any stage before the rename
 still refuses evidence, now with its stage named. Missing manifests from past
 runs are never rebuilt; the two spent trials stay 0/2 admitted.

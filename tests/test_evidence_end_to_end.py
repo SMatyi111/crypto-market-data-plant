@@ -190,9 +190,8 @@ def test_second_segment_after_a_failed_terminal_still_gets_its_own_slot(tmp_path
     claims slot two and publishes normally."""
     paths, pipeline, evidence, controller, _ = recorded_session(tmp_path, monkeypatch, directory, run="first")
     monkeypatch.setattr(journal, "TERMINAL_WAIT_SECONDS", 0.3)
-    import threading
-    release = threading.Event()
-    evidence._terminal_stage_hook = lambda stage: stage == "manifest_write" and release.wait(10)
+    from test_session_evidence import stall_at
+    release, entered = stall_at(evidence, "manifest_write")
     try:
         assert asyncio.run(pipeline.run(limit=3)).raw_messages == 3
         refs.drain_reference_finalizers()

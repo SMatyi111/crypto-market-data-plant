@@ -30,6 +30,11 @@ TICKER = "tickers.BTCUSDT"
 # never reported as a failure. `terminal_timing_ms` adds `drain` (finish() to
 # the sentinel) and the completed stages before manifest encoding.
 TERMINAL_WAIT_SECONDS = 2
+# The writer stops renaming this long before the caller's join expires, so a
+# rename that starts inside the wait normally also lands inside it. A rename
+# syscall that stalls past the join is still reported as a timeout; the
+# manifest it eventually leaves is valid and verifiable offline.
+TERMINAL_RENAME_MARGIN_SECONDS = 0.1
 _WRITER_SLOT = threading.BoundedSemaphore(1)
 
 
@@ -394,7 +399,8 @@ class SessionEvidence:
         # The writer alone names its stage; this thread only records when the
         # terminal wait began so the writer can report the drain duration.
         self._finish_started = time.monotonic()
-        self._publish_deadline = self._finish_started + TERMINAL_WAIT_SECONDS
+        self._publish_deadline = (self._finish_started + TERMINAL_WAIT_SECONDS
+                                  - min(TERMINAL_RENAME_MARGIN_SECONDS, TERMINAL_WAIT_SECONDS / 2))
         if self._thread is not None and self._thread.ident is not None:
             self._queue.put_nowait(None)
             self._thread.join(timeout=TERMINAL_WAIT_SECONDS)

@@ -200,16 +200,18 @@ class EvidenceLease:
         the trial row (read-only, no commit) and refuses a trial that another
         process has durably stopped meanwhile, which the former checkpoint did.
         """
-        self._observe_clock()
+        now, _ = self._observe_clock()
         if control:
             conn = _connect(self.directory)
             try:
-                row = conn.execute("SELECT stopped FROM trial WHERE id=?", (self.trial_id,)).fetchone()
+                row = conn.execute("SELECT last_utc, stopped FROM trial WHERE id=?", (self.trial_id,)).fetchone()
             finally:
                 conn.close()
-            if row is None:
+            # Same refusals the former durable checkpoint made here: a missing row,
+            # a clock behind another process's persisted high-water mark, a stop.
+            if row is None or now < row[0]:
                 raise LeaseRefused("lease_clock_or_missing")
-            if row[0] is not None:
+            if row[1] is not None:
                 raise LeaseRefused("lease_stopped")
 
     def check(self, *, checkpoint=False):
