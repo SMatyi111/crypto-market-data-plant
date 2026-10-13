@@ -88,7 +88,9 @@ class CanaryRefused(ValueError):
 def _is_lock_contention(exc: sqlite3.Error) -> bool:
     code = getattr(exc, "sqlite_errorcode", None)
     if code is not None:
-        return code in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+        # Extended codes (SQLITE_BUSY_TIMEOUT, SQLITE_LOCKED_SHAREDCACHE...) keep the
+        # primary code in the low byte.
+        return (int(code) & 0xFF) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
     text = str(exc).lower()
     return "locked" in text or "busy" in text
 
@@ -97,16 +99,16 @@ def _retry_locked(operation, *, attempts: int = 3):
     """Run a control-DB operation, retrying transient lock contention with a sibling
     lane. Raises CanaryRefused('canary_control_busy') when it persists and
     CanaryRefused('canary_control_db') for every other SQLite failure."""
-    for attempt in range(attempts):
+    attempts = max(1, int(attempts))
+    for attempt in range(1, attempts + 1):
         try:
             return operation()
         except sqlite3.Error as exc:
             if not _is_lock_contention(exc):
                 raise CanaryRefused("canary_control_db") from exc
-            if attempt == attempts - 1:
+            if attempt == attempts:
                 raise CanaryRefused("canary_control_busy") from exc
             time.sleep(1.0)
-    raise CanaryRefused("canary_control_busy")
 
 
 def _clock_disagrees(now, last, mono, last_mono) -> bool:
@@ -299,7 +301,9 @@ def job_identity(job: dict) -> str:
     return hashlib.sha256(json.dumps(row, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def _connect(directory: Path) -> sqlite3.Connection:
+def _connect(directory: Path, *, check_version: bool = True) -> sqlite3.Connection:
+    """Every surface (workers, status, stop, finalize, preflight) opens the control DB
+    here, so a directory written by another schema version is refused everywhere."""
     db = directory / "canary.sqlite3"
     if not db.is_file() or db.stat().st_size > DB_MAX_PAGES * 4096:
         raise CanaryRefused("canary_missing_or_oversize")
@@ -311,6 +315,10 @@ def _connect(directory: Path) -> sqlite3.Connection:
         conn.execute(f"PRAGMA max_page_count={DB_MAX_PAGES}")
         if conn.execute("PRAGMA page_size").fetchone()[0] != 4096:
             raise CanaryRefused("canary_page_size")
+        if check_version:
+            rows = conn.execute("SELECT version FROM canary").fetchall()
+            if len(rows) != 1 or rows[0][0] != VERSION:
+                raise CanaryRefused("canary_corrupt")
         return conn
     except BaseException:
         conn.close()
@@ -404,7 +412,7 @@ def prepare(directory: Path, canary_id: str, *, config_path: Path, symbol: str, 
     (directory / "receipts").mkdir()
     with (directory / "canary.sqlite3").open("xb"):
         pass
-    conn = _connect(directory)
+    conn = _connect(directory, check_version=False)
     try:
         with conn:
             conn.execute("CREATE TABLE canary (id TEXT PRIMARY KEY, version INTEGER, symbol TEXT, "
@@ -720,12 +728,17 @@ class CanaryGrant:
         receipt_path = self.directory / "receipts" / f"{self.lane}__{self.grant_id}.json"
         receipt_error = None
         try:
-            payload = (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode("utf-8")
-            with receipt_path.open("xb") as stream:
-                stream.write(payload)
-                stream.flush()
-                os.fsync(stream.fileno())
-            self.receipt_path = receipt_path
+            if receipt_path.is_file():
+                # A previous close of this very grant wrote its receipt and then lost
+                # the row update to lock contention: the receipt stands, the row closes.
+                self.receipt_path = receipt_path
+            else:
+                payload = (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode("utf-8")
+                with receipt_path.open("xb") as stream:
+                    stream.write(payload)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                self.receipt_path = receipt_path
         except Exception as exc:  # noqa: BLE001 - the DB row must still close
             receipt_error = type(exc).__name__
 

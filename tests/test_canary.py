@@ -389,11 +389,37 @@ def test_lock_contention_is_a_short_refusal_and_close_retries_through_it(prepare
     assert sleeps == [1.0, 1.0]
 
 
-def test_older_control_schema_is_refused_as_corrupt(prepared):
+def test_older_control_schema_is_refused_as_corrupt_on_every_surface(prepared):
     with sqlite3.connect(prepared.control / "canary.sqlite3") as conn:
         conn.execute("UPDATE canary SET version=1")
     with pytest.raises(CanaryRefused, match="canary_corrupt"):
         grant_for(prepared).claim()
+    for surface in (canary.status, canary.finalize, lambda d: canary.stop(d, apply=True, wait_seconds=0)):
+        with pytest.raises(CanaryRefused, match="canary_corrupt"):
+            surface(prepared.control)
+    with pytest.raises(CanaryRefused, match="canary_corrupt"):
+        canary.preflight(prepared.control, config_path=prepared.config, disk_usage_fn=lambda p: SimpleNamespace(free=10**12))
+
+
+def test_close_after_lost_row_update_keeps_the_existing_receipt(prepared, clock, monkeypatch):
+    import sqlite3 as sq
+    grant = grant_for(prepared)
+    grant.claim()
+    real_connect = canary._connect
+
+    def always_locked(directory, **kwargs):
+        raise sq.OperationalError("database is locked")
+
+    monkeypatch.setattr(clock, "sleep", lambda s: None)
+    monkeypatch.setattr(canary, "_connect", always_locked)
+    with pytest.raises(CanaryRefused, match="canary_control_busy"):
+        grant.close(reason="limit", replayable=True)
+    receipt = grant.receipt_path
+    assert receipt is not None and receipt.is_file()
+    monkeypatch.setattr(canary, "_connect", real_connect)
+    closed = grant.close(reason="limit", replayable=True)  # the retry reuses the receipt, no FileExistsError
+    assert closed["receipt_error"] is None
+    assert rows(prepared, "SELECT reason, receipt FROM grants") == [("limit", str(receipt))]
 
 
 def test_prepare_refuses_an_attempt_the_control_db_cannot_hold(tmp_path, small):
@@ -666,11 +692,15 @@ def test_segment_exception_still_closes_the_grant(prepared, clock, tmp_path, mon
                               "max_segments": 1, "cooldown_seconds": 0, "heartbeat_interval_seconds": 30.0,
                               "canary_lane": job["name"], "canary_identity": prepared.identities[job["name"]],
                               "canary_hold_seconds": 0, "canary_min_free_gib": 0})
+    holds = []
+    monkeypatch.setattr(cli.time, "sleep", lambda s: holds.append(s))
+    args.canary_hold_seconds = 5
     with pytest.raises(RuntimeError):
         cli._run_segmented_worker(args=args, default_worker_name="bybit-depth-worker", worker_type="bybit-depth-worker",
                                   build_segment_args=lambda a: SimpleNamespace(), collect_segment=collect_segment,
                                   progress_message=lambda i, s: "", venue="bybit")
     assert rows(prepared, "SELECT reason, closed_utc IS NOT NULL FROM grants") == [("exception:RuntimeError", 1)]
+    assert holds == [5.0]  # the instant failure held the slot (capped by canary_hold_seconds) before exiting
 
 
 def test_bind_refuses_parquet_and_evidence_and_caps_the_frame(prepared, clock, tmp_path):
