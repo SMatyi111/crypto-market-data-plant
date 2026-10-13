@@ -4247,11 +4247,10 @@ def _execute_ops_job_inprocess(job: JobSpec) -> JobExecutionResult | str | None:
     # Bounded alt canary (STANDARDS 4.18): the control directory, this job's identity
     # digest (the prepared canary must carry the same digest), the lane key, the
     # bounded refusal hold and the free-space floor. Absent -> every lane unchanged.
-    if "canary_control" in job.args:
-        # Once more in the child (the runner validated at load), BEFORE the key is
-        # normalised, so a hand-run job with an empty control path is refused rather
-        # than silently run without its canary.
-        validate_canary_args(job.name, job.args)
+    # Once more in the child (the runner validated at load), BEFORE the key is
+    # normalised, so a hand-run job with an empty control path is refused rather
+    # than silently run without its canary. An explicit null is "absent" by contract.
+    validate_canary_args(job.name, job.args)
     args.canary_control = job.args.get("canary_control") or None
     if args.canary_control:
         from .canary import job_identity

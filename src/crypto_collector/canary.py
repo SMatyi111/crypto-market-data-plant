@@ -339,9 +339,6 @@ def _connect(directory: Path, *, check_version: bool = True) -> sqlite3.Connecti
         raise
 
 
-def _open(directory: Path) -> sqlite3.Connection:
-    """Operator-surface open: lock contention retried, every other failure a token."""
-    return _retry_locked(lambda: _connect(directory))
 
 
 def _stop(conn: sqlite3.Connection, reason: str, now: float) -> None:
@@ -431,6 +428,19 @@ def prepare(directory: Path, canary_id: str, *, config_path: Path, symbol: str, 
     (directory / "receipts").mkdir()
     with (directory / "canary.sqlite3").open("xb"):
         pass
+    try:
+        _prepare_db(directory, canary_id, symbol, max_bytes, max_seconds, max_grants, config_path, lanes)
+    except sqlite3.Error as exc:
+        # Never repaired or removed: the directory now exists and a retry must name a
+        # new one. Reported as a token so the operator sees the cause, not a trace.
+        raise CanaryRefused("canary_control_db") from exc
+    return {"canary_id": canary_id, "directory": str(directory), "symbol": symbol,
+            "lanes": [{"lane": n, "job_type": t, "kind": k, "identity": i} for n, t, k, i in lanes],
+            "max_bytes": max_bytes, "max_seconds": max_seconds, "metadata_bytes": METADATA_BYTES,
+            "max_grants": max_grants}
+
+
+def _prepare_db(directory, canary_id, symbol, max_bytes, max_seconds, max_grants, config_path, lanes) -> None:
     conn = _connect(directory, check_version=False)
     try:
         with conn:
@@ -449,10 +459,6 @@ def prepare(directory: Path, canary_id: str, *, config_path: Path, symbol: str, 
             conn.executemany("INSERT INTO lanes VALUES (?, ?, ?, ?)", lanes)
     finally:
         conn.close()
-    return {"canary_id": canary_id, "directory": str(directory), "symbol": symbol,
-            "lanes": [{"lane": n, "job_type": t, "kind": k, "identity": i} for n, t, k, i in lanes],
-            "max_bytes": max_bytes, "max_seconds": max_seconds, "metadata_bytes": METADATA_BYTES,
-            "max_grants": max_grants}
 
 
 def _committed_bytes(conn: sqlite3.Connection) -> int:
@@ -792,20 +798,26 @@ class CanaryGrant:
 # --------------------------------------------------------------------------- operator surfaces
 
 
-def _snapshot(directory: Path) -> dict:
-    conn = _open(directory)
+def _read_control(directory: Path) -> tuple[dict, list[dict], list[dict], int, int]:
+    conn = _connect(directory)
     try:
-        canary = conn.execute("SELECT * FROM canary").fetchone()
-        columns = [d[0] for d in conn.execute("SELECT * FROM canary").description]
+        cursor = conn.execute("SELECT * FROM canary")
+        canary = cursor.fetchone()
+        columns = [d[0] for d in cursor.description]
         row = dict(zip(columns, canary, strict=True))
         lanes = [dict(zip(["lane", "job_type", "kind", "identity"], r, strict=True))
                  for r in conn.execute("SELECT lane, job_type, kind, identity FROM lanes ORDER BY lane")]
-        grant_columns = [d[0] for d in conn.execute("SELECT * FROM grants").description]
-        grants = [dict(zip(grant_columns, r, strict=True)) for r in conn.execute("SELECT * FROM grants ORDER BY id")]
-        closed_consumed = _closed_consumed(conn)
-        committed = _committed_bytes(conn)
+        cursor = conn.execute("SELECT * FROM grants ORDER BY id")
+        grant_rows = cursor.fetchall()
+        grant_columns = [d[0] for d in cursor.description]
+        grants = [dict(zip(grant_columns, r, strict=True)) for r in grant_rows]
+        return row, lanes, grants, _closed_consumed(conn), _committed_bytes(conn)
     finally:
         conn.close()
+
+
+def _snapshot(directory: Path) -> dict:
+    row, lanes, grants, closed_consumed, committed = _retry_locked(lambda: _read_control(directory))
     now = time.time()
     pool = int(row["max_bytes"]) - int(row["metadata_bytes"])
     deadline = None if row["first_utc"] is None else float(row["first_utc"]) + int(row["max_seconds"])
@@ -826,11 +838,15 @@ def _snapshot(directory: Path) -> dict:
 def _open_writers(directory: Path) -> list[int]:
     """Grant ids whose recorded process is alive or of unknown liveness (one cheap
     query plus one identity probe per open grant; used while a stop waits)."""
-    conn = _open(directory)
-    try:
-        rows = conn.execute("SELECT id, pid, identity FROM grants WHERE closed_utc IS NULL").fetchall()
-    finally:
-        conn.close()
+
+    def read():
+        conn = _connect(directory)
+        try:
+            return conn.execute("SELECT id, pid, identity FROM grants WHERE closed_utc IS NULL").fetchall()
+        finally:
+            conn.close()
+
+    rows = _retry_locked(read)
     return [int(gid) for gid, pid, identity in rows if owned_process_alive(int(pid), str(identity)) is not False]
 
 
@@ -866,7 +882,12 @@ def stop(directory: Path, *, reason: str = "operator_stop", apply: bool = False,
 
     _retry_locked(mark)
     deadline = monotonic() + max(0.0, float(wait_seconds))
-    while _open_writers(directory) and monotonic() < deadline:
+    while monotonic() < deadline:
+        try:
+            if not _open_writers(directory):
+                break
+        except CanaryRefused:
+            pass  # writers are busy checkpointing: keep waiting, the mark already stands
         sleep(0.5)
     snapshot = _snapshot(directory)
     terminations = []
@@ -888,27 +909,32 @@ def finalize(directory: Path) -> dict:
     writer has provably exited and every grant is closed (abandoned grants are charged
     what their run holds). Refuses otherwise with the exact blocker."""
     now = time.time()
-    conn = _open(directory)
-    try:
-        with conn:
-            conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute("SELECT id, first_utc, max_seconds, stopped, finalized_utc FROM canary").fetchone()
-            if row is None:
-                raise CanaryRefused("canary_corrupt")
-            canary_id, first, max_seconds, stopped, finalized = row
-            if finalized is not None:
-                raise CanaryRefused("canary_already_finalized")
-            if stopped is None:
-                if first is not None and now >= float(first) + int(max_seconds):
-                    conn.execute("UPDATE canary SET stopped='canary_expired', stopped_utc=?", (now,))
-                else:
-                    raise CanaryRefused("canary_not_terminal")
-            blocking = _reconcile_open_grants(conn, now)
-            if blocking:
-                raise CanaryRefused("canary_writers_alive_or_unknown")
-            conn.execute("UPDATE canary SET finalized_utc=?", (now,))
-    finally:
-        conn.close()
+    final_path = directory / "receipt.json"
+    if final_path.is_file():
+        raise CanaryRefused("canary_already_finalized")
+
+    def settle():
+        conn = _connect(directory)
+        try:
+            with conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute("SELECT id, first_utc, max_seconds, stopped, finalized_utc FROM canary").fetchone()
+                if row is None:
+                    raise CanaryRefused("canary_corrupt")
+                canary_id, first, max_seconds, stopped, finalized = row
+                if finalized is not None:
+                    raise CanaryRefused("canary_already_finalized")
+                if stopped is None:
+                    if first is not None and now >= float(first) + int(max_seconds):
+                        conn.execute("UPDATE canary SET stopped='canary_expired', stopped_utc=?", (now,))
+                    else:
+                        raise CanaryRefused("canary_not_terminal")
+                if _reconcile_open_grants(conn, now):
+                    raise CanaryRefused("canary_writers_alive_or_unknown")
+        finally:
+            conn.close()
+
+    _retry_locked(settle)
     snapshot = _snapshot(directory)
     receipts = sorted(p.name for p in (directory / "receipts").glob("*.json"))
     unverified = [g["id"] for g in snapshot["grants"] if g["receipt"] is None]
@@ -922,10 +948,22 @@ def finalize(directory: Path) -> dict:
              "note": "Receipts describe bytes as measured on disk at close; partial runs are preserved, "
                      "never reclaimed. Replayability is the lane scorer's verdict per run, not a canary claim."}
     payload = (json.dumps(final, indent=2, sort_keys=True, default=str) + "\n").encode("utf-8")
-    with (directory / "receipt.json").open("xb") as stream:
+    # The final receipt lands first (exclusive create, fsync); only then is the attempt
+    # marked finalized, so a failed write leaves finalize re-runnable, not wedged.
+    with final_path.open("xb") as stream:
         stream.write(payload)
         stream.flush()
         os.fsync(stream.fileno())
+
+    def mark():
+        conn = _connect(directory)
+        try:
+            with conn:
+                conn.execute("UPDATE canary SET finalized_utc=COALESCE(finalized_utc, ?)", (now,))
+        finally:
+            conn.close()
+
+    _retry_locked(mark)
     return final
 
 
@@ -1050,6 +1088,10 @@ def main(argv: list[str] | None = None) -> int:
         return _dispatch(args)
     except CanaryRefused as exc:
         print(json.dumps({"ok": False, "refused": str(exc), "directory": str(args.directory)}, indent=2))
+        return 1
+    except (ValueError, OSError) as exc:
+        print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}", "directory": str(args.directory)},
+                         indent=2))
         return 1
 
 

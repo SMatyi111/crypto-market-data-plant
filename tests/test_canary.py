@@ -442,6 +442,7 @@ def test_half_prepared_or_foreign_control_file_is_refused_not_a_traceback(tmp_pa
     with pytest.raises(CanaryRefused, match="canary_corrupt"):
         canary.status(control)
     assert canary.main(["status", str(control)]) == 1  # a token on stdout, never a traceback
+    assert canary.main(["stop", str(control), "--apply", "--reason", "not a token"]) == 1  # ValueError -> token too
 
 
 def test_operator_surfaces_retry_lock_contention_and_report_io_errors_as_control_db(prepared, clock, monkeypatch):
@@ -633,9 +634,16 @@ def test_stop_is_dry_run_by_default_then_durable_with_bounded_wait_and_exact_ter
         canary.finalize(prepared.control)
     assert live.admit_frame() == "operator_stop"  # the writer sees the durable stop at its next checkpoint
     live.close(reason="operator_stop", replayable=False)
+    # A final receipt that cannot be written leaves finalize re-runnable, not wedged.
+    final_path = prepared.control / "receipt.json"
+    final_path.mkdir()  # open("xb") on a directory fails
+    with pytest.raises(OSError):
+        canary.finalize(prepared.control)
+    assert rows(prepared, "SELECT finalized_utc FROM canary") == [(None,)]
+    final_path.rmdir()
     final = canary.finalize(prepared.control)
     assert final["consumed_bytes"] == 0 and final["unreplayable_or_unscored_runs"] == [None]
-    assert (prepared.control / "receipt.json").is_file()
+    assert final_path.is_file() and rows(prepared, "SELECT finalized_utc IS NOT NULL FROM canary") == [(1,)]
     with pytest.raises(CanaryRefused, match="already_finalized"):
         canary.finalize(prepared.control)
     with pytest.raises(CanaryRefused, match="operator_stop"):
