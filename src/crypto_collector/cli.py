@@ -530,7 +530,7 @@ def build_parser() -> argparse.ArgumentParser:
         "bybit-linear-universe-snapshot",
         help="Archive one dated snapshot of the Bybit linear universe: instruments-info "
         "linear pages (bounded cursor pagination), instruments-info spot, and one linear "
-        "tickers payload (raw-only reference lane, STANDARDS section 4.15). Records the "
+        "tickers payload (raw-only reference lane, STANDARDS section 4.17). Records the "
         "alt research panel's last-known membership and delisting times per run.",
     )
     bu_parser.add_argument(

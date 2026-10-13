@@ -61,7 +61,7 @@ COLLECTOR_JOB_TYPES: frozenset[str] = frozenset(
         # leaderboard lane, pool-dispatched for the same reason.
         "binance-options-chain-snapshot",
         "deribit-options-snapshot",
-        # Daily Bybit linear universe snapshot (STANDARDS 4.15): raw-only reference
+        # Daily Bybit linear universe snapshot (STANDARDS 4.17): raw-only reference
         # lane; one-shot interval job that holds a pool slot while it runs.
         "bybit-linear-universe-snapshot",
         # Text-capture P1 lanes (ROADMAP item 15): REST-polled, low-volume, but
@@ -249,7 +249,7 @@ POLL_LANE_JOB_TYPES = frozenset(
         # Universe positions ingest (STANDARDS 4.11): interval job, freshness only
         # visible here; a stale row = hl-ladder-sweep or the ingest has stopped.
         "hyperliquid-universe-positions-snapshot",
-        # Bybit linear universe snapshot (STANDARDS 4.15): daily interval job, so
+        # Bybit linear universe snapshot (STANDARDS 4.17): daily interval job, so
         # poll_lanes is the only place its freshness is visible.
         "bybit-linear-universe-snapshot",
     }

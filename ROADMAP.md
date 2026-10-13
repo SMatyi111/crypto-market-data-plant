@@ -25,7 +25,7 @@ Four mid-liquidity Bybit USDT perpetuals (XLMUSDT, GRAMUSDT, TRXUSDT, MEGAUSDT; 
 snapshot in `market-edge-factory/reports/alt-collection-shortlist-20261013`) get trades and
 depth lanes on the existing Bybit linear workers, each with its own `source_suffix` dir,
 quarantine, promoter and score job, plus a daily raw-only universe snapshot lane
-(STANDARDS 4.15). Everything ships `enabled:false`; the pool cap is untouched in this
+(STANDARDS 4.17). Everything ships `enabled:false`; the pool cap is untouched in this
 change. Activation is staged in the factory's `tickets/ALT_PANEL_ROLLOUT_20261013.md`:
 stage one is one symbol plus the snapshot (3 lanes), the cap must become enabled lanes +
 subset + 2 in both runner scripts, and the canary carries explicit duration and byte caps

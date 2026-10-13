@@ -1757,7 +1757,7 @@ control read and the rename. A kernel-level stall in any stage before the rename
 still refuses evidence, now with its stage named. Missing manifests from past
 runs are never rebuilt; the two spent trials stay 0/2 admitted.
 
-## 4.15 Bybit linear universe snapshot (raw-only reference lane) and the alt research panel
+## 4.17 Bybit linear universe snapshot (raw-only reference lane) and the alt research panel
 
 **Added 2026-10-13, shipped disabled.** `STANDARDS_VERSION` is unchanged: no schema,
 partition layout or replayable verdict changes. The alt panel reuses the Bybit linear

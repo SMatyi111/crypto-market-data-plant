@@ -1,14 +1,16 @@
-"""Bybit linear universe snapshot lane (STANDARDS 4.15): hermetic fixtures only.
+"""Bybit linear universe snapshot lane (STANDARDS 4.17): hermetic fixtures only.
 
 Covers bounded pagination (completeness, bounded maximum, repeated cursor, duplicate
-symbols), strict retCode, spot-cursor refusal, panel absence recorded without failing,
-fetch failure and wall budget still writing a summary, request/byte/time bounds, and the
-ops job registration + arg threading. No socket is opened: every fetch is a dict lookup.
+symbols), strict retCode, spot-cursor refusal, panel membership semantics (present /
+absent only under complete coverage / unknown otherwise), fetch and truncated-read
+failures still writing a summary, the wall budget, request/byte/time bounds, and the ops
+job registration + arg threading. No socket is opened: every fetch is a dict lookup.
 """
 
 from __future__ import annotations
 
 import gzip
+import http.client
 import json
 from datetime import UTC, datetime
 from pathlib import Path
@@ -84,17 +86,19 @@ def test_complete_two_page_snapshot_archives_verbatim_and_records_membership(tmp
     assert data["payload_families"] == 3
     assert data["linear_pages_fetched"] == 2
     assert data["linear_pagination_complete"] is True
+    assert data["panel_membership_coverage"] == "complete"
     assert data["panel_membership"]["GRAMUSDT"] == {
         "present_in_instruments": True, "status": "Trading", "delivery_time": "1800000000000",
         "funding_interval": 240, "present_in_tickers": True,
     }
-    assert data["panel_absent"] == []
+    assert data["panel_absent"] == [] and data["panel_unknown"] == []
+    assert data["payloads"]["instruments_linear_p1"]["row_count"] == 2
     assert data["limits"] == {"max_response_bytes": 1024 * 1024, "timeout_seconds": 10.0, "wall_budget_seconds": 120.0}
     assert set(data["payload_fetched_at"]) == {"instruments_linear_p1", "instruments_linear_p2", "instruments_spot", "tickers_linear"}
     assert "SENTINEL_PRICE" not in json.dumps(data)  # summary holds counts and membership, not quotes
 
 
-def test_pagination_bound_yields_incomplete_but_archives_everything(tmp_path: Path) -> None:
+def test_pagination_bound_yields_incomplete_with_unknown_membership(tmp_path: Path) -> None:
     urls = payloads(pages=3)
     urls[universe._cursor_url("c2")] = page([lin("CCCUSDT")], "linear", cursor="c3")  # still more
     with pytest.raises(ValueError, match="pagination incomplete after 3 page\\(s\\)"):
@@ -104,8 +108,23 @@ def test_pagination_bound_yields_incomplete_but_archives_everything(tmp_path: Pa
     assert data["linear_pages_fetched"] == 3
     assert data["request_count"] == 5  # 3 linear pages + spot + tickers, never a 4th page
     assert data["linear_pagination_complete"] is False
+    assert data["panel_membership_coverage"] == "incomplete"
+    # GRAM and XLM were on page 2 (positive evidence); nothing is marked absent under incomplete coverage.
+    assert data["panel_membership"]["XLMUSDT"]["present_in_instruments"] is True
+    assert data["panel_absent"] == []
     assert (run_dir(tmp_path) / "raw" / "instruments_linear_p3.json.gz").exists()
     assert (run_dir(tmp_path) / "raw" / "tickers_linear.json.gz").exists()
+
+
+def test_symbol_missing_under_incomplete_coverage_is_unknown_not_absent(tmp_path: Path) -> None:
+    urls = payloads(pages=3, panel_present=False)
+    urls[universe._cursor_url("c2")] = page([lin("CCCUSDT")], "linear", cursor="c3")
+    with pytest.raises(ValueError, match="pagination incomplete"):
+        snapshot_bybit_linear_universe(tmp_path, panel_symbols=PANEL, fetch=lambda u: urls[u], clock=lambda: NOW)
+    data = summary(tmp_path)
+    assert data["panel_membership"]["XLMUSDT"]["present_in_instruments"] is None
+    assert data["panel_absent"] == []
+    assert data["panel_unknown"] == ["XLMUSDT", "GRAMUSDT"]
 
 
 @pytest.mark.parametrize("bad", [False, True, "0", 0.0, None])
@@ -119,6 +138,7 @@ def test_ret_code_must_be_a_strict_integer_zero(tmp_path: Path, bad) -> None:
     data = summary(tmp_path)
     assert data["payloads"]["instruments_linear_p1"]["parse_ok"] is False
     assert data["request_count"] == 3  # page 1 failed, no page 2, spot and tickers still requested
+    assert data["panel_unknown"] == ["XLMUSDT", "GRAMUSDT"]
 
 
 def test_spot_cursor_and_repeated_cursor_and_duplicate_symbol_are_failures(tmp_path: Path) -> None:
@@ -137,13 +157,15 @@ def test_spot_cursor_and_repeated_cursor_and_duplicate_symbol_are_failures(tmp_p
         snapshot_bybit_linear_universe(tmp_path / "c", panel_symbols=PANEL, fetch=lambda u: urls[u], clock=lambda: NOW)
 
 
-def test_absent_panel_symbol_is_recorded_not_fatal(tmp_path: Path) -> None:
+def test_absent_panel_symbol_under_complete_coverage_is_recorded_not_fatal(tmp_path: Path) -> None:
     urls = payloads(panel_present=False)
     result = snapshot_bybit_linear_universe(tmp_path, panel_symbols=PANEL, fetch=lambda u: urls[u], clock=lambda: NOW)
     assert result.payload_count == 4
     data = summary(tmp_path)
     assert data["parse_ok"] is True
+    assert data["panel_membership_coverage"] == "complete"
     assert data["panel_absent"] == ["XLMUSDT", "GRAMUSDT"]
+    assert data["panel_unknown"] == []
     assert data["panel_membership"]["XLMUSDT"]["present_in_instruments"] is False
     assert data["panel_membership"]["XLMUSDT"]["present_in_tickers"] is True  # tickers still list it
     assert data["panel_membership"]["GRAMUSDT"]["present_in_tickers"] is False
@@ -165,7 +187,29 @@ def test_fetch_failure_on_page_one_still_writes_summary_and_skips_further_pages(
     data = summary(tmp_path)
     assert data["payloads"]["instruments_linear_p1"]["raw_bytes"] is None
     assert data["payloads"]["tickers_linear"]["parse_ok"] is True
-    assert data["panel_absent"] == ["XLMUSDT", "GRAMUSDT"]  # unknown this run, recorded as absent
+    assert data["panel_membership"]["XLMUSDT"] == {
+        "present_in_instruments": None, "status": None, "delivery_time": None, "funding_interval": None,
+        "present_in_tickers": True,
+    }
+    assert data["panel_unknown"] == ["XLMUSDT", "GRAMUSDT"] and data["panel_absent"] == []
+
+
+def test_truncated_read_is_a_recorded_fetch_failure_with_summary(tmp_path: Path) -> None:
+    """http.client.IncompleteRead is not an OSError; it must still land in the summary."""
+    urls = payloads()
+
+    def fetch(url: str) -> bytes:
+        if url == universe.TICKERS_URL:
+            raise http.client.IncompleteRead(b"partial", 10)
+        return urls[url]
+
+    with pytest.raises(ValueError, match="tickers_linear fetch failed: IncompleteRead"):
+        snapshot_bybit_linear_universe(tmp_path, panel_symbols=PANEL, fetch=fetch, clock=lambda: NOW)
+    data = summary(tmp_path)
+    assert data["payloads"]["instruments_linear_p2"]["parse_ok"] is True  # earlier bytes kept
+    assert data["payloads"]["tickers_linear"]["raw_bytes"] is None
+    assert data["panel_membership"]["XLMUSDT"]["present_in_tickers"] is None  # unknown, not false
+    assert data["panel_membership"]["XLMUSDT"]["present_in_instruments"] is True
 
 
 def test_wall_budget_stops_remaining_requests_without_sending_them(tmp_path: Path) -> None:
@@ -185,6 +229,7 @@ def test_wall_budget_stops_remaining_requests_without_sending_them(tmp_path: Pat
     data = summary(tmp_path)
     assert data["request_count"] == 4  # attempted entries recorded, three as budget failures
     assert "wall budget" in data["payloads"]["instruments_spot"]["error"]
+    assert data["panel_membership_coverage"] == "incomplete"
 
 
 def test_fetch_url_applies_one_mib_cap_and_ten_second_timeout(monkeypatch) -> None:

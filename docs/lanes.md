@@ -105,7 +105,7 @@ coverage, or whole-day completeness. Other inventory dates above are unchanged.
 | 53 | bybit-trx-perp-depth | Bybit linear perp | TRXUSDT | depth | WS | market_replayable | **configured, disabled** (alt panel; grade inherits lane 38 once activated and verified) |
 | 54 | bybit-mega-perp-trades | Bybit linear perp | MEGAUSDT | trades | WS | trades_replayable | **configured, disabled** (alt panel 2026-10-13; grade inherits lane 36 once activated and verified) |
 | 55 | bybit-mega-perp-depth | Bybit linear perp | MEGAUSDT | depth | WS | market_replayable | **configured, disabled** (alt panel; grade inherits lane 38 once activated and verified) |
-| 56 | bybit-linear-universe-snapshot | Bybit v5 REST | all linear symbols + spot pairs | instruments-info pages, spot, tickers | REST daily | raw only | **configured, disabled**; R reference (STANDARDS 4.15) |
+| 56 | bybit-linear-universe-snapshot | Bybit v5 REST | all linear symbols + spot pairs | instruments-info pages, spot, tickers | REST daily | raw only | **configured, disabled**; R reference (STANDARDS 4.17) |
 
 ## 2026-09-17/18 — the ETH/SOL completeness build (lanes 34-43)
 

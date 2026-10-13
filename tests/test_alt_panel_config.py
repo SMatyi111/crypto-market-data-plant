@@ -1,37 +1,28 @@
 """Alt research panel config (ops.live.example.json): disabled lanes, per-instrument
-isolation, exactly one promoter per lane, offload and cleanup rows, and the derived
-concurrency arithmetic for the staged phase-2 subsets. Hermetic: reads the example config
-and the runner scripts only."""
+isolation, exactly one promoter per lane, bounded segments that the scorers' floor
+covers, offload and cleanup rows, and the untouched pool cap. Hermetic: reads the example
+config and the runner scripts only; the cap and lane-count helpers are the hygiene suite's."""
 
 from __future__ import annotations
 
 import json
-import re
-from pathlib import Path
 
-from crypto_collector.cli import _build_source_name, _job_args
+from test_repo_hygiene import REPO_ROOT, _concurrency_default, _enabled_collector_lanes
+
+from crypto_collector.cli import DEFAULT_MIN_AGE_HOURS, _build_source_name, _job_args
 from crypto_collector.ops import COLLECTOR_JOB_TYPES, JobSpec
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
 PANEL = ("XLMUSDT", "GRAMUSDT", "TRXUSDT", "MEGAUSDT")
 UNIVERSE_JOB = "bybit-linear-universe-snapshot"
+CONFIG = REPO_ROOT / "ops.live.example.json"
 
 
 def _config() -> dict:
-    return json.loads((REPO_ROOT / "ops.live.example.json").read_text(encoding="utf-8"))
+    return json.loads(CONFIG.read_text(encoding="utf-8"))
 
 
 def _jobs_by_name(config: dict) -> dict[str, dict]:
     return {job["name"]: job for job in config["jobs"]}
-
-
-def _cap_default() -> int:
-    body = (REPO_ROOT / "scripts" / "run_ops_runner.ps1").read_text(encoding="ascii")
-    return int(re.search(r"\[int\]\$CollectorConcurrency\s*=\s*(\d+)", body).group(1))
-
-
-def _enabled_collector_lanes(config: dict) -> list[dict]:
-    return [job for job in config["jobs"] if job.get("enabled", True) and job["job_type"] in COLLECTOR_JOB_TYPES]
 
 
 def _panel_lane_names() -> list[str]:
@@ -66,9 +57,20 @@ def test_panel_lanes_exist_disabled_with_linear_market_and_distinct_dirs() -> No
             # Threaded through the central job-arg builder, not a per-venue lambda.
             ns = _job_args(JobSpec(name=name, job_type=job_type, interval_seconds=5, args=args, enabled=False))
             assert (ns.symbol, ns.market, ns.source_suffix, ns.channel) == (symbol, "linear", suffix, channel)
-            assert ns.rotate_at_midnight is True
-            assert ns.idle_timeout_seconds == 120
+            assert ns.idle_timeout_seconds == 900  # thin symbols: a quiet 2 minutes is not a dead feed
     assert len(dirs) == 8
+
+
+def test_panel_segments_are_time_bounded_below_the_scorer_floor() -> None:
+    """A midnight-rotated 24 h segment would be scored while still open (the 2026-09-07
+    truncation); the panel copies the BTC perp pattern: 30-minute segments, no midnight
+    rotation, so the default 1 h scorer floor covers them once enabled."""
+    jobs = _jobs_by_name(_config())
+    for name in _panel_lane_names():
+        args = jobs[name]["args"]
+        assert args.get("rotate_at_midnight") in (None, False), f"{name} must not rotate at midnight"
+        assert args["max_segment_seconds"] == 1800
+        assert DEFAULT_MIN_AGE_HOURS * 3600 > args["max_segment_seconds"]
 
 
 def test_each_panel_lane_has_exactly_one_disabled_promoter_quarantine_and_score() -> None:
@@ -92,7 +94,6 @@ def test_each_panel_lane_has_exactly_one_disabled_promoter_quarantine_and_score(
             )
             quarantine = [j for j in jobs if j["job_type"] == "quarantine-runs" and j["args"]["source_root"] == source_root]
             assert len(quarantine) == 1 and quarantine[0]["enabled"] is False
-    # Scoring: trades per lane (disabled), depth through one disabled stream-depth job listing the four dirs.
     for symbol in PANEL:
         suffix = symbol.lower()
         score = [j for j in jobs if j["job_type"] == "backfill-trades-replay"
@@ -102,7 +103,6 @@ def test_each_panel_lane_has_exactly_one_disabled_promoter_quarantine_and_score(
     assert depth_score["enabled"] is False
     assert depth_score["job_type"] == "backfill-stream-depth"
     assert sorted(depth_score["args"]["source"]) == sorted(f"bybit_perp_depth_{s.lower()}" for s in PANEL)
-    # No existing enabled job gained the new sources (nothing in the example turns on by accident).
     enabled_depth_scores = [j for j in jobs if j["job_type"] == "backfill-stream-depth" and j.get("enabled", True)]
     for job in enabled_depth_scores:
         assert not any(s.endswith(tuple(f"_{x.lower()}" for x in PANEL)) for s in job["args"]["source"])
@@ -110,7 +110,7 @@ def test_each_panel_lane_has_exactly_one_disabled_promoter_quarantine_and_score(
 
 def test_universe_snapshot_job_disabled_and_pooled() -> None:
     jobs = _jobs_by_name(_config())
-    job = jobs["bybit-linear-universe-snapshot"]
+    job = jobs[UNIVERSE_JOB]
     assert job["job_type"] == UNIVERSE_JOB
     assert job["enabled"] is False
     assert job["interval_seconds"] == 86400
@@ -121,8 +121,7 @@ def test_universe_snapshot_job_disabled_and_pooled() -> None:
 
 
 def test_offload_and_cleanup_rows_cover_the_new_sources() -> None:
-    config = _config()
-    jobs = _jobs_by_name(config)
+    jobs = _jobs_by_name(_config())
     lanes = {lane["source"]: lane for lane in jobs["archive-offload-cold"]["args"]["lanes"]}
     for symbol in PANEL:
         suffix = symbol.lower()
@@ -139,24 +138,12 @@ def test_offload_and_cleanup_rows_cover_the_new_sources() -> None:
     assert "market/bybit_linear_universe=3650" in policy
 
 
-def test_concurrency_is_derived_not_raised_in_phase_one() -> None:
-    """Phase 1 ships everything disabled, so the pool default is untouched. The staged
-    phase-2 subsets must raise the cap to (enabled lanes + subset + reserve) in BOTH
-    scripts before activation; this pins the arithmetic the rollout ticket quotes."""
+def test_phase_one_enables_nothing_and_leaves_the_pool_cap_alone() -> None:
+    """Activation raises the cap per staged subset (enabled lanes + subset + reserve, both
+    scripts); phase 1 must not pre-raise it, because a raised cap is not capacity."""
     config = _config()
-    enabled = len(_enabled_collector_lanes(config))
-    cap = _cap_default()
-    assert cap == 49, "phase 1 must not raise the pool cap; activation does, with the subset arithmetic"
-    assert enabled <= cap
-    reserve = 2
-    stage_one = 1 + 2 + 1  # universe snapshot + one symbol's trades and depth  (3 lanes)
-    stage_two = 1 + 8  # universe snapshot + four symbols' trades and depth (9 lanes)
-    ticker_worker = 1  # 60 s coarse reference poll, NOT implemented in phase 1 -> 10 collectors if added
-    assert stage_one - 1 == 3 and stage_two == 9 and stage_two + ticker_worker == 10
-    new_lane_names = set(_panel_lane_names()) | {"bybit-linear-universe-snapshot"}
     jobs = _jobs_by_name(config)
-    assert all(jobs[name]["enabled"] is False for name in new_lane_names)
-    # Required cap for a subset is a function of the live enabled count at activation time.
-    def required_cap(live_enabled: int, subset: int) -> int:
-        return live_enabled + subset + reserve
-    assert required_cap(47, 3) == 52 and required_cap(47, 9) == 58 and required_cap(47, 10) == 59
+    for name in [*_panel_lane_names(), UNIVERSE_JOB, "score-bybit-alt-panel-depth"]:
+        assert jobs[name]["enabled"] is False, name
+    assert _concurrency_default(REPO_ROOT / "scripts" / "run_ops_runner.ps1") == 49
+    assert _enabled_collector_lanes(CONFIG) <= 49
