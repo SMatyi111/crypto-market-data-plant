@@ -133,7 +133,7 @@ if ($invalidJobs.Count -gt 0) {
 # enumerated EXPLICITLY (pinned by tests/test_repo_hygiene.py): a kalshi- prefix wildcard
 # also matched the maintenance job kalshi-summarize-crypto-quotes, so adding that to
 # the config would have tripped this preflight and refused a valid boot.
-$nonWorkerPoolTypes = @("kalshi-collect-crypto-quotes", "kalshi-discover-crypto", "hyperliquid-leaderboard-snapshot", "hyperliquid-universe-positions-snapshot", "binance-options-chain-snapshot", "deribit-options-snapshot")
+$nonWorkerPoolTypes = @("kalshi-collect-crypto-quotes", "kalshi-discover-crypto", "hyperliquid-leaderboard-snapshot", "hyperliquid-universe-positions-snapshot", "binance-options-chain-snapshot", "deribit-options-snapshot", "bybit-linear-universe-snapshot")
 $collectorLanes = @($configPayload.jobs | Where-Object {
     ($_.job_type -like "*-worker" -or $nonWorkerPoolTypes -contains $_.job_type) -and ($null -eq $_.enabled -or $_.enabled)
 })

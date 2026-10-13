@@ -97,6 +97,15 @@ coverage, or whole-day completeness. Other inventory dates above are unchanged.
 | 45 | hyperliquid-btc-trades | Hyperliquid | BTC perp (BTCUSDC) | trades + buyer/seller wallets | WS `trades`, 30-min segments | trades_replayable (`instrument=BTCUSDC`) | **B** `none_native` (tid unique, not dense). Owner-approved 2026-10-06, live from the 2026-10-06 redeploy; **forward-only** (the public WS has no history; S3 fill archive ended 2026-09-26). `metadata.users` = `[buyer, seller]` as the venue lists them, independent of `side` (taker = buyer if side B, seller if A); prints without a valid pair are quarantined, so every clean row is wallet-attributed. Subscribe-snapshot prints (~30 per connect) are quarantined as `subscribe_replay`; dedupe on `tid` to recover reconnect-gap prints from quarantine (STANDARDS 4.15) |
 | 46 | hyperliquid-eth-trades | Hyperliquid | ETH perp (ETHUSDC) | trades + buyer/seller wallets | WS `trades` | trades_replayable (`instrument=ETHUSDC`) | **B** as lane 45 |
 | 47 | hyperliquid-sol-trades | Hyperliquid | SOL perp (SOLUSDC) | trades + buyer/seller wallets | WS `trades` | trades_replayable (`instrument=SOLUSDC`) | **B** as lane 45 |
+| 48 | bybit-xlm-perp-trades | Bybit linear perp | XLMUSDT | trades | WS | trades_replayable | **configured, disabled** (alt panel 2026-10-13; grade inherits lane 36 once activated and verified) |
+| 49 | bybit-xlm-perp-depth | Bybit linear perp | XLMUSDT | depth | WS | market_replayable | **configured, disabled** (alt panel; grade inherits lane 38 once activated and verified) |
+| 50 | bybit-gram-perp-trades | Bybit linear perp | GRAMUSDT | trades | WS | trades_replayable | **configured, disabled** (alt panel 2026-10-13; grade inherits lane 36 once activated and verified) |
+| 51 | bybit-gram-perp-depth | Bybit linear perp | GRAMUSDT | depth | WS | market_replayable | **configured, disabled** (alt panel; grade inherits lane 38 once activated and verified) |
+| 52 | bybit-trx-perp-trades | Bybit linear perp | TRXUSDT | trades | WS | trades_replayable | **configured, disabled** (alt panel 2026-10-13; grade inherits lane 36 once activated and verified) |
+| 53 | bybit-trx-perp-depth | Bybit linear perp | TRXUSDT | depth | WS | market_replayable | **configured, disabled** (alt panel; grade inherits lane 38 once activated and verified) |
+| 54 | bybit-mega-perp-trades | Bybit linear perp | MEGAUSDT | trades | WS | trades_replayable | **configured, disabled** (alt panel 2026-10-13; grade inherits lane 36 once activated and verified) |
+| 55 | bybit-mega-perp-depth | Bybit linear perp | MEGAUSDT | depth | WS | market_replayable | **configured, disabled** (alt panel; grade inherits lane 38 once activated and verified) |
+| 56 | bybit-linear-universe-snapshot | Bybit v5 REST | all linear symbols + spot pairs | instruments-info pages, spot, tickers | REST daily | raw only | **configured, disabled**; R reference (STANDARDS 4.15) |
 
 ## 2026-09-17/18 — the ETH/SOL completeness build (lanes 34-43)
 

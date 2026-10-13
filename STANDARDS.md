@@ -1756,3 +1756,36 @@ glob plus one `stat` per raw file, the manifest write/fsync, one read-only
 control read and the rename. A kernel-level stall in any stage before the rename
 still refuses evidence, now with its stage named. Missing manifests from past
 runs are never rebuilt; the two spent trials stay 0/2 admitted.
+
+## 4.15 Bybit linear universe snapshot (raw-only reference lane) and the alt research panel
+
+**Added 2026-10-13, shipped disabled.** `STANDARDS_VERSION` is unchanged: no schema,
+partition layout or replayable verdict changes. The alt panel reuses the Bybit linear
+trades/depth lanes exactly (section 4.1/4.3 verdicts, `perp:bybit:<SYMBOL>` instruments,
+per-instrument `bybit_perp_{trades,depth}_<symbol>` directories via `source_suffix`,
+one promoter per lane).
+
+`bybit-linear-universe-snapshot` is a 4.9-pattern raw-only lane on
+`collectors/raw_snapshot.py`: once a day it archives the exact bytes of three payload
+families under `raw/market/bybit_linear_universe/<run_id>/raw/`: `instruments_linear_p<n>`
+(cursor pagination, bounded at 3 pages; a non-empty cursor on the last page fails the run
+as INCOMPLETE with the bytes kept), `instruments_spot` (no pagination; a cursor is a
+failure) and `tickers_linear`. Every request has a 1 MiB body cap and a 10 s socket
+timeout; the run has a 120 s wall budget after which remaining requests are recorded as
+failures without being sent. `retCode` must be a strict integer 0; category, list shape,
+string symbols, cross-page duplicates and repeated cursors are checked.
+
+`metrics/summary.json` adds `request_count` (requests, not families), `payload_families`,
+`linear_pages_fetched`, `linear_pagination_complete`, `payload_fetched_at` (actual request
+times; the skeleton's per-payload `fetched_at` is the capture time), and
+`panel_membership`/`panel_absent`: for each configured panel symbol, presence in the
+instruments and tickers payloads, `status`, `deliveryTime` and `fundingInterval` as seen
+in THIS run. Absence is recorded, never fabricated and never a failure, so a delisted
+contract cannot break the daily job. Membership is prospective evidence per dated run;
+nothing reconstructs historical membership, nothing auto-deletes data, and no replacement
+symbol is enabled by code. The tickers payload is a coarse once-a-day reference (OI value,
+funding quote and next time, mark, index): a funding quote is not a settlement and a
+displayed quote is not an executable fill.
+
+Activation, caps and canary measurements are a separate decision; see the factory's
+`tickets/ALT_PANEL_ROLLOUT_20261013.md`.

@@ -818,6 +818,478 @@
       }
     },
     {
+      "// alt research panel (2026-10-13)": "Four mid-liquidity Bybit USDT perpetuals selected by the saved rule in market-edge-factory/reports/alt-collection-shortlist-20261013 (institutional participation is unobserved). Every job below ships DISABLED; activation is a separate staged decision (tickets/ALT_PANEL_ROLLOUT_20261013.md) that must raise CollectorConcurrency in BOTH runner scripts to enabled lanes + subset + reserve. Per-instrument dirs via source_suffix; exactly one promoter per lane; delisting keeps the lane through deliveryTime + 1 h then enabled:false with a logged reason, never deletion.",
+      "name": "bybit-xlm-perp-trades",
+      "job_type": "bybit-trades-worker",
+      "enabled": false,
+      "interval_seconds": 5,
+      "args": {
+        "symbol": "XLMUSDT",
+        "channel": "publicTrade",
+        "market": "linear",
+        "source_suffix": "xlmusdt",
+        "normalized_parquet": false,
+        "segment_count": 100000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "worker_name": "bybit-trades-worker-xlm-perp",
+        "idle_timeout_seconds": 120,
+        "rotate_at_midnight": true,
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\trades",
+        "jsonl_fsync": true,
+        "fsync_interval_events": 64,
+        "fsync_interval_ms": 200
+      }
+    },
+    {
+      "name": "quarantine-bybit-xlm-perp-trades",
+      "job_type": "quarantine-runs",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\bybit_perp_trades_xlmusdt",
+        "quarantine_root": "G:\\market_archive\\quarantine\\market\\bybit_perp_trades_xlmusdt",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "promote-bybit-xlm-perp-trades",
+      "job_type": "promote-replayable",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\bybit_perp_trades_xlmusdt",
+        "target_root": "G:\\market_archive\\curated\\research\\trades_replayable",
+        "quarantine_index": "G:\\market_archive\\quarantine\\market\\bybit_perp_trades_xlmusdt\\_quarantine_index.jsonl",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "score-bybit-xlm-perp-trades",
+      "job_type": "backfill-trades-replay",
+      "enabled": false,
+      "interval_seconds": 3600,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\bybit_perp_trades_xlmusdt",
+        "stream": true,
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "bybit-xlm-perp-depth",
+      "job_type": "bybit-depth-worker",
+      "enabled": false,
+      "interval_seconds": 5,
+      "args": {
+        "symbol": "XLMUSDT",
+        "channel": "orderbook.50",
+        "market": "linear",
+        "source_suffix": "xlmusdt",
+        "normalized_parquet": false,
+        "segment_count": 100000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "worker_name": "bybit-depth-worker-xlm-perp",
+        "idle_timeout_seconds": 120,
+        "rotate_at_midnight": true,
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\market"
+      }
+    },
+    {
+      "name": "quarantine-bybit-xlm-perp-depth",
+      "job_type": "quarantine-runs",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\bybit_perp_depth_xlmusdt",
+        "quarantine_root": "G:\\market_archive\\quarantine\\market\\bybit_perp_depth_xlmusdt",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "promote-bybit-xlm-perp-depth",
+      "job_type": "promote-replayable",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\bybit_perp_depth_xlmusdt",
+        "target_root": "G:\\market_archive\\curated\\research\\market_replayable",
+        "quarantine_index": "G:\\market_archive\\quarantine\\market\\bybit_perp_depth_xlmusdt\\_quarantine_index.jsonl",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "bybit-gram-perp-trades",
+      "job_type": "bybit-trades-worker",
+      "enabled": false,
+      "interval_seconds": 5,
+      "args": {
+        "symbol": "GRAMUSDT",
+        "channel": "publicTrade",
+        "market": "linear",
+        "source_suffix": "gramusdt",
+        "normalized_parquet": false,
+        "segment_count": 100000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "worker_name": "bybit-trades-worker-gram-perp",
+        "idle_timeout_seconds": 120,
+        "rotate_at_midnight": true,
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\trades",
+        "jsonl_fsync": true,
+        "fsync_interval_events": 64,
+        "fsync_interval_ms": 200
+      }
+    },
+    {
+      "name": "quarantine-bybit-gram-perp-trades",
+      "job_type": "quarantine-runs",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\bybit_perp_trades_gramusdt",
+        "quarantine_root": "G:\\market_archive\\quarantine\\market\\bybit_perp_trades_gramusdt",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "promote-bybit-gram-perp-trades",
+      "job_type": "promote-replayable",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\bybit_perp_trades_gramusdt",
+        "target_root": "G:\\market_archive\\curated\\research\\trades_replayable",
+        "quarantine_index": "G:\\market_archive\\quarantine\\market\\bybit_perp_trades_gramusdt\\_quarantine_index.jsonl",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "score-bybit-gram-perp-trades",
+      "job_type": "backfill-trades-replay",
+      "enabled": false,
+      "interval_seconds": 3600,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\bybit_perp_trades_gramusdt",
+        "stream": true,
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "bybit-gram-perp-depth",
+      "job_type": "bybit-depth-worker",
+      "enabled": false,
+      "interval_seconds": 5,
+      "args": {
+        "symbol": "GRAMUSDT",
+        "channel": "orderbook.50",
+        "market": "linear",
+        "source_suffix": "gramusdt",
+        "normalized_parquet": false,
+        "segment_count": 100000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "worker_name": "bybit-depth-worker-gram-perp",
+        "idle_timeout_seconds": 120,
+        "rotate_at_midnight": true,
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\market"
+      }
+    },
+    {
+      "name": "quarantine-bybit-gram-perp-depth",
+      "job_type": "quarantine-runs",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\bybit_perp_depth_gramusdt",
+        "quarantine_root": "G:\\market_archive\\quarantine\\market\\bybit_perp_depth_gramusdt",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "promote-bybit-gram-perp-depth",
+      "job_type": "promote-replayable",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\bybit_perp_depth_gramusdt",
+        "target_root": "G:\\market_archive\\curated\\research\\market_replayable",
+        "quarantine_index": "G:\\market_archive\\quarantine\\market\\bybit_perp_depth_gramusdt\\_quarantine_index.jsonl",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "bybit-trx-perp-trades",
+      "job_type": "bybit-trades-worker",
+      "enabled": false,
+      "interval_seconds": 5,
+      "args": {
+        "symbol": "TRXUSDT",
+        "channel": "publicTrade",
+        "market": "linear",
+        "source_suffix": "trxusdt",
+        "normalized_parquet": false,
+        "segment_count": 100000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "worker_name": "bybit-trades-worker-trx-perp",
+        "idle_timeout_seconds": 120,
+        "rotate_at_midnight": true,
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\trades",
+        "jsonl_fsync": true,
+        "fsync_interval_events": 64,
+        "fsync_interval_ms": 200
+      }
+    },
+    {
+      "name": "quarantine-bybit-trx-perp-trades",
+      "job_type": "quarantine-runs",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\bybit_perp_trades_trxusdt",
+        "quarantine_root": "G:\\market_archive\\quarantine\\market\\bybit_perp_trades_trxusdt",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "promote-bybit-trx-perp-trades",
+      "job_type": "promote-replayable",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\bybit_perp_trades_trxusdt",
+        "target_root": "G:\\market_archive\\curated\\research\\trades_replayable",
+        "quarantine_index": "G:\\market_archive\\quarantine\\market\\bybit_perp_trades_trxusdt\\_quarantine_index.jsonl",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "score-bybit-trx-perp-trades",
+      "job_type": "backfill-trades-replay",
+      "enabled": false,
+      "interval_seconds": 3600,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\bybit_perp_trades_trxusdt",
+        "stream": true,
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "bybit-trx-perp-depth",
+      "job_type": "bybit-depth-worker",
+      "enabled": false,
+      "interval_seconds": 5,
+      "args": {
+        "symbol": "TRXUSDT",
+        "channel": "orderbook.50",
+        "market": "linear",
+        "source_suffix": "trxusdt",
+        "normalized_parquet": false,
+        "segment_count": 100000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "worker_name": "bybit-depth-worker-trx-perp",
+        "idle_timeout_seconds": 120,
+        "rotate_at_midnight": true,
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\market"
+      }
+    },
+    {
+      "name": "quarantine-bybit-trx-perp-depth",
+      "job_type": "quarantine-runs",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\bybit_perp_depth_trxusdt",
+        "quarantine_root": "G:\\market_archive\\quarantine\\market\\bybit_perp_depth_trxusdt",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "promote-bybit-trx-perp-depth",
+      "job_type": "promote-replayable",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\bybit_perp_depth_trxusdt",
+        "target_root": "G:\\market_archive\\curated\\research\\market_replayable",
+        "quarantine_index": "G:\\market_archive\\quarantine\\market\\bybit_perp_depth_trxusdt\\_quarantine_index.jsonl",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "bybit-mega-perp-trades",
+      "job_type": "bybit-trades-worker",
+      "enabled": false,
+      "interval_seconds": 5,
+      "args": {
+        "symbol": "MEGAUSDT",
+        "channel": "publicTrade",
+        "market": "linear",
+        "source_suffix": "megausdt",
+        "normalized_parquet": false,
+        "segment_count": 100000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "worker_name": "bybit-trades-worker-mega-perp",
+        "idle_timeout_seconds": 120,
+        "rotate_at_midnight": true,
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\trades",
+        "jsonl_fsync": true,
+        "fsync_interval_events": 64,
+        "fsync_interval_ms": 200
+      }
+    },
+    {
+      "name": "quarantine-bybit-mega-perp-trades",
+      "job_type": "quarantine-runs",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\bybit_perp_trades_megausdt",
+        "quarantine_root": "G:\\market_archive\\quarantine\\market\\bybit_perp_trades_megausdt",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "promote-bybit-mega-perp-trades",
+      "job_type": "promote-replayable",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\bybit_perp_trades_megausdt",
+        "target_root": "G:\\market_archive\\curated\\research\\trades_replayable",
+        "quarantine_index": "G:\\market_archive\\quarantine\\market\\bybit_perp_trades_megausdt\\_quarantine_index.jsonl",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "score-bybit-mega-perp-trades",
+      "job_type": "backfill-trades-replay",
+      "enabled": false,
+      "interval_seconds": 3600,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\bybit_perp_trades_megausdt",
+        "stream": true,
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "bybit-mega-perp-depth",
+      "job_type": "bybit-depth-worker",
+      "enabled": false,
+      "interval_seconds": 5,
+      "args": {
+        "symbol": "MEGAUSDT",
+        "channel": "orderbook.50",
+        "market": "linear",
+        "source_suffix": "megausdt",
+        "normalized_parquet": false,
+        "segment_count": 100000,
+        "max_segments": 1,
+        "cooldown_seconds": 1.0,
+        "worker_name": "bybit-depth-worker-mega-perp",
+        "idle_timeout_seconds": 120,
+        "rotate_at_midnight": true,
+        "output_root": "G:\\market_archive\\raw\\market",
+        "ops_root": "G:\\market_archive\\ops",
+        "normalized_root": "G:\\market_archive\\normalized\\market"
+      }
+    },
+    {
+      "name": "quarantine-bybit-mega-perp-depth",
+      "job_type": "quarantine-runs",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\bybit_perp_depth_megausdt",
+        "quarantine_root": "G:\\market_archive\\quarantine\\market\\bybit_perp_depth_megausdt",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "promote-bybit-mega-perp-depth",
+      "job_type": "promote-replayable",
+      "enabled": false,
+      "interval_seconds": 300,
+      "args": {
+        "source_root": "G:\\market_archive\\raw\\market\\bybit_perp_depth_megausdt",
+        "target_root": "G:\\market_archive\\curated\\research\\market_replayable",
+        "quarantine_index": "G:\\market_archive\\quarantine\\market\\bybit_perp_depth_megausdt\\_quarantine_index.jsonl",
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "name": "score-bybit-alt-panel-depth",
+      "job_type": "backfill-stream-depth",
+      "enabled": false,
+      "interval_seconds": 3600,
+      "args": {
+        "raw_root": "G:\\market_archive\\raw\\market",
+        "source": [
+          "bybit_perp_depth_xlmusdt",
+          "bybit_perp_depth_gramusdt",
+          "bybit_perp_depth_trxusdt",
+          "bybit_perp_depth_megausdt"
+        ],
+        "target_root": "G:\\market_archive\\curated\\research\\market_replayable",
+        "score_only": true,
+        "limit": 1000,
+        "max_age_hours": 168
+      }
+    },
+    {
+      "// bybit-linear-universe-snapshot": "Raw-only daily reference (STANDARDS 4.15): linear instruments pages (bounded cursor pagination), spot instruments, one linear tickers payload. Dated universe membership, delisting times and turnover ranks for every linear symbol; panel absence is recorded, not fatal. Holds a pool slot while it runs. Offloaded age_only. Disabled until activation.",
+      "name": "bybit-linear-universe-snapshot",
+      "job_type": "bybit-linear-universe-snapshot",
+      "enabled": false,
+      "interval_seconds": 86400,
+      "args": {
+        "panel_symbols": [
+          "XLMUSDT",
+          "GRAMUSDT",
+          "TRXUSDT",
+          "MEGAUSDT"
+        ],
+        "output_root": "G:\\market_archive\\raw\\market"
+      }
+    },
+    {
       "// Binance USDT-M perp trades": "Set market='futures' on the Binance trades worker to collect USDT-M perpetual aggregate trades from fstream.binance.com. The frame shape matches spot (BinanceTradeNormalizer already reads the aggTrade `a` id), so this is a URL + endpoint + instrument-tagging switch: channel is forced to aggTrade, runs land in binance_perp_trades/ tagged perp:binance-futures:* (the explicit instrument-master record), and `a` is a dense counter so the lane stays a provable sequence feed. NOTE: this is Phase-3 TRADES ONLY. Binance futures DEPTH is intentionally absent \u2014 futures depth chains via the `pu` (previous-final-update-id) field, NOT the spot snapshot-anchor rule the binance-depth-worker book-sync is built on, so a futures depth lane needs its own sync variant + book-sync-health before it can be added (it would false-green otherwise). Enable to activate trades.",
       "name": "binance-perp-trades",
       "job_type": "binance-trades-worker",
@@ -1580,6 +2052,50 @@
             "source": "binance_perp_open_interest_solusdt",
             "promotion_index": "G:\\market_archive\\curated\\research\\open_interest\\_promotion_index.jsonl",
             "quarantine_index": "G:\\market_archive\\quarantine\\market\\binance_perp_open_interest_solusdt\\_quarantine_index.jsonl"
+          },
+          {
+            "source": "bybit_perp_trades_xlmusdt",
+            "promotion_index": "G:\\market_archive\\curated\\research\\trades_replayable\\_promotion_index.jsonl",
+            "quarantine_index": "G:\\market_archive\\quarantine\\market\\bybit_perp_trades_xlmusdt\\_quarantine_index.jsonl"
+          },
+          {
+            "source": "bybit_perp_depth_xlmusdt",
+            "promotion_index": "G:\\market_archive\\curated\\research\\market_replayable\\_promotion_index.jsonl",
+            "quarantine_index": "G:\\market_archive\\quarantine\\market\\bybit_perp_depth_xlmusdt\\_quarantine_index.jsonl"
+          },
+          {
+            "source": "bybit_perp_trades_gramusdt",
+            "promotion_index": "G:\\market_archive\\curated\\research\\trades_replayable\\_promotion_index.jsonl",
+            "quarantine_index": "G:\\market_archive\\quarantine\\market\\bybit_perp_trades_gramusdt\\_quarantine_index.jsonl"
+          },
+          {
+            "source": "bybit_perp_depth_gramusdt",
+            "promotion_index": "G:\\market_archive\\curated\\research\\market_replayable\\_promotion_index.jsonl",
+            "quarantine_index": "G:\\market_archive\\quarantine\\market\\bybit_perp_depth_gramusdt\\_quarantine_index.jsonl"
+          },
+          {
+            "source": "bybit_perp_trades_trxusdt",
+            "promotion_index": "G:\\market_archive\\curated\\research\\trades_replayable\\_promotion_index.jsonl",
+            "quarantine_index": "G:\\market_archive\\quarantine\\market\\bybit_perp_trades_trxusdt\\_quarantine_index.jsonl"
+          },
+          {
+            "source": "bybit_perp_depth_trxusdt",
+            "promotion_index": "G:\\market_archive\\curated\\research\\market_replayable\\_promotion_index.jsonl",
+            "quarantine_index": "G:\\market_archive\\quarantine\\market\\bybit_perp_depth_trxusdt\\_quarantine_index.jsonl"
+          },
+          {
+            "source": "bybit_perp_trades_megausdt",
+            "promotion_index": "G:\\market_archive\\curated\\research\\trades_replayable\\_promotion_index.jsonl",
+            "quarantine_index": "G:\\market_archive\\quarantine\\market\\bybit_perp_trades_megausdt\\_quarantine_index.jsonl"
+          },
+          {
+            "source": "bybit_perp_depth_megausdt",
+            "promotion_index": "G:\\market_archive\\curated\\research\\market_replayable\\_promotion_index.jsonl",
+            "quarantine_index": "G:\\market_archive\\quarantine\\market\\bybit_perp_depth_megausdt\\_quarantine_index.jsonl"
+          },
+          {
+            "source": "bybit_linear_universe",
+            "gate": "age_only"
           }
         ]
       }
@@ -1612,7 +2128,16 @@
           "text/text_rss=14",
           "text/text_reddit=14",
           "market/binance_options_chain=3650",
-          "market/deribit_options=3650"
+          "market/deribit_options=3650",
+          "market/bybit_perp_trades_xlmusdt=14",
+          "market/bybit_perp_depth_xlmusdt=14",
+          "market/bybit_perp_trades_gramusdt=14",
+          "market/bybit_perp_depth_gramusdt=14",
+          "market/bybit_perp_trades_trxusdt=14",
+          "market/bybit_perp_depth_trxusdt=14",
+          "market/bybit_perp_trades_megausdt=14",
+          "market/bybit_perp_depth_megausdt=14",
+          "market/bybit_linear_universe=3650"
         ],
         "apply": false
       }
