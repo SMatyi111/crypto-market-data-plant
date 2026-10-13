@@ -1805,8 +1805,11 @@ contracts are untouched. Module `crypto_collector.canary`; runbook
 **One immutable attempt.** `python -m crypto_collector.canary prepare <dir> <id> --config
 <ops json> --symbol <SYMBOL> --job <name>...` creates control state only (SQLite, DELETE
 journaling, 4 KiB pages, at most 2048 pages, plus a `receipts/` directory) and refuses any
-existing directory. It also refuses an attempt whose worst-case grant count (every lane
-re-claiming at its shortest segment for the whole duration) would not fit that DB. It admits at most one `bybit-trades-worker`, one `bybit-depth-worker`
+existing directory. Each attempt carries a hard grant ceiling (eight times the planned
+count of segments; refused at `prepare` if that would not fit the DB): segments can end
+early and the runner re-dispatches on its cadence, so a flapping lane reaches the
+ceiling and the attempt stops durably (`canary_grants_exhausted`) instead of wedging its
+control plane. It admits at most one `bybit-trades-worker`, one `bybit-depth-worker`
 and the `bybit-linear-universe-snapshot` job; every other job type is refused, so ticker,
 liquidation, replacement-symbol or second-symbol lanes cannot join a canary by config.
 Each admitted job row is digested (name, type, interval, args; `enabled` excluded) and the
@@ -1821,7 +1824,7 @@ finished attempt stays on disk as evidence and a new attempt is a new prepared d
 (`canary_expiring`); at or after it the attempt is durably stopped (`canary_expired`).
 Workers clamp every segment deadline to the canary deadline, check wall and monotonic
 clocks before every frame (a reversal, or a wall/monotonic disagreement over 0.5 s plus
-1 % of the gap since the last checkpoint, is a durable `canary_clock` stop; cross-process
+1 % of the gap since the last sample, is a durable `canary_clock` stop; cross-process
 comparisons sample the clocks under the DB lock so a sibling lane's checkpoint can never
 look like the future) and tell the receive loop to end an idle wait at the deadline, so an
 idle lane stops without waiting for its idle timeout. These are bounds on the
@@ -1836,7 +1839,8 @@ is not a spawn loop; the lane still has to be disabled by config.
 under their run directories: raw, clean, quarantine, metrics, replay summaries and the
 universe snapshot's gzipped bodies and summary. 32 MiB is reserved for the control DB and
 receipts. A control DB that cannot be opened or written refuses the claim or ends the
-segment (`canary_control_db`); it never crashes a worker past its bounded hold. Stream grants reserve 16 MiB chunks **before** writing plus 1 MiB per segment;
+segment (`canary_control_db`); transient lock contention retries, then refuses with
+`canary_control_busy` and a 30 s hold. Neither crashes a worker past its hold. Stream grants reserve 16 MiB chunks **before** writing plus 1 MiB per segment;
 a frame is admitted only while the open grant still covers a 4 MiB margin (inbound frames
 are capped at 1 MiB on canary lanes; raw plus fan-out plus a metrics row is assumed to
 fit 4x). Bytes are accounted from the sinks' own counters after each frame; if a frame
@@ -1868,8 +1872,9 @@ blocks a lane claim, finalization and a stop's exit verification. `stop` is a dr
 unless `--apply` (durable stop, then a bounded wait for recorded writers to close);
 `--terminate` terminates only still-alive recorded writers through a handle whose
 creation time is re-checked before `TerminateProcess` and whose kernel image path must
-be a plant interpreter (POSIX: SIGTERM after the same checks); a control-DB row naming
-any other process is refused (`image_not_plant_interpreter`). The control directory
+equal the image the worker recorded for itself at claim (POSIX: SIGTERM after the same
+checks); a control-DB row naming any other process, or without a recorded image, is
+refused (`image_mismatch`, `image_unrecorded`). The control directory
 should be restricted to SYSTEM and Administrators (runbook). No pid-only lock, no process-name or tree sweep, no action on any other plant
 worker, no runner restart.
 

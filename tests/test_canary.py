@@ -343,6 +343,40 @@ def test_control_db_fault_is_a_refusal_not_a_crash(prepared, clock, monkeypatch)
         grant_for(prepared, "bybit-gram-perp-depth").claim()
 
 
+def test_flapping_lane_hits_the_grant_ceiling_and_stops_durably(tmp_path, small, clock):
+    control = tmp_path / "c"
+    jobs = lane_jobs(control, tmp_path / "raw")[:1]
+    config = write_config(tmp_path, jobs)
+    info = canary.prepare(control, "flap", config_path=config, symbol=SYMBOL, job_names=[jobs[0]["name"]],
+                          max_bytes=canary.METADATA_BYTES + 100 * 4096, max_seconds=1800)
+    assert info["max_grants"] == (1 + 1) * canary.GRANT_SLACK  # one planned segment + 1, times the slack
+    identity = info["lanes"][0]["identity"]
+    for _ in range(info["max_grants"]):
+        grant = CanaryGrant(control, lane=jobs[0]["name"], identity=identity, min_free_bytes=0)
+        grant.claim()
+        grant.close(reason="unexpected_end", replayable=False)  # a segment that ended in seconds
+    with pytest.raises(CanaryRefused, match="canary_grants_exhausted"):
+        CanaryGrant(control, lane=jobs[0]["name"], identity=identity, min_free_bytes=0).claim()
+    assert canary.status(control)["canary"]["stopped"] == "canary_grants_exhausted"
+
+
+def test_lock_contention_is_a_short_refusal(prepared, clock, monkeypatch):
+    import sqlite3 as sq
+    real_connect = canary._connect
+
+    def locked(directory):
+        conn = real_connect(directory)
+        conn.close()
+        raise sq.OperationalError("database is locked")
+
+    monkeypatch.setattr(canary, "_connect", locked)
+    sleeps = []
+    monkeypatch.setattr(clock, "sleep", lambda s: sleeps.append(s))
+    with pytest.raises(CanaryRefused, match="canary_control_busy"):
+        grant_for(prepared).claim()
+    assert sleeps == [1.0, 1.0]
+
+
 def test_prepare_refuses_an_attempt_the_control_db_cannot_hold(tmp_path, small):
     control = tmp_path / "c"
     jobs = lane_jobs(control, tmp_path / "raw")
@@ -441,14 +475,15 @@ def test_stop_is_dry_run_by_default_then_durable_with_bounded_wait_and_exact_ter
     assert rows(prepared, "SELECT stopped FROM canary") == [(None,)]
     calls = []
 
-    def failing_terminate(pid, identity):
-        calls.append((pid, identity))
+    def failing_terminate(pid, identity, image):
+        calls.append((pid, identity, image))
         return {"terminated": False, "reason": "terminate_failed_5"}
 
     result = canary.stop(prepared.control, apply=True, wait_seconds=2, terminate=True,
                          terminate_fn=failing_terminate, sleep=clock.sleep, monotonic=clock.monotonic)
     assert rows(prepared, "SELECT stopped FROM canary") == [("operator_stop",)]
-    assert calls == [(os.getpid(), live.process_identity)]  # only the recorded writer, by identity
+    assert calls == [(os.getpid(), live.process_identity, live.image)]  # only the recorded writer
+    assert live.image == canary.process_image(os.getpid())
     assert result["terminations"][0]["reason"] == "terminate_failed_5"
     assert result["writers_alive_after"] == [live.grant_id] and result["verified_exited"] is False
     with pytest.raises(CanaryRefused, match="writers_alive_or_unknown"):
@@ -522,22 +557,25 @@ def test_process_identity_and_termination_target_only_the_exact_process():
     child = subprocess.Popen([executable, "-c", "import time; time.sleep(60)"])
     try:
         identity = canary.process_identity(child.pid)
-        assert identity and canary.owned_process_alive(child.pid, identity) is True
+        image = canary.process_image(child.pid)
+        assert identity and image and canary.owned_process_alive(child.pid, identity) is True
+        assert image == os.path.normcase(os.path.realpath(executable))
         assert canary.owned_process_alive(child.pid, identity + "0") is False  # a different incarnation
-        assert canary.terminate_owned(child.pid, identity + "0")["terminated"] is False  # never by pid alone
+        assert canary.terminate_owned(child.pid, identity + "0", image)["terminated"] is False  # never by pid alone
+        assert canary.terminate_owned(child.pid, identity, None) == {"terminated": False, "reason": "image_unrecorded"}
         assert child.poll() is None
-        # A row that names a live non-plant process is refused by image path.
-        foreign = subprocess.Popen(["cmd.exe", "/c", "ping -n 30 127.0.0.1 >nul"] if sys.platform == "win32"
-                                   else ["sleep", "30"])
+        # A row whose recorded image is not the target's kernel image is refused.
+        foreign = subprocess.Popen(["ping", "-n", "30", "127.0.0.1"] if sys.platform == "win32" else ["sleep", "30"],
+                                   stdout=subprocess.DEVNULL)
         try:
             foreign_identity = canary.process_identity(foreign.pid)
-            refused = canary.terminate_owned(foreign.pid, foreign_identity)
-            assert refused == {"terminated": False, "reason": "image_not_plant_interpreter"}
+            refused = canary.terminate_owned(foreign.pid, foreign_identity, image)
+            assert refused == {"terminated": False, "reason": "image_mismatch"}
             assert foreign.poll() is None
         finally:
             foreign.kill()
             foreign.wait(timeout=10)
-        result = canary.terminate_owned(child.pid, identity, wait_seconds=10)
+        result = canary.terminate_owned(child.pid, identity, image, wait_seconds=10)
         assert result["terminated"] is True
         child.wait(timeout=10)
     finally:

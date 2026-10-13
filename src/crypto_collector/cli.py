@@ -4039,6 +4039,8 @@ def _claim_canary_grant(args: argparse.Namespace, *, runtime, worker_name: str):
         hold = getattr(args, "canary_hold_seconds", None)
         if hold is None:
             hold = getattr(args, "max_segment_seconds", None) or 1800.0
+        if reason == "canary_control_busy":
+            hold = min(float(hold), 30.0)  # transient lock contention, not a terminal state
         time.sleep(min(max(0.0, float(hold)), 7200.0))
         return f"canary_refused:{reason}"
     runtime.record_event("canary_granted", details={"grant_id": grant.grant_id, "deadline_utc": grant.deadline})
