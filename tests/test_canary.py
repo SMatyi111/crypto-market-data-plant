@@ -143,6 +143,8 @@ def test_prepare_refuses_reuse_unsupported_lanes_and_mismatched_jobs(tmp_path, s
         canary.prepare(control, "x", config_path=config, symbol=SYMBOL, job_names=names + ["trades-dup"])
     with pytest.raises(ValueError, match="include"):
         canary.prepare(control, "x", config_path=config, symbol="TRXUSDT", job_names=[names[2]])
+    with pytest.raises(ValueError, match="bounded tokens"):
+        canary.prepare(control, "x", config_path=config, symbol=SYMBOL, job_names=["../escape"])
     assert not control.exists()  # every refusal above happened before any state was created
     info = canary.prepare(control, "stage-one", config_path=config, symbol=SYMBOL, job_names=names)
     assert {lane["kind"] for lane in info["lanes"]} == {"stream", "snapshot"}
@@ -285,6 +287,72 @@ def test_expiry_refuses_dispatch_and_ends_an_open_segment(prepared, clock, tmp_p
     late.close(reason="canary_expired", replayable=True)
     with pytest.raises(CanaryRefused, match="canary_expired"):
         grant_for(prepared).claim()
+
+
+def test_sibling_checkpoints_and_slew_do_not_false_stop(prepared, clock):
+    """Clocks are sampled under the DB lock, so a sibling lane's later checkpoint is
+    never 'in the future'; the cross-process agreement tolerance grows with the gap."""
+    trades, depth = grant_for(prepared), grant_for(prepared, "bybit-gram-perp-depth")
+    trades.claim()
+    depth.claim()
+
+    class Ticking(Clock):
+        def time(self):
+            self.wall += 0.01  # every call observes a later wall clock
+            return self.wall
+
+        def monotonic(self):
+            self.mono += 0.01
+            return self.mono
+
+    ticking = Ticking(clock.wall, clock.mono)
+    import crypto_collector.canary as module
+    module.time = ticking
+    try:
+        trades.consumed(trades.reserved)  # force a DB visit (chunk needed)
+        assert trades.admit_frame() is None
+        depth.consumed(depth.reserved)
+        assert depth.admit_frame() in (None, "canary_budget")  # never canary_clock
+    finally:
+        module.time = clock
+    assert rows(prepared, "SELECT stopped FROM canary") == [(None,)]
+    trades.close(reason="limit", replayable=True)
+    depth.close(reason="limit", replayable=True)
+    # 20 minutes without a checkpoint, then a 1.5 s slew: tolerated. A 60 s step: not.
+    clock.advance(1200)
+    clock.wall += 1.5
+    grant_for(prepared).claim()
+    rows(prepared, "SELECT 1")
+    clock.wall += 60
+    with pytest.raises(CanaryRefused, match="canary_clock"):
+        grant_for(prepared, "bybit-gram-perp-depth").claim()
+
+
+def test_control_db_fault_is_a_refusal_not_a_crash(prepared, clock, monkeypatch):
+    grant = grant_for(prepared)
+    grant.claim()
+    import sqlite3 as sq
+
+    def broken(directory):
+        raise sq.OperationalError("database or disk is full")
+
+    monkeypatch.setattr(canary, "_connect", broken)
+    grant.consumed(grant.reserved)
+    assert grant.admit_frame() == "canary_control_db"
+    with pytest.raises(CanaryRefused, match="canary_control_db"):
+        grant_for(prepared, "bybit-gram-perp-depth").claim()
+
+
+def test_prepare_refuses_an_attempt_the_control_db_cannot_hold(tmp_path, small):
+    control = tmp_path / "c"
+    jobs = lane_jobs(control, tmp_path / "raw")
+    for job in jobs[:2]:
+        job["args"]["max_segment_seconds"] = 60
+    config = write_config(tmp_path, jobs)
+    with pytest.raises(ValueError, match="cannot hold"):
+        canary.prepare(control, "long", config_path=config, symbol=SYMBOL, job_names=[j["name"] for j in jobs],
+                       max_seconds=30 * 86400)
+    assert not control.exists()
 
 
 def test_clock_reversal_is_a_durable_stop(prepared, clock):
@@ -458,6 +526,17 @@ def test_process_identity_and_termination_target_only_the_exact_process():
         assert canary.owned_process_alive(child.pid, identity + "0") is False  # a different incarnation
         assert canary.terminate_owned(child.pid, identity + "0")["terminated"] is False  # never by pid alone
         assert child.poll() is None
+        # A row that names a live non-plant process is refused by image path.
+        foreign = subprocess.Popen(["cmd.exe", "/c", "ping -n 30 127.0.0.1 >nul"] if sys.platform == "win32"
+                                   else ["sleep", "30"])
+        try:
+            foreign_identity = canary.process_identity(foreign.pid)
+            refused = canary.terminate_owned(foreign.pid, foreign_identity)
+            assert refused == {"terminated": False, "reason": "image_not_plant_interpreter"}
+            assert foreign.poll() is None
+        finally:
+            foreign.kill()
+            foreign.wait(timeout=10)
         result = canary.terminate_owned(child.pid, identity, wait_seconds=10)
         assert result["terminated"] is True
         child.wait(timeout=10)
@@ -489,7 +568,7 @@ def test_segmented_worker_threads_the_grant_clamps_the_deadline_and_holds_on_ref
         seen.append(segment_args)
         paths = prepare_run_paths(prepared.output_root, "bybit_perp_trades_gramusdt")
         (paths.raw / "messages.jsonl").write_bytes(b"{}\n" * 10)
-        return {"run_path": str(paths.base), "replayable": True, "deadline_reached": True, "canary_stop_reason": None}
+        return {"run_path": str(paths.base), "replayable": True, "deadline_reached": True, "segment_reason": "deadline"}
 
     job = prepared.jobs[0]
     args = SimpleNamespace(**{**job["args"], "output_root": prepared.output_root, "ops_root": prepared.output_root / "ops",
@@ -570,12 +649,27 @@ def test_universe_snapshot_claims_measures_and_refuses_without_fetching(prepared
     args = SimpleNamespace(output_root=prepared.output_root, panel_symbol=job["args"]["panel_symbols"], format="text",
                            canary_control=str(prepared.control), canary_lane=job["name"],
                            canary_identity=prepared.identities[job["name"]], canary_min_free_gib=0)
-    cli.run_bybit_linear_universe_snapshot(args)
+    assert cli.run_bybit_linear_universe_snapshot(args) is None
     assert rows(prepared, "SELECT lane, reserved, consumed, reason FROM grants") == [
         ("bybit-linear-universe-snapshot", 2048, 300, "complete")]
+
+    def failing_snapshot(output_root, *, panel_symbols):
+        calls.append(panel_symbols)
+        raise OSError("dns")
+
+    monkeypatch.setattr(cli, "snapshot_bybit_linear_universe", failing_snapshot)
+    with pytest.raises(OSError):
+        cli.run_bybit_linear_universe_snapshot(args)
+    # The failure created no run dir: nothing is charged and yesterday's run is NOT
+    # attributed to this grant.
+    assert rows(prepared, "SELECT consumed, run_path, reason FROM grants WHERE id=2") == [(0, None, "exception:OSError")]
     canary.stop(prepared.control, apply=True, wait_seconds=0, sleep=clock.sleep, monotonic=clock.monotonic)
-    cli.run_bybit_linear_universe_snapshot(args)
-    assert len(calls) == 1  # refused before any request
+    message = cli.run_bybit_linear_universe_snapshot(args)
+    assert message.startswith("bybit linear universe snapshot: canary refused (operator_stop)")
+    assert len(calls) == 2  # refused before any request
+    from crypto_collector.ops import JobSpec
+    spec = JobSpec.from_dict(prepared.jobs[2])
+    assert "canary refused" in cli._execute_ops_job_inprocess(spec)  # never reads as a plain success
 
 
 def test_ops_job_threads_canary_fields_and_runner_parses_refusal(prepared, monkeypatch):
@@ -620,6 +714,11 @@ def test_preflight_is_read_only_and_refuses_enabled_promotion_for_canary_sources
     assert report["headroom_model"]["required_free_bytes"] == 10**6 + report["headroom_model"]["unspent_pool_bytes"] + canary.EXTERNAL_OVERHEAD_BYTES
     assert report["pool_cap"]["needed"] == 0 + 3 + 2 and all(v >= 5 for v in report["pool_cap"]["scripts"].values())
     assert (prepared.control / "canary.sqlite3").read_bytes() == before  # nothing written
+    promoter["args"]["source_root"] = promoter["args"]["source_root"].upper()  # NTFS is case-insensitive
+    path.write_text(json.dumps({"jobs": prepared.jobs + [promoter, scorer]}), encoding="utf-8")
+    report = canary.preflight(prepared.control, config_path=path, min_free_bytes=10**6,
+                              disk_usage_fn=lambda p: SimpleNamespace(free=10**12))
+    assert "promotion_or_scoring_enabled_for_canary_source:promote-bybit-gram-perp-trades" in report["findings"]
     promoter["enabled"] = scorer["enabled"] = False
     path.write_text(json.dumps({"jobs": prepared.jobs + [promoter, scorer]}), encoding="utf-8")
     report = canary.preflight(prepared.control, config_path=path, min_free_bytes=10**6,

@@ -103,12 +103,12 @@ class GenericWebsocketCollector(BaseCollector):
                         message_iter = websocket.__aiter__()
                         while True:
                             try:
+                                duration_bound = False
                                 remaining = (depth_deadline - time.monotonic()
                                              if reference_mode else idle_timeout)
                                 if reference_mode and remaining <= 0:
                                     raise TimeoutError("Depth idle despite reference traffic")
                                 stop_at = self.stop_at_monotonic
-                                duration_bound = False
                                 if stop_at is not None:
                                     left = stop_at - time.monotonic()
                                     if left <= 0:

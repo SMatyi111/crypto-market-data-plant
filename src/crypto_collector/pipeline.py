@@ -35,6 +35,9 @@ class RunSummary:
     # Set only when an optional byte/duration budget ended the segment before the
     # next frame was written (canary lanes); None for every ordinary lane.
     stop_reason: str | None = None
+    # Why the segment ended: deadline, limit, the budget's stop reason, unexpected_end,
+    # or the exception type name. Not part of the metrics row.
+    reason: str | None = None
 
     def to_dict(self) -> dict[str, int | bool | str | None]:
         return {
@@ -188,6 +191,7 @@ class CollectorPipeline:
             reason = ("deadline" if summary.deadline_reached else
                       "limit" if limit is not None and summary.raw_messages >= limit else
                       summary.stop_reason or "unexpected_end")
+            summary.reason = reason
         finally:
             # Always flush, even on cancellation / exception, so buffered Parquet rows
             # and the summary metrics are persisted instead of lost on shutdown. Each
@@ -197,6 +201,8 @@ class CollectorPipeline:
             # for. The first cleanup failure is re-raised only when no exception is
             # already propagating, so the original error is never masked.
             cleanup_error: BaseException | None = None
+            if sys.exc_info()[0] is not None:
+                summary.reason = sys.exc_info()[0].__name__
             if evidence is not None or budget is not None:
                 if sys.exc_info()[0] is not None:
                     reason = sys.exc_info()[0].__name__

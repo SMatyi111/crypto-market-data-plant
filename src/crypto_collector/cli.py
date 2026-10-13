@@ -2450,7 +2450,7 @@ async def _collect_trades_segment(
         "replay_summary_path": replay_summary_path,
         "deadline_reached": bool(pipeline_summary.deadline_reached),
         "idle_timeout_count": collector.idle_timeout_count,
-        "canary_stop_reason": getattr(pipeline_summary, "stop_reason", None),
+        "segment_reason": getattr(pipeline_summary, "reason", None),
     }
 
 
@@ -2710,7 +2710,7 @@ async def _collect_depth_stream_segment(
         "replay_summary_path": replay_summary_path,
         "deadline_reached": bool(pipeline_summary.deadline_reached),
         "idle_timeout_count": collector.idle_timeout_count,
-        "canary_stop_reason": getattr(pipeline_summary, "stop_reason", None),
+        "segment_reason": getattr(pipeline_summary, "reason", None),
     }
 
 
@@ -3108,8 +3108,11 @@ def run_hyperliquid_universe_positions_snapshot(args: argparse.Namespace) -> Non
     )
 
 
-def run_bybit_linear_universe_snapshot(args: argparse.Namespace) -> None:
+def run_bybit_linear_universe_snapshot(args: argparse.Namespace) -> str | None:
+    """Returns the refusal message when the canary refused the run (nothing fetched),
+    None otherwise, so the dispatcher's job-run message never reads as a success."""
     grant = None
+    lane_root = Path(args.output_root) / "bybit_linear_universe"
     if getattr(args, "canary_control", None):
         from .canary import GIB, CanaryGrant, CanaryRefused
         grant = CanaryGrant(Path(args.canary_control), lane=str(getattr(args, "canary_lane", "")),
@@ -3119,19 +3122,22 @@ def run_bybit_linear_universe_snapshot(args: argparse.Namespace) -> None:
             grant.claim()
         except CanaryRefused as exc:
             logger.warning("canary refused: %s", exc)
-            print(f"bybit linear universe snapshot: canary refused ({exc}); no request sent")
-            return
+            message = f"bybit linear universe snapshot: canary refused ({exc}); no request sent"
+            print(message)
+            return message
+        runs_before = _run_dirs(lane_root)
     try:
         result = snapshot_bybit_linear_universe(
             args.output_root, panel_symbols=tuple(args.panel_symbol)
         )
     except Exception as exc:
         if grant is not None:
-            # The skeleton has already archived whatever arrived under the run dir it
-            # named in the message; measure the lane directory's newest run instead of
-            # trusting the exception, then re-raise so the job is recorded as failed.
+            # The skeleton archives whatever arrived under a run dir it created during
+            # this call; charge exactly that directory (none if it never got that far),
+            # never an older run of the lane, then re-raise so the job records failure.
+            created = _run_dirs(lane_root) - runs_before
             grant.close(reason=f"exception:{type(exc).__name__}", replayable=None,
-                        run_path=_newest_run_dir(Path(args.output_root) / "bybit_linear_universe"))
+                        run_path=next(iter(created)) if len(created) == 1 else None)
         raise
     if grant is not None:
         grant.close(reason="complete", replayable=None, run_path=result.run_path)
@@ -3151,11 +3157,10 @@ def run_bybit_linear_universe_snapshot(args: argparse.Namespace) -> None:
     )
 
 
-def _newest_run_dir(lane_root: Path) -> Path | None:
+def _run_dirs(lane_root: Path) -> set[Path]:
     if not lane_root.is_dir():
-        return None
-    runs = sorted(p for p in lane_root.iterdir() if p.is_dir())
-    return runs[-1] if runs else None
+        return set()
+    return {p for p in lane_root.iterdir() if p.is_dir()}
 
 
 def run_binance_options_chain_snapshot(args: argparse.Namespace) -> None:
@@ -3977,10 +3982,8 @@ def _run_segmented_worker(
                 completed_segments += 1
                 last_run_path = str(summary.get("run_path")) if summary.get("run_path") is not None else None
                 if canary_grant is not None:
-                    stop_reason = summary.get("canary_stop_reason")
-                    reason = (str(stop_reason) if stop_reason else
-                              "deadline" if summary.get("deadline_reached") else "limit")
-                    _close_canary_grant(canary_grant, runtime=runtime, reason=reason,
+                    _close_canary_grant(canary_grant, runtime=runtime,
+                                        reason=str(summary.get("segment_reason") or "unknown"),
                                         replayable=summary.get("replayable"), run_path=last_run_path)
                 runtime.record_event("segment_complete", details={"segment_index": completed_segments, **summary})
                 runtime.write_heartbeat(status="idle", last_segment_index=completed_segments, last_run_path=last_run_path)
@@ -4228,8 +4231,7 @@ def _execute_ops_job_inprocess(job: JobSpec) -> JobExecutionResult | str | None:
         run_hyperliquid_universe_positions_snapshot(args)
         return "hyperliquid universe positions snapshot completed"
     if job.job_type == "bybit-linear-universe-snapshot":
-        run_bybit_linear_universe_snapshot(args)
-        return "bybit linear universe snapshot completed"
+        return run_bybit_linear_universe_snapshot(args) or "bybit linear universe snapshot completed"
     if job.job_type == "binance-options-chain-snapshot":
         run_binance_options_chain_snapshot(args)
         return "binance options chain snapshot completed"

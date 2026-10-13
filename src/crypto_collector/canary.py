@@ -39,9 +39,13 @@ DEFAULT_MAX_SECONDS = 86_400
 MAX_MAX_BYTES = 64 * GIB
 MAX_MAX_SECONDS = 30 * 86_400
 # Reserved out of the shared allowance for the control DB, its rollback journal and
-# every receipt (one small JSON per grant plus the final one). DB max 256 pages.
-METADATA_BYTES = 8 * MIB
-DB_MAX_PAGES = 256
+# every receipt (one small JSON per grant plus the final one). The DB is capped at
+# DB_MAX_PAGES x 4 KiB; `prepare` refuses an attempt whose worst-case grant count
+# (every lane re-claiming at its shortest segment for the whole duration) would not
+# fit, so a long attempt cannot wedge its own control plane.
+METADATA_BYTES = 32 * MIB
+DB_MAX_PAGES = 2048
+GRANT_ROW_BYTES = 512
 # Stream lanes reserve this much from the pool at a time (pre-write). Up to one chunk
 # per open stream grant is in flight (reserved, not yet written) at any moment.
 CHUNK_BYTES = 16 * MIB
@@ -62,6 +66,9 @@ EXTERNAL_OVERHEAD_BYTES = 256 * MIB
 MIN_CLAIM_SECONDS = 60
 DEFAULT_MIN_FREE_GIB = 215
 CLOCK_TOLERANCE_SECONDS = 0.5
+# Cross-process clock agreement is checked against a checkpoint of arbitrary age, so
+# the tolerance grows with the gap (time-service slew is gradual, a step is not).
+CLOCK_SLEW_FRACTION = 0.01
 STREAM_LANES = frozenset({"bybit-trades-worker", "bybit-depth-worker"})
 SNAPSHOT_LANES = frozenset({"bybit-linear-universe-snapshot"})
 TERMINAL_REASONS = frozenset({"canary_expired", "canary_exhausted", "canary_clock", "canary_headroom",
@@ -70,6 +77,11 @@ TERMINAL_REASONS = frozenset({"canary_expired", "canary_exhausted", "canary_cloc
 
 class CanaryRefused(ValueError):
     """Reason token only; never a payload, path or pid."""
+
+
+def _clock_disagrees(now, last, mono, last_mono) -> bool:
+    gap = max(0.0, mono - last_mono)
+    return abs((now - last) - (mono - last_mono)) > CLOCK_TOLERANCE_SECONDS + CLOCK_SLEW_FRACTION * gap
 
 
 # --------------------------------------------------------------------------- identity
@@ -116,7 +128,27 @@ def _kernel32():
     kernel32.TerminateProcess.restype = wintypes.BOOL
     kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
     kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+                                                    ctypes.POINTER(wintypes.DWORD)]
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
     return kernel32
+
+
+def _plant_interpreters() -> set[str]:
+    """Image paths a plant worker can have: this interpreter and, inside a venv, the
+    base interpreter the launcher stub hands off to."""
+    return {os.path.normcase(os.path.abspath(p)) for p in (sys.executable, getattr(sys, "_base_executable", None)) if p}
+
+
+def _image_path_windows(kernel32, handle) -> str | None:
+    import ctypes
+    from ctypes import wintypes
+
+    size = wintypes.DWORD(32767)
+    buffer = ctypes.create_unicode_buffer(size.value)
+    if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+        return None
+    return os.path.normcase(os.path.abspath(buffer.value))
 
 
 def _identity_windows(pid: int) -> str | None:
@@ -166,6 +198,12 @@ def terminate_owned(pid: int, identity: str, *, wait_seconds: float = 10.0) -> d
     try:
         if owned_process_alive(pid, identity) is not True:
             return {"terminated": False, "reason": "identity_mismatch_or_exited"}
+        try:
+            image = os.path.normcase(os.path.abspath(os.readlink(f"/proc/{pid}/exe")))
+        except OSError:
+            image = None
+        if image not in _plant_interpreters():
+            return {"terminated": False, "reason": "image_not_plant_interpreter"}
         import signal
         os.kill(pid, signal.SIGTERM)
     except (PermissionError, ProcessLookupError) as exc:
@@ -195,6 +233,11 @@ def _terminate_windows(pid: int, identity: str, wait_seconds: float) -> dict:
             return {"terminated": False, "reason": str(exc)}
         if current != identity:
             return {"terminated": False, "reason": "identity_mismatch_or_exited"}
+        # The control DB names the target; the kernel must also say it is a plant
+        # interpreter. A row describing some other process is refused, not killed.
+        image = _image_path_windows(kernel32, handle)
+        if image is None or image not in _plant_interpreters():
+            return {"terminated": False, "reason": "image_not_plant_interpreter"}
         if not kernel32.TerminateProcess(handle, 1):
             return {"terminated": False, "reason": f"terminate_failed_{ctypes.get_last_error()}"}
         result = kernel32.WaitForSingleObject(handle, int(max(0.0, wait_seconds) * 1000))
@@ -291,7 +334,10 @@ def prepare(directory: Path, canary_id: str, *, config_path: Path, symbol: str, 
     by_name = {job["name"]: job for job in load_jobs(config_path)}
     lanes = []
     kinds: dict[str, int] = {}
+    worst_case_grants = 0
     for name in job_names:
+        if not ID.fullmatch(name):
+            raise ValueError(f"{name!r}: lane job names are bounded tokens (they name receipt files)")
         if name not in by_name:
             raise ValueError(f"{name}: not in {config_path}")
         job = by_name[name]
@@ -300,7 +346,14 @@ def prepare(directory: Path, canary_id: str, *, config_path: Path, symbol: str, 
         kinds[key] = kinds.get(key, 0) + 1
         if kinds[key] > 1:
             raise ValueError(f"{name}: stage one allows one lane per kind")
+        if kind == "stream":
+            worst_case_grants += math.ceil(max_seconds / float(job["args"]["max_segment_seconds"])) + 1
+        else:
+            worst_case_grants += math.ceil(max_seconds / max(1, int(job.get("interval_seconds", 86400)))) + 1
         lanes.append((name, str(job["job_type"]), kind, job_identity(job)))
+    if worst_case_grants * GRANT_ROW_BYTES > (DB_MAX_PAGES - 16) * 4096:
+        raise ValueError(f"control DB cannot hold the worst case of {worst_case_grants} grants: "
+                         "shorten max_seconds or lengthen the lanes' segments")
     directory.mkdir(exist_ok=False)
     (directory / "receipts").mkdir()
     with (directory / "canary.sqlite3").open("xb"):
@@ -401,7 +454,6 @@ class CanaryGrant:
     # -- claim ------------------------------------------------------------------
 
     def claim(self) -> None:
-        now, mono = time.time(), time.monotonic()
         pid = os.getpid()
         try:
             self_identity = process_identity(pid)
@@ -409,10 +461,19 @@ class CanaryGrant:
             self_identity = None
         if self_identity is None:
             raise CanaryRefused("canary_identity_unavailable")
+        try:
+            self._claim(pid, self_identity)
+        except sqlite3.Error as exc:
+            raise CanaryRefused("canary_control_db") from exc
+
+    def _claim(self, pid: int, self_identity: str) -> None:
         conn = _connect(self.directory)
         try:
             with conn:
                 conn.execute("BEGIN IMMEDIATE")
+                # Sampled while the lock is held: a sibling lane's checkpoint committed
+                # before this transaction can never carry a later time than this sample.
+                now, mono = time.time(), time.monotonic()
                 row = conn.execute("SELECT id, version, symbol, max_bytes, max_seconds, metadata_bytes, first_utc, "
                                    "first_mono, last_utc, last_mono, stopped FROM canary").fetchall()
                 if len(row) != 1 or row[0][1] != VERSION:
@@ -428,7 +489,7 @@ class CanaryGrant:
                     if (not all(isinstance(v, (int, float)) and math.isfinite(v) for v in (first, first_mono, last, last_mono))
                             or not (first <= last and 0 <= first_mono <= last_mono)):
                         _stop(conn, "canary_corrupt", now)
-                    if now < last or mono < last_mono or abs((now - last) - (mono - last_mono)) > CLOCK_TOLERANCE_SECONDS:
+                    if now < last or mono < last_mono or _clock_disagrees(now, last, mono, last_mono):
                         _stop(conn, "canary_clock", now)
                     if now >= first + max_seconds or mono >= first_mono + max_seconds:
                         _stop(conn, "canary_expired", now)
@@ -487,7 +548,7 @@ class CanaryGrant:
         self.stop_reason, self.terminal = reason, True
         try:
             conn = _connect(self.directory)
-        except CanaryRefused:
+        except (CanaryRefused, sqlite3.Error):
             return reason
         try:
             conn.execute("UPDATE canary SET stopped=COALESCE(stopped, ?), stopped_utc=COALESCE(stopped_utc, ?)",
@@ -515,10 +576,15 @@ class CanaryGrant:
         need_chunk = self.reserved - self.accounted < FRAME_MARGIN_BYTES + SEGMENT_OVERHEAD_BYTES
         if not need_chunk and mono - self._last_checkpoint < 1.0:
             return None
-        conn = _connect(self.directory)
+        try:
+            conn = _connect(self.directory)
+        except (CanaryRefused, sqlite3.Error) as exc:
+            self.stop_reason = str(exc) if isinstance(exc, CanaryRefused) else "canary_control_db"
+            return self.stop_reason
         try:
             with conn:
                 conn.execute("BEGIN IMMEDIATE")
+                now, mono = time.time(), time.monotonic()  # see claim(): sampled under the lock
                 row = conn.execute("SELECT stopped, last_utc, max_bytes, metadata_bytes FROM canary").fetchone()
                 if row is None:
                     raise CanaryRefused("canary_corrupt")
@@ -546,6 +612,10 @@ class CanaryGrant:
                     self.reserved += chunk
         except CanaryRefused as exc:
             self.stop_reason = str(exc)
+            return self.stop_reason
+        except sqlite3.Error:
+            # A wedged or unwritable control DB cannot authorize further writes.
+            self.stop_reason = "canary_control_db"
             return self.stop_reason
         finally:
             conn.close()
@@ -576,6 +646,8 @@ class CanaryGrant:
             raise CanaryRefused("canary_not_claimed")
         if run_path is not None:
             self.run_path = Path(run_path)
+        elif run_path is None and self.kind == "snapshot":
+            self.run_path = None
         now = time.time()
         measured, files = measure_run(str(self.run_path) if self.run_path else None)
         overshoot = max(self.overshoot, measured - self.reserved, 0)
@@ -648,6 +720,17 @@ def _snapshot(directory: Path) -> dict:
             "writers_unknown": [g["id"] for g in grants if g["closed_utc"] is None and g.get("alive") is None]}
 
 
+def _open_writers(directory: Path) -> list[int]:
+    """Grant ids whose recorded process is alive or of unknown liveness (one cheap
+    query plus one identity probe per open grant; used while a stop waits)."""
+    conn = _connect(directory)
+    try:
+        rows = conn.execute("SELECT id, pid, identity FROM grants WHERE closed_utc IS NULL").fetchall()
+    finally:
+        conn.close()
+    return [int(gid) for gid, pid, identity in rows if owned_process_alive(int(pid), str(identity)) is not False]
+
+
 def status(directory: Path) -> dict:
     return _snapshot(directory)
 
@@ -676,12 +759,7 @@ def stop(directory: Path, *, reason: str = "operator_stop", apply: bool = False,
     finally:
         conn.close()
     deadline = monotonic() + max(0.0, float(wait_seconds))
-    while True:
-        snapshot = _snapshot(directory)
-        if not snapshot["writers_alive"] and not snapshot["writers_unknown"]:
-            break
-        if monotonic() >= deadline:
-            break
+    while _open_writers(directory) and monotonic() < deadline:
         sleep(0.5)
     snapshot = _snapshot(directory)
     terminations = []
@@ -791,8 +869,9 @@ def preflight(directory: Path, *, config_path: Path, min_free_bytes: int = DEFAU
         args = job.get("args", {})
         listed = args.get("source")
         targets = [str(args.get("source_root", ""))] + ([str(s) for s in listed] if isinstance(listed, list) else [])
+        targets = [t.replace("\\", "/").rstrip("/").lower() for t in targets]
         if job["job_type"] in {"promote-replayable", "backfill-trades-replay", "backfill-stream-depth"} and any(
-                t.replace("\\", "/").rstrip("/").endswith("/" + s) or t == s for t in targets for s in sources):
+                t.endswith("/" + s) or t == s for t in targets for s in sources):
             findings.append(f"promotion_or_scoring_enabled_for_canary_source:{job['name']}")
     unspent = snapshot["unspent_bytes"]
     required = int(min_free_bytes) + unspent + EXTERNAL_OVERHEAD_BYTES

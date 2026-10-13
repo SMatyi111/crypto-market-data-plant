@@ -1804,8 +1804,9 @@ contracts are untouched. Module `crypto_collector.canary`; runbook
 
 **One immutable attempt.** `python -m crypto_collector.canary prepare <dir> <id> --config
 <ops json> --symbol <SYMBOL> --job <name>...` creates control state only (SQLite, DELETE
-journaling, 4 KiB pages, at most 256 pages, plus a `receipts/` directory) and refuses any
-existing directory. It admits at most one `bybit-trades-worker`, one `bybit-depth-worker`
+journaling, 4 KiB pages, at most 2048 pages, plus a `receipts/` directory) and refuses any
+existing directory. It also refuses an attempt whose worst-case grant count (every lane
+re-claiming at its shortest segment for the whole duration) would not fit that DB. It admits at most one `bybit-trades-worker`, one `bybit-depth-worker`
 and the `bybit-linear-universe-snapshot` job; every other job type is refused, so ticker,
 liquidation, replacement-symbol or second-symbol lanes cannot join a canary by config.
 Each admitted job row is digested (name, type, interval, args; `enabled` excluded) and the
@@ -1819,8 +1820,10 @@ finished attempt stays on disk as evidence and a new attempt is a new prepared d
 (default 24 h). A claim within `MIN_CLAIM_SECONDS` (60 s) of the deadline is refused
 (`canary_expiring`); at or after it the attempt is durably stopped (`canary_expired`).
 Workers clamp every segment deadline to the canary deadline, check wall and monotonic
-clocks before every frame (a reversal or disagreement over 0.5 s is a durable
-`canary_clock` stop) and tell the receive loop to end an idle wait at the deadline, so an
+clocks before every frame (a reversal, or a wall/monotonic disagreement over 0.5 s plus
+1 % of the gap since the last checkpoint, is a durable `canary_clock` stop; cross-process
+comparisons sample the clocks under the DB lock so a sibling lane's checkpoint can never
+look like the future) and tell the receive loop to end an idle wait at the deadline, so an
 idle lane stops without waiting for its idle timeout. These are bounds on the
 worker's own loop; process start-up, OS calls, an already-entered fsync or rename, the
 runner's dispatch cadence and subprocess teardown are **not an unconditional wall bound**
@@ -1831,8 +1834,9 @@ is not a spawn loop; the lane still has to be disabled by config.
 
 **Shared bytes.** `max_bytes` (default 2 GiB) covers every file the admitted lanes write
 under their run directories: raw, clean, quarantine, metrics, replay summaries and the
-universe snapshot's gzipped bodies and summary. 8 MiB is reserved for the control DB and
-receipts. Stream grants reserve 16 MiB chunks **before** writing plus 1 MiB per segment;
+universe snapshot's gzipped bodies and summary. 32 MiB is reserved for the control DB and
+receipts. A control DB that cannot be opened or written refuses the claim or ends the
+segment (`canary_control_db`); it never crashes a worker past its bounded hold. Stream grants reserve 16 MiB chunks **before** writing plus 1 MiB per segment;
 a frame is admitted only while the open grant still covers a 4 MiB margin (inbound frames
 are capped at 1 MiB on canary lanes; raw plus fan-out plus a metrics row is assumed to
 fit 4x). Bytes are accounted from the sinks' own counters after each frame; if a frame
@@ -1863,8 +1867,10 @@ non-elevated shell looking at SYSTEM workers). Unknown is never treated as exite
 blocks a lane claim, finalization and a stop's exit verification. `stop` is a dry run
 unless `--apply` (durable stop, then a bounded wait for recorded writers to close);
 `--terminate` terminates only still-alive recorded writers through a handle whose
-creation time is re-checked before `TerminateProcess` (POSIX: SIGTERM after the same
-check). No pid-only lock, no process-name or tree sweep, no action on any other plant
+creation time is re-checked before `TerminateProcess` and whose kernel image path must
+be a plant interpreter (POSIX: SIGTERM after the same checks); a control-DB row naming
+any other process is refused (`image_not_plant_interpreter`). The control directory
+should be restricted to SYSTEM and Administrators (runbook). No pid-only lock, no process-name or tree sweep, no action on any other plant
 worker, no runner restart.
 
 **Receipts.** Each grant closes with an exclusive-create, fsynced JSON receipt (run
@@ -1876,7 +1882,8 @@ terminal, every grant is closed (provably dead writers are closed as `abandoned`
 what their run directory holds) and no writer is alive or unknown. Partial runs are
 preserved exactly as the sinks left them; a stop never reclaims, offloads or deletes.
 `metrics/summary.jsonl` rows gain `stop_reason` (null on every ordinary lane) and the
-segment result gains `canary_stop_reason`.
+segment result gains `segment_reason` (deadline, limit, the budget's reason, unexpected_end
+or the exception type), which is the receipt's `reason`.
 
 Activation, caps and canary measurements remain a separate owner decision recorded
 outside this repo; the runbook lists the exact finite checklist.

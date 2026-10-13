@@ -40,11 +40,15 @@ main that contains this change; never from an older main.
    - do NOT copy the GRAM promoter, quarantine or score rows, or copy them disabled;
    - copy only the offload and cleanup-policy rows for these three sources
      (rollout correction 8).
-3. **Prepare the attempt** (creates control state only, refuses an existing directory):
+3. **Prepare the attempt** (creates control state only, refuses an existing directory),
+   then restrict the directory to SYSTEM and Administrators, because `stop --terminate`
+   acts on the pids the control DB records (it also requires the target to be a plant
+   interpreter, by kernel image path, and to match the recorded creation time):
    ```
    python -m crypto_collector.canary prepare G:\market_archive\canary\gram-stage-one gram-stage-one ^
      --config ops.live.local.json --symbol GRAMUSDT ^
      --job bybit-gram-perp-trades --job bybit-gram-perp-depth --job bybit-linear-universe-snapshot
+   icacls G:\market_archive\canary\gram-stage-one /inheritance:r /grant:r "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F"
    ```
    Keep the printed lane identities with the activation record.
 4. **Derive the pool cap**: `enabled collector lanes in ops.live.local.json + 3 + 2`,
