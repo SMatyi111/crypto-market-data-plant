@@ -125,6 +125,7 @@ from .models import RawMessage, utc_now
 from .normalizer import GenericL3Normalizer
 from .ops import (
     COLLECTOR_JOB_TYPES,
+    validate_canary_args,
     JobExecutionResult,
     JobSpec,
     OpsRunner,
@@ -3114,10 +3115,10 @@ def run_bybit_linear_universe_snapshot(args: argparse.Namespace) -> str | None:
     grant = None
     lane_root = Path(args.output_root) / "bybit_linear_universe"
     if getattr(args, "canary_control", None):
-        from .canary import GIB, CanaryGrant, CanaryRefused
+        from .canary import CanaryGrant, CanaryRefused
         grant = CanaryGrant(Path(args.canary_control), lane=str(getattr(args, "canary_lane", "")),
                             identity=str(getattr(args, "canary_identity", "") or ""), kind="snapshot",
-                            min_free_bytes=int(getattr(args, "canary_min_free_gib", 215) or 215) * GIB)
+                            min_free_bytes=_canary_min_free_bytes(args))
         try:
             grant.claim()
         except CanaryRefused as exc:
@@ -3896,6 +3897,7 @@ def _run_segmented_worker(
                     last_segment_index=completed_segments,
                     last_run_path=last_run_path,
                 )
+                hold_after_error = False
                 try:
                     segment_args = build_segment_args(args)
                     if segment_deadline_utc is not None:
@@ -3964,6 +3966,12 @@ def _run_segmented_worker(
                     segment_args.canary_grant = canary_grant
                     summary = asyncio.run(collect_segment(segment_args))
                 except Exception as exc:
+                    # A refused subscription or exhausted connect retries end in under
+                    # a second; the hold below (taken in `finally`, after the error
+                    # record and after the segment heartbeat thread has stopped, and
+                    # regardless of whether the record itself could be written) keeps
+                    # the runner's re-dispatch from spending a grant per tick.
+                    hold_after_error = canary_grant is not None
                     if canary_grant is not None:
                         _close_canary_grant(canary_grant, runtime=runtime,
                                             reason=f"exception:{type(exc).__name__}", replayable=None)
@@ -3975,17 +3983,12 @@ def _run_segmented_worker(
                         current_segment_index=segment_index,
                         current_segment_started_at=segment_started_at,
                     )
-                    if canary_grant is not None:
-                        # A refused subscription or exhausted connect retries end in
-                        # under a second; without this hold the runner's re-dispatch
-                        # would spend a grant per tick (same hold as the summary path).
-                        # After the error record and heartbeat, so a kill inside the
-                        # hold loses nothing.
-                        _hold_after_short_canary_segment(args, runtime=runtime, started_at=segment_started_at)
                     raise
                 finally:
                     stop_event.set()
                     heartbeat_thread.join(timeout=max(1.0, float(args.heartbeat_interval_seconds) + 1.0))
+                    if hold_after_error:
+                        _hold_after_short_canary_segment(args, runtime=runtime, started_at=segment_started_at)
                 completed_segments += 1
                 last_run_path = str(summary.get("run_path")) if summary.get("run_path") is not None else None
                 if canary_grant is not None:
@@ -4032,13 +4035,13 @@ def _claim_canary_grant(args: argparse.Namespace, *, runtime, worker_name: str):
     time so the runner's re-dispatch cannot become a spawn loop. Returns the grant, or
     the `canary_refused:<reason>` heartbeat message when refused (the caller ends the
     worker and records that message)."""
-    from .canary import GIB, CanaryGrant, CanaryRefused
+    from .canary import CanaryGrant, CanaryRefused
     grant = CanaryGrant(
         Path(args.canary_control),
         lane=str(getattr(args, "canary_lane", "") or worker_name),
         identity=str(getattr(args, "canary_identity", "") or ""),
         kind="stream",
-        min_free_bytes=int(getattr(args, "canary_min_free_gib", 215) or 215) * GIB,
+        min_free_bytes=_canary_min_free_bytes(args),
     )
     try:
         grant.claim()
@@ -4060,6 +4063,13 @@ def _claim_canary_grant(args: argparse.Namespace, *, runtime, worker_name: str):
 
 # Sleep used by the canary holds; tests replace this attribute instead of the stdlib.
 _canary_sleep = time.sleep
+
+
+def _canary_min_free_bytes(args: argparse.Namespace) -> int:
+    """Configured free-space floor for the canary (GiB); 0 is a real zero, absent is 215."""
+    from .canary import GIB
+    value = getattr(args, "canary_min_free_gib", None)
+    return int(215 if value is None else value) * GIB
 
 
 def _hold_after_short_canary_segment(args: argparse.Namespace, *, runtime, started_at) -> None:
@@ -4128,6 +4138,7 @@ def _execute_ops_job(job: JobSpec) -> JobExecutionResult | str | None:
     if job.job_type in COLLECTOR_JOB_TYPES:
         return _run_collector_in_subprocess(job)
     return _execute_ops_job_inprocess(job)
+
 
 
 def _collector_subprocess_timeout_seconds(job: JobSpec) -> float:
@@ -4241,11 +4252,10 @@ def _execute_ops_job_inprocess(job: JobSpec) -> JobExecutionResult | str | None:
         args.canary_identity = job_identity({"name": job.name, "job_type": job.job_type,
                                              "interval_seconds": job.interval_seconds, "args": job.args})
         args.canary_lane = job.name
+        validate_canary_args(job.name, job.args)  # once more in the child; the runner validated at load
         hold = job.args.get("canary_hold_seconds")
-        if hold is not None and (isinstance(hold, bool) or not isinstance(hold, (int, float)) or not 0 <= hold <= 7200):
-            raise ValueError(f"{job.name}: canary_hold_seconds must be a number in 0..7200")
         args.canary_hold_seconds = None if hold is None else float(hold)
-        args.canary_min_free_gib = job.args.get("canary_min_free_gib", 215)
+        args.canary_min_free_gib = job.args.get("canary_min_free_gib")
     if "jsonl_fsync" in job.args:
         args.jsonl_fsync = bool(job.args["jsonl_fsync"])
     if "normalized_parquet" in job.args:

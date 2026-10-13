@@ -426,9 +426,78 @@ def test_close_after_lost_row_update_keeps_the_existing_receipt(prepared, clock,
     torn = prepared.control / "receipts" / f"bybit-gram-perp-depth__{other.grant_id}.json"
     torn.write_text("{")
     closed = other.close(reason="limit", replayable=True)
-    assert closed["receipt_error"] == "JSONDecodeError" and torn.read_text() == "{"
+    assert closed["receipt_error"] == "ReceiptInvalid" and torn.read_text() == "{"
     assert rows(prepared, "SELECT reason, receipt FROM grants WHERE id=?".replace("?", str(other.grant_id))) == [
-        ("limit:receipt_failed:JSONDecodeError", None)]
+        ("limit:receipt_failed:ReceiptInvalid", None)]
+
+
+def test_half_prepared_or_foreign_control_file_is_refused_not_a_traceback(tmp_path):
+    control = tmp_path / "c"
+    (control / "receipts").mkdir(parents=True)
+    (control / "canary.sqlite3").write_bytes(b"")  # prepare interrupted before CREATE TABLE
+    for surface in (canary.status, canary.finalize, lambda d: canary.stop(d, apply=True, wait_seconds=0)):
+        with pytest.raises(CanaryRefused, match="canary_corrupt"):
+            surface(control)
+    (control / "canary.sqlite3").write_bytes(b"not a database at all, just bytes" * 200)
+    with pytest.raises(CanaryRefused, match="canary_corrupt"):
+        canary.status(control)
+
+
+def test_lock_contention_while_opening_is_retried_not_corrupt(prepared, clock, monkeypatch):
+    import sqlite3 as sq
+    real = sq.connect
+    calls = {"n": 0}
+
+    class LockedOnce:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, *a, **k):
+            if calls["n"] == 0:
+                calls["n"] += 1
+                raise sq.OperationalError("database is locked")
+            return self._conn.execute(*a, **k)
+
+        def __getattr__(self, item):
+            return getattr(self._conn, item)
+
+        def __enter__(self):
+            return self._conn.__enter__()
+
+        def __exit__(self, *a):
+            return self._conn.__exit__(*a)
+
+    monkeypatch.setattr(canary.sqlite3, "connect", lambda *a, **k: LockedOnce(real(*a, **k)))
+    monkeypatch.setattr(clock, "sleep", lambda s: None)
+    grant = grant_for(prepared)
+    grant.claim()  # the first open hit the lock; the retry succeeded
+    assert calls["n"] == 1 and grant.grant_id == 1
+
+
+def test_terminal_attempt_ends_the_worker_with_one_stop_record(prepared, tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "_canary_sleep", lambda s: None)
+
+    async def collect_segment(segment_args):
+        paths = prepare_run_paths(prepared.output_root, "bybit_perp_trades_gramusdt")
+        grant = segment_args.canary_grant
+        grant.stop_reason, grant.terminal = "canary_headroom", True  # what admit_frame sets on a durable stop
+        return {"run_path": str(paths.base), "replayable": False, "deadline_reached": False,
+                "segment_reason": "canary_headroom"}
+
+    job = prepared.jobs[0]
+    args = SimpleNamespace(**{**job["args"], "output_root": prepared.output_root, "ops_root": prepared.output_root / "ops",
+                              "max_segments": None, "cooldown_seconds": 0, "heartbeat_interval_seconds": 30.0,
+                              "canary_lane": job["name"], "canary_identity": prepared.identities[job["name"]],
+                              "canary_hold_seconds": 0, "canary_min_free_gib": 0})
+    cli._run_segmented_worker(args=args, default_worker_name="bybit-trades-worker", worker_type="bybit-trades-worker",
+                              build_segment_args=lambda a: SimpleNamespace(), collect_segment=collect_segment,
+                              progress_message=lambda i, s: "", venue="bybit")
+    events = [json.loads(line) for line in (prepared.output_root / "ops/worker_events.jsonl").read_text().splitlines()]
+    kinds = [e["event_type"] for e in events]
+    assert kinds.count("segment_complete") == 1 and kinds.count("canary_short_segment_hold") == 0
+    assert [e["details"]["reason"] for e in events if e["event_type"] == "worker_stopped"] == ["canary_terminal"]
+    heartbeat = json.loads((prepared.output_root / "ops/standalone_workers/bybit-trades-worker-gram-perp.json").read_text())
+    assert heartbeat["status"] == "stopped" and heartbeat["message"] == "canary_terminal:canary_headroom"
 
 
 def test_prepare_refuses_an_attempt_the_control_db_cannot_hold(tmp_path, small):
@@ -785,10 +854,25 @@ def test_ops_job_threads_canary_fields_and_runner_parses_refusal(prepared, monke
     cli._execute_ops_job_inprocess(spec)
     assert captured["canary_control"] == str(prepared.control)
     assert captured["canary_identity"] == prepared.identities[job["name"]] == canary.job_identity(job)
-    assert captured["canary_lane"] == job["name"] and captured["canary_min_free_gib"] == 215
+    assert captured["canary_lane"] == job["name"] and captured["canary_min_free_gib"] is None  # absent: the default applies later
     bad = JobSpec.from_dict({**job, "args": {**job["args"], "canary_hold_seconds": "1m"}})
     with pytest.raises(ValueError, match="canary_hold_seconds"):
         cli._execute_ops_job_inprocess(bad)
+    # The runner refuses the same mistakes at config load, before anything starts.
+    from crypto_collector.ops import load_ops_config
+    for key, value in (("canary_hold_seconds", "1m"), ("canary_min_free_gib", "abc"), ("canary_min_free_gib", True),
+                       ("canary_control", "")):
+        path = prepared.config.parent / "bad.json"
+        path.write_text(json.dumps({"jobs": [{**job, "enabled": True, "args": {**job["args"], key: value}}]}))
+        with pytest.raises(ValueError, match=key):
+            load_ops_config(path)
+    good = prepared.config.parent / "good.json"
+    good.write_text(json.dumps({"jobs": [{**job, "enabled": True, "args": {**job["args"], "canary_min_free_gib": 0}}]}))
+    assert len(load_ops_config(good)) == 1
+    zero = JobSpec.from_dict({**job, "args": {**job["args"], "canary_min_free_gib": 0}})
+    captured.clear()
+    cli._execute_ops_job_inprocess(zero)
+    assert cli._canary_min_free_bytes(SimpleNamespace(**captured)) == 0  # 0 is a real zero, not 215
     plain = JobSpec.from_dict({**job, "args": {k: v for k, v in job["args"].items() if k != "canary_control"}})
     captured.clear()
     cli._execute_ops_job_inprocess(plain)

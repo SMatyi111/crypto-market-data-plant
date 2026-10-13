@@ -85,6 +85,10 @@ class CanaryRefused(ValueError):
     """Reason token only; never a payload, path or pid."""
 
 
+class ReceiptInvalid(ValueError):
+    """A file already at a grant's receipt path that is not that grant's receipt."""
+
+
 def _is_lock_contention(exc: sqlite3.Error) -> bool:
     code = getattr(exc, "sqlite_errorcode", None)
     if code is not None:
@@ -309,19 +313,22 @@ def _connect(directory: Path, *, check_version: bool = True) -> sqlite3.Connecti
         raise CanaryRefused("canary_missing_or_oversize")
     conn = sqlite3.connect(db.resolve().as_uri() + "?mode=rw", uri=True, timeout=5)
     try:
-        if conn.execute("PRAGMA journal_mode").fetchone()[0] != "delete":
-            raise CanaryRefused("canary_journal_mode")
-        conn.execute("PRAGMA synchronous=FULL")
-        conn.execute(f"PRAGMA max_page_count={DB_MAX_PAGES}")
-        if conn.execute("PRAGMA page_size").fetchone()[0] != 4096:
-            raise CanaryRefused("canary_page_size")
-        if check_version:
-            try:
+        try:
+            if conn.execute("PRAGMA journal_mode").fetchone()[0] != "delete":
+                raise CanaryRefused("canary_journal_mode")
+            conn.execute("PRAGMA synchronous=FULL")
+            conn.execute(f"PRAGMA max_page_count={DB_MAX_PAGES}")
+            if conn.execute("PRAGMA page_size").fetchone()[0] != 4096:
+                raise CanaryRefused("canary_page_size")
+            if check_version:
                 rows = conn.execute("SELECT version FROM canary").fetchall()
-            except sqlite3.Error as exc:  # no table: an interrupted prepare, or not ours
-                raise CanaryRefused("canary_corrupt") from exc
-            if len(rows) != 1 or rows[0][0] != VERSION:
-                raise CanaryRefused("canary_corrupt")
+                if len(rows) != 1 or rows[0][0] != VERSION:
+                    raise CanaryRefused("canary_corrupt")
+        except sqlite3.Error as exc:
+            if _is_lock_contention(exc):
+                raise  # a sibling holds the lock: the caller's retry handles it
+            # Not a SQLite file, no table (an interrupted prepare), or not ours.
+            raise CanaryRefused("canary_corrupt") from exc
         return conn
     except BaseException:
         conn.close()
@@ -736,9 +743,13 @@ class CanaryGrant:
                 # the row update to lock contention: the receipt stands if it is whole
                 # and names this grant; otherwise the grant closes as receipt_invalid
                 # (the file is never overwritten or removed).
-                existing = json.loads(receipt_path.read_text(encoding="utf-8"))
-                if existing.get("grant_id") != self.grant_id or existing.get("lane") != self.lane:
-                    raise ValueError("receipt_invalid")
+                try:
+                    existing = json.loads(receipt_path.read_text(encoding="utf-8"))
+                except ValueError as exc:
+                    raise ReceiptInvalid("unparsable") from exc
+                if (not isinstance(existing, dict) or existing.get("grant_id") != self.grant_id
+                        or existing.get("lane") != self.lane):
+                    raise ReceiptInvalid("foreign")
                 self.receipt_path = receipt_path
             else:
                 payload = (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode("utf-8")
