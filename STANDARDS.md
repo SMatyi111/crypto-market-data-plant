@@ -1840,7 +1840,11 @@ under their run directories: raw, clean, quarantine, metrics, replay summaries a
 universe snapshot's gzipped bodies and summary. 32 MiB is reserved for the control DB and
 receipts. A control DB that cannot be opened or written refuses the claim or ends the
 segment (`canary_control_db`); transient lock contention retries, then refuses with
-`canary_control_busy` and a 30 s hold. Neither crashes a worker past its hold. Stream grants reserve 16 MiB chunks **before** writing plus 1 MiB per segment;
+`canary_control_busy` and a 30 s hold (claim, run binding and close all retry). Neither
+crashes a worker past its hold. A segment that ends within 60 s of its start holds the
+slot for the rest of that minute, so a venue outage spends the grant ceiling at most once
+a minute per lane. The control-DB schema is versioned (`VERSION`); a directory prepared by
+an older build is refused as `canary_corrupt`, never reinterpreted. Stream grants reserve 16 MiB chunks **before** writing plus 1 MiB per segment;
 a frame is admitted only while the open grant still covers a 4 MiB margin (inbound frames
 are capped at 1 MiB on canary lanes; raw plus fan-out plus a metrics row is assumed to
 fit 4x). Bytes are accounted from the sinks' own counters after each frame; if a frame

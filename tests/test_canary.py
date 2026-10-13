@@ -360,21 +360,40 @@ def test_flapping_lane_hits_the_grant_ceiling_and_stops_durably(tmp_path, small,
     assert canary.status(control)["canary"]["stopped"] == "canary_grants_exhausted"
 
 
-def test_lock_contention_is_a_short_refusal(prepared, clock, monkeypatch):
+def test_lock_contention_is_a_short_refusal_and_close_retries_through_it(prepared, clock, monkeypatch):
     import sqlite3 as sq
     real_connect = canary._connect
+    grant = grant_for(prepared)
+    grant.claim()
+    failures = {"left": 2}
 
-    def locked(directory):
-        conn = real_connect(directory)
-        conn.close()
-        raise sq.OperationalError("database is locked")
+    def flaky(directory):
+        if failures["left"] > 0:
+            failures["left"] -= 1
+            raise sq.OperationalError("database is locked")
+        return real_connect(directory)
 
-    monkeypatch.setattr(canary, "_connect", locked)
     sleeps = []
     monkeypatch.setattr(clock, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(canary, "_connect", flaky)
+    grant.close(reason="limit", replayable=True)  # two locked attempts, then the row closes
+    assert sleeps == [1.0, 1.0] and rows(prepared, "SELECT reason FROM grants") == [("limit",)]
+
+    def always_locked(directory):
+        raise sq.OperationalError("database is locked")
+
+    monkeypatch.setattr(canary, "_connect", always_locked)
+    sleeps.clear()
     with pytest.raises(CanaryRefused, match="canary_control_busy"):
         grant_for(prepared).claim()
     assert sleeps == [1.0, 1.0]
+
+
+def test_older_control_schema_is_refused_as_corrupt(prepared):
+    with sqlite3.connect(prepared.control / "canary.sqlite3") as conn:
+        conn.execute("UPDATE canary SET version=1")
+    with pytest.raises(CanaryRefused, match="canary_corrupt"):
+        grant_for(prepared).claim()
 
 
 def test_prepare_refuses_an_attempt_the_control_db_cannot_hold(tmp_path, small):
@@ -620,6 +639,9 @@ def test_segmented_worker_threads_the_grant_clamps_the_deadline_and_holds_on_ref
     assert seen[0].deadline_utc == seen[0].canary_grant.deadline_utc  # 7200 s segment clamped to the canary
     closed = rows(prepared, "SELECT reason, replayable, consumed FROM grants ORDER BY id")
     assert closed == [("deadline", 1, 30)] * 3
+    events = [json.loads(line) for line in (prepared.output_root / "ops/worker_events.jsonl").read_text().splitlines()]
+    # Each instant segment held the slot (sleep is patched): an outage cannot burn grants per tick.
+    assert [e["event_type"] for e in events].count("canary_short_segment_hold") == 3
     # A durable stop refuses the next dispatch: heartbeat says so, no segment runs, the
     # bounded hold is taken instead of a spawn loop.
     canary.stop(prepared.control, apply=True, wait_seconds=0)

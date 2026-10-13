@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import math
 import os
 import socket
@@ -33,7 +34,9 @@ from shutil import disk_usage
 from .evidence_budget import GIB, MIB, required_free_bytes
 from .evidence_lease import ID
 
-VERSION = 1
+logger = logging.getLogger(__name__)
+
+VERSION = 2  # control-DB schema: v2 added max_grants and the recorded worker image
 DEFAULT_MAX_BYTES = 2 * GIB
 DEFAULT_MAX_SECONDS = 86_400
 MAX_MAX_BYTES = 64 * GIB
@@ -72,12 +75,38 @@ CLOCK_TOLERANCE_SECONDS = 0.5
 CLOCK_SLEW_FRACTION = 0.01
 STREAM_LANES = frozenset({"bybit-trades-worker", "bybit-depth-worker"})
 SNAPSHOT_LANES = frozenset({"bybit-linear-universe-snapshot"})
-TERMINAL_REASONS = frozenset({"canary_expired", "canary_exhausted", "canary_clock", "canary_headroom",
-                              "canary_corrupt"})
+# A canary segment that ended this soon after it started (socket refused, closed after
+# the ack, immediate exception) makes the worker hold before exiting, so a venue outage
+# burns grants at most once a minute per lane instead of once per runner tick.
+SHORT_SEGMENT_SECONDS = 60.0
 
 
 class CanaryRefused(ValueError):
     """Reason token only; never a payload, path or pid."""
+
+
+def _is_lock_contention(exc: sqlite3.Error) -> bool:
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code is not None:
+        return code in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+    text = str(exc).lower()
+    return "locked" in text or "busy" in text
+
+
+def _retry_locked(operation, *, attempts: int = 3):
+    """Run a control-DB operation, retrying transient lock contention with a sibling
+    lane. Raises CanaryRefused('canary_control_busy') when it persists and
+    CanaryRefused('canary_control_db') for every other SQLite failure."""
+    for attempt in range(attempts):
+        try:
+            return operation()
+        except sqlite3.Error as exc:
+            if not _is_lock_contention(exc):
+                raise CanaryRefused("canary_control_db") from exc
+            if attempt == attempts - 1:
+                raise CanaryRefused("canary_control_busy") from exc
+            time.sleep(1.0)
+    raise CanaryRefused("canary_control_busy")
 
 
 def _clock_disagrees(now, last, mono, last_mono) -> bool:
@@ -481,21 +510,9 @@ class CanaryGrant:
         if self_identity is None:
             raise CanaryRefused("canary_identity_unavailable")
         image = process_image(pid)
-        for attempt in range(3):
-            try:
-                self._claim(pid, self_identity, image)
-                return
-            except sqlite3.OperationalError as exc:
-                # Lock contention with a sibling lane is transient: a short retry here,
-                # a short hold in the worker, never the full refusal hold.
-                if "locked" in str(exc).lower() or "busy" in str(exc).lower():
-                    if attempt < 2:
-                        time.sleep(1.0)
-                        continue
-                    raise CanaryRefused("canary_control_busy") from exc
-                raise CanaryRefused("canary_control_db") from exc
-            except sqlite3.Error as exc:
-                raise CanaryRefused("canary_control_db") from exc
+        # Lock contention with a sibling lane is transient: a short retry here, a
+        # short hold in the worker, never the full refusal hold.
+        _retry_locked(lambda: self._claim(pid, self_identity, image))
 
     def _claim(self, pid: int, self_identity: str, image: str | None) -> None:
         conn = _connect(self.directory)
@@ -568,16 +585,21 @@ class CanaryGrant:
 
     def bind_run(self, run_path: Path) -> None:
         self.run_path = Path(run_path)
-        try:
+
+        def update():
             conn = _connect(self.directory)
             try:
                 with conn:
                     conn.execute("UPDATE grants SET run_path=? WHERE id=?", (str(self.run_path), self.grant_id))
             finally:
                 conn.close()
-        except (CanaryRefused, sqlite3.Error):
+
+        try:
+            _retry_locked(update)
+        except CanaryRefused as exc:
             # The first admission ends the segment cleanly; the receipt still names the run.
-            self.stop_reason = "canary_control_db"
+            self.stop_reason = str(exc)
+            logger.warning("canary bind failed: %s", exc)
 
     # -- per-frame admission (stream lanes) ----------------------------------------
 
@@ -706,18 +728,22 @@ class CanaryGrant:
             self.receipt_path = receipt_path
         except Exception as exc:  # noqa: BLE001 - the DB row must still close
             receipt_error = type(exc).__name__
-        conn = _connect(self.directory)
-        try:
-            with conn:
-                conn.execute("UPDATE grants SET closed_utc=?, consumed=?, accounted=?, overshoot=?, reason=?, "
-                             "replayable=?, run_path=?, receipt=? WHERE id=? AND closed_utc IS NULL",
-                             (now, measured, self.accounted, overshoot,
-                              reason if receipt_error is None else f"{reason}:receipt_failed:{receipt_error}",
-                              None if replayable is None else int(bool(replayable)),
-                              str(self.run_path) if self.run_path else None,
-                              str(receipt_path) if receipt_error is None else None, self.grant_id))
-        finally:
-            conn.close()
+
+        def update():
+            conn = _connect(self.directory)
+            try:
+                with conn:
+                    conn.execute("UPDATE grants SET closed_utc=?, consumed=?, accounted=?, overshoot=?, reason=?, "
+                                 "replayable=?, run_path=?, receipt=? WHERE id=? AND closed_utc IS NULL",
+                                 (now, measured, self.accounted, overshoot,
+                                  reason if receipt_error is None else f"{reason}:receipt_failed:{receipt_error}",
+                                  None if replayable is None else int(bool(replayable)),
+                                  str(self.run_path) if self.run_path else None,
+                                  str(receipt_path) if receipt_error is None else None, self.grant_id))
+            finally:
+                conn.close()
+
+        _retry_locked(update)
         receipt["receipt_error"] = receipt_error
         return receipt
 

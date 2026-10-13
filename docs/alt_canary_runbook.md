@@ -41,9 +41,10 @@ main that contains this change; never from an older main.
    - copy only the offload and cleanup-policy rows for these three sources
      (rollout correction 8).
 3. **Prepare the attempt** (creates control state only, refuses an existing directory),
-   then restrict the directory to SYSTEM and Administrators, because `stop --terminate`
-   acts on the pids the control DB records (it also requires the target to be a plant
-   interpreter, by kernel image path, and to match the recorded creation time):
+   then restrict the directory to SYSTEM and Administrators. This ACL is the defence:
+   `stop --terminate` acts on the pid, creation time and kernel image path that the
+   control DB records (checked through the terminating handle), so whoever can write the
+   DB decides what a terminate targets:
    ```
    python -m crypto_collector.canary prepare G:\market_archive\canary\gram-stage-one gram-stage-one ^
      --config ops.live.local.json --symbol GRAMUSDT ^

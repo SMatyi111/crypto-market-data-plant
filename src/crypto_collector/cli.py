@@ -3985,6 +3985,7 @@ def _run_segmented_worker(
                     _close_canary_grant(canary_grant, runtime=runtime,
                                         reason=str(summary.get("segment_reason") or "unknown"),
                                         replayable=summary.get("replayable"), run_path=last_run_path)
+                    _hold_after_short_canary_segment(args, runtime=runtime, started_at=segment_started_at)
                 runtime.record_event("segment_complete", details={"segment_index": completed_segments, **summary})
                 runtime.write_heartbeat(status="idle", last_segment_index=completed_segments, last_run_path=last_run_path)
                 print(progress_message(completed_segments, summary))
@@ -4045,6 +4046,20 @@ def _claim_canary_grant(args: argparse.Namespace, *, runtime, worker_name: str):
         return f"canary_refused:{reason}"
     runtime.record_event("canary_granted", details={"grant_id": grant.grant_id, "deadline_utc": grant.deadline})
     return grant
+
+
+def _hold_after_short_canary_segment(args: argparse.Namespace, *, runtime, started_at) -> None:
+    """A canary segment that ended within SHORT_SEGMENT_SECONDS of its start (venue
+    refusing, socket closed after the ack) holds the slot before the worker continues
+    or exits, so an outage spends the attempt's grant ceiling once a minute per lane,
+    not once per runner tick. Bounded; recorded as an event."""
+    from .canary import SHORT_SEGMENT_SECONDS
+    elapsed = (utc_now() - started_at).total_seconds()
+    if elapsed >= SHORT_SEGMENT_SECONDS:
+        return
+    hold = min(SHORT_SEGMENT_SECONDS - elapsed, float(getattr(args, "canary_hold_seconds", None) or SHORT_SEGMENT_SECONDS))
+    runtime.record_event("canary_short_segment_hold", details={"elapsed_seconds": elapsed, "hold_seconds": hold})
+    time.sleep(max(0.0, hold))
 
 
 def _close_canary_grant(grant, *, runtime, reason: str, replayable, run_path=None) -> None:
