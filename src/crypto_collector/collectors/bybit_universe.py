@@ -63,6 +63,8 @@ USER_AGENT = "crypto-market-data-plant-bybit-universe/0.1"
 DEFAULT_PANEL = ("XLMUSDT", "GRAMUSDT", "TRXUSDT", "MEGAUSDT")
 PAGE_LIMIT = 500
 MAX_LINEAR_PAGES = 3  # bounded maximum, not a universe size claim
+MAX_CURSOR_CHARS = 1024  # untrusted cursor is percent-encoded into the next URL; bound it
+MAX_FIELD_CHARS = 64  # summary copies of status/deliveryTime/fundingInterval are bounded
 MAX_RESPONSE_BYTES = 1024 * 1024
 TIMEOUT_SECONDS = 10.0
 WALL_BUDGET_SECONDS = 120.0
@@ -115,6 +117,17 @@ def _parse_bytes(raw: bytes, category: str) -> tuple[list[dict[str, Any]], str |
     except (UnicodeDecodeError, ValueError):
         return [], None, "payload is not valid JSON"
     return _check_page(parsed, category)
+
+
+def _bounded(value: Any) -> Any:
+    """Copy a scalar summary field from an untrusted row: bounded ASCII text, int, or None."""
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and len(value) <= MAX_FIELD_CHARS and value.isascii():
+        return value
+    return None
 
 
 def _cursor_url(cursor: str) -> str:
@@ -193,6 +206,11 @@ def snapshot_bybit_linear_universe(
             verdicts[name] = (len(rows), f"{name}: repeated cursor")
             instruments_failed = True
             break
+        if len(next_cursor) > MAX_CURSOR_CHARS or not next_cursor.isascii():
+            # The cursor is untrusted response data echoed into our next URL.
+            verdicts[name] = (len(rows), f"{name}: cursor rejected (length or non-ASCII)")
+            instruments_failed = True
+            break
         seen_cursors.add(next_cursor)
         if page == max_linear_pages:
             verdicts[name] = (len(rows), (
@@ -236,9 +254,9 @@ def snapshot_bybit_linear_universe(
         in_tickers: bool | None = True if symbol in ticker_symbols else (False if tickers_ok else None)
         membership[symbol] = {
             "present_in_instruments": in_instruments,
-            "status": row.get("status") if row is not None else None,
-            "delivery_time": row.get("deliveryTime") if row is not None else None,
-            "funding_interval": row.get("fundingInterval") if row is not None else None,
+            "status": _bounded(row.get("status")) if row is not None else None,
+            "delivery_time": _bounded(row.get("deliveryTime")) if row is not None else None,
+            "funding_interval": _bounded(row.get("fundingInterval")) if row is not None else None,
             "present_in_tickers": in_tickers,
         }
     panel_absent = [s for s in panel_symbols if membership[s]["present_in_instruments"] is False]

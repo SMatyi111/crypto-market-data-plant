@@ -157,6 +157,32 @@ def test_spot_cursor_and_repeated_cursor_and_duplicate_symbol_are_failures(tmp_p
         snapshot_bybit_linear_universe(tmp_path / "c", panel_symbols=PANEL, fetch=lambda u: urls[u], clock=lambda: NOW)
 
 
+def test_oversized_cursor_and_oversized_summary_fields_are_bounded(tmp_path: Path) -> None:
+    """The cursor is untrusted data echoed into the next URL; summary copies of row fields
+    are bounded so a malformed payload cannot bloat summary.json."""
+    urls = payloads()
+    urls[universe.LINEAR_URL] = page([lin("AAAUSDT")], "linear", cursor="x" * (universe.MAX_CURSOR_CHARS + 1))
+    calls: list[str] = []
+
+    def fetch(url: str) -> bytes:
+        calls.append(url)
+        return urls[url]
+
+    with pytest.raises(ValueError, match="cursor rejected"):
+        snapshot_bybit_linear_universe(tmp_path, panel_symbols=PANEL, fetch=fetch, clock=lambda: NOW)
+    assert calls == [universe.LINEAR_URL, universe.SPOT_URL, universe.TICKERS_URL]  # the long cursor was never requested
+
+    urls = payloads()
+    urls[universe._cursor_url("c1")] = page(
+        [lin("GRAMUSDT", status="S" * 500), {"symbol": "XLMUSDT", "status": "Trading", "deliveryTime": "0",
+                                             "fundingInterval": "é" * 10}], "linear")
+    snapshot_bybit_linear_universe(tmp_path / "b", panel_symbols=PANEL, fetch=lambda u: urls[u], clock=lambda: NOW)
+    data = json.loads((tmp_path / "b" / universe.SOURCE_NAME / "20261014_000500" / "metrics" / "summary.json").read_text(encoding="utf-8"))
+    assert data["panel_membership"]["GRAMUSDT"]["status"] is None  # over-long string dropped, presence kept
+    assert data["panel_membership"]["GRAMUSDT"]["present_in_instruments"] is True
+    assert data["panel_membership"]["XLMUSDT"]["funding_interval"] is None  # non-ASCII dropped
+
+
 def test_absent_panel_symbol_under_complete_coverage_is_recorded_not_fatal(tmp_path: Path) -> None:
     urls = payloads(panel_present=False)
     result = snapshot_bybit_linear_universe(tmp_path, panel_symbols=PANEL, fetch=lambda u: urls[u], clock=lambda: NOW)
