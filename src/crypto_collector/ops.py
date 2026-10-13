@@ -158,7 +158,27 @@ def load_ops_config(path: Path) -> list[JobSpec]:
         )
     _reject_shared_worker_names(path, enabled)
     _reject_control_characters(path, enabled)
+    for job in enabled:
+        validate_canary_args(job.name, job.args)
     return enabled
+
+
+def validate_canary_args(name: str, args: dict[str, Any]) -> None:
+    """Bounded alt canary job args (STANDARDS 4.18), refused at config load so a bad
+    value is a startup failure, never a per-tick child crash: `canary_control` is a
+    non-empty string, `canary_hold_seconds` a number in 0..7200 (0 = no hold),
+    `canary_min_free_gib` an integer in 0..4096 (0 = no floor)."""
+    control = args.get("canary_control")
+    if control is None:
+        return
+    if not isinstance(control, str) or not control.strip():
+        raise ValueError(f"{name}: canary_control must be a non-empty path string")
+    hold = args.get("canary_hold_seconds")
+    if hold is not None and (isinstance(hold, bool) or not isinstance(hold, (int, float)) or not 0 <= hold <= 7200):
+        raise ValueError(f"{name}: canary_hold_seconds must be a number in 0..7200")
+    floor = args.get("canary_min_free_gib")
+    if floor is not None and (type(floor) is not int or not 0 <= floor <= 4096):  # bool is not int here
+        raise ValueError(f"{name}: canary_min_free_gib must be an integer in 0..4096")
 
 
 def effective_worker_name(job: JobSpec) -> str | None:
