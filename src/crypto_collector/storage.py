@@ -108,9 +108,14 @@ class JsonlSink:
         self._fsync_pending = 0
         self._last_fsync = 0.0
         self._handle = None
+        # Bytes this sink put on disk (json.dumps is ASCII-only, so characters equal
+        # bytes; the text-mode handle writes os.linesep for the newline). Read by the
+        # canary byte admission; one add per row.
+        self.bytes_written = 0
 
     def write(self, row: dict[str, Any]) -> None:
         line = json.dumps(row, sort_keys=True) + "\n"
+        self.bytes_written += len(line) - 1 + len(os.linesep)
         if self._per_event_fsync:
             with self.path.open("a", encoding="utf-8") as handle:
                 handle.write(line)
@@ -239,6 +244,8 @@ class RotatingJsonlSink:
         self._ledger: list[dict[str, Any]] | None = (
             [] if ledger and self._current_bytes == 0 else None
         )
+        # Encoded bytes this sink wrote across every part (see JsonlSink.bytes_written).
+        self.bytes_written = 0
 
     @property
     def path(self) -> Path:
@@ -297,6 +304,7 @@ class RotatingJsonlSink:
                     handle.flush()
                     self._pending_writes = 0
         self._current_bytes += len(encoded)
+        self.bytes_written += len(encoded)
         entry = self._ledger_entry()
         if entry is not None:
             entry["sha256"].update(encoded)

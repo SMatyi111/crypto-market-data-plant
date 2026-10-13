@@ -31,6 +31,24 @@ staged decision (local rollout ticket): stage one is one symbol plus the snapsho
 canary carries explicit duration and byte caps with verified stop and drain. No
 assumption about these lanes' volume relative to the BTC lanes is made.
 
+## Alt canary controls: bounded stage one, default off (2026-10-13)
+
+The stage-one canary (one symbol's trades and depth lanes plus the daily universe
+snapshot) now has code-enforced bounds: STANDARDS 4.18, module `crypto_collector.canary`,
+runbook `docs/alt_canary_runbook.md`. One prepared, immutable attempt with a job-identity
+digest per lane; a 24 h deadline from the first grant, clamped into every segment and
+into the idle wait; a shared 2 GiB allowance across raw, clean, quarantine, metrics and
+the snapshot, reserved in 16 MiB chunks before writing with a 4 MiB per-frame margin and
+a recorded overshoot; sampled headroom at every chunk and in a read-only preflight that
+also refuses enabled promoters for canary sources; an exact-worker stop by pid plus
+creation time (dry run by default, terminate only on request); immutable per-grant
+receipts and a final receipt. Nothing is enabled: the example config carries no
+`canary_control`, the live checkout is untouched, no canary was prepared or launched.
+Known limits, stated in 4.18: a refused worker holds its slot for the bounded hold
+instead of exiting at once, the duration bound covers the worker loop only, and the
+accounting counts bytes as written (no compression credit). Activation is the owner's
+call: the runbook checklist is the next step.
+
 ## Bybit terminal publication repair: streamed raw accounting + stage diagnostics (2026-10-08)
 
 The owner-authorized v2 source trial (two slots, immutable hour) ended 0/2
@@ -1388,6 +1406,12 @@ owner ask (safe-shaping directive above).
 Decisions waiting on the owner; agents must not act on these without an explicit OK
 (see `CLAUDE.md` Governance):
 
+- **Alt canary stage one activation (2026-10-13; controls on main, nothing launched).**
+  The bounded controls exist (STANDARDS 4.18). Activation needs the owner to run the
+  checklist in `docs/alt_canary_runbook.md`: prepare one control directory for
+  GRAMUSDT, add `canary_control` to the three live lane rows, derive the pool cap
+  (enabled + 3 + 2) in both runner scripts, fresh preflight, enable, `redeploy_runner.ps1
+  -Apply`. Promotion for the canary sources stays disabled during the canary.
 - **Bybit source-trial sizing (2026-10-08, proposal only; see
   `docs/evidence_trial_sizing.md`).** The immutable 3600 s lease cannot hold two
   1800 s segments plus the observed ~15 s gap, the 2 s prepare wait and two

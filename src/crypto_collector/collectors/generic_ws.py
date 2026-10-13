@@ -37,6 +37,9 @@ class GenericWebsocketCollector(BaseCollector):
         # the health report can see a silent-but-connected feed. Stays 0 when the
         # watchdog is disabled (the default) or never trips.
         self.idle_timeout_count = 0
+        # Optional monotonic instant after which the receive loop ends the segment
+        # cleanly even while idle (canary duration bound). None = unchanged behavior.
+        self.stop_at_monotonic: float | None = None
         # Frames that failed to decode (malformed JSON / protobuf) and were skipped.
         # Surfaced in metrics/summary.jsonl like idle_timeout_count so a quietly
         # rotting feed is visible to the health report.
@@ -104,7 +107,15 @@ class GenericWebsocketCollector(BaseCollector):
                                              if reference_mode else idle_timeout)
                                 if reference_mode and remaining <= 0:
                                     raise TimeoutError("Depth idle despite reference traffic")
-                                if idle_timeout > 0:
+                                stop_at = self.stop_at_monotonic
+                                duration_bound = False
+                                if stop_at is not None:
+                                    left = stop_at - time.monotonic()
+                                    if left <= 0:
+                                        return
+                                    if idle_timeout <= 0 or left < remaining:
+                                        remaining, duration_bound = left, True
+                                if idle_timeout > 0 or stop_at is not None:
                                     message = await asyncio.wait_for(
                                         message_iter.__anext__(), timeout=remaining
                                     )
@@ -115,6 +126,9 @@ class GenericWebsocketCollector(BaseCollector):
                                 # the reconnect path below runs (unchanged behavior).
                                 break
                             except (asyncio.TimeoutError, TimeoutError):
+                                if duration_bound:
+                                    # The duration bound, not the feed, ended the wait.
+                                    return
                                 # No data frame within idle_timeout: the feed acked the
                                 # subscription but went silent-but-connected. End the
                                 # stream cleanly so the consumer finalizes (writes

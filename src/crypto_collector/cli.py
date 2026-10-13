@@ -2403,6 +2403,7 @@ async def _collect_trades_segment(
     collector = GenericWebsocketCollector(config=config)
     source_name = _build_source_name(source_base, getattr(args, "source_suffix", ""))
     run_paths = prepare_run_paths(output_root=config.output_root, source=source_name)
+    canary_grant = _bind_canary_grant(args, config=config, collector=collector, run_paths=run_paths)
     fsync_events, fsync_ms = _fsync_intervals(args)
     pipeline = CollectorPipeline(
         collector=collector,
@@ -2421,6 +2422,7 @@ async def _collect_trades_segment(
         jsonl_fsync=bool(getattr(args, "jsonl_fsync", True)),
         fsync_interval_events=fsync_events,
         fsync_interval_ms=fsync_ms,
+        budget=canary_grant,
     )
     pipeline_summary = await pipeline.run(
         limit=args.count,
@@ -2448,6 +2450,7 @@ async def _collect_trades_segment(
         "replay_summary_path": replay_summary_path,
         "deadline_reached": bool(pipeline_summary.deadline_reached),
         "idle_timeout_count": collector.idle_timeout_count,
+        "canary_stop_reason": getattr(pipeline_summary, "stop_reason", None),
     }
 
 
@@ -2642,6 +2645,7 @@ async def _collect_depth_stream_segment(
     collector = GenericWebsocketCollector(config=config)
     source_name = _build_source_name(source_base, getattr(args, "source_suffix", ""))
     run_paths = prepare_run_paths(output_root=config.output_root, source=source_name)
+    canary_grant = _bind_canary_grant(args, config=config, collector=collector, run_paths=run_paths)
     if evidence_enabled:
         from .session_evidence import SessionEvidence
         lease_options = {"lease_directory": lease_directory, "trial_id": trial_id} if lease_directory else {}
@@ -2676,6 +2680,7 @@ async def _collect_depth_stream_segment(
         jsonl_fsync=bool(getattr(args, "jsonl_fsync", True)),
         fsync_interval_events=fsync_events,
         fsync_interval_ms=fsync_ms,
+        budget=canary_grant,
     )
     pipeline_summary = await pipeline.run(
         limit=args.count,
@@ -2705,7 +2710,28 @@ async def _collect_depth_stream_segment(
         "replay_summary_path": replay_summary_path,
         "deadline_reached": bool(pipeline_summary.deadline_reached),
         "idle_timeout_count": collector.idle_timeout_count,
+        "canary_stop_reason": getattr(pipeline_summary, "stop_reason", None),
     }
+
+
+def _bind_canary_grant(args: argparse.Namespace, *, config, collector, run_paths):
+    """Attach the per-segment canary grant (threaded centrally by
+    `_run_segmented_worker`) to this segment: raw-only lanes only, no optional evidence,
+    inbound frames capped at the canary frame bound, the receive loop told when to stop
+    even while idle, and the run directory bound to the grant before any file is
+    written. Returns None for every ordinary lane."""
+    grant = getattr(args, "canary_grant", None)
+    if grant is None:
+        return None
+    from .canary import MAX_FRAME_BYTES
+    if bool(getattr(args, "normalized_parquet", True)):
+        raise ValueError("Canary lanes are raw-only (normalized_parquet must be false)")
+    if bool(getattr(args, "session_evidence", False)):
+        raise ValueError("Canary lanes cannot carry session evidence")
+    config.max_message_bytes = min(config.max_message_bytes or MAX_FRAME_BYTES, MAX_FRAME_BYTES)
+    collector.stop_at_monotonic = grant.monotonic_deadline
+    grant.bind_run(run_paths.base)
+    return grant
 
 
 _BINANCE_FUTURES_REST_STREAMS = ("trades", "depth", "funding", "open_interest")
@@ -3083,9 +3109,32 @@ def run_hyperliquid_universe_positions_snapshot(args: argparse.Namespace) -> Non
 
 
 def run_bybit_linear_universe_snapshot(args: argparse.Namespace) -> None:
-    result = snapshot_bybit_linear_universe(
-        args.output_root, panel_symbols=tuple(args.panel_symbol)
-    )
+    grant = None
+    if getattr(args, "canary_control", None):
+        from .canary import GIB, CanaryGrant, CanaryRefused
+        grant = CanaryGrant(Path(args.canary_control), lane=str(getattr(args, "canary_lane", "")),
+                            identity=str(getattr(args, "canary_identity", "") or ""), kind="snapshot",
+                            min_free_bytes=int(getattr(args, "canary_min_free_gib", 215) or 215) * GIB)
+        try:
+            grant.claim()
+        except CanaryRefused as exc:
+            logger.warning("canary refused: %s", exc)
+            print(f"bybit linear universe snapshot: canary refused ({exc}); no request sent")
+            return
+    try:
+        result = snapshot_bybit_linear_universe(
+            args.output_root, panel_symbols=tuple(args.panel_symbol)
+        )
+    except Exception as exc:
+        if grant is not None:
+            # The skeleton has already archived whatever arrived under the run dir it
+            # named in the message; measure the lane directory's newest run instead of
+            # trusting the exception, then re-raise so the job is recorded as failed.
+            grant.close(reason=f"exception:{type(exc).__name__}", replayable=None,
+                        run_path=_newest_run_dir(Path(args.output_root) / "bybit_linear_universe"))
+        raise
+    if grant is not None:
+        grant.close(reason="complete", replayable=None, run_path=result.run_path)
     payload = {
         "run_path": result.run_path,
         "fetched_at": result.fetched_at,
@@ -3100,6 +3149,13 @@ def run_bybit_linear_universe_snapshot(args: argparse.Namespace) -> None:
         f"bybit linear universe snapshot: {result.payload_count} payloads, "
         f"{result.total_raw_bytes} raw bytes -> {result.run_path}"
     )
+
+
+def _newest_run_dir(lane_root: Path) -> Path | None:
+    if not lane_root.is_dir():
+        return None
+    runs = sorted(p for p in lane_root.iterdir() if p.is_dir())
+    return runs[-1] if runs else None
 
 
 def run_binance_options_chain_snapshot(args: argparse.Namespace) -> None:
@@ -3788,6 +3844,8 @@ def _run_segmented_worker(
     completed_segments = 0
     last_run_path: str | None = None
     rotate_at_midnight = bool(getattr(args, "rotate_at_midnight", False))
+    canary_control = getattr(args, "canary_control", None)
+    canary_refusal: str | None = None
     with StandaloneWorkerLock(args.ops_root, worker_name=worker_name):
         runtime.record_event(
             "worker_started",
@@ -3795,6 +3853,7 @@ def _run_segmented_worker(
                 "max_segments": args.max_segments,
                 "output_root": str(args.output_root),
                 "rotate_at_midnight": rotate_at_midnight,
+                "canary_control": str(canary_control) if canary_control else None,
             },
         )
         runtime.write_heartbeat(status="idle", last_segment_index=0)
@@ -3802,6 +3861,16 @@ def _run_segmented_worker(
             while args.max_segments is None or completed_segments < args.max_segments:
                 segment_index = completed_segments + 1
                 segment_started_at = utc_now()
+                canary_grant = None
+                if canary_control:
+                    # One grant per segment from the shared, immutable canary: refusal
+                    # (expired, exhausted, stopped, busy, identity) ends this worker
+                    # without a retry; the runner re-dispatches on its own cadence and
+                    # the next process is refused again until the lane is disabled.
+                    canary_grant = _claim_canary_grant(args, runtime=runtime, worker_name=worker_name)
+                    if isinstance(canary_grant, str):
+                        canary_refusal = canary_grant
+                        break
                 # A segment may rotate on a wall-clock deadline instead of (or before)
                 # --segment-count: day-bounded (midnight) or a fixed max_segment_seconds
                 # cadence for continuous capture. The segment function checks the deadline
@@ -3812,6 +3881,10 @@ def _run_segmented_worker(
                     rotate_at_midnight=rotate_at_midnight,
                     max_segment_seconds=float(getattr(args, "max_segment_seconds", 0.0) or 0.0),
                 )
+                if canary_grant is not None:
+                    canary_deadline = canary_grant.deadline_utc
+                    if segment_deadline_utc is None or canary_deadline < segment_deadline_utc:
+                        segment_deadline_utc = canary_deadline
                 stop_event, heartbeat_thread = runtime.start_segment_heartbeat(
                     segment_index=segment_index,
                     started_at=segment_started_at,
@@ -3881,8 +3954,14 @@ def _run_segmented_worker(
                     ):
                         if hasattr(args, hl_field):
                             setattr(segment_args, hl_field, hl_cast(getattr(args, hl_field)))
+                    # The canary grant is threaded centrally like every other per-lane
+                    # field so no build_segment_args lambda can drop it.
+                    segment_args.canary_grant = canary_grant
                     summary = asyncio.run(collect_segment(segment_args))
                 except Exception as exc:
+                    if canary_grant is not None:
+                        _close_canary_grant(canary_grant, runtime=runtime,
+                                            reason=f"exception:{type(exc).__name__}", replayable=None)
                     runtime.record_event("segment_error", details={"segment_index": segment_index, "error": str(exc)})
                     runtime.write_heartbeat(
                         status="error",
@@ -3897,10 +3976,21 @@ def _run_segmented_worker(
                     heartbeat_thread.join(timeout=max(1.0, float(args.heartbeat_interval_seconds) + 1.0))
                 completed_segments += 1
                 last_run_path = str(summary.get("run_path")) if summary.get("run_path") is not None else None
+                if canary_grant is not None:
+                    stop_reason = summary.get("canary_stop_reason")
+                    reason = (str(stop_reason) if stop_reason else
+                              "deadline" if summary.get("deadline_reached") else "limit")
+                    _close_canary_grant(canary_grant, runtime=runtime, reason=reason,
+                                        replayable=summary.get("replayable"), run_path=last_run_path)
                 runtime.record_event("segment_complete", details={"segment_index": completed_segments, **summary})
                 runtime.write_heartbeat(status="idle", last_segment_index=completed_segments, last_run_path=last_run_path)
                 print(progress_message(completed_segments, summary))
                 if args.max_segments is not None and completed_segments >= args.max_segments:
+                    break
+                if canary_grant is not None and canary_grant.terminal:
+                    runtime.record_event("worker_stopped", details={"reason": "canary_terminal",
+                                                                    "stop_reason": canary_grant.stop_reason,
+                                                                    "completed_segments": completed_segments})
                     break
                 if args.cooldown_seconds > 0:
                     time.sleep(args.cooldown_seconds)
@@ -3912,12 +4002,56 @@ def _run_segmented_worker(
             runtime.record_event("worker_crashed", details={"completed_segments": completed_segments})
             raise
         else:
-            runtime.record_event("worker_stopped", details={"reason": "completed", "completed_segments": completed_segments})
-            runtime.write_heartbeat(status="stopped", last_segment_index=completed_segments, last_run_path=last_run_path)
+            runtime.record_event("worker_stopped", details={
+                "reason": "canary_refused" if canary_refusal else "completed",
+                "completed_segments": completed_segments})
+            runtime.write_heartbeat(status="stopped", message=canary_refusal,
+                                    last_segment_index=completed_segments, last_run_path=last_run_path)
         finally:
             if getattr(args, "reference_evidence", False):
                 from .bybit_references import drain_reference_finalizers
                 drain_reference_finalizers()
+
+
+def _claim_canary_grant(args: argparse.Namespace, *, runtime, worker_name: str):
+    """Claim this segment's grant or report the refusal and hold the slot for a bounded
+    time so the runner's re-dispatch cannot become a spawn loop. Returns the grant, or
+    the `canary_refused:<reason>` heartbeat message when refused (the caller ends the
+    worker and records that message)."""
+    from .canary import GIB, CanaryGrant, CanaryRefused
+    grant = CanaryGrant(
+        Path(args.canary_control),
+        lane=str(getattr(args, "canary_lane", "") or worker_name),
+        identity=str(getattr(args, "canary_identity", "") or ""),
+        kind="stream",
+        min_free_bytes=int(getattr(args, "canary_min_free_gib", 215) or 215) * GIB,
+    )
+    try:
+        grant.claim()
+    except CanaryRefused as exc:
+        reason = str(exc)
+        runtime.record_event("canary_refused", details={"reason": reason})
+        runtime.write_heartbeat(status="stopped", message=f"canary_refused:{reason}", last_segment_index=0)
+        logger.warning("canary refused: %s", reason)
+        hold = getattr(args, "canary_hold_seconds", None)
+        if hold is None:
+            hold = getattr(args, "max_segment_seconds", None) or 1800.0
+        time.sleep(min(max(0.0, float(hold)), 7200.0))
+        return f"canary_refused:{reason}"
+    runtime.record_event("canary_granted", details={"grant_id": grant.grant_id, "deadline_utc": grant.deadline})
+    return grant
+
+
+def _close_canary_grant(grant, *, runtime, reason: str, replayable, run_path=None) -> None:
+    try:
+        receipt = grant.close(reason=reason, replayable=replayable, run_path=run_path)
+    except Exception as exc:  # noqa: BLE001 - the segment's own result must still be recorded
+        runtime.record_event("canary_close_failed", details={"grant_id": grant.grant_id, "error": type(exc).__name__})
+        logger.warning("canary close failed: %s", type(exc).__name__)
+        return
+    runtime.record_event("canary_closed", details={
+        "grant_id": grant.grant_id, "reason": reason, "measured_bytes": receipt["measured_bytes"],
+        "overshoot_bytes": receipt["overshoot_bytes"], "receipt_error": receipt.get("receipt_error")})
 
 
 def run_ops_runner(args: argparse.Namespace) -> None:
@@ -4012,6 +4146,10 @@ def _run_collector_in_subprocess(job: JobSpec) -> str:
         proc.stderr or "")))[:8]
     if reasons:
         message += "; optional_evidence_unavailable=" + ",".join(reasons)
+    refusals = sorted(set(re.findall(
+        r"(?m)^canary refused: ([A-Za-z][A-Za-z0-9_]{0,63})\r?$", proc.stderr or "")))[:4]
+    if refusals:
+        message += "; canary_refused=" + ",".join(refusals)
     return message
 
 
@@ -4053,6 +4191,17 @@ def _execute_ops_job_inprocess(job: JobSpec) -> JobExecutionResult | str | None:
     args.session_evidence_lease = job.args.get("session_evidence_lease")
     args.session_evidence_trial_id = job.args.get("session_evidence_trial_id")
     args.reference_evidence = bool(job.args.get("reference_evidence", False))
+    # Bounded alt canary (STANDARDS 4.18): the control directory, this job's identity
+    # digest (the prepared canary must carry the same digest), the lane key, the
+    # bounded refusal hold and the free-space floor. Absent -> every lane unchanged.
+    args.canary_control = job.args.get("canary_control") or None
+    if args.canary_control:
+        from .canary import job_identity
+        args.canary_identity = job_identity({"name": job.name, "job_type": job.job_type,
+                                             "interval_seconds": job.interval_seconds, "args": job.args})
+        args.canary_lane = job.name
+        args.canary_hold_seconds = job.args.get("canary_hold_seconds")
+        args.canary_min_free_gib = job.args.get("canary_min_free_gib", 215)
     if "jsonl_fsync" in job.args:
         args.jsonl_fsync = bool(job.args["jsonl_fsync"])
     if "normalized_parquet" in job.args:

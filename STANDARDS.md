@@ -1793,3 +1793,90 @@ displayed quote is not an executable fill.
 
 Activation, caps and canary measurements are a separate decision recorded in a local,
 untracked rollout ticket, not in this repo.
+
+## 4.18 Bounded stage-one alt canary controls (default off)
+
+**Added 2026-10-13, shipped default-off.** `STANDARDS_VERSION` is unchanged: no schema,
+partition layout or replayable verdict changes. The controls add a sidecar control
+directory, one optional job arg and two operational fields; raw, clean and curated
+contracts are untouched. Module `crypto_collector.canary`; runbook
+`docs/alt_canary_runbook.md`.
+
+**One immutable attempt.** `python -m crypto_collector.canary prepare <dir> <id> --config
+<ops json> --symbol <SYMBOL> --job <name>...` creates control state only (SQLite, DELETE
+journaling, 4 KiB pages, at most 256 pages, plus a `receipts/` directory) and refuses any
+existing directory. It admits at most one `bybit-trades-worker`, one `bybit-depth-worker`
+and the `bybit-linear-universe-snapshot` job; every other job type is refused, so ticker,
+liquidation, replacement-symbol or second-symbol lanes cannot join a canary by config.
+Each admitted job row is digested (name, type, interval, args; `enabled` excluded) and the
+worker's own digest must match at every claim (`canary_identity`), so an edited lane is
+refused rather than silently governed. Stream lanes must be the fixed symbol, `linear`,
+their own `source_suffix`, `normalized_parquet:false`, no midnight rotation and
+`max_segment_seconds` in (0, 1800]. There is no reset, refund, renewal or retry API; a
+finished attempt stays on disk as evidence and a new attempt is a new prepared directory.
+
+**Duration.** The first grant fixes a UTC and a monotonic deadline `max_seconds` later
+(default 24 h). A claim within `MIN_CLAIM_SECONDS` (60 s) of the deadline is refused
+(`canary_expiring`); at or after it the attempt is durably stopped (`canary_expired`).
+Workers clamp every segment deadline to the canary deadline, check wall and monotonic
+clocks before every frame (a reversal or disagreement over 0.5 s is a durable
+`canary_clock` stop) and tell the receive loop to end an idle wait at the deadline, so an
+idle lane stops without waiting for its idle timeout. These are bounds on the
+worker's own loop; process start-up, OS calls, an already-entered fsync or rename, the
+runner's dispatch cadence and subprocess teardown are **not an unconditional wall bound**
+and are reported, never assumed. A refused worker writes `canary_refused:<reason>` to its
+heartbeat and job-run message, then holds its pool slot for `canary_hold_seconds`
+(default: the lane's `max_segment_seconds`, at most 7200 s) so the runner's re-dispatch
+is not a spawn loop; the lane still has to be disabled by config.
+
+**Shared bytes.** `max_bytes` (default 2 GiB) covers every file the admitted lanes write
+under their run directories: raw, clean, quarantine, metrics, replay summaries and the
+universe snapshot's gzipped bodies and summary. 8 MiB is reserved for the control DB and
+receipts. Stream grants reserve 16 MiB chunks **before** writing plus 1 MiB per segment;
+a frame is admitted only while the open grant still covers a 4 MiB margin (inbound frames
+are capped at 1 MiB on canary lanes; raw plus fan-out plus a metrics row is assumed to
+fit 4x). Bytes are accounted from the sinks' own counters after each frame; if a frame
+ever exceeds the margin the grant is overshot by that one frame, the segment stops at
+once and the receipt records `overshoot_bytes`. The universe lane reserves a fixed 6 MiB
+(five 1 MiB bodies plus summary) and is charged what it wrote. Up to one chunk per open
+stream grant is in flight (reserved, unwritten) at any moment. Reservations are
+`BEGIN IMMEDIATE` transactions on the shared DB; the pool can never be overbooked, and a
+lane that cannot get a margin-sized chunk ends its segment (`canary_budget`) while the
+attempt stays open until closed consumption alone leaves less than one minimal segment
+(`canary_exhausted`, durable). Segment-end or day-end checks are not the byte cap;
+compression is not assumed. Curated copies are not counted: preflight refuses a config
+whose promoter or scorer jobs are enabled for a canary source directory, so promotion
+stays gated for the canary.
+
+**Headroom.** Every chunk reservation samples free space on the run filesystem and
+requires `floor + (pool - closed consumption)`; a shortfall is a durable
+`canary_headroom` stop. `preflight` requires `floor + unspent pool + 256 MiB` external
+overhead (allocation granularity, ops logs, runner stdout) on every lane output root and
+reports the pool-cap arithmetic (`enabled lanes + pending canary lanes + 2` against both
+runner scripts). All of it is a sample at the time of the call, never a reservation or
+an allocation; activation needs a fresh preflight.
+
+**Exact-worker stop.** A grant records the worker's own pid (the interpreter, not the
+venv launcher stub) and its kernel creation time. Liveness is three-valued: that exact
+process runs, it is gone or the pid was reused, or it cannot be opened (unknown, e.g. a
+non-elevated shell looking at SYSTEM workers). Unknown is never treated as exited: it
+blocks a lane claim, finalization and a stop's exit verification. `stop` is a dry run
+unless `--apply` (durable stop, then a bounded wait for recorded writers to close);
+`--terminate` terminates only still-alive recorded writers through a handle whose
+creation time is re-checked before `TerminateProcess` (POSIX: SIGTERM after the same
+check). No pid-only lock, no process-name or tree sweep, no action on any other plant
+worker, no runner restart.
+
+**Receipts.** Each grant closes with an exclusive-create, fsynced JSON receipt (run
+path, reason, replayable verdict as scored by the lane, reserved/accounted/measured/
+overshoot bytes, per-file sizes, process identity). A receipt that cannot be written
+closes the grant as `<reason>:receipt_failed:<error>` and the final receipt lists it as
+unverified. `finalize` writes the immutable `receipt.json` only when the attempt is
+terminal, every grant is closed (provably dead writers are closed as `abandoned`, charged
+what their run directory holds) and no writer is alive or unknown. Partial runs are
+preserved exactly as the sinks left them; a stop never reclaims, offloads or deletes.
+`metrics/summary.jsonl` rows gain `stop_reason` (null on every ordinary lane) and the
+segment result gains `canary_stop_reason`.
+
+Activation, caps and canary measurements remain a separate owner decision recorded
+outside this repo; the runbook lists the exact finite checklist.

@@ -32,13 +32,17 @@ class RunSummary:
     clean_events: int = 0
     quarantined_events: int = 0
     deadline_reached: bool = False
+    # Set only when an optional byte/duration budget ended the segment before the
+    # next frame was written (canary lanes); None for every ordinary lane.
+    stop_reason: str | None = None
 
-    def to_dict(self) -> dict[str, int | bool]:
+    def to_dict(self) -> dict[str, int | bool | str | None]:
         return {
             "raw_messages": self.raw_messages,
             "clean_events": self.clean_events,
             "quarantined_events": self.quarantined_events,
             "deadline_reached": self.deadline_reached,
+            "stop_reason": self.stop_reason,
         }
 
 
@@ -56,9 +60,15 @@ class CollectorPipeline:
         jsonl_fsync: bool = True,
         fsync_interval_events: int = DEFAULT_FSYNC_INTERVAL_EVENTS,
         fsync_interval_ms: float = DEFAULT_FSYNC_INTERVAL_MS,
+        budget: object | None = None,
     ) -> None:
         self.metrics_flush_every = max(0, int(metrics_flush_every))
         self.collector = collector
+        # Optional pre-write byte/duration admission (canary lanes only). `admit_frame()`
+        # returns None or the reason the segment must end BEFORE the next frame is
+        # written; `consumed(n)` accounts the bytes the sinks wrote for an admitted
+        # frame and may return an overshoot reason. None leaves every lane unchanged.
+        self.budget = budget
         self.normalizer = normalizer
         self.quality_gate = quality_gate
         # The three data sinks share the lane's fsync posture. When fsync is on it is
@@ -110,12 +120,21 @@ class CollectorPipeline:
         summary = RunSummary()
         evidence = getattr(self.collector, "session_evidence", None)
         references = getattr(self.collector, "reference_evidence", None)
+        budget = self.budget
+        accounted_bytes = 0
         stream = self.collector.stream(limit=limit)
         reason = "exception"
         try:
             if references is not None:
                 references.start()
             async for raw in stream:
+                if budget is not None:
+                    refusal = budget.admit_frame()
+                    if refusal is not None:
+                        # The frame just received is NOT written: the budget or the
+                        # clock refused it. Files stay whole; the finally block closes.
+                        summary.stop_reason = str(refusal)
+                        break
                 summary.raw_messages += 1
                 self.raw_sink.write(raw.to_dict())
                 if evidence is not None:
@@ -137,6 +156,14 @@ class CollectorPipeline:
                         quarantined_row = normalized.to_dict()
                         quarantined_row["reasons"] = verdict.reasons
                         self.quarantine_sink.write(quarantined_row)
+
+                if budget is not None:
+                    total = self._bytes_written()
+                    overshoot = budget.consumed(total - accounted_bytes)
+                    accounted_bytes = total
+                    if overshoot is not None:
+                        summary.stop_reason = str(overshoot)
+                        break
 
                 if deadline_utc is not None and utc_now() >= deadline_utc:
                     summary.deadline_reached = True
@@ -160,7 +187,7 @@ class CollectorPipeline:
                     )
             reason = ("deadline" if summary.deadline_reached else
                       "limit" if limit is not None and summary.raw_messages >= limit else
-                      "unexpected_end")
+                      summary.stop_reason or "unexpected_end")
         finally:
             # Always flush, even on cancellation / exception, so buffered Parquet rows
             # and the summary metrics are persisted instead of lost on shutdown. Each
@@ -170,14 +197,15 @@ class CollectorPipeline:
             # for. The first cleanup failure is re-raised only when no exception is
             # already propagating, so the original error is never masked.
             cleanup_error: BaseException | None = None
-            if evidence is not None:
+            if evidence is not None or budget is not None:
                 if sys.exc_info()[0] is not None:
                     reason = sys.exc_info()[0].__name__
                 try:
                     await stream.aclose()
                 except BaseException as exc:
                     cleanup_error = exc
-                    evidence.issue("stream_close_failed")
+                    if evidence is not None:
+                        evidence.issue("stream_close_failed")
             try:
                 self.metrics_sink.write(
                     {
@@ -221,9 +249,16 @@ class CollectorPipeline:
                     references.close(reason=reason, sinks_closed=cleanup_error is None)
                 else:
                     evidence.finish(reason=reason, sinks_closed=cleanup_error is None)
+            if budget is not None:
+                # Account the shutdown metrics row and any final sink bytes too.
+                budget.consumed(self._bytes_written() - accounted_bytes)
             if cleanup_error is not None and sys.exc_info()[0] is None:
                 raise cleanup_error
         return summary
+
+    def _bytes_written(self) -> int:
+        return (self.raw_sink.bytes_written + self.clean_sink.bytes_written
+                + self.quarantine_sink.bytes_written + self.metrics_sink.bytes_written)
 
 
 def _normalize_events(normalizer: object, raw: RawMessage) -> list:
