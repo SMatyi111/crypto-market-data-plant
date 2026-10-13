@@ -316,7 +316,10 @@ def _connect(directory: Path, *, check_version: bool = True) -> sqlite3.Connecti
         if conn.execute("PRAGMA page_size").fetchone()[0] != 4096:
             raise CanaryRefused("canary_page_size")
         if check_version:
-            rows = conn.execute("SELECT version FROM canary").fetchall()
+            try:
+                rows = conn.execute("SELECT version FROM canary").fetchall()
+            except sqlite3.Error as exc:  # no table: an interrupted prepare, or not ours
+                raise CanaryRefused("canary_corrupt") from exc
             if len(rows) != 1 or rows[0][0] != VERSION:
                 raise CanaryRefused("canary_corrupt")
         return conn
@@ -532,7 +535,7 @@ class CanaryGrant:
                 now, mono = time.time(), time.monotonic()
                 row = conn.execute("SELECT id, version, symbol, max_bytes, max_seconds, metadata_bytes, max_grants, "
                                    "first_utc, first_mono, last_utc, last_mono, stopped FROM canary").fetchall()
-                if len(row) != 1 or row[0][1] != VERSION:
+                if len(row) != 1:  # version itself is checked once, in _connect
                     raise CanaryRefused("canary_corrupt")
                 (canary_id, _, _, max_bytes, max_seconds, metadata, max_grants, first, first_mono,
                  last, last_mono, stopped) = row[0]
@@ -730,7 +733,12 @@ class CanaryGrant:
         try:
             if receipt_path.is_file():
                 # A previous close of this very grant wrote its receipt and then lost
-                # the row update to lock contention: the receipt stands, the row closes.
+                # the row update to lock contention: the receipt stands if it is whole
+                # and names this grant; otherwise the grant closes as receipt_invalid
+                # (the file is never overwritten or removed).
+                existing = json.loads(receipt_path.read_text(encoding="utf-8"))
+                if existing.get("grant_id") != self.grant_id or existing.get("lane") != self.lane:
+                    raise ValueError("receipt_invalid")
                 self.receipt_path = receipt_path
             else:
                 payload = (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode("utf-8")

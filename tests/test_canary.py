@@ -420,6 +420,15 @@ def test_close_after_lost_row_update_keeps_the_existing_receipt(prepared, clock,
     closed = grant.close(reason="limit", replayable=True)  # the retry reuses the receipt, no FileExistsError
     assert closed["receipt_error"] is None
     assert rows(prepared, "SELECT reason, receipt FROM grants") == [("limit", str(receipt))]
+    # A foreign or torn file at the receipt path is never adopted (nor touched).
+    other = grant_for(prepared, "bybit-gram-perp-depth")
+    other.claim()
+    torn = prepared.control / "receipts" / f"bybit-gram-perp-depth__{other.grant_id}.json"
+    torn.write_text("{")
+    closed = other.close(reason="limit", replayable=True)
+    assert closed["receipt_error"] == "JSONDecodeError" and torn.read_text() == "{"
+    assert rows(prepared, "SELECT reason, receipt FROM grants WHERE id=?".replace("?", str(other.grant_id))) == [
+        ("limit:receipt_failed:JSONDecodeError", None)]
 
 
 def test_prepare_refuses_an_attempt_the_control_db_cannot_hold(tmp_path, small):
@@ -644,7 +653,7 @@ def test_pipeline_without_budget_is_unchanged(tmp_path):
 
 def test_segmented_worker_threads_the_grant_clamps_the_deadline_and_holds_on_refusal(prepared, tmp_path, monkeypatch):
     # Real clocks here: the worker compares the canary deadline with utc_now().
-    monkeypatch.setattr(cli.time, "sleep", lambda s: None)
+    monkeypatch.setattr(cli, "_canary_sleep", lambda s: None)
     seen = []
 
     async def collect_segment(segment_args):
@@ -672,7 +681,7 @@ def test_segmented_worker_threads_the_grant_clamps_the_deadline_and_holds_on_ref
     # bounded hold is taken instead of a spawn loop.
     canary.stop(prepared.control, apply=True, wait_seconds=0)
     holds = []
-    monkeypatch.setattr(cli.time, "sleep", lambda s: holds.append(s))
+    monkeypatch.setattr(cli, "_canary_sleep", lambda s: holds.append(s))
     cli._run_segmented_worker(args=args, default_worker_name="bybit-trades-worker", worker_type="bybit-trades-worker",
                               build_segment_args=lambda a: SimpleNamespace(), collect_segment=collect_segment,
                               progress_message=lambda i, s: "", venue="bybit")
@@ -681,6 +690,8 @@ def test_segmented_worker_threads_the_grant_clamps_the_deadline_and_holds_on_ref
     assert heartbeat["status"] == "stopped" and heartbeat["message"] == "canary_refused:operator_stop"
     events = [json.loads(line) for line in (prepared.output_root / "ops/worker_events.jsonl").read_text().splitlines()]
     assert [e["event_type"] for e in events].count("canary_refused") == 1
+    stops = [e["details"]["reason"] for e in events if e["event_type"] == "worker_stopped"]
+    assert stops == ["completed", "canary_refused"]  # exactly one stop record per worker run
 
 
 def test_segment_exception_still_closes_the_grant(prepared, clock, tmp_path, monkeypatch):
@@ -693,7 +704,7 @@ def test_segment_exception_still_closes_the_grant(prepared, clock, tmp_path, mon
                               "canary_lane": job["name"], "canary_identity": prepared.identities[job["name"]],
                               "canary_hold_seconds": 0, "canary_min_free_gib": 0})
     holds = []
-    monkeypatch.setattr(cli.time, "sleep", lambda s: holds.append(s))
+    monkeypatch.setattr(cli, "_canary_sleep", lambda s: holds.append(s))
     args.canary_hold_seconds = 5
     with pytest.raises(RuntimeError):
         cli._run_segmented_worker(args=args, default_worker_name="bybit-depth-worker", worker_type="bybit-depth-worker",
@@ -701,6 +712,9 @@ def test_segment_exception_still_closes_the_grant(prepared, clock, tmp_path, mon
                                   progress_message=lambda i, s: "", venue="bybit")
     assert rows(prepared, "SELECT reason, closed_utc IS NOT NULL FROM grants") == [("exception:RuntimeError", 1)]
     assert holds == [5.0]  # the instant failure held the slot (capped by canary_hold_seconds) before exiting
+    events = [json.loads(line) for line in (prepared.output_root / "ops/worker_events.jsonl").read_text().splitlines()]
+    kinds = [e["event_type"] for e in events]
+    assert kinds.index("segment_error") < kinds.index("canary_short_segment_hold")  # record first, then hold
 
 
 def test_bind_refuses_parquet_and_evidence_and_caps_the_frame(prepared, clock, tmp_path):
@@ -772,6 +786,9 @@ def test_ops_job_threads_canary_fields_and_runner_parses_refusal(prepared, monke
     assert captured["canary_control"] == str(prepared.control)
     assert captured["canary_identity"] == prepared.identities[job["name"]] == canary.job_identity(job)
     assert captured["canary_lane"] == job["name"] and captured["canary_min_free_gib"] == 215
+    bad = JobSpec.from_dict({**job, "args": {**job["args"], "canary_hold_seconds": "1m"}})
+    with pytest.raises(ValueError, match="canary_hold_seconds"):
+        cli._execute_ops_job_inprocess(bad)
     plain = JobSpec.from_dict({**job, "args": {k: v for k, v in job["args"].items() if k != "canary_control"}})
     captured.clear()
     cli._execute_ops_job_inprocess(plain)

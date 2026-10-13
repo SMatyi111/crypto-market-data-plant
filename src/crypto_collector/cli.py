@@ -3967,10 +3967,6 @@ def _run_segmented_worker(
                     if canary_grant is not None:
                         _close_canary_grant(canary_grant, runtime=runtime,
                                             reason=f"exception:{type(exc).__name__}", replayable=None)
-                        # A refused subscription or exhausted connect retries end in
-                        # under a second; without this hold the runner's re-dispatch
-                        # would spend a grant per tick (same hold as the summary path).
-                        _hold_after_short_canary_segment(args, runtime=runtime, started_at=segment_started_at)
                     runtime.record_event("segment_error", details={"segment_index": segment_index, "error": str(exc)})
                     runtime.write_heartbeat(
                         status="error",
@@ -3979,6 +3975,13 @@ def _run_segmented_worker(
                         current_segment_index=segment_index,
                         current_segment_started_at=segment_started_at,
                     )
+                    if canary_grant is not None:
+                        # A refused subscription or exhausted connect retries end in
+                        # under a second; without this hold the runner's re-dispatch
+                        # would spend a grant per tick (same hold as the summary path).
+                        # After the error record and heartbeat, so a kill inside the
+                        # hold loses nothing.
+                        _hold_after_short_canary_segment(args, runtime=runtime, started_at=segment_started_at)
                     raise
                 finally:
                     stop_event.set()
@@ -3994,9 +3997,8 @@ def _run_segmented_worker(
                 print(progress_message(completed_segments, summary))
                 if canary_grant is not None and canary_grant.terminal:
                     # The next claim's refusal hold covers a terminal attempt; no hold here.
-                    runtime.record_event("worker_stopped", details={"reason": "canary_terminal",
-                                                                    "stop_reason": canary_grant.stop_reason,
-                                                                    "completed_segments": completed_segments})
+                    # The single worker_stopped record below carries the reason.
+                    canary_refusal = f"canary_terminal:{canary_grant.stop_reason}"
                     break
                 if canary_grant is not None:
                     # After the completion record and heartbeat, so a kill inside the
@@ -4015,7 +4017,7 @@ def _run_segmented_worker(
             raise
         else:
             runtime.record_event("worker_stopped", details={
-                "reason": "canary_refused" if canary_refusal else "completed",
+                "reason": canary_refusal.split(":", 1)[0] if canary_refusal else "completed",
                 "completed_segments": completed_segments})
             runtime.write_heartbeat(status="stopped", message=canary_refusal,
                                     last_segment_index=completed_segments, last_run_path=last_run_path)
@@ -4050,10 +4052,14 @@ def _claim_canary_grant(args: argparse.Namespace, *, runtime, worker_name: str):
             hold = getattr(args, "max_segment_seconds", None) or 1800.0
         if reason == "canary_control_busy":
             hold = min(float(hold), 30.0)  # transient lock contention, not a terminal state
-        time.sleep(min(max(0.0, float(hold)), 7200.0))
+        _canary_sleep(min(max(0.0, float(hold)), 7200.0))
         return f"canary_refused:{reason}"
     runtime.record_event("canary_granted", details={"grant_id": grant.grant_id, "deadline_utc": grant.deadline})
     return grant
+
+
+# Sleep used by the canary holds; tests replace this attribute instead of the stdlib.
+_canary_sleep = time.sleep
 
 
 def _hold_after_short_canary_segment(args: argparse.Namespace, *, runtime, started_at) -> None:
@@ -4069,9 +4075,12 @@ def _hold_after_short_canary_segment(args: argparse.Namespace, *, runtime, start
     configured = getattr(args, "canary_hold_seconds", None)
     if configured is not None:
         hold = min(hold, float(configured))  # 0 = no hold, as for the refusal hold
-    runtime.record_event("canary_short_segment_hold", details={"elapsed_seconds": elapsed, "hold_seconds": hold})
+    try:
+        runtime.record_event("canary_short_segment_hold", details={"elapsed_seconds": elapsed, "hold_seconds": hold})
+    except OSError:
+        pass  # the hold matters more than its log line (full disk is the canary's own failure mode)
     if hold > 0:
-        time.sleep(hold)
+        _canary_sleep(hold)
 
 
 def _close_canary_grant(grant, *, runtime, reason: str, replayable, run_path=None) -> None:
@@ -4232,7 +4241,10 @@ def _execute_ops_job_inprocess(job: JobSpec) -> JobExecutionResult | str | None:
         args.canary_identity = job_identity({"name": job.name, "job_type": job.job_type,
                                              "interval_seconds": job.interval_seconds, "args": job.args})
         args.canary_lane = job.name
-        args.canary_hold_seconds = job.args.get("canary_hold_seconds")
+        hold = job.args.get("canary_hold_seconds")
+        if hold is not None and (isinstance(hold, bool) or not isinstance(hold, (int, float)) or not 0 <= hold <= 7200):
+            raise ValueError(f"{job.name}: canary_hold_seconds must be a number in 0..7200")
+        args.canary_hold_seconds = None if hold is None else float(hold)
         args.canary_min_free_gib = job.args.get("canary_min_free_gib", 215)
     if "jsonl_fsync" in job.args:
         args.jsonl_fsync = bool(job.args["jsonl_fsync"])
