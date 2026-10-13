@@ -170,6 +170,11 @@ def test_symbol_repeated_within_one_page_is_a_failure_and_membership_unknown(tmp
     )
     with pytest.raises(ValueError, match="instruments_linear_p2: 1 symbol\\(s\\) repeated within or across pages"):
         snapshot_bybit_linear_universe(tmp_path, panel_symbols=PANEL, fetch=lambda u: urls[u], clock=lambda: NOW)
+    # One symbol that is both repeated on this page and present on an earlier page is one offender.
+    urls = payloads()
+    urls[universe._cursor_url("c1")] = page([lin("AAAUSDT"), lin("AAAUSDT"), lin("XLMUSDT")], "linear")
+    with pytest.raises(ValueError, match="instruments_linear_p2: 1 symbol\\(s\\) repeated"):
+        snapshot_bybit_linear_universe(tmp_path / "b", panel_symbols=PANEL, fetch=lambda u: urls[u], clock=lambda: NOW)
     data = summary(tmp_path)
     assert data["payloads"]["instruments_linear_p2"]["parse_ok"] is False
     assert (run_dir(tmp_path) / "raw" / "instruments_linear_p2.json.gz").exists()  # bytes kept
@@ -311,7 +316,7 @@ def test_unsafe_or_empty_panel_fails_before_any_fetch(tmp_path: Path) -> None:
 def test_ops_job_registration_and_arg_threading(tmp_path: Path, monkeypatch) -> None:
     assert "bybit-linear-universe-snapshot" in COLLECTOR_JOB_TYPES
     assert "bybit-linear-universe-snapshot" in POLL_LANE_JOB_TYPES
-    args = _job_args(SimpleNamespace(job_type="bybit-linear-universe-snapshot",
+    args = _job_args(SimpleNamespace(name="u", job_type="bybit-linear-universe-snapshot",
                                      args={"output_root": str(tmp_path / "raw"), "panel_symbols": ["XLMUSDT"], "format": "json"}))
     assert args.output_root == Path(tmp_path / "raw")
     assert args.panel_symbol == ["XLMUSDT"]
@@ -327,7 +332,7 @@ def test_ops_job_registration_and_arg_threading(tmp_path: Path, monkeypatch) -> 
     monkeypatch.setattr(cli, "snapshot_bybit_linear_universe", fake)
     cli.run_bybit_linear_universe_snapshot(args)
     assert captured == {"output_root": Path(tmp_path / "raw"), "panel_symbols": ("XLMUSDT",)}
-    defaults = _job_args(SimpleNamespace(job_type="bybit-linear-universe-snapshot", args={}))
+    defaults = _job_args(SimpleNamespace(name="u", job_type="bybit-linear-universe-snapshot", args={}))
     assert tuple(defaults.panel_symbol) == universe.DEFAULT_PANEL
 
 

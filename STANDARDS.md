@@ -1791,5 +1791,5 @@ symbol is enabled by code. The tickers payload is a coarse once-a-day reference 
 funding quote and next time, mark, index): a funding quote is not a settlement and a
 displayed quote is not an executable fill.
 
-Activation, caps and canary measurements are a separate decision; see the factory's
-`tickets/ALT_PANEL_ROLLOUT_20261013.md`.
+Activation, caps and canary measurements are a separate decision recorded in a local,
+untracked rollout ticket, not in this repo.

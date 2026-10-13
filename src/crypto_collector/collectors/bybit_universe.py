@@ -47,6 +47,7 @@ from __future__ import annotations
 import http.client
 import json
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote
@@ -196,10 +197,11 @@ def snapshot_bybit_linear_universe(
             instruments_failed = True
             break
         # Duplicates within this page count as well as repeats of earlier pages: a
-        # symbol listed twice has two candidate rows and no dated truth.
+        # symbol listed twice has two candidate rows and no dated truth. Counted as
+        # distinct offending symbols, so one symbol is never reported twice.
         page_symbols = [row["symbol"] for row in rows]
-        duplicates = (len(page_symbols) - len(set(page_symbols))) + sum(
-            1 for symbol in set(page_symbols) if symbol in seen_symbols
+        duplicates = sum(
+            1 for symbol, count in Counter(page_symbols).items() if count > 1 or symbol in seen_symbols
         )
         seen_symbols.update(page_symbols)
         if duplicates:
