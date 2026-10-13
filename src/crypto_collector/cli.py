@@ -4066,10 +4066,11 @@ _canary_sleep = time.sleep
 
 
 def _canary_min_free_bytes(args: argparse.Namespace) -> int:
-    """Configured free-space floor for the canary (GiB); 0 is a real zero, absent is 215."""
-    from .canary import GIB
+    """Configured free-space floor for the canary (GiB); 0 is a real zero, absent is
+    the module default shared with preflight and CanaryGrant."""
+    from .canary import DEFAULT_MIN_FREE_GIB, GIB
     value = getattr(args, "canary_min_free_gib", None)
-    return int(215 if value is None else value) * GIB
+    return int(DEFAULT_MIN_FREE_GIB if value is None else value) * GIB
 
 
 def _hold_after_short_canary_segment(args: argparse.Namespace, *, runtime, started_at) -> None:
@@ -4246,13 +4247,17 @@ def _execute_ops_job_inprocess(job: JobSpec) -> JobExecutionResult | str | None:
     # Bounded alt canary (STANDARDS 4.18): the control directory, this job's identity
     # digest (the prepared canary must carry the same digest), the lane key, the
     # bounded refusal hold and the free-space floor. Absent -> every lane unchanged.
+    if "canary_control" in job.args:
+        # Once more in the child (the runner validated at load), BEFORE the key is
+        # normalised, so a hand-run job with an empty control path is refused rather
+        # than silently run without its canary.
+        validate_canary_args(job.name, job.args)
     args.canary_control = job.args.get("canary_control") or None
     if args.canary_control:
         from .canary import job_identity
         args.canary_identity = job_identity({"name": job.name, "job_type": job.job_type,
                                              "interval_seconds": job.interval_seconds, "args": job.args})
         args.canary_lane = job.name
-        validate_canary_args(job.name, job.args)  # once more in the child; the runner validated at load
         hold = job.args.get("canary_hold_seconds")
         args.canary_hold_seconds = None if hold is None else float(hold)
         args.canary_min_free_gib = job.args.get("canary_min_free_gib")

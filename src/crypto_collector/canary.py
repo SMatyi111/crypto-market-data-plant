@@ -327,12 +327,21 @@ def _connect(directory: Path, *, check_version: bool = True) -> sqlite3.Connecti
         except sqlite3.Error as exc:
             if _is_lock_contention(exc):
                 raise  # a sibling holds the lock: the caller's retry handles it
-            # Not a SQLite file, no table (an interrupted prepare), or not ours.
-            raise CanaryRefused("canary_corrupt") from exc
+            text = str(exc).lower()
+            if isinstance(exc, sqlite3.DatabaseError) and ("not a database" in text or "no such table" in text
+                                                             or "malformed" in text):
+                # Not a SQLite file, no table (an interrupted prepare), or not ours.
+                raise CanaryRefused("canary_corrupt") from exc
+            raise  # I/O, read-only, cannot-open: the caller reports canary_control_db
         return conn
     except BaseException:
         conn.close()
         raise
+
+
+def _open(directory: Path) -> sqlite3.Connection:
+    """Operator-surface open: lock contention retried, every other failure a token."""
+    return _retry_locked(lambda: _connect(directory))
 
 
 def _stop(conn: sqlite3.Connection, reason: str, now: float) -> None:
@@ -759,7 +768,7 @@ class CanaryGrant:
                     os.fsync(stream.fileno())
                 self.receipt_path = receipt_path
         except Exception as exc:  # noqa: BLE001 - the DB row must still close
-            receipt_error = type(exc).__name__
+            receipt_error = f"ReceiptInvalid:{exc}" if isinstance(exc, ReceiptInvalid) else type(exc).__name__
 
         def update():
             conn = _connect(self.directory)
@@ -784,7 +793,7 @@ class CanaryGrant:
 
 
 def _snapshot(directory: Path) -> dict:
-    conn = _connect(directory)
+    conn = _open(directory)
     try:
         canary = conn.execute("SELECT * FROM canary").fetchone()
         columns = [d[0] for d in conn.execute("SELECT * FROM canary").description]
@@ -817,7 +826,7 @@ def _snapshot(directory: Path) -> dict:
 def _open_writers(directory: Path) -> list[int]:
     """Grant ids whose recorded process is alive or of unknown liveness (one cheap
     query plus one identity probe per open grant; used while a stop waits)."""
-    conn = _connect(directory)
+    conn = _open(directory)
     try:
         rows = conn.execute("SELECT id, pid, identity FROM grants WHERE closed_utc IS NULL").fetchall()
     finally:
@@ -845,13 +854,17 @@ def stop(directory: Path, *, reason: str = "operator_stop", apply: bool = False,
     if not ID.fullmatch(reason):
         raise ValueError("stop reason must be a bounded token")
     now = time.time()
-    conn = _connect(directory)
-    try:
-        with conn:
-            conn.execute("UPDATE canary SET stopped=COALESCE(stopped, ?), stopped_utc=COALESCE(stopped_utc, ?)",
-                         (reason, now))
-    finally:
-        conn.close()
+
+    def mark():
+        conn = _connect(directory)
+        try:
+            with conn:
+                conn.execute("UPDATE canary SET stopped=COALESCE(stopped, ?), stopped_utc=COALESCE(stopped_utc, ?)",
+                             (reason, now))
+        finally:
+            conn.close()
+
+    _retry_locked(mark)
     deadline = monotonic() + max(0.0, float(wait_seconds))
     while _open_writers(directory) and monotonic() < deadline:
         sleep(0.5)
@@ -875,7 +888,7 @@ def finalize(directory: Path) -> dict:
     writer has provably exited and every grant is closed (abandoned grants are charged
     what their run holds). Refuses otherwise with the exact blocker."""
     now = time.time()
-    conn = _connect(directory)
+    conn = _open(directory)
     try:
         with conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -1033,6 +1046,14 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--terminate", action="store_true")
     s.add_argument("--wait-seconds", type=float, default=120.0)
     args = parser.parse_args(argv)
+    try:
+        return _dispatch(args)
+    except CanaryRefused as exc:
+        print(json.dumps({"ok": False, "refused": str(exc), "directory": str(args.directory)}, indent=2))
+        return 1
+
+
+def _dispatch(args) -> int:
     if args.command == "prepare":
         result = prepare(args.directory, args.canary_id, config_path=args.config, symbol=args.symbol,
                          job_names=args.jobs, max_bytes=args.max_gib * GIB, max_seconds=args.max_hours * 3600)

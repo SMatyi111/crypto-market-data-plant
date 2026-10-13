@@ -426,9 +426,9 @@ def test_close_after_lost_row_update_keeps_the_existing_receipt(prepared, clock,
     torn = prepared.control / "receipts" / f"bybit-gram-perp-depth__{other.grant_id}.json"
     torn.write_text("{")
     closed = other.close(reason="limit", replayable=True)
-    assert closed["receipt_error"] == "ReceiptInvalid" and torn.read_text() == "{"
+    assert closed["receipt_error"] == "ReceiptInvalid:unparsable" and torn.read_text() == "{"
     assert rows(prepared, "SELECT reason, receipt FROM grants WHERE id=?".replace("?", str(other.grant_id))) == [
-        ("limit:receipt_failed:ReceiptInvalid", None)]
+        ("limit:receipt_failed:ReceiptInvalid:unparsable", None)]
 
 
 def test_half_prepared_or_foreign_control_file_is_refused_not_a_traceback(tmp_path):
@@ -441,6 +441,26 @@ def test_half_prepared_or_foreign_control_file_is_refused_not_a_traceback(tmp_pa
     (control / "canary.sqlite3").write_bytes(b"not a database at all, just bytes" * 200)
     with pytest.raises(CanaryRefused, match="canary_corrupt"):
         canary.status(control)
+    assert canary.main(["status", str(control)]) == 1  # a token on stdout, never a traceback
+
+
+def test_operator_surfaces_retry_lock_contention_and_report_io_errors_as_control_db(prepared, clock, monkeypatch):
+    import sqlite3 as sq
+    real = sq.connect
+    state = {"fail": 2}
+
+    def flaky_connect(*a, **k):
+        if state["fail"] > 0:
+            state["fail"] -= 1
+            raise sq.OperationalError("database is locked")
+        return real(*a, **k)
+
+    monkeypatch.setattr(canary.sqlite3, "connect", flaky_connect)
+    monkeypatch.setattr(clock, "sleep", lambda s: None)
+    assert canary.status(prepared.control)["open_grants"] == []  # two locked opens, then success
+    monkeypatch.setattr(canary.sqlite3, "connect", lambda *a, **k: (_ for _ in ()).throw(sq.OperationalError("disk I/O error")))
+    with pytest.raises(CanaryRefused, match="canary_control_db"):
+        canary.status(prepared.control)
 
 
 def test_lock_contention_while_opening_is_retried_not_corrupt(prepared, clock, monkeypatch):
@@ -877,6 +897,9 @@ def test_ops_job_threads_canary_fields_and_runner_parses_refusal(prepared, monke
     captured.clear()
     cli._execute_ops_job_inprocess(plain)
     assert captured["canary_control"] is None and "canary_identity" not in captured
+    empty = JobSpec.from_dict({**job, "args": {**job["args"], "canary_control": ""}})
+    with pytest.raises(ValueError, match="canary_control"):  # never silently uncontrolled
+        cli._execute_ops_job_inprocess(empty)
 
     def fake_run(cmd, **kwargs):
         return SimpleNamespace(returncode=0, stdout="", stderr="canary refused: canary_expired\nother noise\n")

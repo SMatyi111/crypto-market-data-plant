@@ -177,7 +177,7 @@ def validate_canary_args(name: str, args: dict[str, Any]) -> None:
     if hold is not None and (isinstance(hold, bool) or not isinstance(hold, (int, float)) or not 0 <= hold <= 7200):
         raise ValueError(f"{name}: canary_hold_seconds must be a number in 0..7200")
     floor = args.get("canary_min_free_gib")
-    if floor is not None and (isinstance(floor, bool) or type(floor) is not int or not 0 <= floor <= 4096):
+    if floor is not None and (type(floor) is not int or not 0 <= floor <= 4096):  # bool is not int here
         raise ValueError(f"{name}: canary_min_free_gib must be an integer in 0..4096")
 
 
