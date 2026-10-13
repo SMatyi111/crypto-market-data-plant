@@ -56,6 +56,8 @@ from .collectors.binance_futures_rest import (
 )
 from .collectors.rest_poll import RestPollingCollector
 from .collectors.binance_options import snapshot_binance_options_chain
+from .collectors.bybit_universe import DEFAULT_PANEL as BYBIT_UNIVERSE_DEFAULT_PANEL
+from .collectors.bybit_universe import snapshot_bybit_linear_universe
 from .collectors.deribit_options import (
     option_summary_count as deribit_option_summary_count,
     snapshot_deribit_options,
@@ -523,6 +525,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     bo_chain_parser.add_argument("--output-root", type=Path, default=default_output_root())
     bo_chain_parser.add_argument("--format", choices=["json", "text"], default="text")
+
+    bu_parser = subparsers.add_parser(
+        "bybit-linear-universe-snapshot",
+        help="Archive one dated snapshot of the Bybit linear universe: instruments-info "
+        "linear pages (bounded cursor pagination), instruments-info spot, and one linear "
+        "tickers payload (raw-only reference lane, STANDARDS section 4.17). Records the "
+        "alt research panel's last-known membership and delisting times per run.",
+    )
+    bu_parser.add_argument(
+        "--panel-symbol",
+        nargs="+",
+        default=list(BYBIT_UNIVERSE_DEFAULT_PANEL),
+        help="Panel symbols whose membership/absence is recorded in the run summary.",
+    )
+    bu_parser.add_argument("--output-root", type=Path, default=default_output_root())
+    bu_parser.add_argument("--format", choices=["json", "text"], default="text")
 
     dr_options_parser = subparsers.add_parser(
         "deribit-options-snapshot",
@@ -3064,6 +3082,26 @@ def run_hyperliquid_universe_positions_snapshot(args: argparse.Namespace) -> Non
     )
 
 
+def run_bybit_linear_universe_snapshot(args: argparse.Namespace) -> None:
+    result = snapshot_bybit_linear_universe(
+        args.output_root, panel_symbols=tuple(args.panel_symbol)
+    )
+    payload = {
+        "run_path": result.run_path,
+        "fetched_at": result.fetched_at,
+        "payload_count": result.payload_count,
+        "total_raw_bytes": result.total_raw_bytes,
+        "linear_rows_page_1": result.row_counts.get("instruments_linear_p1"),
+    }
+    if getattr(args, "format", "text") == "json":
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    print(
+        f"bybit linear universe snapshot: {result.payload_count} payloads, "
+        f"{result.total_raw_bytes} raw bytes -> {result.run_path}"
+    )
+
+
 def run_binance_options_chain_snapshot(args: argparse.Namespace) -> None:
     result = snapshot_binance_options_chain(
         args.output_root, underlyings=tuple(args.underlying)
@@ -4040,6 +4078,9 @@ def _execute_ops_job_inprocess(job: JobSpec) -> JobExecutionResult | str | None:
     if job.job_type == "hyperliquid-universe-positions-snapshot":
         run_hyperliquid_universe_positions_snapshot(args)
         return "hyperliquid universe positions snapshot completed"
+    if job.job_type == "bybit-linear-universe-snapshot":
+        run_bybit_linear_universe_snapshot(args)
+        return "bybit linear universe snapshot completed"
     if job.job_type == "binance-options-chain-snapshot":
         run_binance_options_chain_snapshot(args)
         return "binance options chain snapshot completed"
@@ -4290,6 +4331,22 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             stale_after_seconds=float(
                 raw_args.get("stale_after_seconds", _HL_UNIVERSE_DEFAULT_STALE)
             ),
+            format=raw_args.get("format", "text"),
+        )
+    if job.job_type == "bybit-linear-universe-snapshot":
+        panel_symbols = raw_args.get("panel_symbols", BYBIT_UNIVERSE_DEFAULT_PANEL)
+        # A scalar string would be exploded into one-letter "symbols" by list(), every
+        # one alphanumeric, and the lane would record nonsense membership without error.
+        if not isinstance(panel_symbols, (list, tuple)) or not all(
+            isinstance(symbol, str) for symbol in panel_symbols
+        ):
+            raise ValueError(
+                f"{job.name}: panel_symbols must be a list of strings, "
+                f"got {type(panel_symbols).__name__}"
+            )
+        return SimpleNamespace(
+            output_root=Path(raw_args.get("output_root", default_output_root())),
+            panel_symbol=list(panel_symbols),
             format=raw_args.get("format", "text"),
         )
     if job.job_type == "binance-options-chain-snapshot":
@@ -5940,6 +5997,8 @@ def main() -> None:
         run_hyperliquid_leaderboard_snapshot(args)
     elif args.command == "hyperliquid-universe-positions-snapshot":
         run_hyperliquid_universe_positions_snapshot(args)
+    elif args.command == "bybit-linear-universe-snapshot":
+        run_bybit_linear_universe_snapshot(args)
     elif args.command == "binance-options-chain-snapshot":
         run_binance_options_chain_snapshot(args)
     elif args.command == "deribit-options-snapshot":

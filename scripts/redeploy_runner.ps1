@@ -67,7 +67,7 @@ function Assert-PlantTaskPreflight([string]$Repo, [string]$Root, [int]$Concurren
     if (@($jobs | Group-Object name | Where-Object Count -gt 1).Count -gt 0) {
         throw 'Duplicate job names. Nothing has been stopped.'
     }
-    $nonWorkerPoolTypes = @("kalshi-collect-crypto-quotes","kalshi-discover-crypto","hyperliquid-leaderboard-snapshot","hyperliquid-universe-positions-snapshot","binance-options-chain-snapshot","deribit-options-snapshot")
+    $nonWorkerPoolTypes = @("kalshi-collect-crypto-quotes","kalshi-discover-crypto","hyperliquid-leaderboard-snapshot","hyperliquid-universe-positions-snapshot","binance-options-chain-snapshot","deribit-options-snapshot","bybit-linear-universe-snapshot")
     $lanes = @($jobs | Where-Object { $_.job_type -like '*-worker' -or $_.job_type -in $nonWorkerPoolTypes })
     if ($lanes.Count -gt $Concurrency) { throw 'Collector capacity exceeded. Nothing has been stopped.' }
     Assert-PlantConfig $Repo $config

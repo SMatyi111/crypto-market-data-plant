@@ -8,7 +8,7 @@ changes scope or state. Companion docs:
 - [`STANDARDS.md`](STANDARDS.md) — the data contract (schemas, replayability, retention)
 - [`docs/HISTORY.md`](docs/HISTORY.md) — resolved-work narrative (what was fixed, and why)
 
-Last updated: **2026-10-08**.
+Last updated: **2026-10-13**.
 
 > **Operating mode — safe shaping (owner directive, 2026-07-04).** No extended
 > building on Claude's initiative: no new venues, lanes, or instruments, no big
@@ -18,6 +18,18 @@ Last updated: **2026-10-08**.
 > explicit owner ask to start.
 
 ---
+
+## Alt research panel, phase 1: configured and disabled (2026-10-13)
+
+Four Bybit USDT perpetuals (XLMUSDT, GRAMUSDT, TRXUSDT, MEGAUSDT; selection rule and
+snapshot in the local, untracked factory docs) get trades and depth lanes on the existing
+Bybit linear workers, each with its own `source_suffix` dir, quarantine, promoter and
+score job, plus a daily raw-only universe snapshot lane (STANDARDS 4.17). Everything
+ships `enabled:false`; the pool cap is untouched in this change. Activation is a separate
+staged decision (local rollout ticket): stage one is one symbol plus the snapshot
+(3 lanes), the cap must become enabled lanes + subset + 2 in both runner scripts, and the
+canary carries explicit duration and byte caps with verified stop and drain. No
+assumption about these lanes' volume relative to the BTC lanes is made.
 
 ## Bybit terminal publication repair: streamed raw accounting + stage diagnostics (2026-10-08)
 
