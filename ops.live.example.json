@@ -818,7 +818,7 @@
       }
     },
     {
-      "// alt research panel (2026-10-13)": "Four mid-liquidity Bybit USDT perpetuals selected by the saved rule in market-edge-factory/reports/alt-collection-shortlist-20261013 (institutional participation is unobserved). Every job below ships DISABLED; activation is a separate staged decision (tickets/ALT_PANEL_ROLLOUT_20261013.md) that must raise CollectorConcurrency in BOTH runner scripts to enabled lanes + subset + reserve. Per-instrument dirs via source_suffix; exactly one promoter per lane; delisting keeps the lane through deliveryTime + 1 h then enabled:false with a logged reason, never deletion.",
+      "// alt research panel (2026-10-13)": "Four Bybit USDT perpetuals (selection rule and snapshot live in local, untracked docs). Every job below ships DISABLED; activation is a separate staged decision (local rollout ticket) that must raise CollectorConcurrency in BOTH runner scripts to enabled lanes + subset + reserve. Per-instrument dirs via source_suffix; exactly one promoter per lane; delisting keeps the lane through deliveryTime + 1 h then enabled:false with a logged reason, never deletion.",
       "name": "bybit-xlm-perp-trades",
       "job_type": "bybit-trades-worker",
       "enabled": false,

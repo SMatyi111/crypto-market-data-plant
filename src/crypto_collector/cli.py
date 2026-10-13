@@ -4334,9 +4334,19 @@ def _job_args(job: JobSpec) -> SimpleNamespace:
             format=raw_args.get("format", "text"),
         )
     if job.job_type == "bybit-linear-universe-snapshot":
+        panel_symbols = raw_args.get("panel_symbols", BYBIT_UNIVERSE_DEFAULT_PANEL)
+        # A scalar string would be exploded into one-letter "symbols" by list(), every
+        # one alphanumeric, and the lane would record nonsense membership without error.
+        if not isinstance(panel_symbols, (list, tuple)) or not all(
+            isinstance(symbol, str) for symbol in panel_symbols
+        ):
+            raise ValueError(
+                f"{job.name}: panel_symbols must be a list of strings, "
+                f"got {type(panel_symbols).__name__}"
+            )
         return SimpleNamespace(
             output_root=Path(raw_args.get("output_root", default_output_root())),
-            panel_symbol=list(raw_args.get("panel_symbols", BYBIT_UNIVERSE_DEFAULT_PANEL)),
+            panel_symbol=list(panel_symbols),
             format=raw_args.get("format", "text"),
         )
     if job.job_type == "binance-options-chain-snapshot":

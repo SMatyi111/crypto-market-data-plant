@@ -93,7 +93,10 @@ def test_complete_two_page_snapshot_archives_verbatim_and_records_membership(tmp
     }
     assert data["panel_absent"] == [] and data["panel_unknown"] == []
     assert data["payloads"]["instruments_linear_p1"]["row_count"] == 2
-    assert data["limits"] == {"max_response_bytes": 1024 * 1024, "timeout_seconds": 10.0, "wall_budget_seconds": 120.0}
+    assert data["limits"] == {
+        "max_response_bytes": 1024 * 1024, "timeout_seconds": 10.0, "wall_budget_seconds": 120.0,
+        "wall_budget_checked": "between_requests",  # not an absolute per-request deadline
+    }
     assert set(data["payload_fetched_at"]) == {"instruments_linear_p1", "instruments_linear_p2", "instruments_spot", "tickers_linear"}
     assert "SENTINEL_PRICE" not in json.dumps(data)  # summary holds counts and membership, not quotes
 
@@ -153,8 +156,27 @@ def test_spot_cursor_and_repeated_cursor_and_duplicate_symbol_are_failures(tmp_p
 
     urls = payloads()
     urls[universe._cursor_url("c1")] = page([lin("AAAUSDT"), lin("XLMUSDT")], "linear")
-    with pytest.raises(ValueError, match="repeated across pages"):
+    with pytest.raises(ValueError, match="1 symbol\\(s\\) repeated within or across pages"):
         snapshot_bybit_linear_universe(tmp_path / "c", panel_symbols=PANEL, fetch=lambda u: urls[u], clock=lambda: NOW)
+
+
+def test_symbol_repeated_within_one_page_is_a_failure_and_membership_unknown(tmp_path: Path) -> None:
+    """Two rows for one symbol on a single page = two candidate delivery times and no dated
+    truth; the page must fail instead of silently keeping whichever row came last."""
+    urls = payloads()
+    urls[universe._cursor_url("c1")] = page(
+        [lin("GRAMUSDT", delivery="1800000000000"), lin("XLMUSDT"), lin("GRAMUSDT", delivery="1700000000000")],
+        "linear",
+    )
+    with pytest.raises(ValueError, match="instruments_linear_p2: 1 symbol\\(s\\) repeated within or across pages"):
+        snapshot_bybit_linear_universe(tmp_path, panel_symbols=PANEL, fetch=lambda u: urls[u], clock=lambda: NOW)
+    data = summary(tmp_path)
+    assert data["payloads"]["instruments_linear_p2"]["parse_ok"] is False
+    assert (run_dir(tmp_path) / "raw" / "instruments_linear_p2.json.gz").exists()  # bytes kept
+    assert data["panel_membership_coverage"] == "incomplete"
+    assert data["panel_membership"]["GRAMUSDT"]["present_in_instruments"] is None
+    assert data["panel_membership"]["GRAMUSDT"]["delivery_time"] is None  # neither row is recorded as truth
+    assert data["panel_unknown"] == ["XLMUSDT", "GRAMUSDT"] and data["panel_absent"] == []
 
 
 def test_oversized_cursor_and_oversized_summary_fields_are_bounded(tmp_path: Path) -> None:
@@ -212,6 +234,8 @@ def test_fetch_failure_on_page_one_still_writes_summary_and_skips_further_pages(
     assert calls == [universe.LINEAR_URL, universe.SPOT_URL, universe.TICKERS_URL]
     data = summary(tmp_path)
     assert data["payloads"]["instruments_linear_p1"]["raw_bytes"] is None
+    assert data["linear_pages_fetched"] == 0  # requested, not fetched
+    assert data["request_count"] == 3
     assert data["payloads"]["tickers_linear"]["parse_ok"] is True
     assert data["panel_membership"]["XLMUSDT"] == {
         "present_in_instruments": None, "status": None, "delivery_time": None, "funding_interval": None,
@@ -254,6 +278,8 @@ def test_wall_budget_stops_remaining_requests_without_sending_them(tmp_path: Pat
     assert calls == [universe.LINEAR_URL]  # page 2, spot and tickers were never sent
     data = summary(tmp_path)
     assert data["request_count"] == 4  # attempted entries recorded, three as budget failures
+    assert data["linear_pages_fetched"] == 1  # page 2 was refused by the budget, so it is not counted
+    assert not (run_dir(tmp_path) / "raw" / "instruments_linear_p2.json.gz").exists()
     assert "wall budget" in data["payloads"]["instruments_spot"]["error"]
     assert data["panel_membership_coverage"] == "incomplete"
 
@@ -303,3 +329,11 @@ def test_ops_job_registration_and_arg_threading(tmp_path: Path, monkeypatch) -> 
     assert captured == {"output_root": Path(tmp_path / "raw"), "panel_symbols": ("XLMUSDT",)}
     defaults = _job_args(SimpleNamespace(job_type="bybit-linear-universe-snapshot", args={}))
     assert tuple(defaults.panel_symbol) == universe.DEFAULT_PANEL
+
+
+@pytest.mark.parametrize("bad", ["XLMUSDT", 7, ["XLMUSDT", 3], {"XLMUSDT": True}])
+def test_scalar_or_non_string_panel_symbols_config_is_rejected_not_exploded(bad) -> None:
+    """list("XLMUSDT") would yield seven one-letter alphanumeric 'symbols' that pass the
+    safe-token check and record nonsense membership without any error."""
+    with pytest.raises(ValueError, match="panel_symbols must be a list of strings"):
+        _job_args(SimpleNamespace(name="u", job_type="bybit-linear-universe-snapshot", args={"panel_symbols": bad}))

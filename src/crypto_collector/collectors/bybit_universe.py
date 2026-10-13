@@ -17,13 +17,17 @@ Design rules (parent findings, 2026-10-13):
   makes the run INCOMPLETE: the bytes that arrived are archived, the summary says why,
   and the job fails loudly. The current two-page universe is not hard-coded as a truth.
 - ``retCode`` must be a strict integer 0 (bool is rejected), the category must match,
-  the list must be a list of objects with string symbols, no symbol may repeat across
-  pages, a repeated cursor is a failure, spot must not return a cursor.
+  the list must be a list of objects with string symbols, no symbol may repeat within
+  a page or across pages, a repeated cursor is a failure, spot must not return a cursor.
 - Every request has a 1 MiB body cap and a 10 s socket timeout from the shared
   skeleton; the whole run has a wall budget after which remaining requests are
-  recorded as failures without being sent. Transport faults that are not ``OSError``
-  (``http.client.IncompleteRead`` and friends) are recorded as fetch failures too, so
-  the summary is always written and received bytes are never discarded.
+  recorded as failures without being sent. Neither is an absolute per-request
+  deadline: the socket timeout is per socket operation and the wall budget is checked
+  between requests only, so one slow-dripping response is bounded by the byte cap and
+  by the runner's subprocess timeout (2 h for this job), not by these two numbers.
+  Transport faults that are not ``OSError`` (``http.client.IncompleteRead`` and
+  friends) are recorded as fetch failures too, so the summary is always written and
+  received bytes are never discarded.
 - Panel membership is evidence from THIS run only. A symbol found in a payload is
   present; a symbol missing from a COMPLETE payload family is recorded absent
   (last-known membership); a symbol missing from an incomplete or failed family is
@@ -180,21 +184,26 @@ def snapshot_bybit_linear_universe(
     pagination_complete = False
     instruments_failed = False
     for page in range(1, max_linear_pages + 1):
-        pages = page
         name = f"instruments_linear_p{page}"
         raw = get(name, LINEAR_URL if cursor is None else _cursor_url(cursor))
         if raw is None:
             instruments_failed = True
             break
+        pages = page  # counts pages whose bytes arrived, not pages merely requested
         rows, next_cursor, failure = _parse_bytes(raw, "linear")
         if failure is not None:
             verdicts[name] = (None, f"{name}: {failure}")
             instruments_failed = True
             break
-        duplicates = sum(1 for row in rows if row["symbol"] in seen_symbols)
-        seen_symbols.update(row["symbol"] for row in rows)
+        # Duplicates within this page count as well as repeats of earlier pages: a
+        # symbol listed twice has two candidate rows and no dated truth.
+        page_symbols = [row["symbol"] for row in rows]
+        duplicates = (len(page_symbols) - len(set(page_symbols))) + sum(
+            1 for symbol in set(page_symbols) if symbol in seen_symbols
+        )
+        seen_symbols.update(page_symbols)
         if duplicates:
-            verdicts[name] = (len(rows), f"{name}: {duplicates} symbol(s) repeated across pages")
+            verdicts[name] = (len(rows), f"{name}: {duplicates} symbol(s) repeated within or across pages")
             instruments_failed = True
             break
         linear_rows.extend(rows)
@@ -288,6 +297,7 @@ def snapshot_bybit_linear_universe(
             "max_response_bytes": MAX_RESPONSE_BYTES,
             "timeout_seconds": TIMEOUT_SECONDS,
             "wall_budget_seconds": wall_budget_seconds,
+            "wall_budget_checked": "between_requests",
         },
         "coverage_note": (
             "point-in-time receipt of three payload families; panel membership is "

@@ -1772,8 +1772,12 @@ families under `raw/market/bybit_linear_universe/<run_id>/raw/`: `instruments_li
 as INCOMPLETE with the bytes kept), `instruments_spot` (no pagination; a cursor is a
 failure) and `tickers_linear`. Every request has a 1 MiB body cap and a 10 s socket
 timeout; the run has a 120 s wall budget after which remaining requests are recorded as
-failures without being sent. `retCode` must be a strict integer 0; category, list shape,
-string symbols, cross-page duplicates and repeated cursors are checked.
+failures without being sent. Neither is an absolute deadline: the socket timeout is per
+socket operation and the wall budget is checked between requests, so one slow-dripping
+response is bounded by the byte cap and the runner's subprocess timeout (2 h for this
+job), after which the run dir has no summary (killed, per 4.9). `retCode` must be a
+strict integer 0; category, list shape, string symbols, duplicate symbols within or
+across pages and repeated cursors are checked.
 
 `metrics/summary.json` adds `request_count` (requests, not families), `payload_families`,
 `linear_pages_fetched`, `linear_pagination_complete`, `payload_fetched_at` (actual request
