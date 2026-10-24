@@ -19,6 +19,45 @@ Last updated: **2026-10-13**.
 
 ---
 
+## Finding - per-lane loss and causes of the 2026-10-06/07 outages (2026-10-24)
+
+**Loss inventory** (read-only; coverage = first..last `received_at` of each cold raw run,
+gaps > 120 s, window 10-06 12:00 -> 10-07 15:00 UTC). Every streaming lane lost the same
+two windows: **10-06 15:05:04 -> 16:00:16 (55 min)** and **10-07 00:02:46 -> 13:38:31
+(13 h 36 m)**, 14.52 h in total, on every trades, depth, funding and OI lane. The first post-
+restart runs start at restart time (e.g. `binance_perp_trades` first aggTrade
+13:38:21), so nothing was back-filled: the gap is permanent in the plant. Exceptions:
+`hyperliquid_wallet_flow` re-polled by time window and its 13:38 run carries 3,962 fills
+dated inside the 10-07 gap (recovered as far as the API window allows; plus 2-5 min gaps
+at 17:29, 18:27, 20:30 on 10-06); the Bybit liquidation lanes stopped 23:34 on 10-06,
+~28 min earlier than the rest; the HL WS trades lanes only started 13:51 on 10-06 (not a
+loss). Trades for Binance, Bybit and OKX in both windows are re-buyable from the venues'
+public daily dumps; depth, funding/OI snapshots and Coinbase/Kraken/MEXC trades are not.
+
+**10-06 15:05:04 UTC - probable cause: Windows servicing the Codex desktop app (MSIX).**
+That runner (pid 45532) was not the SYSTEM task: `redeploy_runner.ps1` started it at
+13:51 UTC from an elevated PowerShell launched by an agent session
+(`logs/redeploy-hl-trades-20261006.log`). At 15:04:25-15:05:06 UTC the Application log
+shows the Codex sandbox service stopped, package `OpenAI.Codex_26.930.4958.0` removed and
+`26.930.3930.0` started; the runner and every worker vanished at 15:05:04 with no
+`worker_stopped` events (abrupt tree kill). Windows terminates processes that carry a
+package's identity when it services the package; an agent shell running inside the
+Codex app would pass that identity to everything it launches. Not proven (no
+process-creation audit), but the timing is to the second. Lesson, already the rule since
+PR #101: restart only through the SYSTEM task, never from an agent's process tree.
+
+**10-07 00:02:46 UTC - cause NOT found.** Unlike 10-06 this was a graceful drain: workers
+ended their segments with `deadline_reached` and `worker_stopped: completed` between
+00:02:30 and 00:02:46, i.e. the runner was asked to stop. No agent transcript (Claude
+`~/.claude/projects`, checked 23:40-00:06) issued a stop; no package servicing. Nearby:
+Chrome Remote Desktop client connected 00:00:55 UTC; Tcpip 4231 (ephemeral ports
+exhausted) at 00:04:59 UTC. The 13.6 h duration is the known part (an unrelated venv
+process held the old helper's post-stop guard; fixed in PR #101). The Task Scheduler
+operational log is disabled, and the task definition is not readable unelevated. To
+close it next time: an elevated session should (1) `wevtutil sl
+Microsoft-Windows-TaskScheduler/Operational /e:true`, (2) dump the task XML (principal,
+settings), (3) consider logging the stop reason/signal in `run_ops_runner`.
+
 ## Alt research panel, phase 1: configured and disabled (2026-10-13)
 
 Four Bybit USDT perpetuals (XLMUSDT, GRAMUSDT, TRXUSDT, MEGAUSDT; selection rule and
