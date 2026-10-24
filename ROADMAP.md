@@ -667,7 +667,39 @@ the same restart.
 | ~~2026-06-19~~ DONE 06-24 | The 06-17 `robocopy /MINAGE:3` move never finished (~88% of partitions still on G:), leaving G: at **3.9 GB free**. First retry (06-22) was killed by the Bash tool's 10-min timeout after freeing ~57 GB. Relaunched **detached via `Start-Process`** (pid 48444) so it survives session/tool teardown -> **COMPLETED 2026-06-24 16:19, FAILED: 0** (45.29 M files / 555 GB moved G:->`D:\market_archive_cold`). **G: now 489 GB free.** D: holds 113,407 normalized partitions (full set). 1 partition / 2 parquet files remain on G: -- robocopy *skipped* them (already byte-present on D: from the 06-17 partial), so redundant not stranded; immaterial (489 GB free). Lesson: long-running moves must be detached, never run inside a Bash call (10-min cap). |
 | ~~2026-07-26~~ DONE 08-01 | **Text raw offload wired for the next restart.** `archive-offload-text` is enabled in `ops.live.local.json` with the indexed promotion/quarantine gate, preserve-first aged-run backstop, byte-verified cold move, and `write_report:false` so it cannot replace the market health report. It remains inert until the guarded elevated runner restart. |
 
-**Last ops audit:** 2026-10-08 - read-only, 10:35-11:00 UTC. Health: `status=ok`, findings
+**Last ops audit:** 2026-10-24 - read-only except the live-checkout pull, ~15:30-16:30 UTC.
+Health: runner `running`, heartbeat fresh, 166 jobs; 24 h 19,372 success / 3 error
+(99.98 %): one each `binance-futures-rest-depth` and `binance-sol-funding` subprocess
+exits (fapi, self-recovered) and one `archive-offload-cold` run with 2 failed moves (next
+runs clean; latest offload 104 moved, 0 failed, `stuck_unaccounted=0`, warnings only the
+usual unconfigured/missing legacy lanes). Every segment lane's newest run < 1 h old; after the pull 466 job runs to 16:18 UTC, 0 errors, no lane stale;
+liquidation day-runs 15 h (expected). Hot raw oldest files 10-20 on every lane, so the
+4-day offload gate is draining. Quarantine 7 d: OI lanes ~340 each, text_rss 132, trades
+lanes <= 26. **Outages since 10-08 (job_runs gaps > 5 min): one, 2026-10-21 01:40-01:54
+UTC (~14 min)** - bugcheck 0x7E (SYSTEM_THREAD_EXCEPTION_NOT_HANDLED, c0000005, minidump
+`C:/Windows/Minidump/102126-74906-01.dmp`, admin-only, module not yet identified) followed
+by three TrustedInstaller update restarts; the SYSTEM task brought the runner back
+(pid 11512, lock 01:54:35 UTC) with no intervention. Two 0x133 bugchecks on 10-13 (known
+GPU/nvlddmkm pattern) left no gap > 5 min. **Deployed: PR #104 + #105** (merged 10-13,
+live checkout was still on `bb3f03b`): suite on `origin/main` 899 passed / 5 skipped, the
+new loader reads `ops.live.local.json` as 166 jobs, then `git pull --ff-only` to
+`1ceb6ff`. Both ship disabled; the runner-script change (`bybit-linear-universe-snapshot`
+in the non-pool list) takes effect at the next restart. No restart, config change,
+transfer or deletion.
+
+**G: headroom finding:** 144 GiB free (264.0 on 10-08), -120 GiB in 16 days. Decomposed
+(creation-time scan, junction `G:/market_archive` -> `G:/03-reference-data/market_archive`
+counted once): persistent growth ~75 GiB = curated research tree +44 GiB (~2.75 GiB/day,
+254 GiB total, never offloaded) + project folders ~30 GiB; transient ~45-55 GiB = the
+4-day hot window now holds high-volume days (~176 GiB) where on 10-08 it held the
+outage-thin 10-04..10-07 (~119 GiB on cold). Daily ingest is flat (cold tier 09-20..10-20:
+19-57 GiB/day, mean ~40; per-lane drift <= +0.6 GiB/day, plus the new HL WS trades lanes
+~0.5). At ~4.7 GiB/day persistent and a hot window that can swing +-50 GiB, G: crosses the
+100 GiB evidence floor within days on a heavy week and fills around late November. Core
+lanes have no free-space floor (the v16 guard covers optional evidence only). Options in
+the Decision queue.
+
+**Previous ops audit:** 2026-10-08 - read-only, 10:35-11:00 UTC. Health: `status=ok`, findings
 none, heartbeat 4 s; 166 jobs, none stale, no partition stale, none long-running; poll lanes
 (universe positions, options chain, Deribit) fresh. Runner pid 9664 up since 2026-10-07
 13:38 UTC (after the 13 h 36 m outage); since then 17,017 success / 24 error (99.86 %).
@@ -1406,6 +1438,15 @@ owner ask (safe-shaping directive above).
 Decisions waiting on the owner; agents must not act on these without an explicit OK
 (see `CLAUDE.md` Governance):
 
+- **G: headroom (2026-10-24 audit; 144 GiB free, ~4.7 GiB/day persistent, full ~late
+  Nov).** Core lanes have no free-space floor. Options, cheapest first: (A) move static
+  non-plant reference data off G: to the Deep pair I: (e.g. `G:/03-reference-data/
+  DataPolygon.ioV5.0/V6.0/V7.0` = 524 GiB, `hyperliquid_node` 167 GiB, static since the
+  AWS close) - frees months, no plant change, but repoint any reader first; (B) a curated
+  cold tier: offload curated partitions older than N days to I: like raw (needs reader
+  repointing + a STANDARDS change); (C) hot `min_age_days` 4 -> 3 frees ~40 GiB once,
+  shortens the replay/re-promote window. Recommendation: A now, B designed before
+  January.
 - **Alt canary stage one activation (2026-10-13; controls on main, nothing launched).**
   The bounded controls exist (STANDARDS 4.18). Activation needs the owner to run the
   checklist in `docs/alt_canary_runbook.md`: prepare one control directory for
