@@ -1481,7 +1481,7 @@ Decisions waiting on the owner; agents must not act on these without an explicit
   moved to `I:/reference-data/`, SHA-256 verified both sides (0 mismatches), G: copies
   replaced by junctions, added to `pair-mirror-daily`; G: 667 GiB free. `hyperliquid_node`
   stays on G: (~30 study readers, written daily). B (curated cold tier) still worth
-  designing before ~mid-2027 at ~4.7 GiB/day.** Original item:
+  designing by ~January 2027: at ~4.7 GiB/day G: is full again ~mid-March 2027.** Original item:
 - **G: headroom (2026-10-24 audit; 144 GiB free, ~4.7 GiB/day persistent, full ~late
   Nov).** Core lanes have no free-space floor. Options, cheapest first: (A) move static
   non-plant reference data off G: to the Deep pair I: (e.g. `G:/03-reference-data/
