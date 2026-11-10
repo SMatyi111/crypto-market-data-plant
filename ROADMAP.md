@@ -8,7 +8,7 @@ changes scope or state. Companion docs:
 - [`STANDARDS.md`](STANDARDS.md) — the data contract (schemas, replayability, retention)
 - [`docs/HISTORY.md`](docs/HISTORY.md) — resolved-work narrative (what was fixed, and why)
 
-Last updated: **2026-10-13**.
+Last updated: **2026-11-10**.
 
 > **Operating mode — safe shaping (owner directive, 2026-07-04).** No extended
 > building on Claude's initiative: no new venues, lanes, or instruments, no big
@@ -706,7 +706,30 @@ the same restart.
 | ~~2026-06-19~~ DONE 06-24 | The 06-17 `robocopy /MINAGE:3` move never finished (~88% of partitions still on G:), leaving G: at **3.9 GB free**. First retry (06-22) was killed by the Bash tool's 10-min timeout after freeing ~57 GB. Relaunched **detached via `Start-Process`** (pid 48444) so it survives session/tool teardown -> **COMPLETED 2026-06-24 16:19, FAILED: 0** (45.29 M files / 555 GB moved G:->`D:\market_archive_cold`). **G: now 489 GB free.** D: holds 113,407 normalized partitions (full set). 1 partition / 2 parquet files remain on G: -- robocopy *skipped* them (already byte-present on D: from the 06-17 partial), so redundant not stranded; immaterial (489 GB free). Lesson: long-running moves must be detached, never run inside a Bash call (10-min cap). |
 | ~~2026-07-26~~ DONE 08-01 | **Text raw offload wired for the next restart.** `archive-offload-text` is enabled in `ops.live.local.json` with the indexed promotion/quarantine gate, preserve-first aged-run backstop, byte-verified cold move, and `write_report:false` so it cannot replace the market health report. It remains inert until the guarded elevated runner restart. |
 
-**Last ops audit:** 2026-10-24 - read-only except the live-checkout pull, ~15:30-16:30 UTC.
+**Last ops audit:** 2026-11-10, read-only around 17:09-17:12 UTC. Built-in health
+`ok`, no findings, 166 jobs, 43 fresh managed workers; G: 590.6 GiB free. Last 24 h:
+19,029 success / 12 errors (99.937%); affected Binance and Deribit jobs subsequently
+succeeded. Since Nov2 restart metadata: 1,000 errors, including 884 on Nov8,
+predominantly network handshake/read timeouts; historical lost intervals not yet
+quantified. Offload: 101 moved / 0 failed / 0 stuck; 12 cold receipt samples match
+file counts. Mirror reports 537,074/537,074 files, exit 3, zero count delta.
+
+**Open finding: OI curation is not healthy despite live collection.** BTC/ETH/SOL
+each have 341-345 seven-day `non_monotonic_event_time` run rejections. Positive
+promotion intake since Nov3 is only 196/257/250 rows; latest promotions Nov8-9.
+Fresh raw runs have approximately 1,100-1,200 clean events. Next: diagnose the
+replay timestamp rejection and propose a tested fix; preserve raw order/clocks,
+no unreviewed gate relaxation or history repair. Curated OI is not complete.
+
+SQD catch-up and later scheduled run succeeded; independent footer check found
+1,091 readable nonempty hour files, zero missing, Sep26 04Z to Nov10 15Z exclusive.
+The Nov5-6 hourly-file hole is filled; this is not per-block completeness proof.
+Liquidation tags and misc_events remain unavailable from that source. Detailed
+local evidence is in the Second Brain `04 - Logs/plant-audit-20261110/REPORT.md`.
+No plant restart, source mutation or protected research read. Next weekly audit
+Nov17; OI diagnosis before discretionary factory expansion.
+
+**Previous ops audit:** 2026-10-24 - read-only except the live-checkout pull, ~15:30-16:30 UTC.
 Health: runner `running`, heartbeat fresh, 166 jobs; 24 h 19,372 success / 3 error
 (99.98 %): one each `binance-futures-rest-depth` and `binance-sol-funding` subprocess
 exits (fapi, self-recovered) and one `archive-offload-cold` run with 2 failed moves (next
