@@ -19,7 +19,7 @@ Last updated: **2026-11-10**.
 
 ---
 
-## OI receipt-order scoring proposal (2026-11-10, not deployed)
+## OI receipt-order scoring correction (approved/deployed 2026-11-12)
 
 The audit's sparse curation has a reproduced cause: three fixed BTC/ETH/SOL raw
 runs contain 32/19/26 adjacent venue timestamp regressions, up to 1.989/2.121/2.223
@@ -36,13 +36,24 @@ Synthetic regressions include missing/naive clocks, receipt reversal, identity,
 invalid quantities, skew, mixed metric types and actual Parquet promotion with
 both clocks preserved. Existing quarantine indexing still blocks promotion.
 
-**Owner contract decision pending.** The repo reserves STANDARDS/replayability
-changes to the owner. This proposal is isolated and must not reach live collectors
-before that decision. No historical summary, quarantine index, source or curated
-file is changed. Deployment and historical repair are distinct: existing indexed
-quarantine will not be rescued by this code alone. Collectors can pick code up
-at the next segment after a live pull; in-runner scorers/manifests require the
-reviewed SYSTEM-task redeploy. No new poll cadence, lane or source.
+**Owner approved the contract and forward deployment on November 12.** PR110
+merged as `0885199` after green Windows 3.11/3.12 CI and independent review. Live
+main was pulled; the pinned fixed SYSTEM-task restart passed preflight and
+verified runner PID 103660, created 15:47:12 UTC, with an advancing heartbeat and
+166 jobs. No new poll cadence, lane or source. Historical quarantines remain
+excluded; any recovery is a separate inventoried repair.
+
+Fresh forward promotion verification waits for finalized 30-minute OI segments.
+A bounded read-only verifier checks all three symbols, replay mode, promotion
+counts and exact original venue/receipt clock pairs. Its receipt is in the local
+Second Brain `04 - Logs/oi-v20-deployment-20261112/forward_verification.json`;
+runner restart alone is not a successful curation result.
+
+Post-restart checks found two non-OI lanes temporarily blocked by stale locks:
+Bybit BTC depth and Binance perp trades. Windows reused the old lock PIDs for new
+processes (one is conhost). Their 600-second heartbeat guard expires around
+15:56:53 UTC; verify automatic reclaim and fresh lane writes. No PID kill,
+manual lock deletion or second restart is authorized by this observation.
 
 ## Finding - per-lane loss and causes of the 2026-10-06/07 outages (2026-10-24)
 
