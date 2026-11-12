@@ -2,6 +2,13 @@
 
 Prepared November 10; packaged November 12, 2026. Proposed STANDARDS v20.
 
+Deployment addendum, November 12: owner approved the contract and forward
+deployment; PR110 merged as `0885199`, live checkout aligned and fixed SYSTEM
+restart verified at 15:47:12 UTC (runner 103660, 166 jobs). Fresh OI promotion
+verification remains a separate check after finalized segments. Existing
+historical quarantines remain excluded. The proposal wording below records the
+reviewed scope; approval no longer remains outstanding.
+
 ## Problem and behavior
 
 Three fixed BTC/ETH/SOL samples contain 3,469 observations in total. Their raw
