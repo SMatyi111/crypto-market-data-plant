@@ -46,7 +46,9 @@ DEFAULT_ARCHIVE_ROOT = Path(r"G:\market_archive")
 # v19 (2026-10-08): optional Bybit evidence manifest adds raw_accounting,
 # terminal_wait_seconds and terminal_timing_ms; raw_files hashes come from the
 # sink's streamed account (STANDARDS 4.16). Market schemas unchanged.
-STANDARDS_VERSION = 19
+# v20: OI replay gates on per-product receipt order; venue time regressions are
+# retained diagnostics. Raw and normalized values/clocks are never rewritten.
+STANDARDS_VERSION = 20
 
 _FALLBACK_WARNED: set[str] = set()
 

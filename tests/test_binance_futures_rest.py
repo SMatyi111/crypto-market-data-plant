@@ -500,7 +500,7 @@ def test_backfill_trades_replay_funding_rescores_stale_open_interest_summary(tmp
     report = json.loads(capsys.readouterr().out)
     assert report["updated_count"] == 1 and report["failed_count"] == 0
     summary = json.loads((run_dir / "metrics" / "replay_summary.json").read_text(encoding="utf-8"))
-    assert summary["mode"] == "funding_none_native"
+    assert summary["mode"] == "open_interest_receipt_order_none_native"
     assert summary["replayable"] is True and summary["findings"] == []
 
 
@@ -799,7 +799,7 @@ def test_backfill_trades_replay_min_age_hours_skips_live_run(tmp_path, capsys) -
 def test_replay_funding_run_open_interest_orders_per_product(tmp_path) -> None:
     # Until 2026-09-02 the three OI symbol lanes shared one raw dir and their
     # lockstep segments merged into one run: three interleaved monotonic series.
-    # Each series is checked on its own; a regression WITHIN a product still fails.
+    # Receipt ordering is per product; venue-time regressions remain diagnostic.
     now = utc_now()
     ms = int(now.timestamp() * 1000)
 
@@ -821,4 +821,5 @@ def test_replay_funding_run_open_interest_orders_per_product(tmp_path) -> None:
         for row in [oi("BTCUSDT", ms + 30000), oi("ETHUSDT", ms + 1000), oi("BTCUSDT", ms + 5000)]:
             fh.write(json.dumps(row) + "\n")
     bad = replay_funding_run(bad_run, write_summary=True)
-    assert bad.replayable is False and "non_monotonic_event_time" in bad.findings
+    assert bad.replayable is True and "non_monotonic_event_time" in bad.informational_findings
+    assert bad.non_monotonic_count == 1

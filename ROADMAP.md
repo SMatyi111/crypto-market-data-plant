@@ -19,6 +19,31 @@ Last updated: **2026-11-10**.
 
 ---
 
+## OI receipt-order scoring proposal (2026-11-10, not deployed)
+
+The audit's sparse curation has a reproduced cause: three fixed BTC/ETH/SOL raw
+runs contain 32/19/26 adjacent venue timestamp regressions, up to 1.989/2.121/2.223
+seconds. Receipt clocks never regress and raw-to-clean clocks match. The scorer's
+exchange-order assumption rejects whole structurally captured observation runs;
+the source's internal reason for its timestamp regressions is not established.
+
+Proposed STANDARDS v20: OI requires per-product ordered receipt timestamps,
+explicit timezone-aware clocks, matching identity, finite nonnegative OI with no
+price, and the unchanged finite clock-skew bound. Original venue regressions are
+counted in informational diagnostics. Both clocks, duplicate observations and
+capture order survive unchanged. Funding's exchange-order requirement remains.
+Synthetic regressions include missing/naive clocks, receipt reversal, identity,
+invalid quantities, skew, mixed metric types and actual Parquet promotion with
+both clocks preserved. Existing quarantine indexing still blocks promotion.
+
+**Owner contract decision pending.** The repo reserves STANDARDS/replayability
+changes to the owner. This proposal is isolated and must not reach live collectors
+before that decision. No historical summary, quarantine index, source or curated
+file is changed. Deployment and historical repair are distinct: existing indexed
+quarantine will not be rescued by this code alone. Collectors can pick code up
+at the next segment after a live pull; in-runner scorers/manifests require the
+reviewed SYSTEM-task redeploy. No new poll cadence, lane or source.
+
 ## Finding - per-lane loss and causes of the 2026-10-06/07 outages (2026-10-24)
 
 **Loss inventory** (read-only; coverage = first..last `received_at` of each cold raw run,

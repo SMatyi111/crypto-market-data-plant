@@ -197,12 +197,10 @@ def make_funding_poll(symbol: str, *, fetch: FetchFn = _get_json):
 def make_open_interest_poll(symbol: str, *, fetch: FetchFn = _get_json):
     """Build an open-interest poll over /fapi/v1/openInterest.
 
-    OI is the one derivatives metric here with a RETENTION cliff rather than a
-    stream-or-nothing property: Binance serves ~30 days of history and nothing
-    older, so a poll gap is recoverable for a month and then becomes permanent.
-    The response is a single low-rate row ({openInterest, symbol, time}); polling
-    every poll_interval loses nothing because OI is venue-computed state, not an
-    event stream.
+    This endpoint returns present state ({openInterest, symbol, time}). Missed
+    poll observations cannot be reconstructed from its response. Binance's
+    separate historical statistics endpoint has coarser time buckets; it is
+    not a completeness oracle or a replacement for this receipt-time series.
     """
     sym = symbol.upper()
 

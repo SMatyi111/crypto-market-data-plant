@@ -1,6 +1,13 @@
 # Data Standards
 
-`STANDARDS_VERSION = 19`
+`STANDARDS_VERSION = 20`
+
+> **v20 (2026-11-10, proposed; not deployed):** Binance open-interest replay
+> validates per-product receipt order. Original venue-time regressions remain
+> visible as diagnostics, not proof of capture reordering. Both clocks and row
+> order are preserved. Funding's exchange-time gate is unchanged. See the
+> open-interest channel contract below. No historical re-score or repair is
+> included; quarantined runs retain their existing disposition.
 
 > **v19 (2026-10-08, offline implementation; live flags still point at a spent lease):** the
 > optional Bybit evidence manifest adds `raw_accounting`, `terminal_wait_seconds`
@@ -397,9 +404,40 @@ would let contract counts leak into price aggregation; the value rides in
 funding replayer, which scores `open_interest` rows on `size` (finite, >= 0 -
 zero OI is a legal reading) instead of `price`; a missing/invalid reading is
 the `invalid_open_interest` finding. (Until 2026-09-02 the replayer scored OI
-rows on `price` and every OI run was flagged `invalid_mark_price`.) Venue
-retention is ~30 days, so a poll gap is recoverable for a month and permanent
-after.
+rows on `price` and every OI run was flagged `invalid_mark_price`.)
+
+**v20 OI observation contract:** `/fapi/v1/openInterest` is present state, not
+a sequenced event stream. Three fixed November 10 raw samples had 32/19/26
+adjacent venue-time regressions (maximum 1.989/2.121/2.223 seconds), with ordered
+receipt clocks and exact raw-to-clean clock agreement. This establishes that
+the returned timestamp can regress; the venue's internal cause is unknown.
+
+- For OI-only runs the replay mode is `open_interest_receipt_order_none_native`.
+  Require finite nonnegative size, absent price, Binance futures source and a
+  matching nonempty product/instrument identity, explicit timezone-aware venue
+  and receipt clocks, nondecreasing receipt order per product, and the existing
+  absolute clock-skew limit (default 60 seconds). No receipt jitter allowance.
+- The legacy `non_monotonic_count` still counts venue timestamps below the
+  per-product running high-water. In OI mode these are exposed in
+  `informational_findings: ["non_monotonic_event_time"]`; they do not gate replay.
+  Receipt regressions gate via `non_monotonic_received_at` and its count. Invalid
+  or missing/naive clocks gate via `invalid_timestamp` and `invalid_timestamp_count`.
+  Mixed OI/non-OI metric runs fail `mixed_metric_channels`. Funding-only scoring
+  retains its previous semantics.
+- Do not sort, clamp, replace, or drop source timestamps/rows to obtain a pass.
+  Duplicate observations and zero OI remain valid. Curated partitioning still
+  follows venue event date; file order is not a global availability order.
+  Research decisions must use `received_at` for availability, retaining the
+  original venue time as source metadata. Replayability does not prove complete
+  capture, novelty, value accuracy, or economic usability.
+- Existing summaries/quarantine indexes are not rewritten automatically. A new
+  verdict does not override quarantine indexing. Historical recovery requires
+  a separate inventoried repair; no such repair is part of v20 deployment.
+
+Binance documents a separate historical-statistics endpoint with periods starting
+at five minutes and a last-month window. It cannot recreate missed high-frequency
+poll observations or their original receipt times. See the official
+[Open Interest and Open Interest Statistics documentation](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/market-data#open-interest).
 
 ### Liquidations channel (`channel = "liquidations"`)
 
