@@ -981,6 +981,7 @@ class TradesReplaySummary:
     non_monotonic_received_at_count: int = 0
     received_at_jitter_count: int = 0
     wrong_channel_count: int = 0
+    invalid_timestamp_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1634,15 +1635,14 @@ def replay_funding_run(
     max_clock_skew_ms: float = 60_000.0,
     write_summary: bool = True,
 ) -> TradesReplaySummary:
-    """Replay-validate a funding / mark-price metric run (Binance USDT-M `premiumIndex`).
+    """Validate funding, or an OI observation stream (STANDARDS v20).
 
-    Mirrors `replay_trades_stream_run` but there is NO `size` (funding is a metric, not a
-    trade). The structural bar is: `event_count > 0`, monotonic non-decreasing exchange
-    timestamps, a finite-positive mark price (carried as `price`), and exchange->receipt
-    clock skew within `max_clock_skew_ms`. Tagged `gap_detection="none_native"` and writes
-    the same `metrics/replay_summary.json` contract so the quarantine + promote chain
-    curates funding runs unchanged.
+    Funding retains its exchange-order gate. OI preserves both original clocks and
+    capture order: receipt regressions fail, venue regressions are diagnostics.
+    Both retain value/skew gates and none_native (no completeness guarantee).
     """
+    if not (_is_finite_positive(max_clock_skew_ms) or max_clock_skew_ms == 0.0):
+        raise ValueError("max_clock_skew_ms must be finite and nonnegative")
     resolved_run_path, events_path, summary_path = _resolve_run_paths(run_path)
     event_count = 0
     first_event_time: str | None = None
@@ -1663,6 +1663,12 @@ def replay_funding_run(
     # Rows are promoted per row with an instrument partition, so a merged run is
     # curated correctly once each series is monotonic on its own.
     previous_event_dt_by_product: dict[str, datetime] = {}
+    previous_receipt_dt_by_product: dict[str, datetime] = {}
+    funding_non_monotonic_count = 0
+    oi_non_monotonic_count = 0
+    non_monotonic_received_at_count = 0
+    invalid_timestamp_count = 0
+    channels: set[str | None] = set()
 
     for row in _read_jsonl(events_path):
         event_count += 1
@@ -1673,6 +1679,9 @@ def replay_funding_run(
         if instrument_id is None:
             instrument_id = _optional_str(metadata.get("instrument_id"))
 
+        channel = _optional_str(row.get("channel"))
+        channels.add(channel)
+        is_oi = channel == "open_interest"
         exchange_time_str = _optional_str(row.get("exchange_time"))
         if first_event_time is None:
             first_event_time = exchange_time_str
@@ -1680,14 +1689,31 @@ def replay_funding_run(
 
         event_dt = _parse_iso_dt(exchange_time_str)
         if event_dt is not None:
-            series_key = row_product or "" if _optional_str(row.get("channel")) == "open_interest" else ""
+            series_key = (row_product or "") if is_oi else ""
             previous_event_dt = previous_event_dt_by_product.get(series_key)
             if previous_event_dt is not None and event_dt < previous_event_dt:
                 non_monotonic_time_count += 1
+                if is_oi:
+                    oi_non_monotonic_count += 1
+                else:
+                    funding_non_monotonic_count += 1
             if previous_event_dt is None or event_dt >= previous_event_dt:
                 previous_event_dt_by_product[series_key] = event_dt
 
-        if _optional_str(row.get("channel")) == "open_interest":
+        if is_oi:
+            # OI is a series of received state observations, not a sequenced feed.
+            # Require explicit aware clocks; the generic parser's legacy naive-UTC
+            # fallback must not turn an absent/ambiguous clock into admission.
+            receipt_dt = _parse_aware_metric_time(row.get("received_at"))
+            aware_event_dt = _parse_aware_metric_time(row.get("exchange_time"))
+            if aware_event_dt is None or receipt_dt is None:
+                invalid_timestamp_count += 1
+            if receipt_dt is not None:
+                previous = previous_receipt_dt_by_product.get(row_product or "")
+                if previous is not None and receipt_dt < previous:
+                    non_monotonic_received_at_count += 1
+                if previous is None or receipt_dt >= previous:
+                    previous_receipt_dt_by_product[row_product or ""] = receipt_dt
             # STANDARDS "Open-interest channel": OI is a quantity and deliberately
             # never rides in `price` (None by contract) - the value is `size`. Scoring
             # it on `price` made every OI run unreplayable (245/245 live runs flagged
@@ -1700,6 +1726,10 @@ def replay_funding_run(
                 metric is None
                 or not (_is_finite_positive(metric) or metric == 0.0)
                 or row.get("price") is not None
+                or row.get("source") != "binance-futures"
+                or not row_product
+                or row_product == "UNKNOWN"
+                or metadata.get("instrument_id") != f"perp:binance-futures:{row_product}"
             ):
                 invalid_open_interest_count += 1
         else:
@@ -1707,7 +1737,13 @@ def replay_funding_run(
             if price is None or not _is_finite_positive(price):
                 invalid_price_count += 1
 
-        skew_ms = _abs_skew_ms(exchange_time_str, _optional_str(row.get("received_at")))
+        if is_oi:
+            skew_ms = (
+                abs((receipt_dt - aware_event_dt).total_seconds() * 1000.0)
+                if receipt_dt is not None and aware_event_dt is not None else None
+            )
+        else:
+            skew_ms = _abs_skew_ms(exchange_time_str, _optional_str(row.get("received_at")))
         if skew_ms is not None:
             if max_clock_skew_ms_seen is None or skew_ms > max_clock_skew_ms_seen:
                 max_clock_skew_ms_seen = skew_ms
@@ -1717,8 +1753,15 @@ def replay_funding_run(
     findings: list[str] = []
     if event_count == 0:
         findings.append("no_events")
-    if non_monotonic_time_count:
+    if funding_non_monotonic_count:
         findings.append("non_monotonic_event_time")
+    if non_monotonic_received_at_count:
+        findings.append("non_monotonic_received_at")
+    if invalid_timestamp_count:
+        findings.append("invalid_timestamp")
+    mixed_oi = "open_interest" in channels and len(channels) != 1
+    if mixed_oi:
+        findings.append("mixed_metric_channels")
     if invalid_price_count:
         findings.append("invalid_mark_price")
     if invalid_open_interest_count:
@@ -1728,7 +1771,10 @@ def replay_funding_run(
 
     replayable = (
         event_count > 0
-        and non_monotonic_time_count == 0
+        and funding_non_monotonic_count == 0
+        and non_monotonic_received_at_count == 0
+        and invalid_timestamp_count == 0
+        and not mixed_oi
         and invalid_price_count == 0
         and invalid_open_interest_count == 0
         and excessive_clock_skew_count == 0
@@ -1736,7 +1782,7 @@ def replay_funding_run(
 
     summary = TradesReplaySummary(
         replay_type="trades",
-        mode="funding_none_native",
+        mode="open_interest_receipt_order_none_native" if channels == {"open_interest"} else "funding_none_native",
         run_path=str(resolved_run_path),
         events_path=str(events_path),
         source=source,
@@ -1759,6 +1805,9 @@ def replay_funding_run(
         findings=findings,
         gap_detection="none_native",
         summary_path=str(summary_path) if summary_path is not None else None,
+        informational_findings=["non_monotonic_event_time"] if oi_non_monotonic_count else [],
+        non_monotonic_received_at_count=non_monotonic_received_at_count,
+        invalid_timestamp_count=invalid_timestamp_count,
     )
 
     if write_summary and summary_path is not None:
@@ -1766,6 +1815,16 @@ def replay_funding_run(
         _write_json_atomic(summary_path, summary.to_dict())
 
     return summary
+
+
+def _parse_aware_metric_time(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
 
 
 @dataclass(slots=True)
