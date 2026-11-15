@@ -2,12 +2,13 @@
 
 `STANDARDS_VERSION = 20`
 
-> **v20 (2026-11-10, proposed; not deployed):** Binance open-interest replay
+> **v20 (approved and deployed 2026-11-12):** Binance open-interest replay
 > validates per-product receipt order. Original venue-time regressions remain
 > visible as diagnostics, not proof of capture reordering. Both clocks and row
 > order are preserved. Funding's exchange-time gate is unchanged. See the
 > open-interest channel contract below. No historical re-score or repair is
-> included; quarantined runs retain their existing disposition.
+> included; quarantined runs retain their existing disposition. Fresh forward
+> promotion verification is recorded separately from runner deployment.
 
 > **v19 (2026-10-08, offline implementation; live flags still point at a spent lease):** the
 > optional Bybit evidence manifest adds `raw_accounting`, `terminal_wait_seconds`
