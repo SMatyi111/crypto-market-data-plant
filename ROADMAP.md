@@ -8,7 +8,7 @@ changes scope or state. Companion docs:
 - [`STANDARDS.md`](STANDARDS.md) — the data contract (schemas, replayability, retention)
 - [`docs/HISTORY.md`](docs/HISTORY.md) — resolved-work narrative (what was fixed, and why)
 
-Last updated: **2026-11-10**.
+Last updated: **2026-11-15**.
 
 > **Operating mode — safe shaping (owner directive, 2026-07-04).** No extended
 > building on Claude's initiative: no new venues, lanes, or instruments, no big
@@ -27,7 +27,7 @@ seconds. Receipt clocks never regress and raw-to-clean clocks match. The scorer'
 exchange-order assumption rejects whole structurally captured observation runs;
 the source's internal reason for its timestamp regressions is not established.
 
-Proposed STANDARDS v20: OI requires per-product ordered receipt timestamps,
+Approved STANDARDS v20: OI requires per-product ordered receipt timestamps,
 explicit timezone-aware clocks, matching identity, finite nonnegative OI with no
 price, and the unchanged finite clock-skew bound. Original venue regressions are
 counted in informational diagnostics. Both clocks, duplicate observations and
@@ -43,17 +43,21 @@ verified runner PID 103660, created 15:47:12 UTC, with an advancing heartbeat an
 166 jobs. No new poll cadence, lane or source. Historical quarantines remain
 excluded; any recovery is a separate inventoried repair.
 
-Fresh forward promotion verification waits for finalized 30-minute OI segments.
-A bounded read-only verifier checks all three symbols, replay mode, promotion
-counts and exact original venue/receipt clock pairs. Its receipt is in the local
-Second Brain `04 - Logs/oi-v20-deployment-20261112/forward_verification.json`;
-runner restart alone is not a successful curation result.
+**Forward verification passed November 15 at 21:12 UTC.** One recent finalized
+run per symbol contains 1,394 BTC / 1,389 ETH / 1,400 SOL observations (4,183 total).
+Replay and promotion counts agree; curated provenance and exact original
+venue/receipt timestamp multisets match the unchanged clean files. All three
+runs use the new replay mode. This is a bounded end-to-end sample, not a claim of
+continuous coverage or recovered history. Private receipt: Second Brain
+`04 - Logs/oi-v20-deployment-20261112/forward_verification_20261115T211236Z.json`.
 
-Post-restart checks found two non-OI lanes temporarily blocked by stale locks:
-Bybit BTC depth and Binance perp trades. Windows reused the old lock PIDs for new
-processes (one is conhost). Their 600-second heartbeat guard expires around
-15:56:53 UTC; verify automatic reclaim and fresh lane writes. No PID kill,
-manual lock deletion or second restart is authorized by this observation.
+The original November 12 verifier was interrupted by the documented PC crash
+around 16:00 UTC and never produced a final receipt. The SYSTEM task recovered
+after reboot. Bybit BTC depth and Binance perp trades had initially encountered
+reused-PID stale locks; the post-reboot record reports recovery, and both workers
+have fresh running heartbeats in the November 15 check. No PID kill, manual lock
+deletion or plant restart was performed for this verification. Next scheduled
+operations audit: November 17; historical OI repair remains a separate decision.
 
 ## Finding - per-lane loss and causes of the 2026-10-06/07 outages (2026-10-24)
 
