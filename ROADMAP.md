@@ -59,6 +59,13 @@ have fresh running heartbeats in the November 15 check. No PID kill, manual lock
 deletion or plant restart was performed for this verification. Next scheduled
 operations audit: November 17; historical OI repair remains a separate decision.
 
+Documentation-closeout CI exposed an existing lease contention test assumption:
+Python 3.11 twice refused all six concurrent callers, with no successful claim.
+The lease uses nonblocking locks and does not promise a winner. The test now
+checks bounded durable reservations and successful-claim provenance, including a
+deterministically locked database that must refuse all claims. Sequential
+availability tests remain. No production lease behavior or data contract changed.
+
 ## Finding - per-lane loss and causes of the 2026-10-06/07 outages (2026-10-24)
 
 **Loss inventory** (read-only; coverage = first..last `received_at` of each cold raw run,

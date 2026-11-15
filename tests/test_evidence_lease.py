@@ -81,20 +81,40 @@ def test_competing_writer_is_refused_but_its_committed_slot_is_spent(directory):
         claim(directory, "run-3")
 
 
-def test_concurrent_claims_cannot_overbook(directory):
+@pytest.mark.parametrize("database_blocked", [False, True])
+def test_concurrent_claims_cannot_overbook(directory, database_blocked):
     barrier = threading.Barrier(6)
     def attempt(i):
         barrier.wait()
         try:
             obj = claim(directory, f"run-{i}")
             obj.close()
-            return True
+            return f"run-{i}"
         except (OSError, sqlite3.Error, lease.LeaseRefused):
-            return False
-    with ThreadPoolExecutor(max_workers=6) as pool:
-        results = list(pool.map(attempt, range(6)))
-    assert 1 <= sum(results) <= 2
-    assert 1 <= len(rows(directory)) <= 2
+            return None
+    blocker = sqlite3.connect(directory / "lease.sqlite3")
+    try:
+        if database_blocked:
+            blocker.execute("BEGIN EXCLUSIVE")
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            results = list(pool.map(attempt, range(6)))
+    finally:
+        blocker.rollback()
+        blocker.close()
+    successful = [run for run in results if run is not None]
+    committed = rows(directory)
+    # Nonblocking SQLite/writer locks may refuse every contender. Sequential
+    # availability is covered above; this test pins safety, not liveness.
+    assert len(successful) <= len(committed) <= lease.SLOTS
+    assert len(set(successful)) == len(successful)
+    assert set(successful) <= {row[1] for row in committed}
+    assert [row[0] for row in committed] == list(range(1, len(committed) + 1))
+    assert all(row[2] == lease.RESERVATION_BYTES for row in committed)
+    with sqlite3.connect(directory / "lease.sqlite3") as conn:
+        reserved, = conn.execute("SELECT reserved FROM trial").fetchone()
+    assert reserved == sum(row[2] for row in committed) <= lease.TOTAL_BYTES
+    if database_blocked:
+        assert successful == [] and committed == [] and reserved == 0
 
 
 def test_process_crash_releases_writer_without_refunding_claim(directory, monkeypatch):
